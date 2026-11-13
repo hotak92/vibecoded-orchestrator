@@ -90,32 +90,34 @@ describe('Projects page — card routing (P299-C3)', () => {
     ).toBe(true);
   });
 
-  it('ProjectCard is interactive: role=button, click AND keyboard route through onOpen', () => {
-    const div = [...walk(CARD.fragment)].find(
+  it('ProjectCard is interactive: a real open button whose click routes through onOpen', () => {
+    // v0.2.106 fix round 1 (review R2-6): the open action is a native
+    // <button> (keyboard activation is the browser's), not a role=button div
+    // with hand-written key handling — so the card's Remove button can sit
+    // beside it instead of nested inside an interactive element.
+    const openBtn = [...walk(CARD.fragment)].find(
       (n) =>
         n.type === 'RegularElement' &&
-        n.name === 'div' &&
+        n.name === 'button' &&
         (n.attributes as Node[]).some(
-          (a) => a.type === 'Attribute' && a.name === 'role' && JSON.stringify(a.value).includes('button'),
+          (a) => a.type === 'Attribute' && a.name === 'data-testid'
+            && JSON.stringify(a.value).includes('project-card-open'),
         ),
     );
-    expect(div, 'the card body has no role=button').toBeTruthy();
-    for (const attr of ['onclick', 'onkeydown'] as const) {
-      const handler = (div!.attributes as Node[]).find(
-        (a) => a.type === 'Attribute' && a.name === attr,
-      );
-      expect(handler, `the card body has no ${attr}`).toBeTruthy();
-    }
-    // Both handlers reach onOpen (the keyboard handler via handleKey).
-    const handlers = [...walk((CARD.instance as Node).content)].filter(
-      (n) => n.type === 'FunctionDeclaration' && (isIdent(n.id, 'handleKey') || true),
+    expect(openBtn, 'the card has no open button').toBeTruthy();
+    const onclick = (openBtn!.attributes as Node[]).find(
+      (a) => a.type === 'Attribute' && a.name === 'onclick',
     );
+    expect(onclick, 'the open button has no onclick').toBeTruthy();
     expect(
-      [...walk(handlers[0])].some((n) => n.type === 'CallExpression' && isIdent(n.callee, 'onOpen'))
-        || [...walk(CARD.fragment)].some(
-          (n) => n.type === 'CallExpression' && isIdent(n.callee, 'onOpen'),
-        ),
-      'no handler calls onOpen',
+      [...walk(onclick!)].some((n) => n.type === 'CallExpression' && isIdent(n.callee, 'onOpen')),
+      'the open button does not call onOpen',
     ).toBe(true);
+    expect(
+      [...walk(CARD.fragment)].some(
+        (n) => n.type === 'Attribute' && n.name === 'role' && JSON.stringify(n.value).includes('button'),
+      ),
+      'no role=button wrapper may remain',
+    ).toBe(false);
   });
 });

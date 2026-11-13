@@ -365,7 +365,11 @@ fn install_dirs_for(exe: Option<&std::path::Path>, discovery_disabled: bool) -> 
 /// — a hash-suffixed file whose PARENT DIRECTORY is named `deps`. That holds
 /// for unit tests (`--lib`), integration tests (`tests/*.rs`), doc-tests and
 /// `cargo nextest`, on all three OSes, and it does not depend on anyone
-/// remembering to set anything.
+/// remembering to set anything. Newer cargo (the build-dir layout GitHub's
+/// runners use since 2026-11) puts them in
+/// `<target>/<profile>/build/<crate>/<hash>/out/` instead, so a parent named
+/// `out` whose third ancestor is `build` is a harness too (the same layout
+/// `install_root::MAX_WALK_LEVELS` is sized for).
 ///
 /// It cannot fire in production. Shipped layouts are
 /// `<install>/launcher/dist/<os>-<arch>/vct-launcher` (parent
@@ -382,10 +386,21 @@ fn install_dirs_for(exe: Option<&std::path::Path>, discovery_disabled: bool) -> 
 /// discovery falls through to `$VCT_HUB_BIN`, `$PATH` and `~/.vct/bin`, which
 /// is a degraded lookup — never a wrong action.
 fn exe_is_test_harness(exe: &std::path::Path) -> bool {
-    exe.parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n == std::ffi::OsStr::new("deps"))
-        .unwrap_or(false)
+    let name_is = |p: Option<&std::path::Path>, want: &str| {
+        p.and_then(|p| p.file_name())
+            .map(|n| n == std::ffi::OsStr::new(want))
+            .unwrap_or(false)
+    };
+    let parent = exe.parent();
+    if name_is(parent, "deps") {
+        return true;
+    }
+    // Newer cargo build-dir layout: `<target>/<profile>/build/<crate>/<hash>/out/<bin>`.
+    let build = parent
+        .and_then(|p| p.parent()) // <hash>
+        .and_then(|p| p.parent()) // <crate>
+        .and_then(|p| p.parent()); // build
+    name_is(parent, "out") && name_is(build, "build")
 }
 
 /// [`exe_is_test_harness`] applied to THIS process.
@@ -672,6 +687,8 @@ mod tests {
             "/repo/launcher/src-tauri/target/debug/deps/vct_launcher_temp-1a2b3c",
             "/repo/target/release/deps/integration_test-9f8e7d",
             "/custom/CARGO_TARGET_DIR/debug/deps/doctest-0000",
+            // Newer cargo build-dir layout.
+            "/repo/launcher/src-tauri/target/debug/build/vct-launcher-temp/800d3b3efb2363fb/out/vct_launcher_temp_lib-800d3b3efb2363fb",
         ] {
             assert!(
                 exe_is_test_harness(std::path::Path::new(p)),
@@ -693,6 +710,9 @@ mod tests {
             // Dev: `cargo run` / `cargo build` output (NOT under deps/).
             "/repo/launcher/src-tauri/target/debug/vct-launcher",
             "/repo/launcher/src-tauri/target/release/vct-launcher",
+            // An `out/` that is not under `build/<crate>/<hash>/`.
+            "/opt/vct/out/vct-launcher",
+            "/home/u/build/out/vct-launcher",
             // A path with no parent at all.
             "vct-launcher",
         ] {

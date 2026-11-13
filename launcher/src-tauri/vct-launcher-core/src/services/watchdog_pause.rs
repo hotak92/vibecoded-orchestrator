@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 VibeCoded Tools
 //
-//! Shared pause-marker mechanism for the hub-side infra-container watchdog
-//! (v0.2.62).
+//! Shared pause-marker mechanism for every automatic restarter: the
+//! hub-side infra-container watchdog (v0.2.62) and the launcher's services
+//! watcher (v0.2.106).
 //!
 //! ## Why this module exists (the producer/consumer split)
 //!
@@ -27,13 +28,24 @@
 //! ## Lifecycle contract
 //!
 //! - A deliberate STOP of a VCO-managed service (a `vco_managed`
-//!   `service_endpoints` row, or no row) CREATES its marker → the watchdog
-//!   leaves it down. Adopted services are never supervised, so they get none.
+//!   `service_endpoints` row, or no row) CREATES its marker → BOTH
+//!   consumers leave it down. Adopted services are never supervised, so
+//!   they get none.
 //! - A deliberate START / RESTART of the same service REMOVES its marker →
-//!   the watchdog resumes supervision.
+//!   supervision resumes. An AUTOMATIC restart (the launcher watcher's
+//!   self-healing path) must NEVER remove it (v0.2.106) — only an explicit
+//!   user action does.
 //! - A RAW external stop (the user runs `podman stop` themselves, a crash,
 //!   an OOM kill) leaves NO marker → the watchdog restarts it (the desired
 //!   self-healing behavior).
+//!
+//! ## Consumers (v0.2.106: one pause rule for every automatic restarter)
+//!
+//! TWO automatic restarters consult this SAME module — the hub-side infra
+//! watchdog (`vct_hub::infra_watchdog`) and the launcher's services
+//! watcher (`launcher::services::watcher`). Skipping a paused service and
+//! never clearing its marker is the rule for BOTH; there is no second
+//! copy of the path logic anywhere.
 //!
 //! ## Safety
 //!

@@ -85,6 +85,33 @@ SYNC_PS1 = (
 COST_SH = '[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/cost-tracker.sh'
 COST_PS1 = "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/cost-tracker.ps1"
 
+# v0.2.106: the inline py_compile registration cb0ffb4e introduced and
+# 94f78f82 (shipped in v0.2.75) replaced with the named hook. Read off
+# `94f78f82^:templates/settings.json.{linux,windows}.template:397` — the JSON
+# string VALUES, not their escaped source form.
+#   `git show cb0ffb4e -- templates/settings.json.linux.template`
+PY_COMPILE_LINUX = (
+    'python3 -c "import json,sys,py_compile; '
+    "d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; "
+    "fp=d.get('tool_input',{}).get('file_path',''); "
+    'py_compile.compile(fp) if fp else None" 2>&1 || echo "Syntax error"'
+)
+PY_COMPILE_PS1 = (
+    'powershell -NoProfile -Command "try { $payload = '
+    "[Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = "
+    "$payload.tool_input.file_path; if ($fp) { python -m py_compile $fp 2>&1 } "
+    '} catch { Write-Output \\"Syntax error\\" }"'
+)
+# The OLDER forms those replaced (a028ab91 / da830e45 → cb0ffb4e), the JSON
+# string values of `cb0ffb4e^:templates/settings.json.{linux,windows}.template:247`.
+PY_COMPILE_ARGPATH_LINUX = (
+    "python -m py_compile \"$CLAUDE_TOOL_ARG_PATH\" 2>&1 || echo 'Syntax error'"
+)
+PY_COMPILE_ARGPATH_PS1 = (
+    'powershell -NoProfile -Command "try { python -m py_compile '
+    "$env:CLAUDE_TOOL_ARG_PATH } catch { Write-Output 'Syntax error' }\""
+)
+
 
 def _cmds(hooks: dict, event: str) -> list:
     out = []
@@ -106,6 +133,10 @@ class TableIsHonestTests(unittest.TestCase):
             ("PostToolUse", SYNC_PS1, None),
             ("Stop", COST_SH, "cost-tracker.sh"),
             ("Stop", COST_PS1, "cost-tracker.ps1"),
+            ("PostToolUse", PY_COMPILE_LINUX, None),
+            ("PostToolUse", PY_COMPILE_PS1, None),
+            ("PostToolUse", PY_COMPILE_ARGPATH_LINUX, None),
+            ("PostToolUse", PY_COMPILE_ARGPATH_PS1, None),
         ]
         for event, cmd, identity in cases:
             with self.subTest(cmd=cmd[:48]):
@@ -178,6 +209,25 @@ class LeaveAloneTests(unittest.TestCase):
             )
         )
 
+    def test_a_near_identical_py_compile_command_is_kept(self):
+        """v0.2.106: the retirement is the WHOLE command, normalised. A user
+        who runs the same compile one character differently owns that
+        command — only a byte-equal (after normalisation) VCO spelling goes."""
+        for near in (
+            PY_COMPILE_LINUX.replace("python3", "python"),
+            PY_COMPILE_LINUX.replace(' || echo "Syntax error"', ""),
+            PY_COMPILE_LINUX.replace(
+                "py_compile.compile(fp)",
+                "py_compile.compile(fp, doraise=True)"),
+            PY_COMPILE_PS1.replace("Write-Output", "Write-Host"),
+            PY_COMPILE_ARGPATH_LINUX.replace("$CLAUDE_TOOL_ARG_PATH", "$MY_FILE"),
+            PY_COMPILE_ARGPATH_LINUX.replace("python ", "python3 "),
+            PY_COMPILE_ARGPATH_PS1.replace("Write-Output", "Write-Host"),
+        ):
+            with self.subTest(near=near[:60]):
+                self.assertIsNone(hr.match_retired_registration(
+                    "PostToolUse", near, hook_identity=None))
+
     def test_right_command_wrong_event_is_kept(self):
         self.assertIsNone(
             hr.match_retired_registration("PreToolUse", SYNC_SH_BARE, hook_identity=None)
@@ -223,6 +273,68 @@ class MergeRemovalTests(unittest.TestCase):
         self.assertEqual(removed[0]["event"], "PostToolUse")
         self.assertEqual(removed[0]["command"], SYNC_SH_BARE)
         self.assertEqual(removed[0]["retirement"].retired_in, "v0.2.73")
+
+    def test_retired_inline_py_compile_is_removed_beside_the_named_hook(self):
+        """v0.2.106 F1: the inline entry still sits beside the named
+        py-compile-check hook on a live install. The update takes it out of
+        the same group and leaves the named hook exactly as it was."""
+        named = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/py-compile-check.sh"'
+        user_hooks = {
+            "PostToolUse": [
+                {"matcher": "Write", "hooks": [
+                    {"type": "command", "command": PY_COMPILE_LINUX,
+                     "timeout": 10},
+                    {"type": "command", "command": named, "timeout": 10},
+                ]},
+            ],
+        }
+        removed: list = []
+        merged = project_init._merge_hooks_for_bundle(
+            user_hooks, {}, retired_removed=removed,
+        )
+        self.assertEqual(_cmds(merged, "PostToolUse"), [named])
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["command"], PY_COMPILE_LINUX)
+        self.assertEqual(removed[0]["retirement"].retired_in, "v0.2.75")
+
+    def test_the_older_arg_path_one_liners_are_removed_beside_the_named_hook(self):
+        """v0.2.106 fix round 1 (U1-4): the pre-cb0ffb4e ``CLAUDE_TOOL_ARG_PATH``
+        forms (both OS spellings) go too; the named hook stays. RED-PROOF
+        TARGET: delete their two table rows → both kept."""
+        named = 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/py-compile-check.sh"'
+        for inline in (PY_COMPILE_ARGPATH_LINUX, PY_COMPILE_ARGPATH_PS1):
+            with self.subTest(inline=inline[:40]):
+                user_hooks = {"PostToolUse": [{"matcher": "Write", "hooks": [
+                    {"type": "command", "command": inline, "timeout": 10},
+                    {"type": "command", "command": named, "timeout": 10},
+                ]}]}
+                removed: list = []
+                merged = project_init._merge_hooks_for_bundle(
+                    user_hooks, {}, retired_removed=removed)
+                self.assertEqual(_cmds(merged, "PostToolUse"), [named])
+                self.assertEqual([r["command"] for r in removed], [inline])
+
+    def test_unregister_takes_the_retired_inline_command_out_too(self):
+        """v0.2.106 F1: the unregister path reads the SAME retirement table
+        (``settings_merge._shipped_spellings``), so "Remove project" takes the
+        inline py_compile entry out too — with no second list to keep in step.
+        A near-identical command of the user's stays."""
+        from vco_lib.settings_merge import strip_shipped_hooks
+
+        near = PY_COMPILE_LINUX.replace("python3", "python")
+        hooks = {
+            "PostToolUse": [
+                {"matcher": "Write", "hooks": [
+                    {"type": "command", "command": PY_COMPILE_LINUX},
+                    {"type": "command", "command": near},
+                    {"type": "command", "command": "bash .claude/hooks/my-own.sh"},
+                ]},
+            ],
+        }
+        out, removed = strip_shipped_hooks(hooks, [{}])
+        self.assertEqual(_cmds(out, "PostToolUse"),
+                         [near, "bash .claude/hooks/my-own.sh"])
+        self.assertEqual([r["command"] for r in removed], [PY_COMPILE_LINUX])
 
     def test_group_left_empty_is_pruned_and_the_event_key_dropped(self):
         user_hooks = {

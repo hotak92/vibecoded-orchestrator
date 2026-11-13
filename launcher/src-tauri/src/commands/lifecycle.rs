@@ -854,13 +854,50 @@ pub async fn service_stop(name: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Restart a single service.
+/// Restart a single service — the USER action (Services page Restart
+/// button). An explicit user restart resumes watchdog supervision: the
+/// pause marker is removed.
 #[command]
 pub async fn service_restart(name: String) -> Result<(), String> {
-    validate_service_name(&name)?;
+    service_restart_with_origin(&name, RestartOrigin::User).await
+}
+
+/// Restart a single service WITHOUT touching the watchdog pause marker —
+/// the AUTOMATIC path (the launcher's services watcher self-healing
+/// restart). v0.2.106 rule: an automatic restart must never clear the
+/// user's "stopped on purpose" signal; only an explicit user action
+/// (Start / Restart from the GUI or CLI) clears it.
+pub(crate) async fn service_restart_automatic(name: String) -> Result<(), String> {
+    service_restart_with_origin(&name, RestartOrigin::Automatic).await
+}
+
+/// Who asked for a restart — the ONLY input that decides the pause-marker
+/// side effect (see [`restart_clears_pause_marker`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartOrigin {
+    /// An explicit user action (GUI button / registered command).
+    User,
+    /// An automatic restarter (the services watcher).
+    Automatic,
+}
+
+/// PURE: does a restart from `origin` clear the watchdog pause marker?
+/// Only [`RestartOrigin::User`] does — the watcher's automatic restart
+/// leaves the marker exactly as it is. One home for the v0.2.106 split so
+/// tests can pin it without a container runtime.
+pub(crate) fn restart_clears_pause_marker(origin: RestartOrigin) -> bool {
+    matches!(origin, RestartOrigin::User)
+}
+
+/// Shared routing for both restart paths (user command + watcher). The
+/// action is identical; ONLY the pause-marker side effect differs.
+async fn service_restart_with_origin(name: &str, origin: RestartOrigin) -> Result<(), String> {
+    validate_service_name(name)?;
     let info = require_runtime().await?;
-    route_service_action(&info, &name, "restart").await?;
-    set_pause_marker_for_service(&name, false);
+    route_service_action(&info, name, "restart").await?;
+    if restart_clears_pause_marker(origin) {
+        set_pause_marker_for_service(name, false);
+    }
     Ok(())
 }
 
@@ -1982,6 +2019,37 @@ mod services_lifecycle_tests {
         assert!(all.iter().all(|s| is_service_paused(s)));
         set_pause_markers(&all, false);
         assert!(all.iter().all(|s| !is_service_paused(s)));
+    }
+
+    /// v0.2.106: an AUTOMATIC restart must never clear a pause marker —
+    /// the watcher's restart path performs no marker write at all, so the
+    /// marker the user's Stop created survives it untouched.
+    #[test]
+    #[serial_test::serial]
+    fn automatic_restart_path_never_clears_a_pause_marker() {
+        use vct_launcher_core::services::watchdog_pause::create_pause_marker;
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        create_pause_marker("weaviate").expect("create marker");
+        assert!(
+            !restart_clears_pause_marker(RestartOrigin::Automatic),
+            "the automatic (watcher) restart must not clear the pause marker"
+        );
+        // The automatic path's ONLY marker handling is "none": the marker
+        // the user's Stop created is still there.
+        assert!(is_service_paused("weaviate"));
+    }
+
+    /// v0.2.106: only an explicit user restart clears the marker — and the
+    /// clearing the user path performs is the existing producer helper.
+    #[test]
+    #[serial_test::serial]
+    fn user_restart_path_clears_the_pause_marker() {
+        use vct_launcher_core::services::watchdog_pause::create_pause_marker;
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        create_pause_marker("weaviate").expect("create marker");
+        assert!(restart_clears_pause_marker(RestartOrigin::User));
+        set_pause_marker_for_service("weaviate", false);
+        assert!(!is_service_paused("weaviate"));
     }
 
     #[test]

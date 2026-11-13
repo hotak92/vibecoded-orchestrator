@@ -99,8 +99,9 @@
       <span class="providers-tag">machine-wide</span>
     </div>
     <p class="providers-intro">
-      Turn off a subscription you no longer have. Off is remembered: VCO stops
-      delivering that provider's agents and hides its model rows.
+      Turn off a subscription you no longer have. Off is remembered and applies
+      at once: VCO parks that provider's agents in every project (nothing is
+      deleted), hides its model rows, and the gateway stops serving its models.
     </p>
 
     {#key renderKey}

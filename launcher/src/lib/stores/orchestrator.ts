@@ -129,6 +129,12 @@ export interface UpdateStatus {
    *  finished). Rendered as a warning line in the badge popover.
    *  Optional: pre-v0.2.93 Rust omits it. */
   binary_ahead_of_install?: boolean;
+  /** v0.2.106: the last launcher-driven `install.py --update` failed after
+   *  the git operation had advanced the tree (the root ledger carries
+   *  `update_install_phase_failed`). Implies `install_stale`; lets the badge
+   *  say "the last update did not finish" when the versions agree.
+   *  Optional: pre-v0.2.106 Rust omits it. */
+  install_incomplete?: boolean;
 }
 
 /** What a probe actually established. Mirror of Rust

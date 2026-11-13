@@ -107,7 +107,9 @@ class FileCopyRecord:
     dest_bytes_after: int = 0
     appended_lines: int = 0
     #: Every source line is present in the destination at least as many times
-    #: as it appears in the source, and the byte/line arithmetic adds up.
+    #: as it appears in the source, and the destination did not lose lines.
+    #: Semantic, never byte equality (v0.2.106: line endings, a BOM and a
+    #: concurrent appender are not content differences).
     verified: bool = False
     #: Set when the fast path skipped the file: the sentinel already records
     #: this exact source digest and the destination still satisfies it.
@@ -167,6 +169,13 @@ def _read_lines(path: Path) -> list[str]:
     telemetry stream must not abort a migration whose job is to preserve it.
     The line still round-trips as the same string on both sides of the
     comparison, which is all the dedup needs.
+
+    v0.2.106: the comparison is SEMANTIC, not byte-for-byte, so a line is
+    normalized before it is compared: a trailing ``\\r`` (a CRLF file, which
+    PowerShell writers on this machine produce) and a UTF-8 BOM on the first
+    line are line endings/encoding, not content. They used to make the same
+    row read as a different one — the duplicate append and the misleading
+    "bytes N != M" warning the field report showed.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -179,7 +188,9 @@ def _read_lines(path: Path) -> list[str]:
     lines = text.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
-    return lines
+    if lines:
+        lines[0] = lines[0].lstrip("﻿")
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
 
 
 def _measure(path: Path) -> tuple[int, int, str]:
@@ -218,8 +229,8 @@ def _lines_to_append(source_lines: list[str], dest_lines: list[str]) -> list[str
     return out
 
 
-def _append_lines(path: Path, lines: list[str]) -> int:
-    """Append ``lines`` to ``path``; return the bytes written.
+def _append_lines(path: Path, lines: list[str]) -> None:
+    """Append ``lines`` to ``path``.
 
     Append mode, not read-modify-rewrite: a metrics file can be receiving
     concurrent appends from a hook, and ``os.replace`` of a whole rewritten
@@ -229,12 +240,11 @@ def _append_lines(path: Path, lines: list[str]) -> int:
 
     If the destination exists and does not end in a newline (a torn previous
     append), the terminator is added first so our first row is not glued onto
-    a partial one. Those repair bytes are included in the return value, so the
-    caller's byte arithmetic still balances.
+    a partial one. (v0.2.106: no byte count is returned any more — the copy
+    is verified by content, :func:`_copy_one`, not by byte arithmetic.)
     """
     if not lines:
-        return 0
-    written = 0
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_terminator = False
     try:
@@ -247,11 +257,8 @@ def _append_lines(path: Path, lines: list[str]) -> int:
     with open(path, "a", encoding="utf-8") as fh:
         if needs_terminator:
             fh.write("\n")
-            written += 1
         for line in lines:
             fh.write(line + "\n")
-            written += len(line.encode("utf-8")) + 1
-    return written
 
 
 def _load_sentinel(dest: Path) -> Optional[dict]:
@@ -349,7 +356,7 @@ def _copy_one(
         return rec
 
     try:
-        bytes_written = _append_lines(dest_file, pending)
+        _append_lines(dest_file, pending)
     except OSError as exc:
         rec.error = f"append failed: {exc}"
         # Re-measure the source anyway: a failed run still owes the caller an
@@ -363,26 +370,30 @@ def _copy_one(
     rec.dest_lines_after, rec.dest_bytes_after, _ = _measure(dest_file)
 
     # ── VERIFY (the act) ────────────────────────────────────────────────────
-    # Line count, byte count, and containment, all three. Byte arithmetic
-    # alone would miss a wrong-content append; containment alone would miss a
-    # truncation somewhere else in the file.
+    # SEMANTIC, not byte arithmetic (v0.2.106 field report): two byte counts
+    # that differ while every line matches were reported as a failure (14 and
+    # 66 bytes) — the difference came from line endings / a BOM and from
+    # another writer appending between our append and our measure, neither of
+    # which is a lost row. What the verification must prove is CONTENT: every
+    # source row is present, and the file did not lose rows. Byte counts stay
+    # in the record as measurements.
     expected_lines = rec.dest_lines_before + len(pending)
-    expected_bytes = rec.dest_bytes_before + bytes_written
     final_counts = Counter(_read_lines(dest_file))
     contains_all = all(
         final_counts.get(line, 0) >= count
         for line, count in Counter(source_lines).items()
     )
-    rec.verified = (
-        rec.dest_lines_after == expected_lines
-        and rec.dest_bytes_after == expected_bytes
-        and contains_all
-    )
+    rec.verified = contains_all and rec.dest_lines_after >= expected_lines
     if not rec.verified:
+        missing = [
+            line for line, count in Counter(source_lines).items()
+            if final_counts.get(line, 0) < count
+        ]
         rec.error = (
-            f"verification failed: lines {rec.dest_lines_after} != "
-            f"{expected_lines} or bytes {rec.dest_bytes_after} != "
-            f"{expected_bytes} or missing rows (contains_all={contains_all})"
+            f"verification failed: {rec.dest_lines_after} line(s) in the "
+            f"destination after the append (expected at least "
+            f"{expected_lines}); {len(missing)} source row(s) missing"
+            + (f", e.g. {missing[0][:80]!r}" if missing else "")
         )
 
     # ── VERIFY (the leave-alone) ────────────────────────────────────────────

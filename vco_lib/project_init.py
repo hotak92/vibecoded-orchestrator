@@ -66,7 +66,7 @@ from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
 # in-function local imports of `to_posix_rel` elsewhere in this file are left as
 # they are — pre-existing, and harmless (same object).
 from vco_lib.paths import to_posix_rel
-from vco_lib import codegraph_orphan_snapshot as _cos
+from vco_lib import codegraph_orphan_snapshot as _cos, weaviate_case_history as _wch
 from vco_lib import codegraph_prefix_record as _cpr
 # v0.2.95 WP-9: "which plan actions may be applied without consent" is a policy,
 # not plumbing, and it had a second implementation in Rust. One home now; this
@@ -78,6 +78,7 @@ from vco_lib import migration_plan_classify as _mpc
 from vco_lib import git_exclude as _git_exclude
 from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
+from vco_lib.bundle_manifest_lock import serialized_bundle_run as _serialized_bundle_run
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
 # v0.2.103 (review L-1): the formats-migration deferral emitters (whose
@@ -730,12 +731,8 @@ def rebuild_collections(args, log_event=None) -> None:
                     continue
                 if client.collections.exists(name):
                     print(f"  Dropping {label}: {name} ...")
-                    client.collections.delete(name)
-                    _log(
-                        "7b.1/10", "step",
-                        f"dropped {label}: {name}",
-                        data={"collection": name},
-                    )
+                    _wch.delete_collection(client, name, weaviate_url)  # v0.2.106: + recorded
+                    _log("7b.1/10", "step", f"dropped {label}: {name}", data={"collection": name})
                 else:
                     print(f"  {label} ({name}) does not exist — skipping drop")
         finally:
@@ -1014,9 +1011,9 @@ def _create_class(payload: dict, weaviate_url: Optional[str] = None) -> None:
     # them (exit 2). One rule, one escape (`VCT_ALLOW_FIXTURE_CLASS_WRITES=1`),
     # decided ONCE at add time instead of surfacing at every later sync.
     # Placed AFTER the idempotency return: an existing class is not a write.
-    from vco_lib.fixture_class_guard import guard_fixture_class_write
+    from vco_lib.fixture_class_guard import guard_class_create  # v0.2.106: + case-variant rule
 
-    guard_fixture_class_write(name, operation="create", weaviate_url=base)
+    guard_class_create(name, weaviate_url=base)
     status, body = _http_request("POST", f"{base}/v1/schema", body=payload, timeout=30)
     if status not in (200, 201):
         raise RuntimeError(f"POST /v1/schema ({name}) → HTTP {status}: {body[:300]!r}")
@@ -1042,6 +1039,7 @@ def _delete_class(name: str, weaviate_url: Optional[str] = None) -> None:
     status, body = _http_request("DELETE", f"{base}/v1/schema/{name}", timeout=30)
     if status not in (200, 204, 404):
         raise RuntimeError(f"DELETE /v1/schema/{name} → HTTP {status}: {body[:300]!r}")
+    _wch.record_deleted(name, base, status=status)  # v0.2.106: case-variant guard evidence
 
 
 def _count_objects(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:
@@ -3117,6 +3115,7 @@ def _hook_globs_for_os() -> tuple[str, ...]:
 # v0.2.102 (W6-HTAB): the OS template pick moved to its one home beside the
 # merge I/O, so the launcher's parked-hook carry check reads the same file.
 from vco_lib.bundle_settings_io import settings_template_path as _settings_template_path  # noqa: E402
+from vco_lib import settings_provenance as _settings_prov  # noqa: E402
 
 
 # v0.2.92: `_prune_now_empty_parents` moved to `vco_lib.fs_prune`. This module
@@ -3238,6 +3237,8 @@ def _enumerate_bundle_files(
     sink: "Any" = None,
     project_name: Optional[str] = None,
     gate_verdict: "Any" = None,
+    gate_reach: "Any" = None,
+    disabled_vendors: "Any" = None,
 ) -> list[_BundleFileOp]:
     """Build the list of files to install. Hooks ship BOTH .sh + .ps1
     flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
@@ -3269,6 +3270,7 @@ def _enumerate_bundle_files(
       whose VENDOR the user switched off is held with
       `SIGNAL_PROVIDER_DISABLED` and never enumerated — the orphan walk parks
       an earlier delivery instead (see `module_gated_delivery`).
+      v0.2.106: `disabled_vendors` = the off-list from the run's own DB (`--db-path`); omitted → the default DB's.
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
       .claude/specializations/<rel>        from templates/specializations/<rel>
                                            (recursive PLAIN copy, no substitution —
@@ -3403,7 +3405,8 @@ def _enumerate_bundle_files(
         verdict = (gate_verdict if gate_verdict is not None else
                    _mgd.gateway_agents_gate(
                        orchestrator_root if project_root is None else project_root))
-        gw_files, gw_held = _mgd.select_gateway_agents(gateway_agents_src, verdict)
+        gw_files, gw_held = _mgd.select_gateway_agents(
+            gateway_agents_src, verdict, reach_hint=gate_reach, disabled_vendors=disabled_vendors)
         if gate_outcomes is not None:
             gate_outcomes += [(_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict), *gw_held]
         for agent_file in gw_files:
@@ -4114,8 +4117,9 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
 # names stay HERE as the patch point the adoption tests use.
 from vco_lib.bundle_backup import (  # noqa: E402
     adopt_backup_timestamp as _adopt_backup_timestamp,
-    backup_bytes_for_adoption as _backup_bytes_for_adoption,
+    backup_bytes_for_adoption as _backup_bytes_for_adoption,  # noqa: F401  # pyright: ignore[reportUnusedImport] — the patch point adopt_write calls through
 )
+from vco_lib import bundle_backup as _bundle_backup  # noqa: E402
 
 
 def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
@@ -5647,34 +5651,30 @@ def _emit_chunker_revision_resync_deferral(
 
     detected = (
         f"The KG chunker revision changed from `{prev_revision}` to "
-        f"`{cur_revision}` (see `_CHUNKER_REVISION` in "
-        f"`claude_mcp_servers/weaviate_mcp/chunking.py`). For entries whose "
-        f"content now plans differently under the new revision (for this "
-        f"transition: content above the new 8 192-unit qwen3 chunk budget), "
-        f"the boundaries differ from the rows already in this project's "
-        f"KG + code graph — search recall degrades on long answers because "
-        f"relevant content lives in a chunk the new preset would fold "
-        f"differently. Re-sync to re-chunk under the current revision."
+        f"`{cur_revision}` (`_CHUNKER_REVISION` in "
+        f"`claude_mcp_servers/weaviate_mcp/chunking.py`; its revision history "
+        f"says what moved). Entries whose content now plans differently keep "
+        f"their old chunk boundaries in this project's KG + code graph until "
+        f"they are re-chunked once."
     )
     cmd = _chunker_revision.resync_commands(
         folder,
-        "# The kg-sync half re-chunks only entries whose stored chunk plan\n"
-        "# differs from the current revision (everything else is hash-\n"
-        "# skipped); the code-graph half re-embeds every entity. Both run\n"
-        "# embed I/O through Ollama — consider a quiet moment.",
+        "# Both halves re-embed only what changed; searches keep working\n"
+        "# while they run.",
     )
     entry = DeferralEntry(
         condition_id="chunker_preset_overhaul_pending",
-        title="KG + codegraph re-sync recommended (chunker revision changed)",
+        title="KG + codegraph re-chunk (chunker revision changed)",
         detected=detected,
         why_deferred=(
-            "Auto-rechunking at update time (every code-graph entity, plus "
-            "the KG entries whose boundaries changed) would run significant "
-            "embed I/O on the user's backends at a moment they did not pick. "
-            "We defer the decision so the user can choose a quiet moment. "
-            "Searches WORK in the meantime — they just return less relevant "
-            "top-k results. Once you run the re-sync commands below, this "
-            "deferral self-resolves on the next bundle update."
+            "The update starts the re-chunk itself: the KG pass runs with the "
+            "update's knowledge sync (launcher bundle update / install.py), "
+            "and the code graph re-walks in the background (extractor-"
+            "generation rung). Each half stamps itself when it completes, and "
+            "this entry then clears on the next bundle update. Run the "
+            "commands below only if a half did not complete (a backend was "
+            "down, the walk was interrupted) — they are the same passes, and "
+            "nothing is deleted before its new vectors are written."
         ),
         command_to_apply=cmd,
         severity="info",
@@ -8553,6 +8553,7 @@ def _record_preserve(
     )
 
 
+@_serialized_bundle_run  # review C-M2: one writer of the manifest at a time
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -8931,9 +8932,11 @@ def install_project_bundle(
     # v0.2.105 per-provider switch: restore what the switch parked BEFORE
     # enumeration (see module_gated_delivery.provider_restore_pass).
     from vco_lib import module_gated_delivery as _mgd
+    _gw_reach: dict = {}  # the restore gate's key answers (review L10)
     _gw_verdict, _gw_restored = _mgd.provider_restore_pass(
         folder, orchestrator_root, manifest, skip_kinds=skip_kinds,
-        dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m))
+        dry_run=dry_run, log=lambda m: _log("4.bundle.gated", "info", m),
+        reach_out=_gw_reach)
     if _gw_restored:
         result["provider_agents_restored"] = _gw_restored
 
@@ -8941,7 +8944,8 @@ def install_project_bundle(
                                   gate_outcomes=_gate_outcomes,
                                   sink=_materialize_sink,
                                   project_name=project_name,
-                                  gate_verdict=_gw_verdict)
+                                  gate_verdict=_gw_verdict,
+                                  gate_reach=_gw_reach)
     # §3.2: pack member ops join the enumeration with default-shaped dest_rels
     # (`.claude/agents|skills/...`), so kind classification, skip-disabled,
     # `--skip-kind` and the orphan machinery all apply to them unchanged.
@@ -9046,16 +9050,17 @@ def install_project_bundle(
                 # which also skip the FS write and manifest record below).
                 pass
             else:
+                if _adopt_backup_ts is None:
+                    _adopt_backup_ts = _adopt_backup_timestamp()
+                # The backup-then-write pair is ONE helper
+                # (`vco_lib.bundle_backup.adopt_write`), shared with the
+                # provider switch's restore (v0.2.106 review M2).
                 try:
-                    current_bytes = target_path.read_bytes()
-                    if _adopt_backup_ts is None:
-                        _adopt_backup_ts = _adopt_backup_timestamp()
-                    backup_rel = _backup_bytes_for_adoption(
-                        folder, op.dest_rel, _adopt_backup_ts, current_bytes,
-                    )
-                except Exception as e:
+                    backup_rel, _redirect = _bundle_backup.adopt_write(
+                        folder, op.dest_rel, target_path, source_bytes, _adopt_backup_ts)
+                except _bundle_backup.AdoptionBackupFailed as e:
                     # Backup failed → do NOT adopt. Fall back to preserve.
-                    err = f"{type(e).__name__}: {e}"
+                    err = str(e)
                     _log("4.bundle.adopt", "warn",
                          f"{op.dest_rel}: adoption backup failed ({err}) — "
                          "falling back to preserve + deferral",
@@ -9071,26 +9076,20 @@ def install_project_bundle(
                     # default-to-safety policy that no longer exists.
                     backup_failures.append((op.dest_rel, err))
                     action = "preserve"
+                except Exception as e:
+                    # The backup was captured but the shipped write failed —
+                    # do NOT claim the manifest entry, do NOT record an
+                    # adoption. The on-disk file is unchanged (atomic write
+                    # never partially replaced it). Skip to the next op.
+                    err = f"{type(e).__name__}: {e}"
+                    _log("4.bundle.adopt", "error",
+                         f"{op.dest_rel}: shipped write failed after backup: {err}",
+                         data={"path": op.dest_rel, "error": err})
+                    result["errors"].append({"path": op.dest_rel, "error": err})
+                    continue
                 else:
-                    # Backup captured — write the shipped bytes.
-                    try:
-                        mode: Optional[int] = None
-                        if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
-                            mode = 0o700
-                        _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
-                        if _redirect is not None:
-                            symlink_redirect_events.append((target_path, _redirect))
-                    except Exception as e:
-                        err = f"{type(e).__name__}: {e}"
-                        _log("4.bundle.adopt", "error",
-                             f"{op.dest_rel}: shipped write failed after backup: {err}",
-                             data={"path": op.dest_rel, "error": err})
-                        result["errors"].append({"path": op.dest_rel, "error": err})
-                        # Bytes were backed up but the shipped write failed —
-                        # do NOT claim the manifest entry, do NOT record an
-                        # adoption. The on-disk file is unchanged (atomic write
-                        # never partially replaced it). Skip to the next op.
-                        continue
+                    if _redirect is not None:
+                        symlink_redirect_events.append((target_path, _redirect))
                     adopted_paths.append((op.dest_rel, backup_rel))
                     record_in_manifest = True
 
@@ -9194,20 +9193,14 @@ def install_project_bundle(
         elif action in ("create", "overwrite", "always-overwrite"):
             if not dry_run:
                 try:
-                    mode: Optional[int] = None
-                    # Preserve executable bit for shell scripts on POSIX.
-                    if op.dest_rel.endswith((".sh",)) or "/scripts/" in _to_posix_rel(op.dest_rel):
-                        # Many launcher scripts have no extension (kg-search,
-                        # code-graph-query, kg-sync). Mark all of
-                        # .claude/scripts/ + *.sh as executable. 0o700
-                        # (owner-only rwx) — CodeQL py/overly-permissive-file
-                        # flagged both 0o755 (world) and 0o750 (group) as
-                        # overly permissive. The project folder belongs to
-                        # the user; group/world access is unnecessary.
-                        mode = 0o700
+                    # Executable bit for shell scripts on POSIX (incl. the
+                    # extension-less .claude/scripts/ launchers): one rule,
+                    # `vco_lib.bundle_backup.bundle_file_mode`.
                     # v0.2.70 (Bug B): capture a `.vco-new` redirect (symlink-
                     # blocking) so the consolidated symlink deferral lists it.
-                    _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
+                    _redirect = _write_file_atomic(
+                        target_path, source_bytes,
+                        mode=_bundle_backup.bundle_file_mode(op.dest_rel))
                     if _redirect is not None:
                         symlink_redirect_events.append((target_path, _redirect))
                 except Exception as e:
@@ -9608,6 +9601,7 @@ def install_project_bundle(
     # maps `--skip-materialize-claude-dir` to `--skip-kind ... settings` so the
     # legacy "don't rewrite my settings" intent is preserved.
     settings_template = _settings_template_path(orchestrator_root)
+    _settings_fp_before = _settings_prov.fingerprint_before(folder)  # v0.2.106: as FOUND
     if "settings" not in skip_kinds and settings_template.exists():
         try:
             settings_target = folder / ".claude" / "settings.json"
@@ -9982,6 +9976,8 @@ def install_project_bundle(
                 _gate_outcomes, restored=_gw_restored)
             if _parked:
                 manifest_payload[_PARKED_KEY] = _parked
+            _settings_prov.carry_record(manifest_payload, manifest, folder,  # v0.2.106
+                                        result.get("settings_action"), _settings_fp_before)
             _write_manifest_atomic(folder, manifest_payload)
             result["manifest_written"] = True
 
@@ -12383,86 +12379,21 @@ def _cmd_bootstrap_collections(args: argparse.Namespace) -> int:
 
 
 def _cmd_drop_collections(args: argparse.Namespace) -> int:
-    """`drop-collections --name <project_name> [--weaviate-url <url>] --json`
+    """`drop-collections --name <project_name> [--project-id <id>]
+    [--weaviate-url <url>] --json` — drop THIS project's own classes (KG,
+    Development, Diagrams, the five code-graph classes; with `--project-id`
+    also the classes its launcher rows bind), never a shared class nor one
+    another registered project uses. The decision lives in
+    `vco_lib.unregister_collections` (v0.2.106, size ratchet).
 
-    Drop the project's OWN Weaviate collections (`<sanitized>_KnowledgeGraph`,
-    `<sanitized>_Development`, `<sanitized>_Diagrams`, and — v0.2.73 GAP-1 —
-    the 5 code-graph classes `<CodePrefix>_CodeModule/CodeClass/CodeFunction/
-    CodeAPI/CodeInteraction`). The shared KG (`VibeCodedOrchestrator_KnowledgeGraph`
-    since v0.2.23 B1, was `VibecodedOrchestrator_KnowledgeGraph` v0.2.12–v0.2.22,
-    or whatever `_SHARED_KG_NAME` resolves to — was `VibeCodedTools_KnowledgeGraph`
-    pre-v0.2.12 PR-26) is NEVER touched — every project depends on read
-    access to it, and it's owned by the orchestrator install, not by any
-    individual project.
-
-    Used by the launcher's `delete_project_v2` when the user opts in to
-    `purge_collections: true` on unregister. Soft-fails idempotently:
-    a 404 from Weaviate (collection already gone) counts as a successful
-    drop. Connection errors land in `errors[]`, never raise, exit 1.
-
-    JSON stdout schema:
-      {"dropped": ["<Project>_KnowledgeGraph", "<Project>_Development"],
-       "skipped_shared": "VibeCodedOrchestrator_KnowledgeGraph",
-       "errors": [{"collection": <name>, "error": <str>}]}
-
-    Exit 0 on clean drop (incl. 404). Exit 1 when at least one drop
-    request hit a non-404 HTTP error.
+    JSON: `{"dropped", "skipped_shared", "kept": [{"collection", "reason"}],
+    "notes", "errors": [{"collection", "error"}]}`. Exit 0 on a clean drop
+    (a 404 counts as dropped); exit 1 when any entry is in `errors`.
     """
-    derived = derive_project_collection_names(args.name)
-    # fix/a1-indexing-pipeline (2026-05-25): include the per-project
-    # Diagrams collection so unregister cleans up the full set the
-    # bootstrap path creates. Idempotent — a 404 from Weaviate on a
-    # never-created Diagrams class still counts as a successful drop
-    # (consistent with the existing KG / Dev semantics).
-    #
-    # v0.2.73 GAP-1 (H3): ALSO drop the 5 code-graph collections. Pre-fix,
-    # `drop-collections` was CODE-BLIND — a consented project-unregister with
-    # `purge_collections:true` left `<Prefix>_CodeFunction` (potentially the
-    # 87 GB monster) et al. behind → an instant orphan the wizard can't
-    # always reclaim (GAP-4). `code_collections` is [] when the code prefix
-    # can't be derived, so this is a no-op on degenerate names. Same
-    # idempotent 404-is-success semantics as the KG/DEV/DIAGRAMS drops. This
-    # is a CONSENTED drop (the user opted into purge_collections) — it does
-    # NOT scan/guess; it drops exactly THIS project's own canonical set.
-    targets = [
-        derived["kg_collection"],
-        derived["development_collection"],
-        derived["diagrams_collection"],
-    ]
-    targets.extend(derived.get("code_collections", []) or [])
-    weaviate_url = args.weaviate_url
-
-    # Defense in depth: never drop a shared collection — the constant or THIS machine's shared
-    # class (v0.2.103: the root's decided name), case-insensitively.
-    machine_shared, protected = _bcs.protected_shared_names()
-    result: dict = {
-        "dropped": [],
-        "skipped_shared": machine_shared,
-        "errors": [],
-    }
-
-    for name in targets:
-        if name.lower() in protected:
-            result["errors"].append({
-                "collection": name,
-                "error": (
-                    f"refusing to drop shared collection {name!r} — "
-                    f"shared KG is install-owned, not project-owned"
-                ),
-            })
-            continue
-        try:
-            _delete_class(name, weaviate_url=weaviate_url)
-            result["dropped"].append(name)
-        except Exception as e:
-            # Connection refused, timeout, malformed URL — surface as
-            # a per-collection error rather than crashing the whole
-            # JSON envelope. Rust caller wraps these as warnings.
-            result["errors"].append({
-                "collection": name,
-                "error": f"{type(e).__name__}: {e}",
-            })
-
+    from vco_lib.unregister_collections import drop_project_collections
+    result = drop_project_collections(
+        args.name, project_id=getattr(args, "project_id", None),
+        weaviate_url=args.weaviate_url, dry_run=bool(getattr(args, "dry_run", False)))
     if args.json:
         print(json.dumps(result))
     else:
@@ -13948,6 +13879,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Project name (raw; sanitization applied internally).",
     )
     p_drop.add_argument(
+        "--project-id", default=None,
+        help="launcher project id: also drop the classes its rows bind, and "
+             "keep any class another registered project uses.",
+    )
+    p_drop.add_argument(
         "--weaviate-url", default=None,
         help="Override Weaviate URL (default: WEAVIATE_URL env or "
              "http://localhost:8081).",
@@ -13955,6 +13891,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_drop.add_argument(
         "--json", action="store_true",
         help="Emit a single JSON object on stdout.",
+    )
+    p_drop.add_argument(
+        "--dry-run", action="store_true",
+        help="Drop nothing; `dropped` lists what would be dropped.",
     )
     p_drop.set_defaults(func=_cmd_drop_collections)
 

@@ -5,6 +5,8 @@ short_desc: Playwright browser automation + screenshot E2E + regression tests
 keywords: [Playwright, GUI test, screenshot test, visual regression, browser automation, "screenshot diff", "test the GUI", "test the UI", "verify the layout", "screenshot the app", "e2e test", "end-to-end test"]
 model: sonnet
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools:
   - mcp__playwright__browser_navigate
   - mcp__playwright__browser_take_screenshot

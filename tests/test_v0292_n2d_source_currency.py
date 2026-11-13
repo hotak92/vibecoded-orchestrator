@@ -845,6 +845,12 @@ class ProbeRegistrationTests(unittest.TestCase):
             pin_rows=lambda: [],
             vco_lib_origin=lambda root: None,
             path_command=lambda name: None,
+            # v0.2.106: the Weaviate memory-cap probe inspects the container
+            # (its one subprocess) — injected like every other spawning seam.
+            weaviate_mem_cap=lambda: None,
+            # v0.2.106: the local-summary-model status may probe the hardware
+            # tier (nvidia-smi) when no install record names the model.
+            local_summary_status=lambda: None,
         )
         with TemporaryDirectory() as td:
             root = Path(td)
@@ -866,7 +872,12 @@ class ProbeRegistrationTests(unittest.TestCase):
         question the user actually has.
         """
         res = doctor.DoctorResolvers()
-        with mock.patch("vco_lib.deferral_probes.run_probe", return_value=False):
+        # v0.2.106: the doctor reads the DIAGNOSIS now (a running launcher is
+        # its own state, never "stale"), so the seam is the diagnosis fn.
+        from vco_lib import deferral_probes
+
+        with mock.patch("vco_lib.deferral_probes.launcher_binary_freshness",
+                        return_value=deferral_probes.LAUNCHER_FRESH):
             findings = doctor.probe_launcher_binary_fresh(
                 Path("/tmp/x"), res, {"launcher_probe_extras": {"any": "thing"}})
         self.assertEqual(findings[0].status, doctor.STATUS_OK)

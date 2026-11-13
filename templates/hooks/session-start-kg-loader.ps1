@@ -96,7 +96,11 @@ except Exception:
     pass
 '@
     try {
-        $out = & $PY -c $pyCode $CronFile 2>$null
+        # v0.2.106: the body runs as a temp FILE through
+        # _lib/run-python-program.ps1 - `& $PY -c $pyCode` loses every
+        # embedded double quote under Windows PowerShell 5.1.
+        . (Join-Path $PSScriptRoot "_lib/run-python-program.ps1")
+        $out = Invoke-VcoPythonProgram -Python $PY -Body $pyCode -Arguments @($CronFile) 2>$null
         if ($out) { Write-Output $out }
     } catch { }
 }

@@ -3,6 +3,8 @@ name: glm-flash-researcher
 description: GLM 5.3 Flash read-only lane via the claude-gw gateway — bounded research, code sweeps and diagnostics, plus bounded code review and fix-delta verification; one report. Large first-pass reviews → glm-reviewer. Not edits.
 model: claude-gw/glm-5.3-flash[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 disallowedTools: mcp__vct-coordination__*
 ---

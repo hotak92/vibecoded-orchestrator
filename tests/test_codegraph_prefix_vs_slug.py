@@ -272,52 +272,11 @@ class HookResolverFieldContract(unittest.TestCase):
             )
 
 
-class DedupInsertUpsertContract(unittest.TestCase):
-    """v0.2.23 — pin the upsert fallback that fixes cold-start writes."""
-
-    def test_dedup_insert_falls_back_to_insert_when_object_missing(self):
-        """The analyzer's ``_dedup_insert`` must fall back to ``insert()``
-        when Weaviate's ``replace()`` reports "no object with id X".
-
-        v0.2.16's docstring claimed ``replace()`` was upsert; the
-        weaviate-client v4.21 runtime requires the object to pre-exist.
-        Without the fallback, a full re-analysis against an empty
-        collection produces 0 successful writes (every file ends up in
-        ``insert_errors``). The fix is straightforward — try ``replace``
-        first (the canonical hot path for incremental re-writes), then
-        ``insert`` on the not-found branch.
-
-        We pin the source-level pattern here so the regression cannot
-        be re-introduced by a refactor that drops the fallback.
-        """
-        for rel in (
-            "templates/scripts/analyze_code_graph.py",
-            ".claude/scripts/analyze_code_graph.py",
-        ):
-            path = PROJECT_ROOT / rel
-            if not path.exists():
-                continue
-            text = path.read_text(encoding="utf-8")
-            # The `_dedup_insert` body must contain BOTH the replace()
-            # call AND an insert() fallback gated on "no object with id".
-            #
-            # Anchor on the replace() call, then look for the fallback
-            # within the next ~50 lines.
-            anchor = text.find("collection.data.replace(uuid=det_uuid")
-            self.assertGreater(anchor, 0, f"{rel}: missing replace() call")
-            tail = text[anchor:anchor + 4000]
-            self.assertIn(
-                "no object with id",
-                tail,
-                f"{rel}: expected an upsert fallback gated on "
-                "'no object with id'",
-            )
-            self.assertIn(
-                "collection.data.insert(uuid=det_uuid",
-                tail,
-                f"{rel}: expected `collection.data.insert(uuid=det_uuid, **insert_params)` "
-                "as the fallback for the 'object does not exist' branch",
-            )
+# v0.2.23's source-text pin of the replace()→insert() fallback lived here. It
+# could not see that the not-found signal changed (Weaviate 1.37 + client 4.21:
+# a 404, not "no object with id"), so every new entity was dropped while it
+# stayed green. Superseded by the behavioural tests in
+# tests/test_analyze_code_graph_extras.py (real exception, real _dedup_insert).
 
 
 class HubAliasFieldDocumentation(unittest.TestCase):

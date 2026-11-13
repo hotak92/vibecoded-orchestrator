@@ -418,8 +418,13 @@ def test_a_real_embed_that_shrinks_reaches_the_notice(metrics_home, tmp_path,
     ``EmbeddingService.embed_text`` — what kg-sync and the MCP node write
     actually call — still routes through it. That is the exact gap this cycle
     kept reproducing (a mechanism credited without evidence it fires), so this
-    test starts at ``embed_text`` with a backend that refuses over-window
-    input and ends at the rendered notice.
+    test starts at the production entry point with a backend that refuses
+    over-window input and ends at the rendered notice.
+
+    v0.2.106 (split on refusal): only a search QUERY still shrinks, so the
+    loss arm starts at ``embed_text_query``; the DOCUMENT arm
+    (``embed_text``) is split instead — every character embedded, recorded
+    as a split, and never a notice on its own.
     """
     from vco_lib.embedding_service import EmbeddingService
 
@@ -441,10 +446,24 @@ def test_a_real_embed_that_shrinks_reaches_the_notice(metrics_home, tmp_path,
     )
 
     long_text = "x" * 12000
-    vector = svc.embed_text(long_text)
+
+    # DOCUMENT arm: split, nothing cut, recorded as a split only.
+    assert svc.embed_text(long_text), "a refused document still gets a vector"
+    assert sum(session.accepted_lengths) == len(long_text), (
+        "every character of a refused document must reach the vector"
+    )
+    assert fid._STATE.splits[model]["count"] == 1
+    assert fid._STATE.shrinks == {}
+    fid.reset_run_state()
+    session.accepted_lengths.clear()
+
+    from claude_mcp_servers.weaviate_mcp.chunking import query_prefix_for_model
+
+    prefixed_len = len(query_prefix_for_model(model, None)) + len(long_text)
+    vector = svc.embed_text_query(long_text)
     assert vector, "the shrink ladder must still produce a vector"
     assert session.accepted_lengths, "no embed was ever accepted"
-    assert session.accepted_lengths[-1] < len(long_text), (
+    assert session.accepted_lengths[-1] < prefixed_len, (
         "the backend accepted the FULL text — this fixture no longer refuses, "
         "so the test would pass without any shrink happening"
     )
@@ -461,7 +480,7 @@ def test_a_real_embed_that_shrinks_reaches_the_notice(metrics_home, tmp_path,
     # Per-rung counting would inflate the summary by the ladder depth and make
     # one pathological chunk look like a corpus-wide problem.
     assert rows[0]["shrinks"][model]["count"] == 1
-    assert rows[0]["shrinks"][model]["orig_chars"] == len(long_text)
+    assert rows[0]["shrinks"][model]["orig_chars"] == prefixed_len
     assert rows[0]["shrinks"][model]["sent_chars"] == session.accepted_lengths[-1]
 
     project = tmp_path / "proj"

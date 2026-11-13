@@ -6,6 +6,8 @@ keywords: [web research, competitor research, link survey, blog research, resear
 tools: WebSearch, WebFetch, Read, Grep, Glob, Bash, Write, Edit
 model: haiku
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

@@ -181,6 +181,7 @@ from vco_lib.embedding_service import (  # noqa: E402 - must follow the sys.path
 # first, so vco_lib is importable wherever this script runs at all.
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 from weaviate_mcp.chunking import chunk_text  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
+from weaviate_mcp.chunking import TokenCounter  # noqa: E402 - v0.2.106 split rows: a piece's token_count; same bootstrap constraint
 from weaviate.classes.query import Filter  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 from weaviate.classes.config import Configure, Property, DataType  # noqa: E402 - must follow the sys.path bootstrap above that makes this module importable
 
@@ -352,9 +353,41 @@ def store_document_chunks(
     v0.2.46 V46-D: cursor-paginates the delete-then-replace scan so
     large multi-chunk documents (> 1000 chunks) no longer leave stale
     chunks behind after re-ingest.
+
+    v0.2.106 (owner rulings 2026-11-11, "split on refusal" / "extra rows in
+    both places"): the rows are embedded FIRST, through the ONE row driver
+    (``vco_lib.embed_split.embed_rows``) — a chunk the model refuses whole is
+    stored as several consecutive rows, each embedded whole (never a cut or
+    averaged vector), renumbered in text order. Only once every vector
+    exists are the old rows deleted, so a failed embed leaves the document's
+    previous rows in place.
     """
     try:
         collection = server.client.collections.get(DOCUMENT_CHUNKS_COLLECTION)
+
+        # Embed every row before touching the stored ones.
+        from vco_lib.embed_split import embed_rows
+
+        rows = embed_rows([c["content"] for c in chunks], server._get_embedding)
+        first_number = chunks[0].get("chunk_number", 0) if chunks else 0
+        if not isinstance(first_number, int):
+            first_number = 0
+        prepared: List[Tuple[Dict, List[float]]] = []
+        for index, row in enumerate(rows):
+            row_data = dict(chunks[row.source_index])
+            if row.piece_count > 1:
+                row_data["content"] = row.text
+                row_data["token_count"] = TokenCounter.count_tokens(row.text)
+            row_data["chunk_number"] = first_number + index
+            row_data["total_chunks"] = len(rows)
+            prepared.append((row_data, row.payload))
+        if len(rows) > len(chunks):
+            print(
+                f"  ✂️  The embedding model refused "
+                f"{len({r.source_index for r in rows if r.piece_count > 1})} chunk(s) "
+                f"whole; storing {len(rows)} rows instead of {len(chunks)} "
+                "(nothing cut off)"
+            )
 
         # Delete old chunks for this document — enumerate ALL of them.
         source_filter = Filter.by_property("source_id").equal(source_id)
@@ -387,18 +420,14 @@ def store_document_chunks(
         if deleted_count > 0:
             print(f"  🗑️  Deleted {deleted_count} old chunks")
 
-        # Store new chunks
-        for chunk_data in chunks:
-            # Get embedding
-            embedding = server._get_embedding(chunk_data["content"])
-
-            # Insert
+        # Store the new rows (embedded above).
+        for row_data, embedding in prepared:
             collection.data.insert(
-                properties=chunk_data,
+                properties=row_data,
                 vector=embedding
             )
 
-        print(f"  ✓ Stored {len(chunks)} new chunks")
+        print(f"  ✓ Stored {len(prepared)} new chunks")
         return True
 
     except Exception as e:
@@ -429,6 +458,10 @@ def generate_document_summary(server: WeaviateMCPServer, title: str, content: st
     # guard exists to close. Deferred (walk active, model not resident and
     # free VRAM below the model-derived floor) → the generic fallback
     # summary, same as any other generation failure here.
+    # v0.2.106: the user turned the local summary model off — it was never
+    # pulled, so do not ask Ollama for it.
+    if _sb.local_summary_model_off():
+        return f"Document about {title}"
     try:
         if _sb._ollama_local_deferred() is not None:
             print("  ⚠️  Local model deferred (VRAM / code-graph walk) — "

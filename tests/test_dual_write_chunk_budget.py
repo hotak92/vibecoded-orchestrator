@@ -71,9 +71,10 @@ class TestMinAcrossSlots:
     """
 
     def test_qwen_plus_arctic_uses_medium_tier(self) -> None:
-        # min(num_ctx) = min(10 240, 4 096) = 4 096 -> medium_context.
+        # min(num_ctx) = min(10 240, 4 096) = 4 096 -> medium_context, clamped
+        # (v0.2.106) to the tighter dense budget — arctic's own preset.
         assert chunking_preset_for_models([_QWEN, _ARCTIC]) == \
-            CHUNKING_PRESETS["medium_context"]
+            chunking_preset_for_model(_ARCTIC) == (1_100, 1_766, 1_766)
 
     def test_singleton_matches_single_model_resolver(self) -> None:
         # Non-dual path is byte-unchanged: min of one model is that model.
@@ -89,9 +90,9 @@ class TestMinAcrossSlots:
     def test_unknown_model_never_widens_budget(self) -> None:
         # arctic (4 096) + an unknown model: D16 made unknown contribute NOTHING
         # to the min (it used to be defaulted to 8 192), so the pair still
-        # resolves to arctic's tighter medium tier.
+        # resolves to arctic's tighter medium tier (dense-clamped, v0.2.106).
         assert chunking_preset_for_models([_ARCTIC, "totally-unknown-model:9b"]) == \
-            CHUNKING_PRESETS["medium_context"]
+            chunking_preset_for_model(_ARCTIC)
 
     def test_order_independent(self) -> None:
         assert chunking_preset_for_models([_QWEN, _ARCTIC]) == \
@@ -124,11 +125,20 @@ class TestActiveSlotFidelityInvariant:
         # SECONDARY's window — the tier is still bounded by
         # min(CHUNK_TOKEN_POLICY_CEILING 8 192, the ACTIVE model's OWN window
         # budget int(10 240 * 0.9) = 9 216); the R39 policy binds for qwen3.
+        # v0.2.106: and by qwen3's OWN dense-content budget (19 560 chars →
+        # 4 890 units), which binds below both.
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            CHARS_PER_TOKEN_TEXT,
+            dense_char_budget,
+        )
         active_chunker = Chunker.for_model(_QWEN)
         capacity = int(MODEL_TOKEN_LIMITS[_QWEN] * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
-        budget = min(capacity, CHUNK_TOKEN_POLICY_CEILING)
+        budget = min(
+            capacity, CHUNK_TOKEN_POLICY_CEILING,
+            dense_char_budget(_QWEN) // CHARS_PER_TOKEN_TEXT,
+        )
         assert (active_chunker.min_tokens, active_chunker.max_tokens,
-                active_chunker.target_tokens) == (4_600, 8_192, 8_192) == (
+                active_chunker.target_tokens) == (4_600, 4_890, 4_890) == (
             min(4_600, budget), min(13_500, budget), min(9_500, budget)
         )
         # And it must NOT be arctic's medium tier (the pre-rework min-clamp value).
@@ -216,7 +226,7 @@ class TestConfiguredTextModels:
         assert _ARCTIC in models
         assert _QWEN in models
         # min-across-slots then uses arctic's tighter budget.
-        assert chunking_preset_for_models(models) == CHUNKING_PRESETS["medium_context"]
+        assert chunking_preset_for_models(models) == chunking_preset_for_model(_ARCTIC)
 
     def test_wpo_qwen_active_arctic_secondary_min_across_slots(
         self, monkeypatch
@@ -248,14 +258,16 @@ class TestConfiguredTextModels:
             "install when DUAL_EMBEDDING_ARCTIC_SECONDARY is on"
         )
         # The min-across-slots UTILITY (retained, NOT the active write budget)
-        # answers "smallest window that fits all slots" = arctic's medium tier.
-        assert chunking_preset_for_models(models) == CHUNKING_PRESETS["medium_context"]
+        # answers "smallest window that fits all slots" = arctic's medium tier
+        # (dense-clamped since v0.2.106, i.e. arctic's own preset).
+        assert chunking_preset_for_models(models) == chunking_preset_for_model(_ARCTIC)
         # The ACTIVE-slot chunk budget, by contrast, is qwen3's own tier —
         # not the min-across-slots medium. (D16 + R39, v0.2.92: "own tier"
         # now means the xlarge SHAPE clamped to min(policy 8 192, qwen3's
         # own 10 240-ctx budget 9 216) = 8 192; "unclamped by the SECONDARY"
         # is the invariant this file guards.)
-        assert chunking_preset_for_model(_QWEN) == (4_600, 8_192, 8_192)
+        # v0.2.106: plus qwen3's own dense budget → (4 600, 4 890, 4 890).
+        assert chunking_preset_for_model(_QWEN) == (4_600, 4_890, 4_890)
         assert chunking_preset_for_model(_QWEN) != chunking_preset_for_models(models)
 
     def test_embedding_model_env_override_sizes_active_slot(self, monkeypatch) -> None:
@@ -330,7 +342,14 @@ class TestChunkerRevisionBumped:
             "cap while the service serves 1 024 (W1) — the revision must "
             "advance so codesage installs re-sync to window-true boundaries"
         )
-        assert _CHUNKER_REVISION == "v0.2.92.1"
+        assert _CHUNKER_REVISION != "v0.2.92.1", (
+            "v0.2.92.1's presets measured 122-136% of their windows on dense "
+            "content (JSON, code, CJK); the revision must advance so installs "
+            "re-chunk to the dense-budget boundaries (v0.2.106)"
+        )
+        # v0.2.106.1: the split-rows heal's one-time crossing (no boundary
+        # change — see the revision history in chunking.py).
+        assert _CHUNKER_REVISION == "v0.2.106.1"
 
 
 # ===========================================================================

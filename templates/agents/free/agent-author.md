@@ -5,6 +5,8 @@ short_desc: author/audit agent + skill definitions and helper scripts
 keywords: ["create agent", "write an agent", "agent definition", "create skill", "SKILL.md", "improve this prompt", "agent frontmatter", "tune description", "helper script", "write a hook", "automation script"]
 model: sonnet
 effort: medium
+background: true
+autoCompactWindow: 750000
 isolation: worktree
 tools: Read, Write, Edit, Grep, Glob, Bash
 disallowedTools: mcp__vct-coordination__*

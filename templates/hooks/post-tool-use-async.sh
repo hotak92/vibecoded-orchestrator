@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Parity-touch 2026-11-11 (v0.2.106): the .ps1 sibling now runs its embedded Python body through _lib/run-python-program.ps1 (Windows PowerShell 5.1 drops embedded double quotes from `python -c` arguments — SyntaxError on every run); no .sh-side behaviour change.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 # post-tool-use-async.sh — the ONE async PostToolUse dispatcher (v0.2.101).

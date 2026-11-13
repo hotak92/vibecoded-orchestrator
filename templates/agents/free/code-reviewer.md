@@ -5,6 +5,8 @@ short_desc: adversarial review with file:line evidence, writes only its own repo
 keywords: ["code review", "review this", "adversarial review", "review the diff", "review before merge", "security review", "review findings", "second pair of eyes", "audit this change"]
 model: fable
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Grep, Glob, Bash, WebSearch, WebFetch, Write
 disallowedTools: mcp__vct-coordination__*
 ---

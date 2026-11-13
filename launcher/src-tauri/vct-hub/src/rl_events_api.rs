@@ -625,7 +625,11 @@ mod tests {
         .unwrap();
         db.module_set_enabled_for_project("p-lock", "vct-rl-reranker", true).unwrap();
         db.module_set_global_enabled("vct-rl-reranker", true).unwrap();
-        assert!(!db.rl_scoring_enabled_for_project("p-lock").unwrap(), "precondition: locked off");
+        // Precondition: the scoring gate (lock + rows) is closed in the
+        // locked case and open with the shipped (v0.2.106 unlocked) table —
+        // ingest below must not care either way.
+        assert!(!db.rl_scoring_enabled_with_lock("p-lock", Some("locked")).unwrap());
+        assert!(db.rl_scoring_enabled_with_lock("p-lock", None).unwrap());
 
         let handle = LauncherDbHandle(Arc::new(db));
         let app: Router = Router::new().nest("/api/v1", router().with_state(handle.clone()));

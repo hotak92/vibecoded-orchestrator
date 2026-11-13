@@ -142,7 +142,7 @@ jobs:
         target:
           - ubuntu-22.04   # Tests L-P0-2 (libwebkit2gtk-4.0-dev fallback)
           - ubuntu-24.04   # Tests L-P0-2 (libwebkit2gtk-4.1-dev primary)
-          - macos-14       # Tests M-P0-* (bash 3.2, /opt/homebrew, arm64)
+          - macos-15       # Tests M-P0-* (bash 3.2, /opt/homebrew, arm64)
           - windows-latest # Tests W-P1-* + first-install.bat (cmd.exe)
           - fedora-40      # Tests L-P0-3 (SELinux :Z mount flag) + L-P0-1 (dnf parity)
         include:
@@ -150,8 +150,8 @@ jobs:
             os: ubuntu-22.04
           - target: ubuntu-24.04
             os: ubuntu-24.04
-          - target: macos-14
-            os: macos-14
+          - target: macos-15
+            os: macos-15
           - target: windows-latest
             os: windows-latest
           - target: fedora-40
@@ -168,7 +168,7 @@ jobs:
       # and Track A's `metadata.json` writer + reader.
       LAUNCHER_DIST_SUBDIR: >-
         ${{
-          (matrix.os == 'macos-14' && 'macos-arm64') ||
+          (matrix.os == 'macos-15' && 'macos-arm64') ||
           (matrix.os == 'windows-latest' && 'windows-x64') ||
           'linux-x64'
         }}
@@ -340,7 +340,7 @@ jobs:
       #     podman.socket isn't active on GH runners → `compose up`
       #     failed with "Cannot connect to the Docker daemon at
       #     unix:///run/user/1001/podman/podman.sock".
-      #   - macos-14: runners ship NO container runtime at all →
+      #   - macos-15: runners ship NO container runtime at all →
       #     install.py exits 1 with "re-run with --no-containers".
       #   - models: Ollama isn't running in CI; pulls would be slow+flaky.
       # The container/compose path keeps real coverage via
@@ -371,7 +371,7 @@ jobs:
           fi
 
       - name: first-install.command (macOS)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
         working-directory: vco-fresh-clone
         shell: bash
         run: |
@@ -608,7 +608,7 @@ jobs:
           assert paths.get('state_dir_exists') is True, 'state_dir_exists should be True after install'
           assert paths.get('launcher_binary_exists') is True, 'launcher_binary_exists should be True after install'
           # v0.2.54 G-1: this smoke installs with --no-containers (GH
-          # runners have no usable compose stack; macos-14 ships no
+          # runners have no usable compose stack; macos-15 ships no
           # container runtime at all), and the bootstrap envelope marks a
           # missing container runtime as a BLOCKING prereq regardless of
           # install flags. A container-runtime blocker is therefore

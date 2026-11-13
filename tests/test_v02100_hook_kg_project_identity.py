@@ -211,7 +211,15 @@ def test_subagent_hook_ps1_runs_the_root_script_with_the_project_identity(tmp_pa
 
 def _run_harness(tmp_path: Path, *, project_dir: Path, configs, extra_env=None, cwd=None):
     res = tmp_path / f"res_{project_dir.name}.json"
-    cfg = {"result_path": str(res), "project_configs": configs}
+    # ``no_pending_staging``: these runs assert the QUERIED collections, not
+    # the staged citation file — and the root-identity run's
+    # ``CLAUDE_PROJECT_DIR`` is the repo root (a lane WORKTREE when the suite
+    # runs there), so the real staging would drop a fixture-named
+    # ``nosession__pre_edit_*.json`` into that root's .claude/state (the
+    # leftovers found in every lane worktree). Staging stays ON for the
+    # harness callers that assert it (dual-log).
+    cfg = {"result_path": str(res), "project_configs": configs,
+           "no_pending_staging": True}
     cfg_path = tmp_path / f"cfg_{project_dir.name}.json"
     cfg_path.write_text(json.dumps(cfg))
     env = {k: v for k, v in os.environ.items() if k not in (

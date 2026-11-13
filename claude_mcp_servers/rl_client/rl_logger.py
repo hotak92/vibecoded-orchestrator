@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# This file is VENDORED into paid-modules/vct-rl-reranker/rl_logger.py
-# Both copies MUST stay byte-identical. The byte-identity test in
-# tests/test_vendored_file_sync.py enforces this on every CI run.
-# To re-sync after an edit: ./scripts/sync-vendored-files.sh
+# One copy (v0.2.106): the RL reranker (claude_mcp_servers/rl_reranker) imports
+# this file as `rl_client.rl_logger`; its container image COPYs it from here
+# (see that Dockerfile). There is no vendored duplicate to keep in sync.
 """
 Global RL data logger for retrieval training data collection.
 
@@ -56,8 +55,9 @@ citation event::
         "task_id":     "abc123",
         "task_type":   "implementation",
         "citations":   {"Foo": true, "Bar": false},   # None = inconclusive
-        "cosine_sims": {"Foo": 0.812, "Bar": 0.341}  # optional: cos(node, agent_output)
-    }
+        "cosine_sims": {"Foo": 0.812, "Bar": 0.341},  # optional: cos(node, agent_output)
+        "label_regime": "answer-window-dense-v1"      # v0.2.106+; absent = the
+    }                                                # legacy regime (resolve_label_regime)
 
 The same ``task_id`` links a retrieval event with its citation event.
 Stored embeddings are frozen at scoring time (Weaviate node content may change
@@ -148,8 +148,8 @@ def default_rl_data_dir() -> Path:
         ImportError: if :mod:`vco_lib` is not importable. Deliberate and loud —
             ``vco_lib`` ships in every healthy VCO install, so a failure here
             means a broken one, and guessing a path would hide it. This module
-            is also VENDORED into the paid RL module's container image, which
-            has no ``vco_lib``; the import is inside this function (not at
+            is also COPIED into the RL reranker's container image, which
+            carries no ``vco_lib.paths``; the import is inside this function (not at
             module scope) precisely so that image can still import the module
             and use ``serialize_node_record`` / ``SCHEMA_VERSION`` / an
             explicitly-pathed ``RLDataLogger(log_path=...)``. It passes
@@ -295,7 +295,7 @@ def serialize_node_record(
     }
     # v0.2.73 (n_emb payload-dedup): the node vector is serialized ONCE, under
     # `emb` — the field the offline trainer actually reads
-    # (paid-modules/vct-rl-reranker/offline_trainer.py `extract_samples`/
+    # (claude_mcp_servers/rl_reranker/offline_trainer.py `extract_samples`/
     # `train_epoch` both read `node.get("emb")`; NO offline consumer reads a
     # stored `n_emb`). The KG enrichment site mirrors the SAME vector into both
     # `emb` and `n_emb` on the candidate dict, so pre-dedup every KG retrieval
@@ -424,6 +424,53 @@ def resolve_emb_truncation_state(
     return TRUNCATION_UNKNOWN
 
 
+# ── v0.2.106: the citation-label regime tag (training-readiness G4) ─────────
+#
+# v0.2.106 changed HOW citation labels are computed: the answer window is now
+# chunked by the shared chunker's ANSWER mode (``chunking.chunk_answer_window``
+# — dense transcript budget, content-defined boundaries) instead of the KG
+# document chunking path, so ``cosine_sims`` (max over answer chunks) shift at
+# the install boundary. Every label recorded by a build BEFORE that change is
+# from the old regime, and old labels cannot be re-chunked offline (the answer
+# text is not stored, only the chunk vectors). A trainer mixing regimes must
+# be able to filter or weight by regime, so every citation event this module's
+# consumers write carries an explicit ``label_regime`` naming the regime it
+# was computed under. ONE constant, ONE home: it lives here — the schema home
+# this module already is — and every writer imports it; a future regime change
+# bumps THIS constant and nothing else.
+
+#: The label regime of the CURRENT build: answer window chunked by the shared
+#: chunker's ANSWER mode (dense budget, content-defined boundaries) — the
+#: regime introduced with v0.2.106.
+CITATION_LABEL_REGIME = "answer-window-dense-v1"
+
+#: The regime every citation event WITHOUT a ``label_regime`` field was
+#: computed under (all pre-v0.2.106 rows — the field could not have existed).
+LEGACY_CITATION_LABEL_REGIME = "answer-window-legacy"
+
+
+def resolve_label_regime(event: "dict[str, Any] | None") -> str:
+    """The label regime a stored CITATION event was computed under.
+
+    Args:
+        event: one citation event payload (the ``payload_json`` shape the
+            writers emit, or a queue payload of the same fields).
+
+    Returns:
+        ``event["label_regime"]`` when present, else
+        :data:`LEGACY_CITATION_LABEL_REGIME` — a missing field means the
+        event predates v0.2.106, which IS the answer. Use this reader, never
+        ``event.get("label_regime")`` alone, so pre-106 rows are classified
+        consistently everywhere.
+    """
+    if isinstance(event, dict):
+        tag = event.get("label_regime")
+        if isinstance(tag, str) and tag:
+            return tag
+    return LEGACY_CITATION_LABEL_REGIME
+
+
+
 class RLDataLogger:
     """
     Append-only JSONL data logger for RL retrieval training.
@@ -436,7 +483,7 @@ class RLDataLogger:
         log_path: Path to the JSONL log file. Defaults to
                   :func:`default_rl_log_path` — ``$VCT_STATE_DIR`` (or ``~/.vct``)
                   ``/retrieval_rl_data/rl_events.jsonl``. Callers that run
-                  without ``vco_lib`` on the path (the vendored container copy)
+                  without ``vco_lib`` on the path (the RL reranker image, which copies it)
                   MUST pass this explicitly.
         project:  Project name tag written to every event.
     """
@@ -725,6 +772,9 @@ class RLDataLogger:
             "embedding_source": self._embedding_source,
             "embedding_dim": self._embedding_dim,
             "embedding_model": self._embedding_model,
+            # v0.2.106 (G4): the label regime this module's schema home owns —
+            # stamped by this legacy writer too so both citation writers agree.
+            "label_regime": CITATION_LABEL_REGIME,
             "citations": {
                 title: (bool(cited) if cited is not None else None)
                 for title, cited in citations.items()

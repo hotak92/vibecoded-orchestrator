@@ -27,18 +27,24 @@ from vco_lib import materialize, model_selection
 #: The source grid (medium-effort re-score, 2026-10-03; owner-approved
 #: revision 2026-10-08: Haiku 5.5 replaces Haiku 4.5, GLM-5.3 Review 8,
 #: DeepSeek V4.1 Flash Docs 7; re-score 2026-10-16: GLM-5.3 Debug 5, DeepSeek
-#: Review 7, `*` dropped on Opus Instr / Kimi Review / DeepSeek Instr), transcribed verbatim: row id -> the 11
+#: Review 7, `*` dropped on Opus Instr / Kimi Review / DeepSeek Instr;
+#: v0.2.106, owner 2026-11-10: Fable 5.1 -> Fable 5.2 (Claude Code 2.1.321)
+#: re-scored from benchmark evidence — Code/Debug/Review/Plan/Tools 10,
+#: Cost 2), transcribed verbatim: row id -> the 11
 #: column scores, in the source's row ORDER.
 #: Columns: Code, Debug, Review, Plan, Bulk, Tools, Instr, LongCtx, Docs,
 #: Vision, Cost.
 EXPECTED_SCORES = {
     "opus": ["10", "10", "9", "9", "5", "10", "8", "10", "9", "10", "4"],
-    "fable": ["9", "10", "10", "10", "3", "9", "6", "10", "10", "10", "1"],
+    "fable": ["10", "10", "10", "10", "3", "10", "6", "10", "10", "10", "2"],
     "glm-5.3": ["7", "5", "8", "6", "6", "6", "7*", "7", "7", "—", "8"],
-    # v0.2.102: scored from cited evidence, not the maintainer's
-    # grid — see the comment above the row in model_selection.toml.
-    "kimi-k3": ["7", "6", "6", "6*", "3", "7", "7*", "8", "8", "8", "3"],
-    "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "6", "7", "8", "7", "7", "10"],
+    # v0.2.106 (owner 2026-11-10): K3.1 Pro replaces K3, re-scored from
+    # cited benchmark evidence (Code 7 -> 8, Tools 7 -> 8) — see the comment
+    # above the row in model_selection.toml.
+    "kimi-k3.1-pro": ["8", "6", "6", "6*", "3", "8", "7*", "8", "8", "8", "3"],
+    # v0.2.106 (owner 2026-11-10): Tools 6 -> 7 from DeepSeek's own 1017-build
+    # figures (vendor-reported); every other cell unchanged.
+    "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "7", "7", "8", "7", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
     "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
     "glm-5.3-flash": ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"],
@@ -48,7 +54,7 @@ EXPECTED_SCORES = {
 
 #: Rows carrying the `†` marker (only xhigh/max benchmark results).
 #: GLM-5.3 lost its dagger 2026-10-16 (owner): ~110 own medium-effort lanes.
-EXPECTED_DAGGERS = {"kimi-k3", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
+EXPECTED_DAGGERS = {"kimi-k3.1-pro", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
 
 EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
                     "Instr", "LongCtx", "Docs", "Vision", "Cost"]
@@ -61,17 +67,24 @@ EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
 #: does (v0.2.103 final review L-3).
 EXPECTED_NOTES = [
     ("opus", "**Opus 5.5** leads at medium on almost every axis and costs less "
-             "per task than Fable 5.1 (≈$1.3 vs ≈$3.0); as a fix-round "
-             "implementer it converges reliably, but its first-pass lanes still "
-             "need an independent review. Keep Fable for final reviews, plans "
-             "and the hardest debugging — a Fable delta review after each fix "
-             "wave has kept finding issues that every per-lane review missed."),
+             "per task than Fable 5.2 at medium (≈$2.45 vs ≈$3.80 on the same "
+             "independent index); as a fix-round implementer it converges "
+             "reliably, but its first-pass lanes still need an independent "
+             "review."),
+    ("fable", "**Fable 5.2** — effort decides both the score and the bill: at "
+              "medium it scores above Opus 5.5 at high for about the same cost "
+              "per task (independent index: 56.4 at ≈$3.80/task); at high "
+              "≈$9/task; at max ≈$26.5/task (about twice Fable 5.1, from ~1.7× "
+              "the output tokens). Keep final reviews at high, not max. Its own "
+              "work still needs an independent review; a Fable delta review "
+              "after each fix wave has kept finding issues that every per-lane "
+              "review missed."),
     ("sonnet", "**Sonnet 5.5** is the most effort-sensitive model: near Opus at "
                "max, but well behind it on coding at medium. Not a default "
                "choice."),
     (("sonnet", "glm-5.3", "deepseek-v4.1-flash"),
-     "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash on "
-     "coding."),
+     "At medium, **Sonnet 5.5** also trails GLM-5.3 and DeepSeek V4.1 Flash "
+     "(1017) on coding."),
     ("haiku", "**Haiku 5.5** — the fastest and cheapest Claude (≈165 tok/s, "
               "≈$0.05 per task at medium) with a 1M window: good for bulk, "
               "classification, extraction and routing. Its headline vendor "
@@ -79,9 +92,12 @@ EXPECTED_NOTES = [
               "keep coding, planning and review on larger models."),
     (("haiku", "deepseek-v4.1-flash"),
      "At medium, **Haiku 5.5** sits below the flash-tier vendor lanes on code."),
-    ("deepseek-v4.1-flash", "**DeepSeek V4.1 Flash** — fastest (≈209 tok/s, ≈1 s "
-                            "to first token) and cheapest per task: default for "
-                            "research, surveys, bulk and bounded implementation. "
+    ("deepseek-v4.1-flash", "**DeepSeek V4.1 Flash (1017)** — fastest (≈209 "
+                            "tok/s, ≈1 s to first token) and cheapest per task: "
+                            "default for research, surveys, bulk and bounded "
+                            "implementation. The 1017 build is better on agentic "
+                            "and terminal work and writes shorter answers than "
+                            "the first V4.1 Flash (vendor-reported). "
                             "Users report fragile tool calls / loops on long runs "
                             "— keep tasks bounded. Accurate as a read-only "
                             "verifier of bounded fix deltas: `deepseek-researcher` "
@@ -98,15 +114,15 @@ EXPECTED_NOTES = [
                 "own tests and still fail in the real order: ask for a real-order "
                 "check, and move a fix that two rounds closed only partly to "
                 "another model family."),
-    ("kimi-k3", "**Kimi K3** — near-frontier code quality on real repos and "
-                "strong long-context retrieval, but the slowest and most verbose "
-                "lane here (independent runs: ≈44 min per ticket, ≈35 tok/s, about "
-                "twice the median output tokens), so queue its work and review it "
-                "later. Give it small, bounded lanes or audits. It always reasons; "
-                "it can repeat the same tool call or stop on reasoning with no "
-                "answer, and it guesses confidently when unsure (51% hallucination "
-                "rate on uncertain questions), so demand quoted evidence in its "
-                "reviews."),
+    ("kimi-k3.1-pro", "**Kimi K3.1 Pro** — a real step up on long-horizon "
+                "coding (Terminal-Bench 4.0 about level with Opus 5.5) and a much "
+                "lower hallucination rate (vendor-reported), but every published "
+                "result is at max effort; `medium` maps to high and thinking cannot "
+                "be switched off, so it is slower and more token-hungry than K3 "
+                "(≈32 tok/s, minutes to the first answer token on hard tasks) and "
+                "wrong for bulk. Give it small, bounded lanes or audits, queue its "
+                "work, and still demand quoted evidence in its reviews. Start a new "
+                "conversation rather than switching an existing one to it."),
     ("glm-5.3-flash", "**GLM-5.3-Flash** suits bulk / first-pass work behind a "
                       "verifier — tests, a diff review or a stronger second pass; "
                       "retries help it, more effort does not (longer runs helped "
@@ -133,7 +149,7 @@ EXPECTED_GENERAL_NOTES = [
     "to the exact versions above.",
 ]
 
-CLAUDE_ROWS = ("Opus 5.5", "Fable 5.1", "Sonnet 5.5", "Haiku 5.5")
+CLAUDE_ROWS = ("Opus 5.5", "Fable 5.2", "Sonnet 5.5", "Haiku 5.5")
 
 
 def _rows_rendered(markdown: str) -> set[str]:
@@ -165,7 +181,7 @@ class TestProviderFilter:
         assert "the non-Claude model users route review/audit to" in md
         assert "GLM-5.3 as implementer" in md
         assert "6.9% of rollouts" in md
-        assert "DeepSeek V4.1 Flash (`" not in md and "Qwen3.8" not in md
+        assert "DeepSeek V4.1 Flash (1017) (`" not in md and "Qwen3.8" not in md
         assert "fragile tool calls" not in md
 
     def test_qwen_key_adds_qwen_vendor_rows_including_glm_5_3(self):
@@ -174,15 +190,15 @@ class TestProviderFilter:
         per-vendor-block."""
         md = model_selection.render_grid(providers=frozenset({"anthropic", "qwen"}))
         assert _rows_rendered(md) == set(CLAUDE_ROWS) | {
-            "GLM-5.3", "DeepSeek V4.1 Flash", "Qwen3.8-Max †", "Qwen3.8-Flash †",
+            "GLM-5.3", "DeepSeek V4.1 Flash (1017)", "Qwen3.8-Max †", "Qwen3.8-Flash †",
         }
         assert "GLM-5.3-Flash" not in md
         assert "best prose and literal instruction-following" in md
 
     def test_kimi_key_adds_the_kimi_row_only(self):
         md = model_selection.render_grid(providers=frozenset({"anthropic", "kimi"}))
-        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"Kimi K3 †"}
-        assert "slowest and most verbose lane" in md
+        assert _rows_rendered(md) == set(CLAUDE_ROWS) | {"Kimi K3.1 Pro †"}
+        assert "thinking cannot be switched off" in md
         assert "GLM-5.3" not in md.split("Columns:")[0].split("|---|")[1]
         assert "fragile tool calls" not in md
 
@@ -190,7 +206,7 @@ class TestProviderFilter:
         md = model_selection.render_grid(
             providers=frozenset({"anthropic", "zai", "qwen"}))
         assert "Kimi K3" not in md
-        assert "slowest and most verbose lane" not in md
+        assert "thinking cannot be switched off" not in md
 
     def test_both_keys_render_every_row(self):
         md = model_selection.render_grid(
@@ -290,7 +306,7 @@ class TestGridData:
         every = frozenset(p for row in model_selection.load_grid().rows
                           for p in row.providers)
         full = model_selection.render_grid(providers=every)
-        assert "also trails GLM-5.3 and DeepSeek V4.1 Flash" in full
+        assert "also trails GLM-5.3 and DeepSeek V4.1 Flash (1017)" in full
         assert "sits below the flash-tier vendor lanes" in full
 
     def test_all_of_must_be_a_boolean(self, tmp_path):

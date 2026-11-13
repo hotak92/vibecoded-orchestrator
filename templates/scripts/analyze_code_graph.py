@@ -48,7 +48,6 @@ import ast
 import json
 import logging
 import os
-import re
 import sys
 import tempfile
 import uuid
@@ -140,18 +139,8 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
 
 
 # v0.2.72 (P3): chunked entity bodies carry a leading `[chunk N/total]\n\n`
-# header (format shared with server._parse_chunk_header). Consumers that parse
-# a chunk-0 body as source (e.g. `ast.parse` in cross-reference call-linking)
-# must strip it first, else the parse fails on the header line.
-_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
-
-
-def _strip_chunk_header(text: str) -> str:
-    """Remove a leading `[chunk N/total]` header from a chunked entity body.
-
-    No-op when the text has no header (the common single-chunk case).
-    """
-    return _CHUNK_HEADER_RE.sub("", text, count=1)
+# header; `_strip_chunk_header` (call-linking parses) is imported from its ONE
+# home, `vco_lib.codegraph_guards.strip_chunk_header`, with the loud-fail block.
 
 
 # v0.2.61 (Track E) content-hash rule — EXTRACTED to
@@ -164,45 +153,18 @@ def _strip_chunk_header(text: str) -> str:
 
 
 # ── v0.2.72 (P7): code-graph embedding-revision sentinel + forced resync ─────
-#
-# OWNED BY T-RESYNC (P7). This is a NEW top-level constant — it does NOT touch
-# T-SCOPE's ignore-dirs regions or T-CHUNK's chunking/store code. It bumps
-# whenever the way an entity's TEXT is turned into embedding vectors changes in
-# a way that INVALIDATES existing stored vectors — i.e. the same source line now
-# lands in a different embedding than the row already in Weaviate carries.
-#
-# WHY it exists (the P3 chunking change): pre-v0.2.72, an over-budget
-# Function/Class had everything past `_max_chars_for_model` DROPPED from its
-# single embedding (the tail was unsearchable). P3 (T-CHUNK) now CHUNKS such
-# entities into N objects (chunk_num/total_chunks), so every line contributes to
-# some chunk's vector. That means the ~7-9% of entities that were over budget
-# have STALE embeddings: their `function_body`/`class_body` text on disk is
-# unchanged, so the per-object content-hash tombstone-skip (`_write_one_object`)
-# would SKIP them forever and they'd never gain their chunks. The revision gate
-# below forces exactly those rows (revision mismatch) to re-embed, while leaving
-# the 91%+ that already fit untouched (content-hash still matches AND revision
-# matches → skip). Re-running after the resync completes is a cheap no-op (all
-# rows at the current revision).
-#
-# WHY per-object (not per-collection): the skip already does a per-UUID
-# point-read of `content_hash`; adding `embed_revision` to that SAME read costs
-# nothing extra and lets the resync be INCREMENTAL + RESUMABLE — each object
-# self-heals the first time it's visited at the new revision, so an interrupted
-# resync simply continues where it left off (no all-or-nothing marker to
-# reconcile). A per-collection marker would force an all-or-nothing decision and
-# couldn't express "this row is fresh, that row is stale."
-#
-# Storage: the `embed_revision` property is ADDITIVE (mirrors T-CHUNK's
-# `_ensure_chunk_props_property` non-destructive `config.add_property` pattern).
-# Pre-migration rows return NULL `embed_revision` → treated as "revision
-# unknown" → FORCED re-embed (fail-safe toward re-embedding, never a wrong
-# skip), after which they carry the current revision and go stable.
-#
-# Revision history:
-#   1 (v0.2.72, P3): model-aware chunking for over-budget Function/Class
-#     entities. Over-budget tails now chunk instead of truncate → existing
-#     single-object embeddings of those entities are stale.
-CODEGRAPH_EMBED_REVISION: int = 1
+# Bumps whenever the way an entity's TEXT becomes vectors changes so that a
+# stored vector is stale although its text (content_hash) is not; the
+# per-object fingerprint gate then re-embeds — or STAMPs (D1, below) — each
+# row the first time a walk visits it: incremental and resumable. The why
+# (P3/P7), the NULL/floor semantics and the per-revision rationale live with
+# the decision in `vco_lib/codegraph_guards.py` ("EMBED REVISIONS").
+# `codegraph_resync` regex-parses the literal: keep the line's shape.
+#   1 (v0.2.72, P3): over-budget Function/Class entities chunk, not truncate.
+#   2 (v0.2.106, split rows): a refused chunk is split into rows; a row written
+#     before (cut or averaged, unmarked) re-embeds once unless its text
+#     provably fits every model (`_guards.may_have_been_refused`) → STAMP.
+CODEGRAPH_EMBED_REVISION: int = 2
 
 # ── v0.2.74 (D1): embedding-space compatibility floor ────────────────────────
 # The LOWEST positive `embed_revision` whose stored VECTOR is still valid in
@@ -219,10 +181,9 @@ CODEGRAPH_EMBED_REVISION: int = 1
 # that alters what a single-chunk entity's vector represents), you MUST raise
 # this floor to that new revision so those rows are RE-EMBEDDED, not stamped.
 # For a metadata-only revision bump, leave this floor unchanged so the cheap
-# stamp-only path applies. Today: rev 1 is the first revision; there is no
-# older-but-compatible vector, so the floor equals 1 and the stamp-only path
-# only ever applies to a row already at the current revision-space (i.e. it
-# activates once a FUTURE metadata-only bump makes rev 1 "old-but-valid").
+# stamp-only path applies. Rev 2 is such a bump for every rev-1 row whose text
+# provably fit every model (its vector is valid); the others are vetoed to a
+# re-embed per row (`_guards.may_have_been_refused`), so the floor stays 1.
 _EMBED_SPACE_COMPATIBLE_FROM_REVISION: int = 1
 
 # Property name carrying the per-object revision. Kept out of
@@ -418,10 +379,12 @@ try:
     # alias — its `classify_row` (embed decision SKIP/STAMP/EMBED) is DISTINCT
     # from codegraph_row_classify.classify_row (prune owed/not_owed/purgeable).
     from vco_lib import codegraph_guards as _guards
+    from vco_lib.codegraph_guards import strip_chunk_header as _strip_chunk_header  # noqa: F401 — re-export
+    from vco_lib.embed_split import ChunkOverflowError  # v0.2.106 split rows
     from vco_lib.kg_vector_slot import collection_vector_slots as _collection_vector_slots
     # v0.2.94: the ONE connect factory + URL resolver, and the guarded create.
     from vco_lib import weaviate_helpers as _wh
-    from vco_lib.fixture_class_guard import guarded_collection_create
+    from vco_lib.fixture_class_guard import guarded_collection_create, record_collection_delete
     from vco_lib.weaviate_vector_index import client_named_vector as _client_named_vector
     # v0.2.92: extractor-generation re-index — the force-rewalk flag
     # resolution, the all-chunks-SKIP verdict, and the completion stamp all
@@ -1308,6 +1271,8 @@ def generate_embedding(text: str) -> Optional[Any]:
             slots = svc.embed_code_all_configured(text)
             return slots if slots else None
         return svc.embed_code(text)
+    except ChunkOverflowError:
+        raise  # v0.2.106: inside a row scope the caller splits the entity into rows
     except Exception as e:
         print(f"⚠️  Embedding generation error: {e}", file=sys.stderr)
         return None
@@ -1361,7 +1326,7 @@ class CodeGraphAnalyzer:
     """Analyzes codebase and extracts entities into Weaviate code graph."""
 
     def __init__(self, project_name: str, weaviate_url: "str | None" = None,
-                 grpc_port: int = 50052, named_vectors: bool = DUAL_EMBEDDING_ENABLED):
+                 grpc_port: Optional[int] = None, named_vectors: bool = DUAL_EMBEDDING_ENABLED):
         self.project_name = project_name
         # v0.2.94: env-resolved (`$WEAVIATE_URL`), not a hardcoded literal.
         self.weaviate_url = weaviate_url or _wh.weaviate_url_default()
@@ -1651,7 +1616,7 @@ class CodeGraphAnalyzer:
         # CodeModule collection
         try:
             if force and self.client.collections.exists(self.coll_module):
-                self.client.collections.delete(self.coll_module)
+                record_collection_delete(self.client, self.coll_module)
                 print(f"🗑️  Deleted existing {self.coll_module} collection")
 
             if not self.client.collections.exists(self.coll_module):
@@ -1713,7 +1678,7 @@ class CodeGraphAnalyzer:
         # CodeClass collection
         try:
             if force and self.client.collections.exists(self.coll_class):
-                self.client.collections.delete(self.coll_class)
+                record_collection_delete(self.client, self.coll_class)
                 print(f"🗑️  Deleted existing {self.coll_class} collection")
 
             if not self.client.collections.exists(self.coll_class):
@@ -1782,7 +1747,7 @@ class CodeGraphAnalyzer:
         # CodeFunction collection
         try:
             if force and self.client.collections.exists(self.coll_function):
-                self.client.collections.delete(self.coll_function)
+                record_collection_delete(self.client, self.coll_function)
                 print(f"🗑️  Deleted existing {self.coll_function} collection")
 
             if not self.client.collections.exists(self.coll_function):
@@ -1849,7 +1814,7 @@ class CodeGraphAnalyzer:
         # CodeAPI collection
         try:
             if force and self.client.collections.exists(self.coll_api):
-                self.client.collections.delete(self.coll_api)
+                record_collection_delete(self.client, self.coll_api)
                 print(f"🗑️  Deleted existing {self.coll_api} collection")
 
             if not self.client.collections.exists(self.coll_api):
@@ -1893,7 +1858,7 @@ class CodeGraphAnalyzer:
         # CodeInteraction collection — cross-language / cross-service calls
         try:
             if force and self.client.collections.exists(self.coll_interaction):
-                self.client.collections.delete(self.coll_interaction)
+                record_collection_delete(self.client, self.coll_interaction)
                 print(f"🗑️  Deleted existing {self.coll_interaction} collection")
 
             if not self.client.collections.exists(self.coll_interaction):
@@ -2081,11 +2046,18 @@ class CodeGraphAnalyzer:
         # soft-fails to None → today's exact order. See
         # `guards.plan_chunk_texts`.
         self._embed_skip_fingerprint = None
-        _planned_chunks = _plan_chunk_texts_for(
+        self._fp_memo = {}  # v0.2.106: one fingerprint read per uuid per entity
+        _plan_texts = _planned_chunks = _plan_chunk_texts_for(
             self, collection, insert_params, identity_key,
         )
+        # v0.2.106 split rows: an unchanged entity whose refused chunk is stored
+        # as several rows is compared row by row (`_guards.stored_split_rows`).
+        _split = getattr(self, "_stored_split_rows", None)
+        if _planned_chunks and callable(_split):
+            _planned_chunks = _split(collection, _planned_chunks, identity_key, file_path_rel, current_source_for_uuid) or _planned_chunks
+        self._planned_embed_texts = _planned_chunks
         _resolver = getattr(self, "_resolve_deferred_embed", None)
-        _guards.dispatch_deferred_embed(
+        _refused = _guards.dispatch_deferred_embed(
             insert_params,
             is_multi_chunk=(
                 _planned_chunks is not None and len(_planned_chunks) > 1
@@ -2097,6 +2069,7 @@ class CodeGraphAnalyzer:
                 )) if callable(_resolver) else None
             ),
             eager_shape_fn=_shape_for_insert,
+            split_scope=_plan_texts is not None,
         )
 
         # v0.2.18 (Plan C): stamp the canonical language ID on every insert
@@ -2192,27 +2165,17 @@ class CodeGraphAnalyzer:
                         pass
 
         # ── v0.2.72 (P3): model-aware chunking for over-budget entities ─────
-        #
-        # ~7-9% of functions/classes exceed the embedding budget (measured 8.6%
-        # CodeFunction). Pre-v0.2.72 those were silently truncated — everything
-        # past `_max_chars_for_model` was dropped from the embedding, so a large
-        # function's tail was unsearchable. Chunking splits the FULL entity text
-        # into N chunks so every line contributes to some chunk's embedding.
-        #
-        # CHOKE-POINT design (v0.2.72): the fan-out lives HERE, at the single
-        # `_dedup_insert` store path, NOT at the 23 per-language embed call
-        # sites. The call sites are untouched — they still call
-        # `embed_function`/`embed_class` (one embed) + build one `insert_params`.
-        # When the entity fits (91%+), we keep that single object verbatim
-        # (just stamping chunk_num=0/total_chunks=1). When it's over budget, we
-        # RE-DERIVE the chunk texts from the `function_body`/`class_body` +
-        # `signature` properties already present on `insert_params`, embed each
-        # chunk, and write N objects. The N-object fan-out never touches the
-        # call sites, so it doesn't collide with T-SCOPE's neighbouring
-        # `_find_*` method edits.
+        # CHOKE-POINT design: the N-row fan-out lives HERE, at the single store
+        # path, not at the 23 per-language embed call sites (which still build
+        # one `insert_params` + one deferred embed). An entity that fits (91%+)
+        # stays one object (chunk_num=0/total_chunks=1); an over-budget one is
+        # re-derived from its body/signature props into N chunk rows so every
+        # line reaches a vector. v0.2.106: so is an entity whose single text a
+        # model REFUSED (`_refused`) — the fan-out splits it into rows.
         chunk_uuid = self._maybe_chunk_and_write(
             collection, insert_params, identity_key, file_path_rel,
             current_source_for_uuid, chunk_texts=_planned_chunks,
+            plan_texts=_plan_texts, refused=_refused,
         )
         if chunk_uuid is not None:
             return chunk_uuid
@@ -2573,6 +2536,7 @@ class CodeGraphAnalyzer:
         self, collection, insert_params: dict, identity_key: str,
         file_path_rel: str, current_source_for_uuid: str,
         chunk_texts: Optional[List[str]] = None,
+        plan_texts: Optional[List[str]] = None, refused: bool = False,
     ) -> Optional[str]:
         """Chunk an over-budget Function/Class into N objects and write them.
 
@@ -2603,51 +2567,42 @@ class CodeGraphAnalyzer:
             chunk_texts = _plan_chunk_texts_for(
                 self, collection, insert_params, identity_key, soft=False,
             )
-        # Not chunkable / no body / single chunk → the entity fits; not our
-        # path. Return None so the caller does the ordinary single-object write
-        # (the deferred-embed resolver decides SKIP/STAMP/EMBED there).
-        if not chunk_texts or len(chunk_texts) <= 1 or not isinstance(props, dict):
+        # Not chunkable / no body / single chunk the models accepted → the
+        # entity fits; the caller does the ordinary single-object write (the
+        # deferred-embed resolver decided SKIP/STAMP/EMBED there).
+        if not chunk_texts or (len(chunk_texts) <= 1 and not refused) or not isinstance(props, dict):
             return None
-        total = len(chunk_texts)
         is_function = coll_name.endswith("CodeFunction")
-
-        # Derive per-chunk UUIDs + content hashes ONCE (reused by the stamp
-        # precheck AND the embed loop). The guard stays I/O-free; inject the
-        # analyzer's module-local UUID + content-hash seeds.
-        chunk_uuids, chunk_hashes = _guards.chunk_identities(
-            chunk_texts, props, is_function, identity_key, total,
-            uuid_fn=lambda key: _deterministic_uuid(
-                self.project_name, file_path_rel, key,
-                project_source=current_source_for_uuid,
-            ),
-            hash_fn=lambda cp: _content_hash_for_object(coll_name, cp),
-        )
-
-        # v0.2.82 (G1 task 3): multi-chunk STAMP precheck — a metadata-only
-        # revision bump PATCHes (never re-embeds) a byte-identical, same-count
-        # multi-chunk entity (D1 extended to the 7-9% tail); ANY non-stampable
-        # chunk → full re-embed below. getattr-guarded for minimal test stubs.
-        _stamper = getattr(self, "_maybe_stamp_all_chunks", None)
-        if callable(_stamper) and _stamper(
-            collection, chunk_uuids, chunk_hashes, total,
-        ):
-            return chunk_uuids[0]
-
-        # Re-embed each chunk (own vector, never the parent's full-body one);
-        # the guard owns the loop + params build, this supplies the two I/O
-        # callables. Both resolved by bare name at call time, so the existing
-        # `generate_embedding` / `_shape_for_insert` monkeypatch seams hold.
+        _uuid = lambda key: _deterministic_uuid(  # noqa: E731 — one seed, two uses
+            self.project_name, file_path_rel, key, project_source=current_source_for_uuid)
+        if not refused:
+            # Per-row UUIDs + content hashes ONCE (the guard stays I/O-free).
+            # v0.2.82 (G1 task 3): SKIP / STAMP precheck — a converged or
+            # metadata-only-stale entity re-embeds nothing; ANY other row →
+            # full re-embed below. getattr-guarded for minimal test stubs.
+            total = len(chunk_texts)
+            chunk_uuids, chunk_hashes = _guards.chunk_identities(
+                chunk_texts, props, is_function, identity_key, total, uuid_fn=_uuid,
+                hash_fn=lambda cp: _content_hash_for_object(coll_name, cp),
+            )
+            _stamper = getattr(self, "_maybe_stamp_all_chunks", None)
+            if callable(_stamper) and _stamper(
+                collection, chunk_uuids, chunk_hashes, total, chunk_texts=chunk_texts,
+            ):
+                return chunk_uuids[0]
+        # Re-embed from the PLAN (own vector per row, never the parent's; a
+        # chunk a model refuses becomes more rows — `fan_out_chunk_writes`).
+        # Both I/O seams resolve by bare name at call time (monkeypatch seams).
         return _guards.fan_out_chunk_writes(
-            insert_params, props, chunk_texts, chunk_uuids, is_function,
+            insert_params, props, plan_texts or chunk_texts, is_function,
             embed_fn=lambda t: _shape_for_insert(generate_embedding(t)),
-            write_fn=lambda cu, cp: self._write_one_object(
-                collection, cu, cp, identity_key,
-            ),
+            write_fn=lambda cu, cp: self._write_one_object(collection, cu, cp, identity_key),
+            uuid_fn=lambda k: _uuid(_guards.chunk_key(identity_key, k)),
         )
 
     def _maybe_stamp_all_chunks(
         self, collection, chunk_uuids: List[str], chunk_hashes: List[str],
-        total: int,
+        total: int, chunk_texts: Optional[List[str]] = None,
     ) -> bool:
         """v0.2.82 (G1 task 3) + v0.2.92: thin I/O seam over
         ``guards.skip_or_stamp_all_chunks``, which owns the all-SKIP-then-STAMP
@@ -2656,6 +2611,7 @@ class CodeGraphAnalyzer:
         per-chunk ``embed_revision`` PATCH, and the visited-mark every branch
         owes ``--prune-stale`` / the per-file reconcile. True → no embed needed
         (skipped or stamped); False → the caller re-embeds every chunk.
+        ``chunk_texts`` arms the v0.2.106 rev-2 STAMP veto per row.
         """
         def _patch(cu: str) -> bool:
             try:
@@ -2683,6 +2639,38 @@ class CodeGraphAnalyzer:
             note_visited=lambda cu: _note_written_uuid(
                 self, getattr(collection, "name", ""), cu,
             ),
+            restamp_blocked=(
+                (lambda i: self._may_have_been_refused(chunk_texts[i]))
+                if chunk_texts else None
+            ),
+        )
+
+    def _may_have_been_refused(self, text: Any) -> bool:
+        """v0.2.106 rev-2 STAMP veto (`_guards.may_have_been_refused`) against this
+        walk's code models (`EmbeddingService.configured_code_write_models`, once)."""
+        models = self.__dict__.get("_code_write_models")
+        if models is None:
+            try:
+                models = list(_get_embedding_service().configured_code_write_models().values())  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001 — no service / unknown → the active model only
+                models = []
+            self._code_write_models = models = models or [_resolve_code_model_id()]
+        return _guards.may_have_been_refused(text, models)
+
+    def _stored_split_rows(
+        self, collection, plan_texts: List[str], identity_key: str,
+        file_path_rel: str, current_source_for_uuid: str,
+    ) -> Optional[List[str]]:
+        """v0.2.106: the stored rows of an unchanged SPLIT entity (seam over
+        ``guards.stored_split_rows``), so a walk compares them row by row and
+        embeds nothing; None → plan and embed as usual."""
+        body = "function_body" if (getattr(collection, "name", "") or "").endswith("CodeFunction") else "class_body"
+        return _guards.stored_split_rows(
+            collection, plan_texts, body,
+            uuid_fn=lambda k: _deterministic_uuid(
+                self.project_name, file_path_rel, _guards.chunk_key(identity_key, k),
+                project_source=current_source_for_uuid),
+            read_fp=lambda cu: self._read_existing_object_fingerprint(collection, cu, want_total_chunks=True),
         )
 
     def _read_existing_object_fingerprint(
@@ -2697,6 +2685,10 @@ class CodeGraphAnalyzer:
         forever. Slot undeclared / schema unreadable / payload unjudgeable →
         no veto (an un-addable slot must not force a re-embed every run).
         """
+        memo = self.__dict__.get("_fp_memo")  # v0.2.106: per-entity, see _dedup_insert
+        key = (getattr(collection, "name", None) or id(collection), det_uuid, bool(want_total_chunks))
+        if isinstance(memo, dict) and key in memo:
+            return dict(memo[key]) if memo[key] is not None else None
         slot = None
         if DUAL_EMBEDDING_ENABLED:
             cache = self.__dict__.setdefault("_declared_slots", {})
@@ -2711,6 +2703,8 @@ class CodeGraphAnalyzer:
         )
         if fp is not None and fp.get("vector_present") is False:
             fp["embed_revision"] = _EMBED_REVISION_VECTORLESS
+        if isinstance(memo, dict):
+            memo[key] = dict(fp) if fp is not None else None
         return fp
 
     def _fingerprint_matches(
@@ -2835,9 +2829,14 @@ class CodeGraphAnalyzer:
         # says so, PATCH the `embed_revision` in place (no embed, no tombstone)
         # and skip the write path — the row converges without touching its
         # vector or summary. Fail-safe: any doubt → fall through to re-embed.
+        # v0.2.106 rev 2: a row whose embed text may have been refused (cut or
+        # averaged, unmarked) is never stamped — it re-embeds once instead.
+        _veto = getattr(self, "_may_have_been_refused", None)
+        _heal_text = ((getattr(self, "_planned_embed_texts", None) or [None])[0] if is_chunkable
+                      else props.get(_guards.HEAL_TEXT_FIELDS.get(coll_name.rsplit("_", 1)[-1], ""), ""))
         if self._stale_row_needs_only_revision_stamp(
             fp, content_hash, is_chunkable,
-        ):
+        ) and not (callable(_veto) and _veto(_heal_text)):
             try:
                 collection.data.update(
                     uuid=det_uuid,
@@ -2897,6 +2896,8 @@ class CodeGraphAnalyzer:
         failure: "Exception | None" = None
         try:
             embedding = deferred()
+        except ChunkOverflowError:
+            raise  # v0.2.106: refused whole → the dispatcher writes split rows
         except Exception as exc:  # noqa: BLE001 — an embed failure must not wedge the write
             embedding = None
             failure = exc
@@ -3102,12 +3103,12 @@ class CodeGraphAnalyzer:
         try:
             collection.data.replace(uuid=det_uuid, **insert_params)
         except BaseException as exc:
-            # Detect Weaviate's "object does not exist" signal. The error
-            # text is stable across v4.x ("no object with id 'X'"); we
-            # match conservatively on substring so a future error-prefix
-            # change (e.g. "no object with uuid") still trips the branch.
-            err_text = str(exc)
-            is_not_found = "no object with id" in err_text or "no object with uuid" in err_text
+            # "Object does not exist" — the signal changed between versions
+            # (a 500 "no object with id" before; a 404 "Object was not
+            # replaced" on Weaviate 1.37 + weaviate-client 4.21, which this
+            # text match missed and so dropped every new entity). One home:
+            # `codegraph_guards.replace_target_missing`.
+            is_not_found = _guards.replace_target_missing(exc)
             if is_not_found:
                 try:
                     collection.data.insert(uuid=det_uuid, **insert_params)
@@ -5309,13 +5310,12 @@ class CodeGraphAnalyzer:
                     cn = int(p.get("chunk_num") or 0)
                 except (TypeError, ValueError):
                     cn = 0
-                body_part = _strip_chunk_header(p.get("function_body", "") or "")
-                rows.append((cn, body_part))
+                rows.append((cn, p.get("function_body", "") or ""))
             if len(rows) <= 1:
                 return fallback
             rows.sort(key=lambda t: t[0])
-            assembled = "\n".join(b for _, b in rows if b)
-            return assembled or fallback
+            # v0.2.106: split pieces glue back exactly (`_guards.join_chunk_bodies`).
+            return _guards.join_chunk_bodies(rows, "\n") or fallback
         except Exception:  # noqa: BLE001 — degrade to the chunk-0 body
             return fallback
 
@@ -6921,8 +6921,8 @@ def main():
         _cem.finish_analyzer_run(project_name, _cem_plan, embedding_service, scoped=_cem_scoped, repo_root=repo_path, index_dot_claude=analyzer.index_dot_claude, stats=stats, revision=CODEGRAPH_EMBED_REVISION)
         # v0.2.91 wave-3 fix (MAJOR-1): the NARROW paired clear, at the only
         # point that proves the walk actually happened. v0.2.95 F1 adds the
-        # chunker re-sync's code-graph half here (force-recreate walks only).
-        _deferral_op("record_successful_walk", deferral_root, args.force_recreate)
+        # chunker re-sync's code-graph half (force-recreate, or v0.2.106 a whole-repo force re-walk).
+        _deferral_op("record_successful_walk", deferral_root, args.force_recreate, bool(_stamped))
         return 0
 
     finally:

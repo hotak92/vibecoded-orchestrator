@@ -18,7 +18,7 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 # propagated from this same logical version by `scripts/bump-version.sh`
 # and verified by `scripts/pre-ship-check.sh`.
 [workspace.package]
-version = "0.2.105"
+version = "0.2.106"
 
 # v0.2.92 (WP-19): SINGLE source of truth for the `serde_json` feature set.
 #
@@ -284,7 +284,10 @@ libloading = "0.8"
 # references `winreg::` after the port — verified by grep over
 # `launcher/src-tauri/src/` and `launcher/src-tauri/vct-hub/src/`.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+# v0.2.106 (review L6): Win32_System_Console for the --remove-project ask
+# path (AttachConsole / AllocConsole / GetStdHandle) — a GUI-subsystem
+# binary started without a console opens one to ask in.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Console"] }
 
 # Release-profile privacy + size hardening (PR-4, 2026-05-06).
 #

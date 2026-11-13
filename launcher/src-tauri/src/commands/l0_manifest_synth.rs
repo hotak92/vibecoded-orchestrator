@@ -241,6 +241,8 @@ pub fn synthesize_install_manifest_from_l0(
         // extracted manifest's flags, not the synth's.
         rotate_weights: false,
         rotate_weights_endpoint: None,
+        build_context: None,
+        dockerfile: None,
     };
     let install = InstallBlock {
         method: InstallMethod::ContainerPull,
@@ -338,6 +340,9 @@ pub fn synthesize_install_manifest_from_l0(
             .map(|r| !r.gpu)
             .unwrap_or(false),
         gpu_image_variants,
+        // L0 carries no image user: a paid image's manifest arrives with
+        // the post-install extract, which replaces this synthesized one.
+        image_user: None,
     };
 
     Ok(ModuleManifest {

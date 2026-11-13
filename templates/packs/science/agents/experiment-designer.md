@@ -6,6 +6,8 @@ keywords: [experiment design, randomisation, blinding, preregistration, confound
 tools: Read, Write, Edit, WebSearch, Bash, mcp__weaviate-kg__*
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

@@ -13,6 +13,10 @@ pub mod blocking;
 // staleness census. Three-state (current/stale/unknown); a probe that
 // could not run reports "could not determine", never "all current".
 pub mod bundle_staleness;
+// v0.2.106: modules whose source ships in the checkout (built locally with
+// `install.method = "container_build"`, no registry, no licence) — the RL
+// reranker. One home for catalog, install, build and update logic.
+pub mod bundled_modules;
 pub mod changes_cmd;
 pub mod claude_env;
 pub mod kg_reviewer_model;
@@ -94,11 +98,15 @@ pub mod kg;
 pub mod kg_sync;
 pub mod kg_summary;
 pub mod lifecycle;
+// v0.2.106: Preferences, KG Summaries, "Local summary model" (opt-out).
+pub mod local_summary_model;
 pub mod licensing;
 // v0.2.91 WP-L (decision #21): the machine-global diagnostic log level
 // preference. Writes app_state `logging.level` — the key
 // `vct_launcher_core::logging` resolves and `crate::logging` applies.
 pub mod logging_prefs;
+// v0.2.106: Preferences idle-unload time + Services Ollama model list (hub-owned).
+pub mod ollama_lifetime_prefs;
 pub mod maintenance;
 pub mod manifest;
 // v0.2.92 WP-12: the model gateway's GUI surface — lifecycle (start / stop /
@@ -237,6 +245,7 @@ pub mod project_hooks_settings;
 pub mod packs_cmd;
 pub mod project_state_cmd;
 pub mod project_state_populate;
+pub mod registry_module_retirement;
 pub mod restart;
 // v0.2.89 BUG 1 (Windows field audit): ONE home for the
 // (program, prefix-args) resolution used to spawn bundled
@@ -273,6 +282,11 @@ pub mod session_autostart;
 // whose logic lives in `vco_lib/container_engine_start.py` and whose
 // readers are the hub, the launcher setup and the session hooks.
 pub mod engine_autostart_pref;
+// v0.2.106: Preferences → Services "Restart stopped services automatically"
+// — the GUI switch for the `launcher.services_watcher_enabled` app_state row
+// that BOTH automatic restarters read (the launcher's services watcher and
+// the hub's infra watchdog).
+pub mod services_watcher_pref;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
 // `update_all_projects` and the orchestrator update (`run_orchestrator_update`

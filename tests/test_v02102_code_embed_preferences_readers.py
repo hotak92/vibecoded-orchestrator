@@ -48,6 +48,11 @@ from vco_lib.embedding_service import (
     NoEmbeddingBackendError,
 )
 
+#: The code graph's CURRENT embed revision (the analyzer constant, read the way
+#: production reads it) — a fill counter stamped at it is current. Pinned to a
+#: literal 1 before v0.2.106 bumped the constant to 2 (split rows).
+_CURRENT_REV = cem.current_embed_revision()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _ANALYZER_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 _JINA = "unclemusclez/jina-embeddings-v2-base-code:latest"
@@ -617,7 +622,7 @@ class TestFillCounters:
         monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 3)
         monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: pytest.fail("no scan"))
         out = cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
-                                      stats={"files_skipped": 0, "insert_errors": 0}, revision=1)
+                                      stats={"files_skipped": 0, "insert_errors": 0}, revision=_CURRENT_REV)
         assert out == "complete" and cem.read_code_model_record("Acme").model == DEFAULT_TEXT_MODEL
 
     def test_an_orphan_row_does_not_block_the_flip(self, launcher_db, monkeypatch):
@@ -634,7 +639,7 @@ class TestFillCounters:
         monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 4)  # + 1 orphan
         monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: (3, 4))
         out = cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
-                                      stats={"files_skipped": 0, "insert_errors": 0}, revision=1)
+                                      stats={"files_skipped": 0, "insert_errors": 0}, revision=_CURRENT_REV)
         assert out == "complete"
         assert cem.read_code_model_record("Acme").model == DEFAULT_TEXT_MODEL
 
@@ -656,17 +661,17 @@ class TestFillCounters:
         guards.start_fill_tally("qwen3_embed")
         self._walk("qwen3_embed", [{"qwen3_embed": [1.0]}])              # visited 1 of 4
         assert cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
-                                       stats={"files_skipped": 2}, revision=1) == "filling"
+                                       stats={"files_skipped": 2}, revision=_CURRENT_REV) == "filling"
         assert scans == ["qwen3_embed"]                                    # dirty walk → scan
         fill = _row(launcher_db)["config"]["code_model_fill"]
         assert (fill["filled"], fill["total"], fill["source"]) == (1, 4, "scan")
         assert cem.finish_analyzer_run("Acme", self._plan(), None, scoped=False,
-                                       stats={}, revision=1) == "filling"
+                                       stats={}, revision=_CURRENT_REV) == "filling"
         assert scans == ["qwen3_embed", "qwen3_embed"]                     # no tally → scan
 
     def test_the_bundle_update_flips_from_stamped_counters_without_a_scan(self, launcher_db, monkeypatch):
         _stamp_record(launcher_db, DEFAULT_CODE_MODEL, 2048, config={"code_model_fill": {
-            "target": DEFAULT_TEXT_MODEL, "filled": 5, "total": 5, "revision": 1, "source": "walk"}})
+            "target": DEFAULT_TEXT_MODEL, "filled": 5, "total": 5, "revision": _CURRENT_REV, "source": "walk"}})
         _state(launcher_db, code_embed_backend_override="qwen3")
         monkeypatch.setattr(cem, "count_code_objects", lambda prefix, **kw: 5)
         monkeypatch.setattr(cem, "scan_slot_fill", lambda *a, **k: pytest.fail("no scan"))

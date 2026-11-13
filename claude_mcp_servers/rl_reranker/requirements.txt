@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# RL reranker container runtime dependencies (the image built from this
+# directory; see Dockerfile). The orchestrator venv does NOT install this
+# file: the repository test suite runs the same code against the root
+# requirements.txt, whose torch / numpy / aiohttp floors are newer.
+#
+# Embeddings are obtained over HTTP from the embedding services — no
+# sentence-transformers here.
+#
+# Licences (all compatible with AGPL-3.0-or-later): torch BSD-3-Clause,
+# numpy BSD-3-Clause, aiohttp Apache-2.0.
+
+# PyTorch. The variant-specific wheel index (cpu / cu121 / rocm6.1) is chosen
+# in the Dockerfile; the ROCm channel pins torch==2.5.1 there, so the CPU and
+# CUDA variants are kept on the same release for identical numerics.
+torch==2.5.1
+
+# Numerical core.
+numpy>=1.26,<3.0
+
+# aiohttp: the HTTP server (rl_server) and the hub / embedding clients
+# (retrieval_rl). Floor matches the orchestrator's root requirements.txt.
+aiohttp>=3.13.5,<4

@@ -11,9 +11,11 @@ now" - and logs are ALWAYS collected.
   it is set, ``search_pipeline._resolve_rl_enabled`` is False whatever the
   per-project row, the host-wide row, the licence or the hub say (including
   hub-down, which used to fall open to the licence alone).
-* Beneath the lock, the hub-served ``rl_reranker_enabled_for_project`` and the
-  licence still decide (pinned with the lock patched off, i.e. the state that
-  applies again once a trained model ships).
+* Beneath the lock, the hub-served ``rl_reranker_enabled_for_project`` alone
+  decides (pinned with the lock patched off, i.e. the state that applies again
+  once a trained model ships). v0.2.106 (owner 2026-11-11, "the RL reranker is
+  no more paid"): the licence gate is gone — every cell below runs with a
+  licence stub answering BOTH ways and the outcome must not change.
 * W5R-09: logging independence is exercised through the REAL consumer gates
   (``_retrieval_emit_has_consumer`` / ``_should_capture_citations``) with local
   logging on. The only patched boundaries are ``emit_rl_event`` (the writer),
@@ -46,14 +48,14 @@ def _fake_license(feature_on: bool):
 
 
 def _resolve(feature_on: bool, cfg, *, unlocked: bool = False) -> bool:
+    """``unlocked=False`` sets a lock (v0.2.106 ships the table unlocked, so
+    the locked cells set one explicitly); ``True`` lifts it."""
     import claude_mcp_servers.weaviate_mcp.server as srv
 
     with patch.dict(sys.modules, _fake_license(feature_on)), patch.object(
         srv, "_try_resolve_project_config", return_value=cfg
-    ):
-        if unlocked:
-            with patch.object(search_pipeline, "_rl_scoring_lock_reason", return_value=None):
-                return search_pipeline._resolve_rl_enabled()
+    ), patch.object(search_pipeline, "_rl_scoring_lock_reason",
+                    return_value=None if unlocked else "locked"):
         return search_pipeline._resolve_rl_enabled()
 
 
@@ -66,11 +68,14 @@ HUB_DOWN = None
 
 
 class TestTheShippedLock:
-    def test_ships_locked_with_the_owner_reason(self):
-        assert rl_scoring_lock.rl_scoring_locked() is True
-        reason = rl_scoring_lock.rl_scoring_lock_reason()
-        assert reason and "until the model is trained" in reason
-        assert "Data collection continues" in reason
+    def test_ships_unlocked_for_opt_in_with_the_old_reason_kept(self):
+        """v0.2.106 (owner 2026-11-12): per-project online adaptation ships
+        opt-in, so the table is unlocked; the pre-v0.2.106 reason stays in it
+        for the record and the ruling is recorded inline."""
+        assert rl_scoring_lock.rl_scoring_locked() is False
+        assert rl_scoring_lock.rl_scoring_lock_reason() is None
+        loaded = rl_scoring_lock.load_rl_scoring_lock()
+        assert "until the model is trained" in loaded["reason"]
 
     def test_loader_reads_an_unlocked_table(self, tmp_path: Path):
         p = tmp_path / "lock.toml"
@@ -119,24 +124,36 @@ class TestLockForcesScoringOff:
         """Same inputs, lock lifted -> scoring on. Proves the OFF above comes
         from the lock, not from the row or licence."""
         assert _resolve(True, ROW_TRUE, unlocked=True) is True
-        assert _resolve(True, HUB_DOWN, unlocked=True) is True
 
 
 class TestResolverBeneathTheLock:
-    """The cascade that applies again once the lock lifts (unchanged)."""
+    """The cascade that applies again once the lock lifts: the per-project
+    row alone (v0.2.106 — no licence gate)."""
 
-    def test_row_off_resolves_scoring_off_even_with_a_licence(self):
-        assert _resolve(True, ROW_FALSE, unlocked=True) is False
+    @pytest.mark.parametrize("licensed", [True, False], ids=["licence-on", "licence-off"])
+    def test_row_off_resolves_scoring_off(self, licensed):
+        assert _resolve(licensed, ROW_FALSE, unlocked=True) is False
 
-    def test_row_on_is_honoured_when_licensed(self):
-        assert _resolve(True, ROW_TRUE, unlocked=True) is True
+    @pytest.mark.parametrize("licensed", [True, False], ids=["licence-on", "licence-off"])
+    def test_row_on_is_honoured_without_any_licence(self, licensed):
+        """Red before v0.2.106: an unlicensed install resolved OFF here."""
+        assert _resolve(licensed, ROW_TRUE, unlocked=True) is True
 
-    def test_licence_gate_still_beats_a_true_row(self):
-        assert _resolve(False, ROW_TRUE, unlocked=True) is False
+    @pytest.mark.parametrize("licensed", [True, False], ids=["licence-on", "licence-off"])
+    def test_hub_unreachable_is_off_because_scoring_is_opt_in(self, licensed):
+        """v0.2.106 (owner 2026-11-12, opt-in): a toggle that cannot be read
+        is not the user's opt-in — scoring is off (it fell open before)."""
+        assert _resolve(licensed, HUB_DOWN, unlocked=True) is False
 
-    def test_hub_unreachable_falls_open_to_the_licence_decision(self):
-        assert _resolve(True, HUB_DOWN, unlocked=True) is True
-        assert _resolve(False, HUB_DOWN, unlocked=True) is False
+    def test_no_licence_validator_at_all_still_resolves_on(self):
+        """A machine with no licence module (``VCThelpers`` unimportable)
+        is not a reason to switch the reranker off any more."""
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        with patch.dict(sys.modules, {"VCThelpers": None, "VCThelpers.license": None}), \
+                patch.object(srv, "_try_resolve_project_config", return_value=ROW_TRUE), \
+                patch.object(search_pipeline, "_rl_scoring_lock_reason", return_value=None):
+            assert search_pipeline._resolve_rl_enabled() is True
 
 
 # ─── W5R-09: logging is independent of the lock and every scoring state ─────
@@ -192,8 +209,8 @@ def _run_pipeline(monkeypatch, *, licensed: bool, cfg, unlocked: bool):
     monkeypatch.setattr(search_pipeline, "_populate_citation_cache", lambda **kw: staged.append(kw["task_id"]))
     monkeypatch.setattr(search_pipeline, "_drive_retention_housekeeping", lambda: None)
     monkeypatch.setattr(srv, "_try_resolve_project_config", lambda *a, **k: cfg)
-    if unlocked:
-        monkeypatch.setattr(search_pipeline, "_rl_scoring_lock_reason", lambda: None)
+    monkeypatch.setattr(search_pipeline, "_rl_scoring_lock_reason",
+                        (lambda: None) if unlocked else (lambda: "locked"))
     with patch.dict(sys.modules, _fake_license(licensed)):
         res = asyncio.run(search_pipeline.rerank_and_emit(_request()))
     return res, emitted, reranks, staged
@@ -211,8 +228,9 @@ def test_logging_is_identical_in_every_scoring_state(monkeypatch, cfg, licensed,
     assert staged == ["T"]
     assert res.emit_success is True
 
-    # Scoring follows the lock, then the licence + row.
-    scoring_expected = unlocked and licensed and cfg is not ROW_FALSE
+    # Scoring follows the lock, then the row (v0.2.106: never the licence;
+    # opt-in, so only an explicit ON row scores — the hub-down cell is off).
+    scoring_expected = unlocked and cfg is ROW_TRUE
     assert bool(reranks) is scoring_expected
     assert res.rl_used is False  # the fake rerank RPC answers "fell back"
 

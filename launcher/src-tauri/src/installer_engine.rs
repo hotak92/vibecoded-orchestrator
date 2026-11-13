@@ -71,6 +71,10 @@ pub enum InstallStage {
     /// short "Pulling image" string; `percent` is a coarse mid-install
     /// marker.
     Pulling,
+    /// v0.2.106: emitted right before a `container_build` module's image is
+    /// built from the orchestrator checkout (the build downloads the
+    /// variant's PyTorch wheel, so it is the slow phase of that install).
+    Building,
     Done,
     /// v0.2.31 (#27): emitted via `report_error` before an error return.
     /// Pre-v0.2.31 errors propagated as `Result::Err` but the progress
@@ -366,6 +370,28 @@ async fn run_install_inner(
                 &image_ref,
                 &manifest.id,
                 &runtime,
+            )
+            .await?;
+        }
+        InstallMethod::ContainerBuild => {
+            // v0.2.106: a module whose source ships in this checkout. Build
+            // the variant image locally (no registry, no pull token, no
+            // licence) and materialise install_dir — manifest + DB
+            // migrations — from the build context, so the steps below and
+            // every later reader of the installed manifest are unchanged.
+            emit_progress(
+                app,
+                project_id,
+                &manifest.id,
+                InstallStage::Building,
+                step_index,
+                total_steps,
+                "Building image",
+            );
+            crate::commands::bundled_modules::build_and_materialize(
+                manifest,
+                &install_dir,
+                gpu_mode,
             )
             .await?;
         }
@@ -1634,7 +1660,9 @@ pub(crate) use vct_launcher_core::services::container_runtime::{
 
 /// `pull_token_endpoint` (Phase 3A, v0.2.35).
 ///
-/// Wire contract (matches `launcher/supabase/functions/rl-artifact-url`):
+/// Wire contract (matches `launcher/supabase/functions/rl-artifact-url`,
+/// kept deployed as paid-module infrastructure; since v0.2.106 the bundled
+/// RL reranker builds its image locally and never requests a pull token):
 ///   Request:  `{ "license_key": "<UUID-or-vct_admin_*>", "machine_id_hash": "<sha256 hex>" }`
 ///   Response: `{ "image", "tag", "registry", "pull_token", "expires_in_s", "expires_at" }`
 ///
@@ -1871,15 +1899,29 @@ fn post_install_command(program: &str, args: &[String], cwd: &Path) -> Command {
     cmd
 }
 
+/// A manifest command template -> argv. The RAW template is tokenized FIRST
+/// and each token resolved after (v0.2.106): resolving first and splitting
+/// the result broke every command whose `{install_dir}` / `{VCT_*}` /
+/// `{HOME}` value contains a space (`C:\Users\First Last`, a macOS folder
+/// named with a space) — the path became two argv words. A placeholder
+/// value is therefore always ONE argv element (or part of one), never
+/// re-parsed for quotes or whitespace; quoting in the template keeps
+/// working as before.
+pub(crate) fn command_argv(raw: &str, ctx: &PlaceholderCtx) -> Result<Vec<String>, String> {
+    let tokens =
+        shlex::split(raw).ok_or_else(|| format!("cannot tokenize command: {}", raw))?;
+    Ok(tokens.iter().map(|t| ctx.resolve(t)).collect())
+}
+
 async fn run_post_install_command(
     spec: &CommandSpec,
     ctx: &PlaceholderCtx,
 ) -> Result<(), String> {
     let raw = pick_platform_cmd(spec);
+    // For messages only; the argv comes from `command_argv`.
     let resolved = ctx.resolve(&raw);
 
-    let tokens = shlex::split(&resolved)
-        .ok_or_else(|| format!("cannot tokenize command: {}", resolved))?;
+    let tokens = command_argv(&raw, ctx)?;
     let (program, args) = tokens
         .split_first()
         .ok_or_else(|| format!("empty command: {}", resolved))?;
@@ -2336,6 +2378,8 @@ async fn run_upgrade_inner(
 ///   - `GitClone`: `git pull` if `install_dir/.git` exists, else
 ///     wipe + re-clone (handles user-corrupted dirs gracefully).
 ///   - `ContainerPull`: `podman pull` the resolved variant tag.
+///   - `ContainerBuild` (v0.2.106): rebuild the variant image from the
+///     checkout and re-materialise install_dir (manifest + migrations).
 ///   - `Local`: no-op (user has already updated by hand).
 ///
 /// v0.2.35 (Agent N): returns `Some(actual_tag)` when the install
@@ -2450,6 +2494,15 @@ async fn refetch_artifact(
             .await?;
             return Ok(Some(actual_tag));
         }
+        InstallMethod::ContainerBuild => {
+            let built_tag = crate::commands::bundled_modules::build_and_materialize(
+                manifest,
+                install_dir,
+                gpu_mode,
+            )
+            .await?;
+            return Ok(Some(built_tag));
+        }
     }
     Ok(None)
 }
@@ -2556,6 +2609,37 @@ mod tests {
     use super::*;
     use crate::commands::gpu_policy::GpuMode;
     use crate::manifest::GpuImageVariants;
+
+    /// v0.2.106: an install_dir with a space stays ONE argv element in every
+    /// post_install / pre_upgrade / post_upgrade / migration command (they all
+    /// run through `run_post_install_command` -> `command_argv`).
+    #[test]
+    fn command_argv_keeps_a_spaced_install_dir_in_one_token() {
+        let dir = PathBuf::from("/Users/First Last/VCO Marti/modules/vct-example");
+        let ctx = PlaceholderCtx::new("vct-example").with_install_dir(dir.clone());
+        let argv = command_argv("{install_dir}/venv/bin/python -m pip install -e {install_dir}", &ctx)
+            .expect("tokenizes");
+        let d = dir.display().to_string();
+        assert_eq!(
+            argv,
+            vec![format!("{d}/venv/bin/python"), "-m".into(), "pip".into(), "install".into(),
+                 "-e".into(), d.clone()],
+        );
+    }
+
+    #[test]
+    fn command_argv_keeps_quoted_literals_and_quoted_placeholders() {
+        let ctx = PlaceholderCtx::new("vct-example")
+            .with_install_dir(PathBuf::from("/opt/with space/x"));
+        let argv = command_argv(r#"python -c "print('a b')" "{install_dir}/cfg file.toml""#, &ctx)
+            .expect("tokenizes");
+        assert_eq!(
+            argv,
+            vec!["python".to_string(), "-c".into(), "print('a b')".into(),
+                 "/opt/with space/x/cfg file.toml".into()],
+        );
+        assert!(command_argv("python \"unterminated", &ctx).is_err());
+    }
 
     /// R12-bis N4 wiring test (run_post_install_command call-site): the
     /// post-install child's env is EXACTLY the ONE child-env table's

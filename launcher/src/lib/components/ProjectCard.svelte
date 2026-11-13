@@ -18,6 +18,8 @@
   // pick up the brand colors (teal #00BFA6 for active, pink #FF4FA0
   // for warning) via inline rgba() literals matching app.css tokens.
 
+  import { isRemovableProject } from '$lib/unregister-escape';
+
   interface Props {
     /** Project view returned by list_projects_v2. */
     project: {
@@ -40,31 +42,54 @@
     folderMissing?: boolean;
     /** Click handler — receives the project id. */
     onOpen: (id: string) => void;
+    /**
+     * v0.2.106 Remove flow: opens the shared "Remove project" confirm
+     * dialog (ProjectRemoveFlow) for this project. Optional so call sites
+     * that only open projects are unaffected. When set, the card renders a
+     * Remove button — a sibling of the card's open button, so activating it
+     * never opens the project — except on the orchestrator root, which is
+     * never removable.
+     */
+    onRemove?: (project: { id: string; name: string }) => void;
   }
 
-  let { project, active = false, folderMissing = false, onOpen }: Props = $props();
+  let { project, active = false, folderMissing = false, onOpen, onRemove }: Props = $props();
 
-  function handleKey(e: KeyboardEvent) {
-    if (e.key === 'Enter' || e.key === ' ') {
-      e.preventDefault();
-      onOpen(project.id);
-    }
-  }
+  // The orchestrator root is never removable (the backend refuses the
+  // orchestrator clone; the top-bar selector never offered it).
+  const removable = $derived(isRemovableProject(project));
 </script>
 
-<div
-  class="pc-card"
-  class:active
-  class:warn={folderMissing}
-  role="button"
-  tabindex="0"
-  onclick={() => onOpen(project.id)}
-  onkeydown={handleKey}
->
+<!-- v0.2.106 fix round 1 (review R2-6): the card is a plain container. Its
+     open action is a real button stretched over the whole card, and the
+     Remove button is that button's SIBLING, stacked above it — never an
+     interactive control nested inside a role="button" element. -->
+<div class="pc-card" class:active class:warn={folderMissing}>
+  <button
+    type="button"
+    class="pc-open"
+    data-testid="project-card-open"
+    aria-label="Open project {project.name}"
+    onclick={() => onOpen(project.id)}
+  ></button>
   <header class="pc-head">
     <h3>{project.name}</h3>
     {#if active}
       <span class="pc-badge">ACTIVE</span>
+    {/if}
+    {#if onRemove && removable}
+      <!-- v0.2.106 Remove flow. Works when the folder is missing too: the
+           unregister backend never needs the folder to be present. -->
+      <button
+        type="button"
+        class="pc-remove"
+        data-testid="project-card-remove"
+        aria-label="Remove {project.name} from VCO"
+        title="Remove {project.name} from VCO — the folder and your files stay on disk"
+        onclick={() => onRemove(project)}
+      >
+        Remove from VCO
+      </button>
     {/if}
   </header>
   <p class="pc-path"><code>{project.folder_path}</code></p>
@@ -88,6 +113,7 @@
 
 <style>
   .pc-card {
+    position: relative;
     background: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 8px;
@@ -97,6 +123,23 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  /* The open action covers the whole card — a real button, so keyboard and
+     screen-reader users reach it; the content sits visually on top. */
+  .pc-open {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: inherit;
+    background: transparent;
+    cursor: pointer;
+  }
+  .pc-open:focus-visible {
+    outline: 2px solid var(--color-teal, #00bfa6);
+    outline-offset: 2px;
   }
   .pc-card:hover {
     background: rgba(255, 255, 255, 0.08);
@@ -169,6 +212,26 @@
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.04em;
+  }
+  /* v0.2.106 Remove flow: quiet chrome at rest, pink accent on hover — the
+     brand's "needs attention / destructive" signal (#FF4FA0), matching the
+     danger row actions elsewhere in the launcher. */
+  .pc-remove {
+    position: relative;
+    z-index: 1;
+    flex-shrink: 0;
+    padding: 2px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: inherit;
+  }
+  .pc-remove:hover {
+    background: rgba(255, 79, 160, 0.08);
+    border-color: rgba(255, 79, 160, 0.5);
+    color: var(--color-pink, #ff4fa0);
   }
   .pc-warn-banner {
     display: flex;

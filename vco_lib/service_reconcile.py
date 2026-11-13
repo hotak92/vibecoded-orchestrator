@@ -78,6 +78,7 @@ from vco_lib import kg_binding_heal as _kg_binding_heal
 from vco_lib import service_detection as _det
 from vco_lib import service_adoption as _service_adoption
 from vco_lib import service_endpoints as _se
+from vco_lib.console_text import console_print as _console_print
 from vco_lib.deferral_report import DeferralEntry
 
 __all__ = [
@@ -1915,6 +1916,11 @@ def _outcome_entries(result: ReconcileResult, root: Path) -> list[DeferralEntry]
         if foreign:
             remedy += "".join(
                 f"# {n} ({s}) is yours: apply the image and settings above in its own compose, if you want them.\n"
+                # v0.2.106: a newer Weaviate image on old data needs a raft
+                # snapshot taken by the old one first (vco_lib.weaviate_raft_guard).
+                + (f"#   before a newer Weaviate image starts on its data: "
+                   f"python -m vco_lib.weaviate_raft_guard snapshot --container {n}\n"
+                   if s == "weaviate" else "")
                 for s, n in foreign)
         entries.append(DeferralEntry(
             condition_id=CID_CONFIG_DRIFT,
@@ -2419,7 +2425,8 @@ AdoptFn = Callable[..., Any]
 
 def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str] = None,
                 db_path: Optional[Path] = None, run: Optional[RunFn] = None,
-                adopt: Optional[AdoptFn] = None, out: LogFn = print) -> int:
+                adopt: Optional[AdoptFn] = None,
+                out: LogFn = _console_print) -> int:  # type: ignore[assignment]
     """``hand-to-vco --service S`` — the opt-in ownership transfer (owner
     ruling Q2): VCO's compose takes over THE container the row names (an
     ``adopted_container``, or a ``vco_managed`` row whose container another

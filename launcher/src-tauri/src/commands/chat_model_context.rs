@@ -1308,11 +1308,12 @@ mod tests {
     /// The REAL shipped seed loads under the launcher's parser, with the ten
     /// cited GLM rows, the four first-party Claude 5 rows (read only by
     /// `vco_lib.vscode_settings.decorate_1m`; the gateway publishes
-    /// first-party ids verbatim), the eight v0.2.98-CORRECTED qwen Token-Plan
-    /// rows (the vendor's PER-MODEL figures — 1M window, `[1m]`, stated
-    /// `max_output`; until v0.2.98 they carried the integration page's
-    /// CLIENT-default 200K and an unstated 0 output), the v0.2.102 Kimi
-    /// Code k3 row, and the version-key evidence intact.
+    /// first-party ids verbatim), the v0.2.98-CORRECTED qwen Token-Plan
+    /// rows, nine since v0.2.106's dated DeepSeek flash (the vendor's
+    /// PER-MODEL figures — 1M window, `[1m]`, stated `max_output`; until
+    /// v0.2.98 they carried the integration page's CLIENT-default 200K and
+    /// an unstated 0 output), the Kimi Code row (k3 in v0.2.102, k3.1-pro
+    /// since the owner ruling of 2026-11-10), and the version-key evidence intact.
     ///
     /// This reads the repo file directly via `CARGO_MANIFEST_DIR`, which is
     /// compile-time-only path resolution INSIDE `#[cfg(test)]` (the same
@@ -1335,20 +1336,23 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            25,
+            26,
             "the cited GLM rows of handoff §7 minus glm-5.2 (owner-retired in \
              v0.2.100), the four Claude 5 rows plus the three 5.5 rows \
              (v0.2.102: Opus/Sonnet owner-confirmed 2026-10-07, Haiku read \
-             from the models overview 2026-10-08), the eight v0.2.96 qwen \
-             Token-Plan rows, and the v0.2.102 Kimi Code k3 row"
+             from the models overview 2026-10-08), the nine qwen Token-Plan \
+             rows (eight from v0.2.96, plus deepseek-v4.1-flash-1017 in \
+             v0.2.106), and the one Kimi Code row (k3.1-pro since the owner \
+             ruling of 2026-11-10, replacing v0.2.102's k3)"
         );
-        // The Kimi Code k3 row (owner ruling 2026-10-07: K3 only, at its
-        // real 1M window — vendor models page + live /v1/models probe)
+        // The Kimi Code k3.1-pro row (owner ruling 2026-11-10: K3.1 Pro
+        // replaces K3, at its real 1M window — vendor models page + live
+        // /v1/models probe 2026-11-10)
         // reaches the launcher's table, and so the Preferences -> Chat model
         // context page, where a Plus subscriber lowers it to 256K, under this
         // parser. window_1m must agree, or the panel's [1m] decoration and
         // the gateway's companion row disagree about the same model.
-        for (id, window, one_m) in [("k3", 1_048_576, true)] {
+        for (id, window, one_m) in [("k3.1-pro", 1_048_576, true)] {
             let row = rows
                 .iter()
                 .find(|r| r.model_id == id)
@@ -1414,7 +1418,7 @@ mod tests {
         // CLIENT's default window.
         let qwen: Vec<&ChatModelContextInput> =
             rows.iter().filter(|r| r.vendor == "qwen").collect();
-        assert_eq!(qwen.len(), 8, "the eight Token-Plan rows; no PAYG row exists");
+        assert_eq!(qwen.len(), 9, "the nine Token-Plan rows; no PAYG row exists");
         for row in &qwen {
             // v0.2.102 (S16-10): qwen3.8-max carries the endpoint's REAL
             // Claude Code ceiling — 983,616, live-verified by the vendor's

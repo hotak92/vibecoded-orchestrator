@@ -111,7 +111,9 @@
           ? 'Indexed · cleanup warnings'
           : `Indexed · ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'} · cleanup warnings`;
       case 'failed': return 'Index failed';
-      case 'skipped': return 'No source files';
+      // v0.2.106: not always "no source files" — a twin-walk skip carries its
+      // reason in `error_message`, which `tooltip` already appends.
+      case 'skipped': return 'Skipped';
     }
   }
 

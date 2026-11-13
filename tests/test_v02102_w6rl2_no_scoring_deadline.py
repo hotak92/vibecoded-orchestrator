@@ -187,13 +187,25 @@ class TestSameChatOnly:
         assert summary["finalized"] == 1
         assert rig.names() == [], "file consumed, end record dropped with it"
 
-    def test_ended_session_without_its_transcript_stays_unscored(self, tmp_path: Path) -> None:
+    def test_ended_session_without_its_transcript_is_removed_unscored(
+            self, tmp_path: Path) -> None:
+        """v0.2.106 (training-readiness survey G5): the chat ENDED and its
+        transcript is not locatable (same folder only, R7-3), so under that
+        ruling nothing can EVER score this file — the finalize pass now
+        removes and records it immediately instead of leaving it for the
+        7-day collector. Pre-106 every drain re-claimed such files forever
+        (measured: 1 084 "transcript is not found" retries in one project's
+        drain log) before the collector recorded the identical unscored row."""
         rig = _Rig(tmp_path)
         _stage(rig.project, "sessGone", "lostG")
         cp.mark_session_ended("sessGone", rig.project)
-        rig.drain()
-        assert rig.computed == []
-        assert "sessGone__lostG.json" in rig.names(), "left for the collector, not scored"
+        summary = rig.drain()
+        assert rig.computed == [], "no transcript: never scored"
+        assert rig.names() == [], "removed now, not left for the collector"
+        assert [(r["task_id"], r["reason"], r["when"]) for r in rig.unscored()] == [
+            ("lostG", "no_transcript", "session_ended")]
+        assert summary["finalized_unscored"] == 1
+        assert cp.ended_sessions(rig.project) == [], "end record cleared with the file"
 
 
 class TestNoSessionAttribution:

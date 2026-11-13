@@ -274,10 +274,13 @@ def ensure_slot_embedding(
     #                           means the whole sized text reached the runner
     #                           → a PROVEN False.
     #   * otherwise           — the active-slot self-heal goes through
-    #                           ``svc.embed_text`` → ``_embed_shrinking_on_
-    #                           overflow``, which can shrink invisibly to us.
-    #                           Not provable → None → slot stays UNMEASURED,
-    #                           so the reader answers UNKNOWN, not False.
+    #                           ``svc.embed_text``. Since v0.2.106 its Ollama
+    #                           leg splits a refused text and combines the
+    #                           pieces (nothing cut), but its OpenAI leg
+    #                           reports nothing back, and this call cannot
+    #                           tell which leg ran. Not provable → None →
+    #                           slot stays UNMEASURED, so the reader answers
+    #                           UNKNOWN, not False (under-report, never claim).
     active_text_slot = ""
     try:
         active_text_slot = str(getattr(svc, "text_vector_slot", "") or "")

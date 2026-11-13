@@ -486,6 +486,12 @@ def _clone(tmp_path: Path, script: Path) -> tuple[Path, Path]:
     copy = root / "scripts" / script.name
     shutil.copy2(script, copy)
     (root / "vco_lib").symlink_to(REPO_ROOT / "vco_lib", target_is_directory=True)
+    # v0.2.106: the wrapper's compose-engine detection runs its embedded
+    # Python body through templates/hooks/_lib/run-python-program.ps1 (the
+    # clone mirrors that _lib exactly like it mirrors vco_lib).
+    (root / "templates" / "hooks").mkdir(parents=True)
+    (root / "templates" / "hooks" / "_lib").symlink_to(
+        REPO_ROOT / "templates" / "hooks" / "_lib", target_is_directory=True)
     (root / "infrastructure").mkdir()
     (root / "infrastructure" / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
     (root / "state" / "install").mkdir(parents=True)

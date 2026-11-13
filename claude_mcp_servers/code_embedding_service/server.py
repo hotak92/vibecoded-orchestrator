@@ -110,6 +110,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 import weakref
 from pathlib import Path
 
@@ -430,7 +431,39 @@ _load_lock = threading.Lock()
 _load_unavailable_until: float = 0.0
 # v0.2.102 observability, reported on ``/health``:
 _last_unload_freed_mb: float | None = None  # MB freed by the most recent idle-unload
-_last_load_error: str | None = None         # last model-load failure (None when healthy)
+_last_load_error: str | None = None         # last model-load failure, IN FULL (log/tests only)
+# What a CLIENT may see of that failure: a fixed sentence + the error id that
+# finds the full text in the service log. Never the exception's own text — a
+# load fault can carry model paths, file contents or a traceback (CodeQL
+# py/stack-trace-exposure). None when healthy.
+_last_load_error_public: str | None = None
+_last_load_error_id: str | None = None
+
+
+def _record_load_error(detail: str, public: str) -> str:
+    """Record a model-load failure: the full ``detail`` on ``_last_load_error``
+    and in the log under a fresh error id; the client-facing
+    ``_last_load_error_public`` is ``public`` (built from constants only) +
+    that id. Returns the public text."""
+    global _last_load_error, _last_load_error_public, _last_load_error_id
+    error_id = uuid.uuid4().hex[:12]
+    _last_load_error = detail
+    _last_load_error_id = error_id
+    _last_load_error_public = f"{public} (error id {error_id}; see the service log)"
+    logger.error("Model load failure [error id %s]: %s", error_id, detail)
+    return _last_load_error_public
+
+
+def _unavailable_detail() -> str:
+    """The 503 body a client gets while the GPU model cannot be loaded: a
+    fixed sentence + the recorded public error (with its id). The wait is in
+    the ``Retry-After`` header."""
+    return f"GPU model unavailable: {_last_load_error_public or 'model load failed'}"
+
+
+def _clear_load_error() -> None:
+    global _last_load_error, _last_load_error_public, _last_load_error_id
+    _last_load_error = _last_load_error_public = _last_load_error_id = None
 
 
 class _ModelLoadUnavailable(RuntimeError):
@@ -522,7 +555,7 @@ def _load_gpu_model():
             raise _ModelLoadUnavailable(
                 "GPU model unavailable: the previous load exhausted its CUDA-OOM "
                 f"budget and VRAM has not freed ({cooldown:.0f}s left in the "
-                f"fail-fast cooldown). Last error: {_last_load_error}",
+                f"fail-fast cooldown). Last error: {_last_load_error_public}",
                 retry_after=int(cooldown) + 1,
             )
         return _load_gpu_model_locked()
@@ -540,7 +573,7 @@ def _load_gpu_model_locked():
     never a 500 with a traceback. A NON-OOM error (a config/import fault) is not
     retried; it propagates immediately and is recorded on ``_last_load_error``.
     """
-    global _st_model, _st_model_dim, _last_load_error, _load_unavailable_until
+    global _st_model, _st_model_dim, _load_unavailable_until
 
     from sentence_transformers import SentenceTransformer
 
@@ -575,7 +608,7 @@ def _load_gpu_model_locked():
             # under ``_load_lock`` never sees a half-initialised model.
             _st_model_dim = dim  # cache for /health so idle-unload survives probes
             _st_model = model
-            _last_load_error = None
+            _clear_load_error()
             _load_unavailable_until = 0.0  # a success ends any cooldown
             logger.info(
                 "Model loaded in %.1fs — dim=%d, device=%s",
@@ -584,7 +617,7 @@ def _load_gpu_model_locked():
             return model
         except Exception as exc:  # noqa: BLE001 — classify, then retry or propagate
             if not _is_cuda_oom(exc):
-                _last_load_error = f"{type(exc).__name__}: {exc}"
+                _record_load_error(f"{type(exc).__name__}: {exc}", "model load failed")
                 raise
             last_exc = exc
             # Reclaim anything this process can before waiting on an external
@@ -599,9 +632,10 @@ def _load_gpu_model_locked():
                 )
                 if LOAD_OOM_BACKOFF_SECS > 0:
                     time.sleep(LOAD_OOM_BACKOFF_SECS)
-    _last_load_error = (
+    public = _record_load_error(
         f"CUDA out of memory persisted through {attempts} load attempt(s) "
-        f"(~{LOAD_OOM_RETRIES * LOAD_OOM_BACKOFF_SECS:.0f}s budget): {last_exc}"
+        f"(~{LOAD_OOM_RETRIES * LOAD_OOM_BACKOFF_SECS:.0f}s budget): {last_exc}",
+        f"CUDA out of memory persisted through {attempts} load attempt(s)",
     )
     # v0.2.102 r2: start the fail-fast cooldown — queued waiters share THIS
     # failed outcome (503 + Retry-After) instead of each re-running the budget.
@@ -614,7 +648,7 @@ def _load_gpu_model_locked():
         "until VRAM frees and a lazy reload succeeds: %s",
         attempts, _retry_after_secs(), last_exc,
     )
-    raise _ModelLoadUnavailable(_last_load_error, retry_after=_retry_after_secs())
+    raise _ModelLoadUnavailable(public, retry_after=_retry_after_secs())
 
 
 def _gpu_token_count(model, text: str) -> int:
@@ -1228,7 +1262,9 @@ async def _run_embed_guarded(
                 except _ModelLoadUnavailable as exc:
                     raise HTTPException(
                         status_code=503,
-                        detail=str(exc),
+                        # Built from the recorded public text, never from
+                        # the exception object (CodeQL py/stack-trace-exposure).
+                        detail=_unavailable_detail(),
                         headers={
                             "Retry-After": str(exc.retry_after or _retry_after_secs())
                         },
@@ -1341,7 +1377,8 @@ async def health():
             # ``last_unload_freed_mb`` near 0 with ``model_loaded`` False was the
             # old broken shape; a non-null ``last_load_error`` names a live OOM.
             "last_unload_freed_mb": _last_unload_freed_mb,
-            "last_load_error": _last_load_error,
+            "last_load_error": _last_load_error_public,
+            "last_load_error_id": _last_load_error_id,
             # v0.2.92 BLOCKER-1: image-vs-source staleness, made CHECKABLE.
             # This service ships as an image BUILT from the checkout, and
             # `compose up` builds only when the image is MISSING — so a

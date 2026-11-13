@@ -103,6 +103,7 @@ from vco_lib import compose_provider as _compose_provider
 from vco_lib import compose_recovery as _compose_recovery
 from vco_lib import gpu_verify as _gpu_verify
 from vco_lib.atomic import atomic_write_text
+from vco_lib.console_text import console_print as _console_print
 from vco_lib.paths import vct_root_dir
 
 __all__ = [
@@ -172,6 +173,14 @@ WEAVIATE_RECLAIM_ENV_KEYS: tuple[str, ...] = (
     "MEMORY_READONLY_PERCENTAGE",
     "LAZY_LOAD_SHARD_COUNT_THRESHOLD",
     "DEFAULT_QUANTIZATION",
+    # v0.2.106: a Weaviate that never takes a raft snapshot replays its whole
+    # schema log at every start (vco_lib.weaviate_raft_guard), so a running
+    # container without the snapshot settings is drift too. The recreate that
+    # applies them goes through data_identity.guard_recreate, which takes a
+    # snapshot with the OLD image first when the recreate moves the data to
+    # a release with the orphan drop.
+    "RAFT_SNAPSHOT_THRESHOLD",
+    "RAFT_SNAPSHOT_INTERVAL",
 )
 BEHAVIOR_CRITICAL_ENV_KEYS: tuple[str, ...] = (
     "OLLAMA_KEEP_ALIVE",
@@ -1644,6 +1653,17 @@ def _record_adopted_rows(root: Path, plans: Sequence[ServicePlan], adopted: Sequ
             "the next `python install.py --update` records them from the running containers.")
 
 
+def _default_log() -> LogFn:
+    """The output the adoption flow uses when the caller supplies none.
+
+    v0.2.106: encoding-safe and unable to abort the run. The field report's
+    cp1252 ``UnicodeEncodeError`` on the "stop → remove" arrow killed a
+    ``hand-to-vco`` run before its stop step; a progress line must never be a
+    precondition of the operation.
+    """
+    return _console_print  # type: ignore[return-value]
+
+
 def adopt_services(
     root: Path,
     *,
@@ -1681,7 +1701,7 @@ def adopt_services(
     searched (the v0.2.96 bulk adoption)."""
     run = run or subprocess.run  # type: ignore[assignment]
     fetch = fetch or _default_fetch
-    log = log or (lambda msg: print(msg))
+    log = log or _default_log()
     root = Path(root)
     result = AdoptionResult()
 
@@ -1767,6 +1787,30 @@ def adopt_services(
     if dry_run:
         result.lines.append("  [adopt] dry run — override NOT written, no"
                             " container touched.")
+        return result
+
+    # v0.2.106: taking Weaviate over re-creates it from VCO's pinned image. When
+    # that MOVES its data onto a release with the 1.37 orphan drop, a raft
+    # snapshot is taken with the container's own image first — or the service
+    # stays as it is (vco_lib.weaviate_raft_guard).
+    for plan in [p for p in adoptable if p.service == "weaviate"]:
+        from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+        target_image = _rg.pinned_target(root)
+        raft = _rg.upgrade_check(service="weaviate", live_state="present", ref=plan.container,
+                                 target_image=target_image, data_mount=None, runtime=runtime,
+                                 run=run, log=log)
+        result.lines.extend(raft.lines)
+        if not raft.ok:
+            adoptable.remove(plan)
+            result.refused[plan.service] = raft.reason
+            result.entries.append(_rg.refusal_entry(
+                plan.service, plan.container, raft.reason, runtime=runtime,
+                target_image=target_image,
+                manual_cmd="python -m vco_lib.service_endpoints hand-to-vco --service weaviate"))
+            log(f"  [adopt:{plan.service}] stays as it is — {raft.reason}")
+    if not adoptable:
+        result.lines.append("  [adopt] nothing adoptable — nothing touched.")
         return result
 
     refusal = write_adoption_override(infra_dir, override_body)

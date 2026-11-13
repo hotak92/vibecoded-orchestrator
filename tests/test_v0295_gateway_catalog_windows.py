@@ -819,17 +819,17 @@ class ShippedDataInvariantTests(unittest.TestCase):
         withheld by the latest filter (hidden, still routable by name).
 
         The Token-Plan rows come from the declared fallback in this fixture
-        (the injected fetch answers nothing, so the row's nine declared
+        (the injected fetch answers nothing, so the row's declared
         ids serve). Since v0.2.98 the seed cites each of their OWN windows
         (1M, from the vendor's per-model table), so the winners publish their
         ``[1m]`` spelling and each withheld sibling is reported under the id
         the user would have SEEN — the suffix, not the bare vendor id.
-        Three of the nine hide as older same-family siblings
-        and two more as curated-hidden (qwen3.7-plus, deepseek-v4-pro).
-        The dated ``deepseek-v4-flash-0731`` snapshot is curated out of the
-        row entirely (owner ruling 2026-09-22 — its four-digit tail parses
-        as VERSION 731 and would outrank ``deepseek-v4.1-flash`` under the
-        latest filter), so the versioned line is the published flash."""
+        Two hide as older same-family siblings (qwen3.7-max, qwen3.6-flash)
+        and three as curated-hidden (qwen3.7-plus, deepseek-v4-pro, and the
+        undated deepseek-v4.1-flash). The published DeepSeek flash is the
+        dated build ``deepseek-v4.1-flash-1017`` (owner 2026-11-10), the one
+        dated id the row offers; every other dated build is dropped from a
+        live list by rule (owner ruling 2026-09-22)."""
         latest = asyncio.run(self.service.union(table=load_seed()))
         self.assertEqual(
             [row.id for row in latest.entries],
@@ -845,11 +845,11 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 f"claude-gw/qwen/qwen3.8-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.8-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/glm-5.3{ONE_M_SUFFIX}",
-                f"claude-gw/qwen/deepseek-v4.1-flash{ONE_M_SUFFIX}",
-                # Kimi Code (v0.2.102, owner ruling: K3 only), from its
-                # shipped snapshot block (the injected fetch answers
+                f"claude-gw/qwen/deepseek-v4.1-flash-1017{ONE_M_SUFFIX}",
+                # Kimi Code (owner ruling 2026-11-10: K3.1 Pro only), from
+                # its shipped snapshot block (the injected fetch answers
                 # nothing); its cited 1M window earns the [1m] spelling.
-                f"claude-gw/kimi/k3{ONE_M_SUFFIX}",
+                f"claude-gw/kimi/k3.1-pro{ONE_M_SUFFIX}",
             ],
         )
         self.assertEqual(
@@ -867,11 +867,14 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 "claude-gw/glm-5", "claude-gw/glm-5-turbo",
                 "claude-gw/glm-5.1",
                 # Withheld by the kimi row's verified_ids (owner ruling
-                # 2026-10-07, K3 only) from its shipped snapshot block.
+                # 2026-11-10, K3.1 Pro only) from its shipped snapshot block.
+                "claude-gw/kimi/k3",
                 "claude-gw/kimi/k3-256k",
+                "claude-gw/kimi/k3.1-pro-highspeed",
                 "claude-gw/kimi/kimi-for-coding",
                 "claude-gw/kimi/kimi-for-coding-highspeed",
                 f"claude-gw/qwen/deepseek-v4-pro{ONE_M_SUFFIX}",
+                f"claude-gw/qwen/deepseek-v4.1-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.6-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}",

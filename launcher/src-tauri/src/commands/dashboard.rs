@@ -104,7 +104,9 @@ pub struct FeatureFlags {
     /// pass unknown slugs through verbatim.
     pub tier: String,
     pub can_auto_update: bool,
-    pub has_rl_retrieval: bool,
+    // v0.2.106: `has_rl_retrieval` REMOVED — owner ruling 2026-11-11, "the
+    // RL reranker is no more paid". RL scoring is no tier feature; the
+    // switch is gated by the shipped scoring lock alone.
     pub has_curated_agents: bool,
     pub has_mao: bool,
 }
@@ -121,7 +123,6 @@ fn feature_flags_for_tier(tier: &str) -> FeatureFlags {
     FeatureFlags {
         tier: tier.to_string(),
         can_auto_update: pro,
-        has_rl_retrieval: pro,
         has_curated_agents: pro,
         has_mao: mao,
     }
@@ -190,28 +191,47 @@ pub fn get_feature_flags(db: State<'_, Db>) -> FeatureFlags {
 
 /// The RL-scoring global default: the host-wide `enabled_for_project` row of
 /// `vct-rl-reranker`, i.e. exactly what a project with no explicit row
-/// inherits and what the hub resolver serves to the MCP. No row reads as OFF
-/// (`module_enable_system_default`). The licence gate is applied separately
-/// and is unchanged. NOT a gate on event collection.
-pub(crate) fn rl_scoring_global_default(db: &Db) -> bool {
+/// inherits and what the hub resolver serves to the MCP. No row reads as the
+/// system default, which follows the bundled weights (v0.2.106, owner
+/// 2026-11-12: ON only with a trained model bundled for the active profile —
+/// `Db::rl_scoring_default`). NOT a gate on event collection.
+///
+/// Async: the bundled-weights default (asked for only when no host-wide row
+/// exists) may spawn Python on a cold cache, so it is resolved off the async
+/// workers (`Db::rl_scoring_default_async`, review W5 M1).
+pub(crate) async fn rl_scoring_global_default(db: &Db) -> bool {
     use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
-    db.module_global_enabled(RL_RERANKER_MODULE_ID)
-        .ok()
-        .flatten()
-        .unwrap_or(false)
+    let default_on = if matches!(db.module_global_enabled(RL_RERANKER_MODULE_ID), Ok(None)) {
+        db.rl_scoring_default_async().await.default_on
+    } else {
+        false
+    };
+    rl_scoring_global_default_with(db, || default_on)
+}
+
+/// [`rl_scoring_global_default`] with the bundled-weights default injected.
+pub(crate) fn rl_scoring_global_default_with(db: &Db, rl_default_on: impl FnOnce() -> bool) -> bool {
+    use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
+    match db.module_global_enabled(RL_RERANKER_MODULE_ID) {
+        Ok(Some(on)) => on,
+        Ok(None) => rl_default_on(),
+        // A DB error cannot confirm a choice: OFF.
+        Err(_) => false,
+    }
 }
 
 /// Overlay the DB-backed RL-scoring default onto a loaded config. The
 /// `rl_retrieval_enabled` key of `orchestrator.json` had no reader; the
 /// authoritative value is the `module_settings` row, so that is what the
 /// dashboard shows.
-fn with_rl_scoring_default(db: &Db, mut config: OrchestratorConfig) -> OrchestratorConfig {
-    config.rl_retrieval_enabled = rl_scoring_global_default(db);
+async fn with_rl_scoring_default(db: &Db, mut config: OrchestratorConfig) -> OrchestratorConfig {
+    config.rl_retrieval_enabled = rl_scoring_global_default(db).await;
     config
 }
 
 /// Write the RL-scoring global default (the host-wide row) and audit it,
-/// like `module_set_global_enabled`. Tier-gated by the caller.
+/// like `module_set_global_enabled`. Not tier-gated (v0.2.106): the only gate
+/// is the scoring lock, applied by [`apply_rl_scoring_switch`].
 fn set_rl_scoring_global_default(db: &Db, enabled: bool) -> Result<(), String> {
     use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
     db.module_set_global_enabled(RL_RERANKER_MODULE_ID, enabled)?;
@@ -223,10 +243,23 @@ fn set_rl_scoring_global_default(db: &Db, enabled: bool) -> Result<(), String> {
     )
 }
 
+/// The "RL-Scored Retrieval" switch: refuse "on" while `lock` is set (the
+/// shipped RL scoring lock — `vct_launcher_core::rl_scoring_lock`), then write
+/// the host-wide default. Licence and tier play no part since v0.2.106 (owner
+/// ruling 2026-11-11: the reranker ships with the orchestrator). Takes the
+/// lock explicitly so the post-unlock behaviour stays testable.
+fn apply_rl_scoring_switch(db: &Db, enabled: bool, lock: Option<&str>) -> Result<(), String> {
+    vct_launcher_core::rl_scoring_lock::refuse_enable_with_lock(lock, enabled)?;
+    set_rl_scoring_global_default(db, enabled)
+}
+
 /// Load the full orchestrator config.
+///
+/// Async (v0.2.106, review W5 M1): a sync Tauri command runs on the GUI's
+/// main thread, and the RL-scoring default may spawn Python on a cold cache.
 #[command]
-pub fn get_orchestrator_config(db: State<'_, Db>) -> OrchestratorConfig {
-    with_rl_scoring_default(&db, load_config())
+pub async fn get_orchestrator_config(db: State<'_, Db>) -> Result<OrchestratorConfig, String> {
+    Ok(with_rl_scoring_default(&db, load_config()).await)
 }
 
 /// Update a single top-level config field.
@@ -262,19 +295,18 @@ async fn update_orchestrator_setting_inner(
         }
         "rl_retrieval_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
-            // v0.2.100 W5R-02: the shipped RL scoring lock refuses "on" first —
-            // a Pro licence cannot lift it.
-            vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(
-                vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID,
+            // v0.2.100 W5R-02: the shipped RL scoring lock refuses "on" first.
+            // v0.2.106: it is the ONLY gate — no tier check (the reranker is
+            // free). The value is the GLOBAL DEFAULT of the per-project RL
+            // toggle (the host-wide module_settings row the hub resolver
+            // reads), not a key of orchestrator.json that nothing read.
+            apply_rl_scoring_switch(
+                db,
                 val,
+                vct_launcher_core::rl_scoring_lock::module_effect_lock(
+                    vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID,
+                ),
             )?;
-            if val && !flags.has_rl_retrieval {
-                return Err(tier_required_message("pro", "RL-scored retrieval"));
-            }
-            // v0.2.100: the GLOBAL DEFAULT of the per-project RL toggle (the
-            // host-wide module_settings row the hub resolver reads), not a
-            // key of orchestrator.json that nothing read.
-            set_rl_scoring_global_default(db, val)?;
             config.rl_retrieval_enabled = val;
         }
         "telemetry_enabled" => {
@@ -290,7 +322,7 @@ async fn update_orchestrator_setting_inner(
     }
 
     save_config(&config).await?;
-    Ok(with_rl_scoring_default(db, config))
+    Ok(with_rl_scoring_default(db, config).await)
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,7 +1055,6 @@ mod tests {
         let f = feature_flags_for_tier("free");
         assert_eq!(f.tier, "free");
         assert!(!f.can_auto_update);
-        assert!(!f.has_rl_retrieval);
         assert!(!f.has_curated_agents);
         assert!(!f.has_mao);
     }
@@ -1033,7 +1064,6 @@ mod tests {
         let f = feature_flags_for_tier("pro");
         assert_eq!(f.tier, "pro");
         assert!(f.can_auto_update);
-        assert!(f.has_rl_retrieval);
         assert!(f.has_curated_agents);
         assert!(!f.has_mao, "pro must not unlock MAO features");
     }
@@ -1048,7 +1078,7 @@ mod tests {
             let f = feature_flags_for_tier(slug);
             assert_eq!(f.tier, slug);
             assert!(f.can_auto_update, "{slug} must unlock pro features");
-            assert!(f.has_rl_retrieval, "{slug} must unlock pro features");
+            assert!(f.has_curated_agents, "{slug} must unlock pro features");
             assert!(f.has_mao, "{slug} must unlock MAO features");
         }
     }
@@ -1906,11 +1936,32 @@ mod rl_scoring_default_tests {
         (db, "proj-rl".to_string())
     }
 
+    /// Drive an async resolver on a current-thread runtime ON THIS THREAD,
+    /// so the per-thread bundled-model override applies.
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    /// v0.2.106 (owner 2026-11-12): no host-wide row reads as the
+    /// bundled-weights default — on with a trained model, off without.
+    #[test]
+    fn no_row_follows_the_bundled_weights_default() {
+        let (db, _pid) = db_with_project();
+        assert!(rl_scoring_global_default_with(&db, || true));
+        assert!(!rl_scoring_global_default_with(&db, || false));
+        set_rl_scoring_global_default(&db, false).unwrap();
+        assert!(!rl_scoring_global_default_with(&db, || true), "a host-wide off beats bundled");
+        set_rl_scoring_global_default(&db, true).unwrap();
+        assert!(rl_scoring_global_default_with(&db, || false), "a host-wide on without weights");
+    }
+
     #[test]
     fn default_is_off_with_no_row() {
         let (db, pid) = db_with_project();
-        assert!(!rl_scoring_global_default(&db));
-        let cfg = with_rl_scoring_default(&db, OrchestratorConfig::default());
+        let _no_model =
+            vct_launcher_core::rl_scoring_default::override_bundled_model_for_thread(false);
+        assert!(!block(rl_scoring_global_default(&db)));
+        let cfg = block(with_rl_scoring_default(&db, OrchestratorConfig::default()));
         assert!(!cfg.rl_retrieval_enabled);
         assert!(!db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
     }
@@ -1921,9 +1972,9 @@ mod rl_scoring_default_tests {
     fn switch_is_the_global_default_the_project_toggle_inherits() {
         let (db, pid) = db_with_project();
         set_rl_scoring_global_default(&db, true).unwrap();
-        assert!(rl_scoring_global_default(&db));
+        assert!(block(rl_scoring_global_default(&db)));
         assert!(db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
-        assert!(with_rl_scoring_default(&db, OrchestratorConfig::default()).rl_retrieval_enabled);
+        assert!(block(with_rl_scoring_default(&db, OrchestratorConfig::default())).rl_retrieval_enabled);
 
         db.module_write_enabled_for_project(&pid, RL_RERANKER_MODULE_ID, Some(false))
             .unwrap();
@@ -1933,28 +1984,43 @@ mod rl_scoring_default_tests {
         );
 
         set_rl_scoring_global_default(&db, false).unwrap();
-        assert!(!rl_scoring_global_default(&db));
+        assert!(!block(rl_scoring_global_default(&db)));
     }
 
-    /// v0.2.100 W5R-02: while the RL scoring lock is set the setting arm
-    /// refuses "on" for EVERY tier (Pro included) and writes nothing; "off"
-    /// is accepted and written.
+    /// v0.2.100 W5R-02: while an RL scoring lock is set the switch refuses
+    /// "on" and writes nothing; "off" is accepted and written.
     #[test]
-    fn the_setting_arm_refuses_on_while_locked_for_every_tier() {
+    fn the_switch_refuses_on_while_locked() {
+        let (db, pid) = db_with_project();
+        let err = apply_rl_scoring_switch(&db, true, Some("locked")).unwrap_err();
+        assert!(err.contains("locked"), "{err}");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None);
+        apply_rl_scoring_switch(&db, false, Some("locked")).expect("off is always allowed");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(false));
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, None).unwrap());
+    }
+
+    /// v0.2.106 (owner 2026-11-12, opt-in): the shipped lock is lifted, so
+    /// the setting arm accepts "on" for every tier and the project inherits
+    /// it; "off" turns it back off. Nothing turns it on without this write.
+    #[test]
+    fn the_setting_arm_turns_on_and_off_with_the_lock_lifted() {
         let (_tmp, _g) = super::tests::setup_temp_env_for_sibling();
         let (db, pid) = db_with_project();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_none(), "ships unlocked");
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "off until the user turns it on");
 
         for tier in ["free", "pro", "mao"] {
-            let err = rt
+            let cfg = rt
                 .block_on(update_orchestrator_setting_inner(
                     "rl_retrieval_enabled".into(), "true".into(), tier, &db,
                 ))
-                .unwrap_err();
-            assert!(err.contains("locked"), "{tier}: {err}");
-            assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None, "{tier}");
+                .unwrap();
+            assert!(cfg.rl_retrieval_enabled, "{tier}");
+            assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(true), "{tier}");
         }
+        assert!(db.rl_scoring_enabled_for_project(&pid).unwrap());
 
         let cfg = rt
             .block_on(update_orchestrator_setting_inner(
@@ -1964,5 +2030,27 @@ mod rl_scoring_default_tests {
         assert!(!cfg.rl_retrieval_enabled);
         assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(false));
         assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap());
+    }
+
+    /// v0.2.106 (owner ruling 2026-11-11, "the RL reranker is no more
+    /// paid"): with the lock lifted, an install WITHOUT any licence turns the
+    /// switch on — no tier is consulted — and the project inherits it. Red
+    /// before v0.2.106: the arm refused "on" for the free tier ("Pro").
+    #[test]
+    fn an_unlicensed_install_can_enable_once_unlocked() {
+        let (db, pid) = db_with_project();
+        apply_rl_scoring_switch(&db, true, None).expect("no licence gate");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(true));
+        assert!(db.rl_scoring_enabled_with_lock(&pid, None).unwrap());
+        // ...and the shipped lock still wins over the stored row.
+        assert!(apply_rl_scoring_switch(&db, true, Some("locked")).is_err());
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("locked")).unwrap());
+    }
+
+    /// The free tier's flags carry no RL field at all any more.
+    #[test]
+    fn feature_flags_have_no_rl_tier_field() {
+        let json = serde_json::to_value(feature_flags_for_tier("free")).unwrap();
+        assert!(json.get("has_rl_retrieval").is_none(), "{json}");
     }
 }

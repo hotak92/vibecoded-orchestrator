@@ -370,7 +370,7 @@ def _rl_is_literal_cited(node: dict, answer_text_lower: str) -> bool:
 
     Skips titles shorter than ``_RL_LITERAL_CITED_MIN_TITLE_LEN`` (default 3)
     to avoid the "RL" / "AI" / "url" / "curl" false-positive class. Same
-    rule as ``paid-modules/vct-rl-reranker/retrieval_rl.py``.
+    rule as ``claude_mcp_servers/rl_reranker/retrieval_rl.py``.
     """
     if not isinstance(node, dict):
         return False
@@ -997,7 +997,25 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                         "(RL_ONLINE_TRAINING_DISABLED[_GLOBAL]); skipping /rl_update",
                         task_id[:8],
                     )
-                client = None if _online_off else server._get_rl_client()
+                # v0.2.106 (owner 2026-11-12: per-project online learning is
+                # OPT-IN): the citation goes to the container only for a
+                # project whose RL scoring is on — the same gate the rerank
+                # uses (scoring lock, then the per-project toggle, which
+                # falls closed). Off = no container call at all; the
+                # citation LOG above is unaffected (logs are always kept).
+                _scoring_on = False
+                if not _online_off:
+                    try:
+                        from claude_mcp_servers.rl_client.search_pipeline import (
+                            _resolve_rl_enabled,
+                        )
+                        _scoring_on = _resolve_rl_enabled()
+                    except Exception as exc:  # noqa: BLE001 — cannot confirm: off
+                        server.logger.debug(
+                            "RL monitor %s: RL scoring gate probe raised (%s); "
+                            "skipping /rl_update", task_id[:8], exc,
+                        )
+                client = server._get_rl_client() if (_scoring_on and not _online_off) else None
                 if (
                     client is not None
                     and ctx is not None
@@ -1119,6 +1137,7 @@ def _get_rl_client():
 
     try:
         from claude_mcp_servers.rl_client import RLClient
+        from claude_mcp_servers.rl_client.client import resolve_wired_base_url
     except Exception as exc:
         server.logger.debug("RLClient import failed (%s); RL features disabled", exc)
         return None
@@ -1140,21 +1159,18 @@ def _get_rl_client():
     except Exception as exc:
         server.logger.debug("EmbeddingService probe failed (%s); using default text_dim=%d", exc, text_dim)
 
-    # V52-AA: derive base_url from hub-resolved rl_server_port as a
-    # fallback when env vars are unset. Env precedence:
-    #   1. RL_SERVER_URL env (canonical override; full URL incl. host)
-    #   2. RL_SERVER_PORT env (composed against 127.0.0.1)
-    #   3. hub-resolved ``rl_server_port`` from ProjectConfig (V52-AA)
-    #   4. None → "disabled mode"
-    # RLClient.__init__ already uses _resolve_base_url() to cover (1)+(2)
-    # internally when ``base_url`` arg is None. We pre-resolve (3) here
-    # and pass it explicitly as ``base_url`` ONLY when (1)+(2) are unset,
-    # so the existing env-override path stays intact for tests + dev.
-    base_url_override: Optional[str] = None
-    _env_url = os.environ.get("RL_SERVER_URL", "").strip()
-    _env_port = os.environ.get("RL_SERVER_PORT", "").strip()
-    if not _env_url and not _env_port and hub_rl_server_port:
-        base_url_override = f"http://127.0.0.1:{hub_rl_server_port}"
+    # V52-AA: derive base_url through the ONE shared resolver
+    # (``rl_client.client.resolve_wired_base_url`` — env first, then the
+    # hub-resolved ``rl_server_port``). Passing the result explicitly is
+    # equivalent to what ``RLClient.__init__`` would re-resolve from env
+    # alone, and adds rung (3) the env-only resolution lacks. rl_doctor
+    # resolves through the SAME function, so the doctor can never report
+    # "not wired" where the MCP finds the container.
+    base_url_override = resolve_wired_base_url(hub_rl_server_port)
+    if base_url_override is not None and hub_rl_server_port and not (
+        os.environ.get("RL_SERVER_URL", "").strip()
+        or os.environ.get("RL_SERVER_PORT", "").strip()
+    ):
         server.logger.debug(
             "RL client: env unset; using hub-resolved rl_server_port=%d",
             hub_rl_server_port,
@@ -2376,7 +2392,11 @@ def _embed_text_in_other_model(
     from the identical backend path (no third embed implementation).
 
     Returns the vector, or None on soft-fail (empty text / backend down / unknown
-    source). Never raises into the citation compute — the caller drops the chunk.
+    source). The ONE exception it raises is ``ChunkOverflowError`` when the
+    model refuses the text for length (v0.2.106): the citation compute splits
+    that answer chunk into pieces (``citation_compute._embed_answer_pieces``)
+    instead of dropping it; the slot regen's caller (``embed_regen``) still
+    soft-fails it to None.
     """
     if not text or not text.strip():
         return None
@@ -2397,6 +2417,11 @@ def _embed_text_in_other_model(
         vec = ollama.embed(model, text)
         return vec or None
     except Exception as exc:  # noqa: BLE001
+        from vco_lib.embed_split import ChunkOverflowError
+        from vco_lib.embedding_service import _is_context_overflow_error
+
+        if _is_context_overflow_error(exc):
+            raise ChunkOverflowError(model, len(text), str(exc)) from exc
         server.logger.debug(
             "_embed_text_in_other_model: embed in %s (%s) failed (%s)",
             other_source, model, exc,
@@ -2429,7 +2454,7 @@ def _rl_pack_linked_embs_for_node(
 ) -> tuple[list[list[float]], list[str]]:
     """Pack up to ``_RL_MAX_LINKED`` linked-slot vectors for one node.
 
-    Order matches what ``paid-modules/vct-rl-reranker/retrieval_rl.py::_train_rl_model``
+    Order matches what ``claude_mcp_servers/rl_reranker/retrieval_rl.py::_train_rl_model``
     builds online today (lines 914-918):
 
         linked_raws = extra_chunks_of_same_node + actual_linked_nodes
@@ -3156,7 +3181,11 @@ def _rl_enrich_nodes_with_linked_embs(
             each node also gets ``emb_other`` (the OTHER slot's per-node
             vector pulled from the SAME already-fetched objects — no second
             Weaviate query, case-(a) 1:1 fan-out) and ``cos_qn_other``
-            (cos(other_query_emb, emb_other)). Empty → no dual-log enrichment.
+            (cos(other_query_emb, emb_other)). v0.2.106 additionally packs
+            ``linked_embs_other`` / ``linked_type_names_other`` (the OTHER
+            slot's linked-slot vectors, same packer + caps as ``linked_embs``)
+            so the dual-log twin can carry its own linked context (survey
+            G1). Empty → no dual-log enrichment.
         other_query_emb: The query vector in the OTHER slot's space, used to
             compute ``cos_qn_other``. Required for ``cos_qn_other``; absent →
             ``emb_other`` may still be attached, ``cos_qn_other`` is skipped.
@@ -3362,6 +3391,34 @@ def _rl_enrich_nodes_with_linked_embs(
             n["linked_embs"] = packed_embs
             n["linked_type_names"] = packed_types
 
+            # v0.2.106 (training-readiness survey G1, 2026-11-11): pack the
+            # OTHER slot's linked vectors from the SAME already-fetched
+            # objects — the one packer call is the shape/caps contract, so
+            # the twin's linked slots are neighbour-first ordered and
+            # _RL_MAX_LINKED capped exactly like the active event's. Pre-106
+            # dual-log twins shipped with the linked fields stripped
+            # (search_pipeline._ACTIVE_SPACE_ONLY_FIELDS), so the other
+            # slot's net trained with 5 zeroed linked slots while an
+            # other-slot-ACTIVE install would have filled them (train/serve
+            # skew). A linked row lacking the other-slot vector is skipped
+            # by the packer — never fabricated — so a twin node may carry
+            # fewer slots than the active record; the trainer zero-pads.
+            if other_slot:
+                try:
+                    packed_other, types_other = server._rl_pack_linked_embs_for_node(
+                        n,
+                        sibling_objs_by_source_id,
+                        link_objs_by_title,
+                        other_slot,
+                    )
+                    n["linked_embs_other"] = packed_other
+                    n["linked_type_names_other"] = types_other
+                except Exception as exc:  # noqa: BLE001 — enrich never breaks search
+                    server.logger.debug(
+                        "dual-log: other-slot linked pack failed for %r (%s)",
+                        (n.get("title") or "")[:60], exc,
+                    )
+
             # n_emb: prefer the existing emb (already on the dict from search).
             n_emb = n.get("emb")
 
@@ -3480,11 +3537,15 @@ def _resolve_dual_rl_log_enabled() -> bool:
       2. ``_resolve_write_all_slots()`` (the dual-WRITE gate) is True.
 
     If dual-log is requested but dual-write is OFF, this returns False (forced
-    off) — the second event is never emitted (see the tests). TODO(T-B-flags):
-    the launcher.db → ProjectConfig → settings.json projection of this flag is a
-    SEPARATE track; this reads the env channel only (the canonical override for
-    CLI/dev + what settings.json mirrors), NOT launcher.db directly — do not add
-    a DB read here.
+    off) — the second event is never emitted (see the tests). The value this
+    reads arrives via the launcher.db → ProjectConfig → settings.json env
+    projection (v0.2.71 T-B-flags; ``vco_lib/config_projection.py``
+    ``APP_STATE_KEY_DUAL_RL_LOG_DEFAULT`` per-project override, global
+    ``embedding.dual_rl_log_default`` fallback, pinned by
+    ``tests/test_dual_flags_projection.py``) — this env read IS the projected
+    channel; there is deliberately no launcher.db read here (the projection
+    runs at project-open time, so a mid-session DB change reaches the next
+    session's env, not this process).
     """
     raw = os.environ.get(server.DUAL_RL_LOG_ENABLED_ENV, "").strip().lower()
     if raw not in ("1", "true", "yes", "on"):

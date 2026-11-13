@@ -173,7 +173,8 @@ _RESET_KEYS = [
     "MAX_SEQ_LEN", "INSTRUCTION", "_st_model", "_st_model_dim", "_in_flight",
     "_last_used", "_inference_lock", "_request_semaphore", "_ollama_dim_cache",
     "LOAD_OOM_RETRIES", "LOAD_OOM_BACKOFF_SECS", "UNLOAD_FREED_MIN_MB",
-    "_last_unload_freed_mb", "_last_load_error",
+    "_last_unload_freed_mb", "_last_load_error", "_last_load_error_public",
+    "_last_load_error_id",
     # Round 2 (v0.2.102 r2): the queue bound + the load fail-fast cooldown.
     "QUEUE_WAIT_SECS", "_load_unavailable_until",
 ]
@@ -523,7 +524,9 @@ def test_health_reports_last_unload_and_load_error():
     es._st_model_dim = 2048
     es._in_flight = 0
     es._last_unload_freed_mb = 7123.0
-    es._last_load_error = "CUDA out of memory persisted through 7 load attempt(s)"
+    detail = ("CUDA out of memory persisted through 7 load attempt(s): "
+              "Traceback (most recent call last): File \"/models/secret/x.py\"")
+    public = es._record_load_error(detail, "CUDA out of memory persisted through 7 load attempt(s)")
 
     def _boom():
         raise AssertionError("/health must not force a model load via get_dim()")
@@ -535,7 +538,28 @@ def test_health_reports_last_unload_and_load_error():
     assert payload["model_loaded"] is False
     assert payload["dim"] == 2048
     assert payload["last_unload_freed_mb"] == 7123.0
-    assert payload["last_load_error"] == es._last_load_error
+    # The client sees the fixed sentence + the id that finds the full text in
+    # the log — never the exception text (CodeQL py/stack-trace-exposure).
+    assert payload["last_load_error"] == public
+    assert payload["last_load_error_id"] == es._last_load_error_id
+    assert es._last_load_error_id in public
+    assert "Traceback" not in payload["last_load_error"]
+    assert "/models/secret" not in str(payload)
+    assert es._last_load_error == detail
+
+
+def test_load_failure_503_carries_no_exception_text():
+    """RED-PROOF (CodeQL #45): a load fault's exception text (paths, file
+    contents) reaches the log only; the 503 detail a client gets on /embed
+    and /api/embeddings is the fixed sentence + error id."""
+    es._record_load_error("OSError: /root/.cache/hf/secret-token-file: denied", "model load failed")
+    es._load_unavailable_until = time.monotonic() + 30.0
+    es._st_model = None
+    with pytest.raises(es._ModelLoadUnavailable) as info:
+        es._load_gpu_model()
+    text = str(info.value)
+    assert "secret-token-file" not in text
+    assert es._last_load_error_id is not None and es._last_load_error_id in text
 
 
 def test_is_cuda_oom_classifier():

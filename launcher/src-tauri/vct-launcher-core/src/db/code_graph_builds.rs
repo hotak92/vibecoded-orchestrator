@@ -184,14 +184,61 @@ impl Db {
     ///
     /// Writes: status='running', started_at=now, pid=`pid`; clears the
     /// terminal fields from any prior row (a fresh walk supersedes the
-    /// previous build's outcome, same as the legacy upsert's semantics).
+    /// previous build's OUTCOME, same as the legacy upsert's semantics).
+    ///
+    /// Never supersedes a LIVE walk (v0.2.106 fix round 1): when the row is
+    /// still `running` and belongs to another walk that is alive — a
+    /// launcher-owned build (pid NULL) whose heartbeat is fresher than
+    /// `kg_syncs::HEARTBEAT_STALE_FLOOR_SECS`, or a detached walk whose
+    /// different pid `is_pid_alive` confirms — nothing is written and
+    /// `Ok(false)` is returned. Before this, a twin resync driver's spawn
+    /// registration overwrote the running row with its own pid; the twin
+    /// then skipped, the real walk's terminal report matched nothing, and the
+    /// pid sweep later wrote "the walk died before completing" over a walk
+    /// that had succeeded. A running row whose pid is dead (a crashed driver)
+    /// or equals `pid` is superseded as before. `Ok(true)` = registered.
     pub fn register_running_code_graph_build(
         &self,
         project_id: &str,
         pid: u32,
-    ) -> Result<(), String> {
+        is_pid_alive: impl Fn(u32) -> bool,
+    ) -> Result<bool, String> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let guard = self.lock();
+        type Current = (String, Option<i64>, Option<i64>, Option<i64>);
+        let current: Option<Current> = guard
+            .query_row(
+                "SELECT status, pid, heartbeat_at, started_at FROM code_graph_builds
+                 WHERE project_id = ?1",
+                params![project_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| format!("read code_graph_build before register: {}", e))?;
+        if let Some((st, row_pid, heartbeat_at, started_at)) = current {
+            if st == status::RUNNING {
+                let live_other = match row_pid {
+                    // A launcher-owned build stamps its heartbeat every 60 s;
+                    // a row stamped within the launcher's own stale floor is
+                    // live, an older one is a ghost the launcher has not
+                    // swept yet (killed for an update) and may be superseded.
+                    None => !super::kg_syncs::heartbeat_is_stale(
+                        heartbeat_at,
+                        started_at,
+                        now_ms,
+                        super::kg_syncs::HEARTBEAT_STALE_FLOOR_SECS,
+                    ),
+                    Some(p) => match u32::try_from(p) {
+                        Ok(p) => p != pid && is_pid_alive(p),
+                        // Corrupt pid: cannot confirm it is dead → leave it.
+                        Err(_) => true,
+                    },
+                };
+                if live_other {
+                    return Ok(false);
+                }
+            }
+        }
         guard
             .execute(
                 "INSERT INTO code_graph_builds
@@ -214,7 +261,7 @@ impl Db {
                 params![project_id, now_ms, pid as i64],
             )
             .map_err(|e| format!("register running code_graph_build: {}", e))?;
-        Ok(())
+        Ok(true)
     }
 
     /// Finalize a DETACHED analyzer walk's build row (v0.2.91 #31 — the
@@ -238,9 +285,11 @@ impl Db {
     /// provenance — every liveness consumer, sweep and heartbeat alike,
     /// gates on `status = 'running'`, so a pid on a terminal row is inert);
     /// `heartbeat_at` untouched (always NULL for detached rows — see the
-    /// field doc). `status` must be one of the terminal trio
-    /// success/partial/failed (same vocabulary as the launcher-spawned
-    /// writer; `skipped` is a launcher-side decision, never a wire status).
+    /// field doc). `status` must be one of the terminal statuses
+    /// success/partial/failed/skipped — `skipped` (v0.2.106) is a run a twin
+    /// walk made unnecessary: a NON-failure terminal state that must not be
+    /// left to the pid-aliveness reconciler's "failed" verdict, and must not
+    /// read as an error in the GUI.
     #[allow(clippy::too_many_arguments)]
     pub fn finalize_detached_code_graph_build(
         &self,
@@ -255,7 +304,7 @@ impl Db {
     ) -> Result<bool, String> {
         if !matches!(
             status,
-            status::SUCCESS | status::PARTIAL | status::FAILED
+            status::SUCCESS | status::PARTIAL | status::FAILED | status::SKIPPED
         ) {
             return Err(format!(
                 "invalid terminal code-graph build status: {}",
@@ -832,7 +881,7 @@ mod tests {
         )
         .unwrap();
 
-        db.register_running_code_graph_build(&pid_str, 424242).unwrap();
+        assert!(db.register_running_code_graph_build(&pid_str, 424242, |_| false).unwrap());
 
         let row = db.get_code_graph_build(&pid_str).unwrap().unwrap();
         assert_eq!(row.status, "running");
@@ -844,6 +893,52 @@ mod tests {
         assert_eq!(row.files_analyzed, 0);
     }
 
+    /// v0.2.106 fix round 1 (U1-1), in the real order: driver A registers,
+    /// twin driver B's spawn registers while A is alive (refused — A's row
+    /// stays), B skips, A posts success → the row ends `success`, never the
+    /// sweep's "died before completing". Red-proof: drop the live-walk check
+    /// → B's pid takes the row, A's finalize matches nothing, the sweep of
+    /// the dead pid B writes `failed`.
+    #[test]
+    fn a_twin_registration_never_steals_a_live_walks_row() {
+        let (db, id) = fresh_db_with_project();
+        let a: u32 = 41_001;
+        let b: u32 = 41_002;
+        let alive_a = |p: u32| p == a;
+        assert!(db.register_running_code_graph_build(&id, a, alive_a).unwrap());
+        assert!(!db.register_running_code_graph_build(&id, b, alive_a).unwrap());
+        assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().pid, Some(i64::from(a)));
+        assert!(db
+            .finalize_detached_code_graph_build(&id, a, status::SUCCESS, 3, Some(5), None, None, None)
+            .unwrap());
+        assert!(db.sweep_dead_detached_code_graph_builds(|_| false).unwrap().is_empty());
+        assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().status, status::SUCCESS);
+    }
+
+    /// Act + leave-alone for the supersede decision: a running row whose pid
+    /// is DEAD (a crashed driver) is superseded; a launcher-owned running
+    /// row (pid NULL) is kept while its heartbeat is fresh and superseded
+    /// once it is older than the launcher's stale floor (a ghost).
+    #[test]
+    fn registration_supersedes_only_a_dead_or_ghost_running_row() {
+        let (db, id) = fresh_db_with_project();
+        assert!(db.register_running_code_graph_build(&id, 50, |_| false).unwrap());
+        assert!(db.register_running_code_graph_build(&id, 51, |_| false).unwrap());
+        assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().pid, Some(51));
+
+        let now = chrono::Utc::now().timestamp_millis();
+        db.upsert_code_graph_build(&id, status::RUNNING, Some(now), None, None, 0, None, false, None, None)
+            .unwrap();
+        assert!(!db.register_running_code_graph_build(&id, 52, |_| false).unwrap());
+        assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().pid, None);
+
+        let old = now - (super::super::kg_syncs::HEARTBEAT_STALE_FLOOR_SECS as i64 + 60) * 1000;
+        db.upsert_code_graph_build(&id, status::RUNNING, Some(old), None, None, 0, None, false, None, None)
+            .unwrap();
+        assert!(db.register_running_code_graph_build(&id, 52, |_| false).unwrap());
+        assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().pid, Some(52));
+    }
+
     /// The legacy (launcher-spawned) upsert CLEARS pid: a launcher-driven
     /// transition superseding a detached-walk row must not leave the
     /// stale pid attached (the sweep would aliveness-check the wrong
@@ -851,7 +946,7 @@ mod tests {
     #[test]
     fn legacy_upsert_clears_pid() {
         let (db, pid_str) = fresh_db_with_project();
-        db.register_running_code_graph_build(&pid_str, 555).unwrap();
+        assert!(db.register_running_code_graph_build(&pid_str, 555, |_| false).unwrap());
         assert_eq!(
             db.get_code_graph_build(&pid_str).unwrap().unwrap().pid,
             Some(555)
@@ -891,7 +986,7 @@ mod tests {
             &slug,
         )
         .unwrap();
-        db.register_running_code_graph_build(&detached, std::process::id())
+        db.register_running_code_graph_build(&detached, std::process::id(), |_| false)
             .unwrap();
 
         let n = db
@@ -927,7 +1022,7 @@ mod tests {
                 &slug,
             )
             .unwrap();
-            db.register_running_code_graph_build(&id, pid).unwrap();
+            db.register_running_code_graph_build(&id, pid, |_| false).unwrap();
             id
         };
         let alive_id = mk(&db, "detached-alive", 1111);
@@ -971,7 +1066,7 @@ mod tests {
     #[test]
     fn finalize_detached_finalizes_matching_running_row() {
         let (db, pid_str) = fresh_db_with_project();
-        db.register_running_code_graph_build(&pid_str, 3924749).unwrap();
+        db.register_running_code_graph_build(&pid_str, 3924749, |_| false).unwrap();
 
         let langs = vec!["py".to_string()];
         let done = db
@@ -1008,7 +1103,7 @@ mod tests {
     #[test]
     fn finalize_detached_failed_records_error_and_duration_fallback() {
         let (db, pid_str) = fresh_db_with_project();
-        db.register_running_code_graph_build(&pid_str, 77).unwrap();
+        db.register_running_code_graph_build(&pid_str, 77, |_| false).unwrap();
 
         let done = db
             .finalize_detached_code_graph_build(
@@ -1043,7 +1138,7 @@ mod tests {
         let (db, pid_str) = fresh_db_with_project();
 
         // Superseded: registered pid differs from the reporting pid.
-        db.register_running_code_graph_build(&pid_str, 2222).unwrap();
+        db.register_running_code_graph_build(&pid_str, 2222, |_| false).unwrap();
         let done = db
             .finalize_detached_code_graph_build(
                 &pid_str, 1111, status::SUCCESS, 5, None, None, None, None,
@@ -1071,7 +1166,7 @@ mod tests {
         );
 
         // Already terminal: a duplicate report is a no-op.
-        db.register_running_code_graph_build(&pid_str, 9).unwrap();
+        db.register_running_code_graph_build(&pid_str, 9, |_| false).unwrap();
         assert!(db
             .finalize_detached_code_graph_build(
                 &pid_str, 9, status::SUCCESS, 5, None, None, None, None,
@@ -1089,12 +1184,15 @@ mod tests {
         );
     }
 
-    /// Vocabulary: only the terminal trio is accepted on the wire writer.
+    /// Vocabulary: the terminal statuses are accepted on the wire writer;
+    /// `running` / `pending` / garbage are not. v0.2.106: `skipped` IS a
+    /// terminal status — a run a twin walk made unnecessary, reported so the
+    /// pid-aliveness sweep does not later fail it.
     #[test]
     fn finalize_detached_rejects_non_terminal_status() {
         let (db, pid_str) = fresh_db_with_project();
-        db.register_running_code_graph_build(&pid_str, 5).unwrap();
-        for bad in ["running", "pending", "skipped", "borked"] {
+        db.register_running_code_graph_build(&pid_str, 5, |_| false).unwrap();
+        for bad in ["running", "pending", "borked"] {
             let err = db
                 .finalize_detached_code_graph_build(
                     &pid_str, 5, bad, 0, None, None, None, None,
@@ -1102,6 +1200,17 @@ mod tests {
                 .expect_err("must reject");
             assert!(err.contains(bad), "error names the status: {}", err);
         }
+        // The skip is a NON-failure terminal state, not a rejected one.
+        assert!(db
+            .finalize_detached_code_graph_build(
+                &pid_str, 5, status::SKIPPED, 0, Some(0), None,
+                Some("another code-graph walk is already running"), None,
+            )
+            .unwrap());
+        assert_eq!(
+            db.get_code_graph_build(&pid_str).unwrap().unwrap().status,
+            "skipped"
+        );
     }
 
     /// The #31 asymmetry, both legs: a finalized (success) row survives the
@@ -1123,7 +1232,7 @@ mod tests {
                 &slug,
             )
             .unwrap();
-            db.register_running_code_graph_build(&id, pid).unwrap();
+            db.register_running_code_graph_build(&id, pid, |_| false).unwrap();
             id
         };
         let reported = mk(&db, "detached-reported", 4001);
@@ -1175,7 +1284,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.get_code_graph_build(&pid_str).unwrap().unwrap().pid, None);
-        db.register_running_code_graph_build(&pid_str, 7).unwrap();
+        db.register_running_code_graph_build(&pid_str, 7, |_| false).unwrap();
         assert_eq!(
             db.get_code_graph_build(&pid_str).unwrap().unwrap().pid,
             Some(7)
@@ -1290,7 +1399,7 @@ mod tests {
 
         // Detached re-registration: the launcher ticker must not stamp a
         // row a detached walk now owns.
-        db.register_running_code_graph_build(&pid, 4242).unwrap();
+        db.register_running_code_graph_build(&pid, 4242, |_| false).unwrap();
         assert_eq!(
             db.touch_code_graph_build_heartbeat(&pid).unwrap(),
             0,
@@ -1334,7 +1443,7 @@ mod tests {
             &slug,
         )
         .unwrap();
-        db.register_running_code_graph_build(&detached, 999).unwrap();
+        db.register_running_code_graph_build(&detached, 999, |_| false).unwrap();
         backdate_build(&db, &detached, None, Some(now - 10 * window_ms));
 
         // Terminal + pending rows with ancient stamps.

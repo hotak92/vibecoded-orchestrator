@@ -76,9 +76,19 @@ pub mod process;
 pub mod project_naming;
 pub mod python_resolve;
 pub mod registry;
+// v0.2.106 (review H1): the JSON key of the project id in the removal report
+// — read by both the hub (which checks the report) and the launcher crate's
+// wire test (which proves the real struct serializes under it).
+pub mod removal_report;
 // v0.2.100 W5R-02: the RL scoring lock — Rust reader of the one home,
 // `vco_lib/rl_scoring_lock.toml` (Python parses the same file).
 pub mod rl_scoring_lock;
+// v0.2.106 (owner 2026-11-12): RL scoring's default follows the bundled
+// weights — Rust caller of the one decision, `vco_lib/rl_scoring_default.py`.
+pub mod rl_scoring_default;
+// v0.2.106: the machine-global ACTIVE_EMBEDDING resolution (hub + launcher +
+// the RL scoring default share it).
+pub mod active_embedding;
 // v0.2.80 A4: the single-line secret-value shape predicate lives in core so
 // the `secrets::set` write chokepoint (this crate) can call it; the app crate
 // re-exports it from here. See `secret_value_shape.rs` header.

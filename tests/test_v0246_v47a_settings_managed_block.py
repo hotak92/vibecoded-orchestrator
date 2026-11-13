@@ -359,6 +359,29 @@ def test_non_object_json_left_alone(
     assert settings_path.read_text(encoding="utf-8") == "[1, 2, 3]\n"
     assert len(report.entries) == 1
     assert report.entries[0].condition_id == "claude_settings_unparseable"
+    _assert_unparseable_remedy_is_safe(report.entries[0])
+
+
+def _assert_unparseable_remedy_is_safe(entry) -> None:
+    """v0.2.106: the printed remedy repairs first; replace-all (which resets
+    the whole file) only as a commented last resort, never as the command."""
+    runnable = [ln.strip() for ln in entry.command_to_apply.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+    assert runnable == ["python install.py"], runnable
+    assert "json.tool" in entry.command_to_apply
+    assert "REWRITES the whole file" in entry.why_deferred
+
+
+def test_unparseable_entry_leads_with_the_repair(
+    isolated_project_root, embed_config,
+):
+    settings_path = _settings_file(isolated_project_root)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text('{"env": {},}\n', encoding="utf-8")
+    report = DeferralReport()
+    install_py._configure_claude_settings(embed_config, deferral_report=report)
+    assert settings_path.read_text(encoding="utf-8") == '{"env": {},}\n'
+    _assert_unparseable_remedy_is_safe(report.entries[0])
 
 
 # ---------------------------------------------------------------------------

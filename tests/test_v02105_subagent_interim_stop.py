@@ -164,13 +164,18 @@ def test_parent_session_background_tasks_do_not_suppress_the_notice(
 def test_shipped_templates_carry_the_interim_notice():
     """Where coordinators and lanes read it: both shipped CLAUDE.md
     templates tell them an interim subagent notification is not a completion,
-    and that a lane keeps its own helpers in the foreground."""
+    that a long command the HARNESS moves to the background wakes THAT
+    subagent (observed 2026-11-10), and — review C-M5 — that a helper the
+    lane starts with run_in_background on purpose may still report to the
+    root session, so a lane keeps running its own helpers in the foreground."""
     for name in ("CLAUDE.md.template", "ORCHESTRATOR-CLAUDE.md.template"):
         text = (TEMPLATES / name).read_text(encoding="utf-8")
         assert "waiting on its own background work is INTERIM" in text, name
         assert "do not tell the user it finished or stalled" in text, name
-        assert "runs its own helpers in the FOREGROUND" in text, name
-        assert "reaches the root session" in text, name
+        assert "completion notification wakes THAT subagent" in text, name
+        assert "moved to the background by the harness itself" in text, name
+        assert "may report to the ROOT session instead" in text, name
+        assert "runs its own helpers in the foreground" in text, name
 
 
 # ── the marker helper, called directly ─────────────────────────────────────

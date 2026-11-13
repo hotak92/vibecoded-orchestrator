@@ -116,6 +116,7 @@
   import type { InstallHealth } from '$lib/types/launcher';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { startChangePoller, onChange } from '$lib/stores/changes';
+  import { startWindowActivity } from '$lib/window-activity';
   import type { LegacyCodegraphReport } from '$lib/types/identity';
 
   let { children } = $props();
@@ -194,6 +195,9 @@
     // `startStatusPolling` runs the immediate check and arms the hourly one
     // (which honours the auto-check preference, L3-F09).
     const stopStatusPolling = startStatusPolling();
+    // v0.2.106: minimised / hidden → CSS animations paused, polls skipped
+    // (`lib/window-activity.ts`).
+    void startWindowActivity();
 
     // v0.2.100 (WP-08, L3-F04 / L2-F05): ONE `vct-tray-action` listener plus
     // the backend notice events that had no listener at all. Routing lives
@@ -330,16 +334,14 @@
       try {
         const { listen: rlListen } = await import('$lib/tauri');
         const { toast: rlToast } = await import('$lib/stores/toast');
+        const { rlAutoEnableToast } = await import('$lib/rl-scoring-default');
         rlListen<{ event_count: number; threshold: number; module_id: string }>(
           'vct-rl-auto-enable-available',
           (e) => {
             const dismissed = localStorage.getItem('vct.rl_auto_enable_dismissed') === '1';
             if (dismissed) return;
             const { event_count, threshold } = e.payload;
-            rlToast.info(
-              `RL Reranker: ${event_count}/${threshold} training events ` +
-                `accumulated — visit Preferences → Modules to enable.`,
-            );
+            rlToast.info(rlAutoEnableToast(event_count, threshold));
           },
         );
       } catch (e) {

@@ -367,10 +367,13 @@ def test_edit_outcome_carries_agent_id(tmp_path: Path, flavour: str, agent: str,
                               "old_string": "x", "new_string": "yy"}}
     if agent:
         payload["agent_id"] = agent
+    # v0.2.106: py-compile-check covers an Edit of a .py file too, so the row
+    # is written by the detached post-check poller (not inline). A short
+    # poll bound keeps the test quick; the agent id must survive that path.
     r = _run_hook("post-edit-outcome", flavour, payload, project,
-                  env=_env(project, VCT_VENV=str(venv)))
+                  env=_env(project, VCT_VENV=str(venv), VCT_EDIT_POST_CHECK_SECS="1"))
     assert r.returncode == 0, r.stderr
-    assert out.exists(), r.stderr
+    assert _wait_for(out.exists, timeout=60.0), r.stderr
     assert json.loads(out.read_text())["payload"]["agent_id"] == want
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Parity-touch 2026-11-11 (v0.2.106): the .ps1 sibling now runs its embedded Python body through _lib/run-python-program.ps1 (Windows PowerShell 5.1 drops embedded double quotes from `python -c` arguments — SyntaxError on every run); no .sh-side behaviour change.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0

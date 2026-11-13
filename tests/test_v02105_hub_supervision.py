@@ -453,7 +453,7 @@ def test_preflight_refuses_a_gateway_lane_whose_key_cannot_resolve(tmp_path, use
     asked: list[str] = []
     env = gp.run(_payload("deepseek-researcher"), project_dir=proj,
                  fetch=lambda m: asked.append(m) or _vendor_missing(m), environ={})
-    assert asked == ["qwen/deepseek-v4.1-flash[1m]"]
+    assert asked == ["claude-gw/qwen/deepseek-v4.1-flash[1m]"]
     assert env is not None
     hso = env["hookSpecificOutput"]
     assert hso["permissionDecision"] == "deny"
@@ -468,6 +468,34 @@ def test_preflight_lets_a_resolvable_lane_through(tmp_path, user_claude):
     assert env is None
 
 
+@pytest.mark.parametrize("model,vendor", [
+    ("claude-gw/kimi/k3.1-pro[1m]", "kimi"),                # two-segment namespace
+    ("claude-gw/glm-5.3[1m]", "zai"),
+    ("claude-gw/qwen/deepseek-v4.1-flash[1m]", "qwen"),
+])
+def test_preflight_asks_about_the_id_the_router_serves(tmp_path, user_claude, model, vendor):
+    """The probe sends the definition's id VERBATIM — the string the lane's
+    first request carries — and the router serves it.
+
+    Regression (2026-11-09): the probe stripped ``claude-gw/`` before asking,
+    so ``claude-gw/kimi/k3[1m]`` was asked about as ``kimi/k3[1m]``. The kimi
+    row's namespace is ``claude-gw/kimi/`` and its only bare-id prefix is
+    ``k3``, so the stripped form matched neither and the gateway answered
+    ``route: refused`` — every Kimi subagent launch was denied at the hook
+    while the gateway was serving Kimi normally. The glm/qwen rows only
+    survived because their ids still matched a bare-id prefix."""
+    from model_router import routing
+
+    proj = _agents(tmp_path, "lane", model)
+    asked: list[str] = []
+    gp.run(_payload("lane"), project_dir=proj, environ={},
+           fetch=lambda m: asked.append(m) or _ok({"route": "vendor", "usable": True}))
+    assert asked == [model], "the probe must ask about the id as spelled"
+    decision = routing.route(asked[0])
+    assert not isinstance(decision, routing.RouteError), decision.message
+    assert decision.vendor.vendor_id == vendor
+
+
 @pytest.mark.parametrize("answer", [
     {"ok": False, "reason": "unreachable", "message": "no gateway"},
     {"ok": False, "reason": "outdated_gateway", "message": "old"},
@@ -475,7 +503,7 @@ def test_preflight_lets_a_resolvable_lane_through(tmp_path, user_claude):
     _ok({"route": "vendor", "vendor": "qwen", "usable": None, "state": "pending"}),
 ])
 def test_preflight_never_refuses_on_uncertainty(tmp_path, user_claude, answer):
-    proj = _agents(tmp_path, "kimi-reviewer", "claude-gw/kimi/k3[1m]")
+    proj = _agents(tmp_path, "kimi-reviewer", "claude-gw/kimi/k3.1-pro[1m]")
     assert gp.run(_payload("kimi-reviewer"), project_dir=proj, environ={}, fetch=lambda m: answer) is None
 
 
@@ -512,7 +540,7 @@ def test_preflight_finds_user_level_and_renamed_definitions(tmp_path, user_claud
     asked: list[str] = []
     gp.run(_payload("my-lane"), project_dir=tmp_path / "noproj", environ={},
            fetch=lambda m: asked.append(m) or _ok({"route": "vendor", "usable": True}))
-    assert asked == ["qwen/qwen3.8-max[1m]"]
+    assert asked == ["claude-gw/qwen/qwen3.8-max[1m]"]
 
 
 def test_preflight_cli_prints_the_deny_envelope(tmp_path, user_claude, monkeypatch, capsys):

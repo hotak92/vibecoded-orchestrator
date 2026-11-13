@@ -48,6 +48,8 @@
   // Settings tab with scope="project" for that project's own choices.
   import DualWriteFlagsPanel from '$lib/project-state/DualWriteFlagsPanel.svelte';
   import KgEmbedStatus from '$lib/preferences/KgEmbedStatus.svelte';
+  import OllamaIdleUnload from '$lib/preferences/OllamaIdleUnload.svelte';
+  import LocalSummaryModel from '$lib/preferences/LocalSummaryModel.svelte';
   // Machine-global Artifact-tool switch. Own component (this page is already
   // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
   // user-scope settings file rather than launcher.db — see
@@ -65,6 +67,11 @@
     resolveEngineAutostart,
     engineAutostartHint,
   } from '$lib/engine-autostart';
+  import {
+    DEFAULT_SERVICES_WATCHER,
+    resolveServicesWatcher,
+    servicesWatcherHint,
+  } from '$lib/services-watcher';
   import {
     resolveModuleUpdateAutoCheck,
     moduleUpdateAutoCheckHint,
@@ -1258,6 +1265,10 @@
   // `get_summary_model_info`) — named by the "No Ollama models" hint.
   let summaryTiers = $state<SummaryTier[]>([]);
   let kgSummaryLoading = $state(false);
+  // v0.2.106: the Local summary model row mounts only once this lazy section
+  // has loaded — its status probe (Ollama tags + a container inspect) must
+  // not run at page mount.
+  let kgSummaryLoadedOnce = $state(false);
   let kgSummarySaving = $state(false);
   let kgSummaryError = $state<string | null>(null);
   let kgSummarySaved = $state(false);
@@ -1314,6 +1325,7 @@
       kgSummaryError = String(e);
     } finally {
       kgSummaryLoading = false;
+      kgSummaryLoadedOnce = true;
     }
   }
 
@@ -1835,6 +1847,44 @@
     }
   }
 
+  // v0.2.106: "Restart stopped services automatically" — the GUI switch
+  // for `launcher.services_watcher_enabled`, the ONE row both automatic
+  // restarters read (this launcher's services watcher and the hub's infra
+  // watchdog). Turns the watcher module's long-standing doc promise into a
+  // real control.
+  let servicesWatcher = $state(DEFAULT_SERVICES_WATCHER);
+  let servicesWatcherBusy = $state(false);
+  let servicesWatcherError = $state<string | null>(null);
+
+  async function loadServicesWatcher() {
+    try {
+      servicesWatcher = resolveServicesWatcher(
+        await PREF_LOADERS.servicesWatcher.load(),
+      );
+    } catch (e) {
+      // Unreachable command (browser mode / partial install): show the
+      // SHIPPED default, because that is what the watcher will do.
+      servicesWatcher = resolveServicesWatcher(null);
+      console.warn('get_services_watcher_enabled failed', e);
+    }
+  }
+
+  async function toggleServicesWatcher(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    servicesWatcherBusy = true;
+    servicesWatcherError = null;
+    try {
+      await invoke('set_services_watcher_enabled', { enabled: enable });
+      servicesWatcher = enable;
+    } catch (e) {
+      servicesWatcherError = e instanceof Error ? e.message : String(e);
+      target.checked = servicesWatcher;
+    } finally {
+      servicesWatcherBusy = false;
+    }
+  }
+
   // ── Module updates: the 24 h automatic check (v0.2.100) ───────────────
   // Opt-out for `spawn_module_update_check_loop`. The shipped default is ON;
   // the switch renders that default while the read is in flight or fails.
@@ -2310,6 +2360,7 @@
     bootAutostart: loadBootAutostart,
     sessionAutostart: loadSessionAutostart,
     engineAutostart: loadEngineAutostart,
+    servicesWatcher: loadServicesWatcher,
     moduleUpdateAutoCheck: loadModuleUpdateAutoCheck,
     services: refreshServices,
     activeEmbedding: loadActiveEmbedding,
@@ -2598,6 +2649,12 @@
         embedded — but summaries improve the score-driven retrieval
         tiers significantly.
       </p>
+
+      <!-- v0.2.106 (owner ruling 2026-11-12): the opt-out for the local
+           summary model download (vco_lib.local_summary_model). -->
+      {#if kgSummaryLoadedOnce}
+        <div class="pr-kgsum-block"><LocalSummaryModel /></div>
+      {/if}
 
       {#if kgSummaryLoading}
         <p class="pr-hint">Loading…</p>
@@ -3929,6 +3986,32 @@
       </div>
     </section>
 
+    <!-- v0.2.106: Services — the shared auto-restart switch. ONE toggle for
+         BOTH automatic restarters (the launcher's services watcher and the
+         hub's infra watchdog); a Stop from the Services page pauses both
+         until Start, independent of this switch. -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['servicesWatcher'] }} aria-labelledby="pr-services-watcher-title">
+      <h2 class="pr-section-title" id="pr-services-watcher-title">Services</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Restart stopped services automatically</strong>
+          <span class="pr-onboarding-hint">
+            {servicesWatcherHint(servicesWatcher)}
+          </span>
+          {#if servicesWatcherError}
+            <span class="pr-onboarding-hint pr-startup-error">{servicesWatcherError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          data-testid="services-watcher-enabled"
+          checked={servicesWatcher}
+          disabled={servicesWatcherBusy}
+          onchange={toggleServicesWatcher}
+        />
+      </div>
+    </section>
+
     <!-- v0.2.100: module-update automatic check (opt-out). -->
     <section class="pr-section" use:lazySection={{ loaders, keys: ['moduleUpdateAutoCheck'] }} aria-labelledby="pr-module-updates-title">
       <h2 class="pr-section-title" id="pr-module-updates-title">Module updates</h2>
@@ -4084,6 +4167,15 @@
            model vs the selected one + fill progress, and the duplicate scan
            with its "objects missing the vector" list. -->
       <KgEmbedStatus />
+    </section>
+
+    <!-- v0.2.106 (owner ruling 2026-11-11): how long Ollama keeps a model
+         loaded after VCO last used it. Machine-wide, app_state
+         `ollama.idle_unload`, applied by the hub (it owns unloading); the
+         component carries the field, its help text and the override note. -->
+    <section class="pr-section" aria-labelledby="pr-ollama-idle-title">
+      <h2 class="pr-section-title" id="pr-ollama-idle-title">Ollama model unloading</h2>
+      <OllamaIdleUnload />
     </section>
 
     <!-- v0.2.23 F2 wave 2b: Volume location. Relocated from the popover.

@@ -164,13 +164,41 @@ pub fn set_project_disabled_mcps(
     project_folder: &Path,
     disabled: &[String],
 ) -> Result<(), String> {
+    edit_project_disabled_mcps(claude_json, project_folder, |_| Some(disabled.to_vec()))
+}
+
+/// The project's current `disabledMcpServers` names in a parsed `~/.claude.json`.
+fn current_disabled_mcps(root: &serde_json::Value, project_folder: &Path) -> Vec<String> {
+    root.get("projects")
+        .and_then(|p| p.get(project_key_for_claude_json(project_folder)))
+        .and_then(|e| e.get("disabledMcpServers"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The ONE writer of `projects[<key>].disabledMcpServers`: under the sidecar
+/// lock, read the file, hand the CURRENT list to `decide`, and write the list
+/// it returns (`None` = write nothing). Reading and deciding under the same
+/// lock hold means a recompute never works from a list read before the lock.
+fn edit_project_disabled_mcps(
+    claude_json: &Path,
+    project_folder: &Path,
+    decide: impl FnOnce(Vec<String>) -> Option<Vec<String>>,
+) -> Result<(), String> {
     let _lock = acquire_lock(claude_json, 5000)?;
     let mut root = read_json_or_empty(claude_json)?;
+    let Some(desired) = decide(current_disabled_mcps(&root, project_folder)) else {
+        return Ok(());
+    };
     let root_obj = root
         .as_object_mut()
         .ok_or("target file root is not a JSON object")?;
 
-    let mut list: Vec<String> = disabled.to_vec();
+    let mut list: Vec<String> = desired;
     list.sort();
     list.dedup();
 
@@ -217,6 +245,35 @@ pub fn set_project_disabled_mcps(
 
     atomic_write_json(claude_json, &root, CLAUDE_JSON_BACKUP)?;
     Ok(())
+}
+
+/// "Remove project" (v0.2.106): take the names VCO disabled for a project
+/// out of its `projects[<key>].disabledMcpServers` and leave every other
+/// name — one the user disabled through Claude Code itself stays. Returns
+/// the names removed (sorted). The list is read and rewritten through
+/// [`edit_project_disabled_mcps`], the ONE writer of that key, under one
+/// lock hold (an emptied list removes the key); nothing is written when no
+/// name of `vco_names` is present. `vco_names` is the launcher DB's opt-out list for the project.
+pub fn remove_project_disabled_mcps(
+    claude_json: &Path,
+    project_folder: &Path,
+    vco_names: &[String],
+) -> Result<Vec<String>, String> {
+    if vco_names.is_empty() || !claude_json.exists() {
+        return Ok(Vec::new());
+    }
+    // Read and rewrite under ONE lock hold (v0.2.106 fix round 1): a list
+    // read before the lock could revert a name added in between.
+    let mut gone: Vec<String> = Vec::new();
+    edit_project_disabled_mcps(claude_json, project_folder, |current| {
+        let (removed, kept): (Vec<String>, Vec<String>) =
+            current.into_iter().partition(|n| vco_names.contains(n));
+        gone = removed;
+        (!gone.is_empty()).then_some(kept)
+    })?;
+    gone.sort();
+    gone.dedup();
+    Ok(gone)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2081,6 +2138,7 @@ mod tests {
     /// symlink must record its opt-out under the literal path or Claude
     /// Code never reads it. Red-proof: restoring `fs::canonicalize` in
     /// `project_key_for_claude_json` resolves the symlink → this fails.
+    #[cfg(unix)] // symlink creation needs privileges on Windows; std::os::unix::fs::symlink
     #[test]
     fn set_project_disabled_mcps_keys_by_the_as_opened_symlinked_path() {
         let target = tmp_target();
@@ -2166,6 +2224,61 @@ mod tests {
             json,
         );
 
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// v0.2.106 "Remove project": the names VCO disabled go, a name the user
+    /// disabled through Claude Code stays — and the last VCO name empties the
+    /// key. Red-proof: partition on `!contains` (keep VCO's) → both fail.
+    #[test]
+    fn remove_project_disabled_mcps_takes_only_vcos_names() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-remove-mcps");
+        fs::create_dir_all(&folder).unwrap();
+        set_project_disabled_mcps(&target, &folder, &["playwright".into(), "users-own".into()]).unwrap();
+        let gone = remove_project_disabled_mcps(&target, &folder, &["playwright".to_string()]).unwrap();
+        assert_eq!(gone, vec!["playwright".to_string()]);
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(project_entry(&json, &folder).unwrap()["disabledMcpServers"], serde_json::json!(["users-own"]));
+
+        let gone = remove_project_disabled_mcps(&target, &folder, &["users-own".to_string()]).unwrap();
+        assert_eq!(gone, vec!["users-own".to_string()]);
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(project_entry(&json, &folder).unwrap().get("disabledMcpServers").is_none());
+        assert!(remove_project_disabled_mcps(&target, &folder, &["x".to_string()]).unwrap().is_empty());
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// v0.2.106 fix round 1 (R1 F5): the removal reads the list UNDER the
+    /// sidecar lock, so a name another writer adds while the lock is held is
+    /// kept. Red-proof: read the list before `acquire_lock` (the pre-fix
+    /// shape) → the late name is reverted.
+    #[test]
+    fn remove_project_disabled_mcps_reads_the_list_under_the_lock() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-remove-mcps-lock");
+        fs::create_dir_all(&folder).unwrap();
+        set_project_disabled_mcps(&target, &folder, &["playwright".into()]).unwrap();
+        let held = acquire_lock(&target, 5000).unwrap();
+        let (t, f) = (target.clone(), folder.clone());
+        let worker = std::thread::spawn(move || {
+            remove_project_disabled_mcps(&t, &f, &["playwright".to_string()]).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        json["projects"][project_key_for_claude_json(&folder)]["disabledMcpServers"] =
+            serde_json::json!(["added-meanwhile", "playwright"]);
+        fs::write(&target, serde_json::to_string(&json).unwrap()).unwrap();
+        drop(held);
+        assert_eq!(worker.join().unwrap(), vec!["playwright".to_string()]);
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            project_entry(&json, &folder).unwrap()["disabledMcpServers"],
+            serde_json::json!(["added-meanwhile"])
+        );
         fs::remove_file(&target).ok();
         fs::remove_dir_all(&folder).ok();
     }

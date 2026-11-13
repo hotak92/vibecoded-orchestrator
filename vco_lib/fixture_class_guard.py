@@ -87,8 +87,10 @@ __all__ = [
     "fixture_stem_of",
     "fixture_writes_allowed",
     "guard_fixture_class_write",
+    "guard_class_create",
     "guarded_collection_create",
     "is_fixture_shaped_class",
+    "record_collection_delete",
     "refusal_text",
     "unregistered_folder_warning_text",
 ]
@@ -131,7 +133,9 @@ UNROUTABLE_SENTINEL_URL = "http://127.0.0.1:9"
 #: which silently refuses writes. Every entry must be grounded in ``tests/``.
 FIXTURE_PROJECT_NAMES: frozenset[str] = frozenset({
     "Acme",
+    "AcmeCode",
     "AcmeCorp",
+    "AcmeRenamed",
     "Alpha",
     "Bar",
     "Baz",
@@ -145,8 +149,10 @@ FIXTURE_PROJECT_NAMES: frozenset[str] = frozenset({
     "GhostName",
     "P1",
     "Phantom",
+    "Proj106",
     "ProjA",
     "Quux",
+    "VibeCodedOrchestrator2",  # v0.2.106 raft-guard test: a second install-root class
 })
 
 #: Class-name families VCO mints per project. A fixture-shaped class is a
@@ -211,6 +217,31 @@ def fixture_stem_of(class_name: object) -> Optional[str]:
 def is_fixture_shaped_class(class_name: object) -> bool:
     """True when *class_name* is ``<fixture stem>_<shipped family>``."""
     return fixture_stem_of(class_name) is not None
+
+
+def is_fixture_project_name(name: object) -> bool:
+    """True when a PROJECT name (not a class name) is a test-fixture name.
+
+    Accepts the bare stem (``"Foo"``), the class-name shape
+    (``"Foo_KnowledgeGraph"``) and the underscore-less display shape some
+    writers record (``"FooKnowledgeGraph"`` — the ``project_name`` column of
+    test rows that reached a real ``rl_events`` table). Case-insensitive, like
+    :func:`fixture_stem_of`. Used by the RL training export to keep test
+    residue out of shipped weights.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False
+    candidate = name.strip()
+    if candidate.casefold() in _FIXTURE_FOLDED:
+        return True
+    folded = candidate.casefold()
+    for suffix in COLLECTION_FAMILY_SUFFIXES:
+        for tail in ("_" + suffix, suffix):
+            t = tail.casefold()
+            if len(folded) > len(t) and folded.endswith(t):
+                if folded[: -len(t)] in _FIXTURE_FOLDED:
+                    return True
+    return False
 
 
 def fixture_writes_allowed() -> bool:
@@ -329,8 +360,36 @@ def guarded_collection_create(client, name: str, **create_kwargs):
     box (``Wt_foo_Code*``, ``LaneCProbe*_Code*``) and which sits under a
     downward-only line ratchet, so an inline guard there was not available.
     """
-    guard_fixture_class_write(name, operation="create")
+    # The guard reads the deletes recorded for the URL THIS client is
+    # connected to (record_collection_delete keys them the same way).
+    from vco_lib.weaviate_case_history import client_url  # noqa: PLC0415
+
+    guard_class_create(name, weaviate_url=client_url(client))
     return client.collections.create(name=name, **create_kwargs)
+
+
+def guard_class_create(name: str, *, weaviate_url: str) -> None:
+    """Every create-time refusal, in one call (v0.2.106): the fixture-class
+    rule (:func:`guard_fixture_class_write`) and the case-variant rule —
+    no create while a delete of a name differing only in case is still
+    replayable by Weaviate (:func:`vco_lib.weaviate_case_history.guard_create`,
+    raising its ``CaseVariantCreateRefused``)."""
+    from vco_lib.weaviate_case_history import guard_create  # noqa: PLC0415
+
+    guard_fixture_class_write(name, operation="create", weaviate_url=weaviate_url)
+    guard_create(name, weaviate_url)
+
+
+def record_collection_delete(client, name: str) -> None:
+    """``client.collections.delete(name)`` recorded for the case-variant create
+    guard (v0.2.106) — the delete-side twin of :func:`guarded_collection_create`,
+    for the same bare-v4 callers."""
+    from vco_lib.weaviate_case_history import (  # noqa: PLC0415
+        client_url,
+        delete_collection,
+    )
+
+    delete_collection(client, name, client_url(client))
 
 
 def guard_fixture_class_write(

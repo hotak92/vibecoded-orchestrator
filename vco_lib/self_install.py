@@ -427,6 +427,19 @@ def root_settings_created_this_run(install_root: Path) -> bool:
     return _ROOT_SETTINGS_ACTION.get(key) == "created"
 
 
+def root_settings_vco_created(install_root: Path) -> bool:
+    """True iff ``<install_root>/.claude/settings.json`` is VCO's own file:
+    this process's bundle run created it (:func:`root_settings_created_this_run`),
+    OR an earlier run's bundle created it and it is still exactly what VCO
+    wrote, ``env`` aside (v0.2.106 — the manifest record of
+    :mod:`vco_lib.settings_provenance`; a rerun after a first install that
+    stopped between step 5b and step 9). A user edit since then → False."""
+    if root_settings_created_this_run(install_root):
+        return True
+    from vco_lib.settings_provenance import created_by_vco_and_unchanged
+    return created_by_vco_and_unchanged(Path(install_root))
+
+
 def adopt_bundle_created_settings(existing: dict, defaults: dict,
                                   sentinel: str) -> dict:
     """Merge install's step-9 ``defaults`` into a settings.json the bundle
@@ -466,8 +479,8 @@ def replace_all_settings(install_root: Path, defaults: dict, sentinel: str) -> d
 
     What replace-all resets is every user edit: nothing of the existing file is
     read. What it no longer does (v0.2.104) is drop the template's own keys —
-    ``hooks``, ``skillOverrides``, ``idleCompaction``, the permission denies —
-    until the next bundle update.
+    ``hooks``, ``skillOverrides``, ``idleCompaction``, the ``env`` block, the
+    permission denies — until the next bundle update.
 
     Raises ``OSError`` / ``ValueError`` when the shipped template cannot be read
     or parsed (a broken install; the caller leaves the file alone and says so).
@@ -528,7 +541,9 @@ def configure_root_settings(
       upstream in install.py ``main()`` before this function is reached.
 
     * No sentinel but step 5b's bundle created the file THIS run (v0.2.103
-      F4) → VCO's own: defaults filled in, sentinel stamped, no deferral.
+      F4), or an earlier run's bundle created it and it is unchanged since
+      (v0.2.106, :func:`root_settings_vco_created`) → VCO's own: defaults
+      filled in, sentinel stamped, no deferral.
 
     ``deferral_report`` is optional (deferrals skipped when not threaded).
     V47-B (Gap B): a symlinked ``.claude/`` or ``settings.json`` is never
@@ -537,7 +552,6 @@ def configure_root_settings(
     """
     import os
 
-    from vco_lib.deferral_report import DeferralEntry
     from vco_lib.symlink_handler import (
         check_vco_new_collision,
         compute_vco_new_path,
@@ -605,7 +619,6 @@ def configure_root_settings(
         settings_file = vco_new_file
 
     defaults = build_defaults()
-    rendered_defaults = json.dumps(defaults, indent=2) + "\n"
 
     # Cases 1 and 2 write the WHOLE file: both write what a fresh install
     # lands (v0.2.104) — the shipped template + these defaults, or the
@@ -646,25 +659,11 @@ def configure_root_settings(
         )
         if deferral_report is not None:
             deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="claude_settings_unparseable",
-                    title="`.claude/settings.json` unparseable; preserved on disk",
-                    detected=(
-                        f"`.claude/settings.json` exists but failed to parse as "
-                        f"JSON ({type(exc).__name__}: {exc}). VCO did not modify "
-                        "the file."
-                    ),
-                    why_deferred=(
-                        "Auto-replacing an unparseable settings file would "
-                        "discard user customizations that may still be "
-                        "recoverable. Inspect manually and either repair the "
-                        "JSON or accept VCO defaults via the command below."
-                    ),
-                    command_to_apply=(
-                        "python install.py --adopt-project-replace-all"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
+                unparseable_settings_entry(
+                    "`.claude/settings.json` unparseable; preserved on disk",
+                    f"`.claude/settings.json` exists but failed to parse as "
+                    f"JSON ({type(exc).__name__}: {exc}). VCO did not modify "
+                    "the file.",
                 )
             )
         return
@@ -677,26 +676,12 @@ def configure_root_settings(
         )
         if deferral_report is not None:
             deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id="claude_settings_unparseable",
-                    title=(
-                        "`.claude/settings.json` is not a JSON object; "
-                        "preserved on disk"
-                    ),
-                    detected=(
-                        "`.claude/settings.json` parsed to a "
-                        f"{type(existing).__name__} (expected a JSON object). "
-                        "VCO did not modify the file."
-                    ),
-                    why_deferred=(
-                        "VCO's settings template is a JSON object; cannot "
-                        "merge with a non-object structure."
-                    ),
-                    command_to_apply=(
-                        "python install.py --adopt-project-replace-all"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
+                unparseable_settings_entry(
+                    "`.claude/settings.json` is not a JSON object; "
+                    "preserved on disk",
+                    "`.claude/settings.json` parsed to a "
+                    f"{type(existing).__name__} (expected a JSON object). "
+                    "VCO did not modify the file.",
                 )
             )
         return
@@ -715,52 +700,151 @@ def configure_root_settings(
     # defaults and stamp the sentinel (vco_lib.self_install). Not a tautology: a symlinked
     # .claude/ or settings.json diverted settings_file to a .vco-new sibling above.
     if settings_file == install_root / ".claude" / "settings.json" and \
-            root_settings_created_this_run(install_root):
+            root_settings_vco_created(install_root):
         adopted = adopt_bundle_created_settings(
             existing, defaults, sentinel)
         settings_file.write_text(json.dumps(adopted, indent=2) + "\n", encoding="utf-8")
         print("  Claude settings: VCO defaults added to the file install-bundle created")
         return
 
-    # Case 5: no _vco_managed_keys, not created this run — legacy / external:
+    # Case 5: no _vco_managed_keys, not VCO's own file — legacy / external:
     # VCO defaults land as a `.vco-new` sibling + a deferral.
     vco_new_path = settings_file.with_suffix(settings_file.suffix + ".vco-new")
-    vco_new_path.write_text(rendered_defaults, encoding="utf-8")
+    vco_new, env_resolved = vco_new_settings(install_root, defaults)
+    vco_new_path.write_text(json.dumps(vco_new, indent=2) + "\n", encoding="utf-8")
     print(
         "  Claude settings: legacy file detected (no `_vco_managed_keys`); "
         f"VCO defaults written to {vco_new_path.name}, original preserved"
     )
     if deferral_report is not None:
         deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="claude_settings_user_modified_preserved",
-                title=(
-                    "`.claude/settings.json` preserved (no VCO-managed-block "
-                    "marker)"
-                ),
-                detected=(
-                    "`.claude/settings.json` exists but lacks the top-level "
-                    f"`{sentinel}` array that marks the file "
-                    "as VCO-managed. VCO treats this as user-owned and did "
-                    f"not modify it. VCO defaults landed at "
-                    f"`.claude/settings.json.vco-new`."
-                ),
-                why_deferred=(
-                    "Without the managed-keys sentinel VCO cannot tell which "
-                    "top-level keys are safe to refresh and which are user "
-                    "extensions. Manual merge keeps you in control. To accept "
-                    "VCO defaults outright run the command below; to merge "
-                    "selectively, copy the keys you want from "
-                    "`.claude/settings.json.vco-new` into your existing file, "
-                    f"then add a top-level "
-                    f'`"{sentinel}": '
-                    f"{list(managed_keys)!r}` so future updates "
-                    "refresh those keys automatically."
-                ),
-                command_to_apply=(
-                    "python install.py --adopt-project-replace-all"
-                ),
-                severity="warning",
-                kg_node_refs=[],
-            )
-        )
+            user_owned_settings_entry(sentinel, list(managed_keys), env_resolved=env_resolved))
+
+
+def vco_new_settings(install_root: Path, defaults: dict) -> tuple[dict, bool]:
+    """The content of ``settings.json.vco-new`` and whether its ``env`` names
+    are THIS install's (v0.2.106).
+
+    install.py's defaults carry factory identity names (``KnowledgeGraph``,
+    ``Development``, ...), which the env projection replaces on a registered
+    root. When the root's canonical env resolves from launcher.db (the
+    projection's own resolver, ``project_env_from_db``), its values replace
+    the defaults' for every key both carry, so the sibling never suggests a
+    wrong collection name. Unresolvable (no launcher DB yet, root not
+    registered, any error) → the defaults unchanged and ``False``; the
+    deferral entry then says the env block is NOT to be copied."""
+    env = defaults.get("env")
+    if not isinstance(env, dict):
+        return dict(defaults), False
+    try:
+        from vco_lib.config_projection import project_env_from_db
+        from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+
+        project_id = resolve_project_id_for_folder(Path(install_root))
+        if project_id is None:
+            return dict(defaults), False
+        canonical = project_env_from_db(
+            project_id, orchestrator_root=Path(install_root))["canonical_env"]
+    except Exception:  # noqa: BLE001 — a suggestion file must never fail step 9
+        return dict(defaults), False
+    resolved = {k: (canonical[k] if k in canonical else v) for k, v in env.items()}
+    out = dict(defaults)
+    out["env"] = resolved
+    return out, True
+
+
+def unparseable_settings_entry(title: str, detected: str) -> Any:
+    """The ``claude_settings_unparseable`` entry (v0.2.106: repair first;
+    replace-all last, saying what it destroys — a printed command is shipped
+    code, and the bare replace-all it used to print reset every edit)."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    return DeferralEntry(
+        condition_id="claude_settings_unparseable",
+        title=title,
+        detected=detected,
+        why_deferred=(
+            "Replacing the file automatically would discard settings that are "
+            "probably still recoverable, so VCO left it alone. Pick ONE: "
+            "(1) repair it by hand — the error above names the problem (often "
+            "a trailing comma or a comment, which JSON does not allow); check "
+            "it with `python -m json.tool .claude/settings.json`, then re-run "
+            "the installer (`python install.py`, what the first-install script "
+            "runs); "
+            "(2) last resort, `python install.py --adopt-project-replace-all`: "
+            "it REWRITES the whole file from the shipped template plus VCO "
+            "defaults — everything in the current file is lost, and its `env` "
+            "holds install defaults until the next env projection rewrites it. "
+            "The flag also lets the installer overwrite other pre-existing "
+            "files it would otherwise preserve (it may recreate `.venv`). Keep "
+            "a copy of the broken file first if it holds anything you need."
+        ),
+        command_to_apply=(
+            "# (1) safe: repair .claude/settings.json by hand, check it with\n"
+            "#   python -m json.tool .claude/settings.json\n"
+            "# then re-run the installer (what the first-install script runs):\n"
+            "python install.py\n"
+            "# (2) last resort, REPLACES the whole file (see above):\n"
+            "#   python install.py --adopt-project-replace-all"
+        ),
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
+def user_owned_settings_entry(sentinel: str, managed_keys: list,
+                              *, env_resolved: bool) -> Any:
+    """The ``claude_settings_user_modified_preserved`` entry (v0.2.106: the
+    safe manual remedies first; replace-all last, with what it destroys)."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    sentinel_line = f'"{sentinel}": {json.dumps(managed_keys)}'
+    env_note = (
+        "Do not copy its `env` block: the env projection writes `env` itself."
+        if env_resolved else
+        "Do not copy its `env` block: it carries install defaults (e.g. "
+        "`KG_COLLECTION=KnowledgeGraph`), not this install's names — the env "
+        "projection writes the right `env` itself.")
+    return DeferralEntry(
+        condition_id="claude_settings_user_modified_preserved",
+        title="`.claude/settings.json` preserved (no VCO-managed-block marker)",
+        detected=(
+            "`.claude/settings.json` exists but lacks the top-level "
+            f"`{sentinel}` array that marks the file as VCO-managed, and VCO "
+            "has no record of having created it unchanged. VCO treated it as "
+            "user-owned and did not modify it; VCO's suggested content is at "
+            f"`.claude/settings.json.vco-new`. {env_note}"
+        ),
+        why_deferred=(
+            "Without the managed-keys marker VCO cannot tell which top-level "
+            "keys are safe to refresh and which are your own, so it asks "
+            "instead of guessing. Pick ONE: "
+            "(1) if you never edited this file (e.g. an earlier install run "
+            "created it and stopped early), it is VCO's own — add the "
+            f"top-level line `{sentinel_line}` to `.claude/settings.json` and "
+            "re-run the installer (`python install.py`, what the first-install "
+            "script runs; an `--update` run leaves this file alone): VCO then "
+            "refreshes only those keys and keeps everything else; "
+            "(2) if you edited it, copy the keys you want (e.g. "
+            "`permissions.allow` entries) from `.claude/settings.json.vco-new`, "
+            "then add the same line; "
+            "(3) last resort, `python install.py --adopt-project-replace-all`: "
+            "it REWRITES the whole file from the shipped template plus VCO "
+            "defaults — every edit you made there (hooks, permissions, extra "
+            "keys) is lost, and its `env` holds install defaults until the "
+            "next env projection rewrites it. The flag also lets the installer "
+            "overwrite other pre-existing files it would otherwise preserve "
+            "(it may recreate `.venv`). Delete "
+            "`.claude/settings.json.vco-new` once you are done."
+        ),
+        command_to_apply=(
+            "# (1)/(2) safe: edit .claude/settings.json by hand — add the line\n"
+            f"#   {sentinel_line}\n"
+            "# then re-run the installer (what the first-install script runs):\n"
+            "python install.py\n"
+            "# (3) last resort, RESETS every edit in the file (see above):\n"
+            "#   python install.py --adopt-project-replace-all"
+        ),
+        severity="warning",
+        kg_node_refs=[],
+    )

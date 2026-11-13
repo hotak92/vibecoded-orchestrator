@@ -86,11 +86,12 @@ fp = (d.get("tool_input") or {}).get("file_path", "") if isinstance(d, dict) els
 if not fp:
     sys.exit(0)
 if not fp.endswith(".py"):
-    # v0.2.80: the settings matcher is bare `Write` (the old `if:
-    # "Write(*.py)"` never matched — hook-if regression fix), so the
-    # .py gate lives HERE. Without it every non-Python Write produced a
-    # false "SyntaxError" and compiling a Python-parsable non-.py file
-    # dropped __pycache__ next to user files (final-review B1).
+    # The settings matcher is `Edit|Write` (v0.2.106; it was a bare `Write`,
+    # so Python changes made with `Edit` were never compiled), so the .py
+    # gate lives HERE. Without it every non-Python write produced a false
+    # "SyntaxError" and compiling a Python-parsable non-.py file dropped
+    # __pycache__ next to user files (final-review B1; hook-if regression
+    # fix in v0.2.80: `if: "Write(*.py)"` never matched).
     sys.exit(0)
 try:
     py_compile.compile(fp, doraise=True)

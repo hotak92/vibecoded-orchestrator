@@ -121,14 +121,24 @@ class EffortTableIntegrityTests(unittest.TestCase):
                     set(policy.collapses) <= policy.accepted,
                     f"{key}: a collapsed value is not in accepted",
                 )
+                # Thinking-off is sent on at an effort the route accepts.
+                if policy.thinking_off_effort is not None:
+                    self.assertIn(policy.thinking_off_effort, policy.accepted, key)
                 self.assertTrue(policy.doc_url.startswith("http"), key)
 
-    def test_the_one_measured_rejection_is_qwen_glm_5_3(self) -> None:
-        """gap 1: the only route with a live 400 is the only one that rewrites."""
+    def test_the_measured_rejections_are_the_only_rewrites(self) -> None:
+        """gap 1: only routes with a live 400 rewrite. qwen glm-5.3 rejects
+        medium/xhigh; kimi k3.1-pro (v0.2.106, live 2026-11-10) rejects only
+        thinking OFF, so it translates nothing Claude Code sends as an
+        effort — just the vendor's own off spellings."""
         rewriting = {
-            key for key, p in E.EFFORT_POLICIES.items() if p.translate
+            key for key, p in E.EFFORT_POLICIES.items()
+            if p.translate or p.thinking_off_effort is not None
         }
-        self.assertEqual(rewriting, {("qwen", "glm-5.3")})
+        self.assertEqual(rewriting, {("qwen", "glm-5.3"), ("kimi", "k3.1-pro")})
+        kimi = E.EFFORT_POLICIES[("kimi", "k3.1-pro")]
+        self.assertFalse(set(kimi.translate) & set(E.EFFORT_VALUES))
+        self.assertEqual(kimi.thinking_off_effort, "low")
         self.assertEqual(
             E.EFFORT_POLICIES[("qwen", "glm-5.3")].translate,
             {"medium": "high", "xhigh": "max"},

@@ -589,9 +589,12 @@ class PrintedRemedyTests(unittest.TestCase):
 
     def test_the_emitter_carries_from_resolver(self):
         content = self._emit()
-        self.assertIn("--from-resolver --force-recreate", content)
+        # v0.2.106: the remedy re-walks (``--force-rewalk``) instead of
+        # dropping the five Code* classes first; the identity flag stays.
+        self.assertIn("--from-resolver --force-rewalk", content)
+        self.assertNotIn("--force-recreate", content)
         self.assertNotIn(
-            "code-graph-analyze . --force-recreate", content,
+            "code-graph-analyze . --force-", content,
             "the basename-resolving shape must never come back",
         )
 

@@ -295,21 +295,35 @@ class TestBudgetResolution:
         preset_max = chunking_preset_for_model(_QWEN3)[1]
         assert preset_max <= num_ctx  # D16 clamp: the gap is closed
 
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            CHARS_PER_TOKEN_TEXT,
+            dense_char_budget,
+        )
+
         budget, _target, conservative = _resolve_budget([_QWEN3])
         assert conservative is False
         assert budget < num_ctx  # strictly under the real window...
-        assert budget == int(num_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
+        # v0.2.106: ...and clamped to the DENSE budget in the same 4-char unit,
+        # which binds for every shipped model (the window budget alone,
+        # 9 216 units = 36 864 chars, is about twice what qwen3's window holds
+        # of dense text).
+        assert budget == min(
+            int(num_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO)),
+            dense_char_budget(_QWEN3) // CHARS_PER_TOKEN_TEXT,
+        ) == 4_890
 
-        # The live discriminator: arctic's preset max (medium tier, 3 200)
-        # differs from its window budget int(4 096 * 0.9) = 3 686. A
-        # _resolve_budget that sized on the preset max would return 3 200.
+        # The discriminator still holds: the budget is the window/dense bound,
+        # not the chunking preset's max, wherever the two differ.
         _arctic = "snowflake-arctic-embed2:latest"
         arctic_ctx = MODEL_TOKEN_LIMITS[_arctic]
+        arctic_budget, _t, _c = _resolve_budget([_arctic])
+        assert arctic_budget == min(
+            int(arctic_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO)),
+            dense_char_budget(_arctic) // CHARS_PER_TOKEN_TEXT,
+        )
         assert chunking_preset_for_model(_arctic)[1] != int(
             arctic_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO)
         )
-        arctic_budget, _t, _c = _resolve_budget([_arctic])
-        assert arctic_budget == int(arctic_ctx * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
 
     def test_conservative_fallback_also_applies_the_safety_margin(self):
         # The unknown-model branch used to return the preset max verbatim —
@@ -687,9 +701,22 @@ class TestSSotParityAcrossConsumers:
         # budget and never exceeds the window itself, and the chunk max
         # never exceeds either bound (the policy can only TIGHTEN).
         window_budget = int(MODEL_TOKEN_LIMITS[_QWEN3] * (1 - _BUDGET_SAFETY_MARGIN_RATIO))
-        assert budget_tokens == window_budget == 9_216
+        assert window_budget == 9_216
+        # v0.2.106: the chunk max AND the enrichment budget are both clamped
+        # to the model's dense-content budget (19 560 chars → 4 890 units),
+        # which binds for qwen3 — one source for both.
+        from claude_mcp_servers.weaviate_mcp.chunking import (
+            CHARS_PER_TOKEN_TEXT,
+            dense_char_budget,
+        )
+        assert budget_tokens == min(
+            window_budget, dense_char_budget(_QWEN3) // CHARS_PER_TOKEN_TEXT
+        ) == 4_890
         assert budget_tokens <= MODEL_TOKEN_LIMITS[_QWEN3] == 10_240
-        assert chunk_max == min(window_budget, CHUNK_TOKEN_POLICY_CEILING) == 8_192
+        assert chunk_max == min(
+            window_budget, CHUNK_TOKEN_POLICY_CEILING,
+            dense_char_budget(_QWEN3) // CHARS_PER_TOKEN_TEXT,
+        ) == 4_890
         assert chunk_max <= budget_tokens
 
 

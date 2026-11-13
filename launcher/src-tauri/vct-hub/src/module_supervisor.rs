@@ -217,6 +217,52 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     let podman = detect_container_runtime().await?;
 
+    // v0.2.106: a container_build module's image is local-only — rebuild it
+    // through the shared ensure step when it is missing or was never built
+    // for this start's GPU variant (same build the installer runs, one
+    // implementation in `vct-launcher-core::services::container_build`;
+    // the global start applies the identical guard).
+    if manifest.install.method == InstallMethod::ContainerBuild {
+        match vct_launcher_core::services::container_build::ensure_bundled_image(
+            manifest, gpu_mode, &podman,
+        )
+        .await
+        {
+            Ok((_, vct_launcher_core::services::container_build::EnsureImageOutcome::Rebuilt)) => {
+                tracing::info!(
+                    project_id = %project.id,
+                    module_id = %manifest.id,
+                    image = %image,
+                    "[module_supervisor] bundled image was missing; rebuilt from the checkout \
+                     before start"
+                );
+                let _ = db.audit(
+                    "module_image_rebuilt",
+                    Some(&project.id),
+                    Some(&manifest.id),
+                    &serde_json::json!({
+                        "image": image,
+                        "scope": "per_project",
+                        "reason": "missing or variant-mismatched at start",
+                    }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    project_id = %project.id,
+                    module_id = %manifest.id,
+                    error = %e,
+                    "[module_supervisor] bundled image rebuild for start failed"
+                );
+                return Err(format!(
+                    "module {}: the bundled image {} is missing and could not be rebuilt: {}",
+                    manifest.id, image, e
+                ));
+            }
+        }
+    }
+
     // v0.2.97 (lane V): the run argv with the module's listed settings
     // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
     // in this spawn's env, below). Built before the pre-pull and the name clear
@@ -676,7 +722,7 @@ pub async fn resume_containers_on_startup_with_starter(
 
         // Runtime-type gate (NEW-3 widening, v0.2.38).
         let is_container_distributed =
-            manifest.install.method == InstallMethod::ContainerPull
+            manifest.install.method.runs_container_image()
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service");
         if !is_container_distributed {
             continue;
@@ -1218,6 +1264,53 @@ pub async fn start_global_container_supervisor(
     let spawn_env = resolve_global_spawn_env(manifest, db)?;
 
     let podman = detect_container_runtime().await?;
+
+    // v0.2.106: a container_build module's image exists ONLY locally. If it
+    // was pruned, or this start resolves a variant that was never built
+    // (the hardware snapshot moved between GPU modes), `podman run` below
+    // would fail with nothing actionable. Rebuild it here through the SAME
+    // build the installer runs (`vct-launcher-core::services::
+    // container_build::ensure_bundled_image` — one implementation). The
+    // rebuild is logged and audited; a failure fails the start loudly (the
+    // module tile's last_error / the HTTP error envelope show it).
+    if manifest.install.method == InstallMethod::ContainerBuild {
+        match vct_launcher_core::services::container_build::ensure_bundled_image(
+            manifest, gpu_mode, &podman,
+        )
+        .await
+        {
+            Ok((_ref, vct_launcher_core::services::container_build::EnsureImageOutcome::Rebuilt)) => {
+                tracing::info!(
+                    module_id,
+                    image = %image,
+                    "[module_supervisor] bundled image was missing; rebuilt from the checkout \
+                     before start"
+                );
+                let _ = db.audit(
+                    "module_image_rebuilt",
+                    None,
+                    Some(module_id),
+                    &serde_json::json!({
+                        "image": image,
+                        "scope": "global",
+                        "reason": "missing or variant-mismatched at start",
+                    }),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    module_id,
+                    error = %e,
+                    "[module_supervisor] bundled image rebuild for start failed"
+                );
+                return Err(format!(
+                    "module {}: the bundled image {} is missing and could not be rebuilt: {}",
+                    module_id, image, e
+                ));
+            }
+        }
+    }
 
     // v0.2.61 (Option H C1): run the (optionally authed) image pre-pull
     // OUTSIDE the spawn lock. On a cold GB-scale image the pull can take
@@ -1779,6 +1872,8 @@ mod tests {
                     pull_token_method: "POST".into(),
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
+                    build_context: None,
+                    dockerfile: None,
                 }),
                 scope: vct_launcher_core::manifest::InstallScope::PerProject,
             },
@@ -1813,6 +1908,7 @@ mod tests {
                 min_gpu_vram_gb: None,
                 gpu_optional: true,
                 gpu_image_variants: None,
+                image_user: None,
                 log_path_template: None,
                 container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
                 image_ref: Some("{install.container.image}:{install.container.tag}".into()),

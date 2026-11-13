@@ -64,6 +64,11 @@ pub mod service_endpoints;
 // (the hub used to hand-mirror the launcher's structs), built from the rows.
 pub mod service_status;
 
+// v0.2.106 (owner ruling 2026-11-11): how long Ollama keeps a model loaded —
+// the shared table, Preferences key and duration parser behind the hub's
+// unloader (`vct_hub::ollama_lifetime`) and the launcher's Preferences field.
+pub mod ollama_lifetime;
+
 // v0.2.97 (R7a F7): the ONE service-probe HTTP client rule — no redirect is
 // followed, only a 2xx is "answers" (mirror of vco_lib/service_probe_http.py).
 pub mod probe_http;
@@ -89,6 +94,15 @@ pub mod compose_args;
 // container plumbing (run args, image refs, pulls, the reaper) and the
 // ownership guard.
 pub mod container_runtime;
+// v0.2.106 (review W5 M2): the host-user mapping for module containers —
+// podman-version-aware (`keep-id:uid=` needs podman >= 4.3).
+pub mod host_user_mapping;
+// v0.2.106: the ONE local image build for `container_build` modules (the
+// RL reranker) + the start-path "image missing → rebuild" guard, shared by
+// the installer (`commands::bundled_modules::build_and_materialize`) and
+// both module-start paths (launcher `module_service`, hub
+// `module_supervisor`).
+pub mod container_build;
 // v0.2.100 (WP-06, AD-5/AD-12): container ownership from real labels — the ONE
 // Rust home of the compose/launcher label keys, the watchdog's and the
 // reaper's ownership verdicts, and the guarded compose verb's Rust caller.

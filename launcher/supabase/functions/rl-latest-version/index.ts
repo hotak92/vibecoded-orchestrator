@@ -3,6 +3,11 @@
 // embedding source (default: qwen3), and if so, issue a short-lived
 // signed Storage URL to the .pt file.
 //
+// v0.2.106 (owner 2026-11-12): kept deployed as paid-module infrastructure
+// for future paid modules. The RL reranker is bundled and free now and the
+// launcher never calls this function for it; only the RL module's paid
+// catalog listing was retired.
+//
 // Called by the launcher's Stream B Rust poller. The poller already
 // knows what weights version it currently has on disk; it POSTs that
 // version plus the license key, and this function answers:

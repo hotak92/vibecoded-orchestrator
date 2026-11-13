@@ -1762,9 +1762,12 @@ def self_wake_subagent_reason(tool: str) -> str:
         f"BLOCKED by the VCO wait-loop guard: the self-wake tool `{tool}` was "
         f"called from inside a subagent (the hook input carries agent_id)."
         + _WHY +
-        " WHAT TO DO INSTEAD: subagents never self-schedule — start the work"
-        " with run_in_background: true and END YOUR TURN; the completion"
-        " notification wakes you (or the parent) when it is done." + _KNOB
+        " WHAT TO DO INSTEAD: subagents never self-schedule — run the long"
+        " command in the foreground: the harness moves one still running"
+        " after about 3 minutes to the background and its completion"
+        " notification wakes you, so END YOUR TURN once it is moved. A"
+        " command you start with run_in_background yourself may notify the"
+        " parent session instead of you." + _KNOB
     )
 
 

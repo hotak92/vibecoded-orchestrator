@@ -23,9 +23,10 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import AdoptProjectModal from '$lib/components/AdoptProjectModal.svelte';
-  import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
-  import { quickUnregister } from '$lib/unregister-escape';
-  import { toast } from '$lib/stores/toast';
+  // v0.2.106: the delete row action opens the ONE shared Remove flow —
+  // no second confirm dialog or invoke copy lives here.
+  import ProjectRemoveFlow from '$lib/components/ProjectRemoveFlow.svelte';
+  import type { RemoveTarget } from '$lib/components/ProjectRemoveFlow.svelte';
   // v0.2.91 (#32): Name↔Path coupling extracted to pure, unit-tested
   // logic (project-selector-path-logic.test.ts). The browse handler's
   // `pathTouched = true` guard was ALREADY present at base (#32's "browse
@@ -309,10 +310,10 @@
   let renamingId = $state<string | null>(null);
   let renameValue = $state('');
 
-  // Delete confirm modal state
-  let deletingProject = $state<ProjectView | null>(null);
-  let deleteConfirmText = $state('');
-  let deleting = $state(false);
+  // Delete confirm state (v0.2.106): the row's delete action only opens the
+  // shared Remove flow (ProjectRemoveFlow), which owns the confirm dialog,
+  // the unregister STOP and the invoke.
+  let removingProject = $state<RemoveTarget | null>(null);
 
   const pState = $derived($projects);
   const current = $derived($selectedProject);
@@ -557,54 +558,7 @@
   }
 
   function startDelete(p: ProjectView) {
-    deletingProject = p;
-    deleteConfirmText = '';
-  }
-
-  async function confirmDelete() {
-    if (!deletingProject) return;
-    if (deleteConfirmText !== deletingProject.name) return;
-    deleting = true;
-    try {
-      // The settings page's default unregister, sent explicitly (review R6
-      // F46): launcher files purged, collections kept — so the stop can fire
-      // here too and its escape re-runs with the same options. The settings
-      // tab's Danger zone exposes the other choices.
-      const target = deletingProject;
-      const outcome = await quickUnregister(
-        (options) => projects.delete(target.id, options),
-        askLeaveAnyway,
-      );
-      if (outcome.kind === 'kept') {
-        toast.info('Unregister stopped — the project is still registered.');
-        return;
-      }
-      for (const w of outcome.report.warnings) toast.error(w);
-      deletingProject = null;
-      deleteConfirmText = '';
-    } catch (e) {
-      // Pre-v0.2.97 this only reached the console — a failed unregister
-      // (including the stop) showed the user nothing.
-      console.error('delete failed', e);
-      toast.error(e);
-    } finally {
-      deleting = false;
-    }
-  }
-
-  // Owner ruling (review R5 F39): the unregister STOP opens a dialog whose
-  // second action is "Unregister anyway — leave these values".
-  let stopMessage = $state('');
-  let stopOpen = $state(false);
-  let resolveStop: ((leaveAnyway: boolean) => void) | null = null;
-  function askLeaveAnyway(message: string): Promise<boolean> {
-    stopMessage = message;
-    stopOpen = true;
-    return new Promise((resolve) => (resolveStop = resolve));
-  }
-  function onStopDecided(leaveAnyway: boolean) {
-    resolveStop?.(leaveAnyway);
-    resolveStop = null;
+    removingProject = p;
   }
 </script>
 
@@ -700,7 +654,12 @@
                         <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/>
                       </svg>
                     </button>
-                    <button class="row-action row-action-danger" title="Delete" onclick={() => startDelete(p)}>
+                    <button
+                      class="row-action row-action-danger"
+                      title="Remove from VCO (the folder and your files stay on disk)"
+                      aria-label="Remove {p.name} from VCO"
+                      onclick={() => startDelete(p)}
+                    >
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="3 6 5 6 21 6"/>
                         <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
@@ -934,64 +893,9 @@
   />
 {/if}
 
-<!-- Delete confirm modal -->
-{#if deletingProject}
-{@const proj = deletingProject}
-<DialogRoot
-  open={true}
-  onClose={() => (deletingProject = null)}
->
-  {#snippet header()}
-    <div class="modal-header-row">
-      <h2>Unregister project</h2>
-    </div>
-  {/snippet}
-  {#snippet body()}
-        <p class="modal-desc">
-          This removes the project from the launcher and uninstalls its modules.
-          It also removes what VCO put in the folder — <code>.claude/hooks/</code>,
-          <code>.claude/scripts/</code>, the infra compose files, and what VCO
-          wrote to your env files. Your own content (agents, skills,
-          <code>CONTEXT_STATE.md</code>, <code>CLAUDE.md</code>, source code, your
-          own <code>.env</code> lines) stays, and the project's Weaviate
-          collections are kept. The folder itself is <strong>not</strong> deleted.
-          For other choices, use the project's Settings → Danger zone.
-        </p>
-        <p class="modal-desc">
-          Type <strong class="mono">{proj.name}</strong> to confirm.
-        </p>
-        <input
-          type="text"
-          class="form-input mono"
-          bind:value={deleteConfirmText}
-          placeholder={proj.name}
-        />
-        <div class="form-actions">
-          <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => (deletingProject = null)} disabled={deleting}>
-            Cancel
-          </button>
-          <button
-            class="btn-3d btn-3d-accent btn-3d-sm"
-            onclick={confirmDelete}
-            disabled={deleting || deleteConfirmText !== proj.name}
-          >
-            {#if deleting}
-              <span class="spinner-sm"></span>
-            {:else}
-              Unregister
-            {/if}
-          </button>
-        </div>
-  {/snippet}
-</DialogRoot>
-{/if}
-
-<UnregisterStoppedDialog
-  bind:open={stopOpen}
-  message={stopMessage}
-  projectName={deletingProject?.name ?? ''}
-  onDecide={onStopDecided}
-/>
+<!-- v0.2.106: the shared Remove flow — confirm dialog, unregister STOP and
+     invoke all live in ProjectRemoveFlow, not here. -->
+<ProjectRemoveFlow bind:project={removingProject} />
 
 <style>
   .project-wrapper {
@@ -1297,13 +1201,6 @@
   .modal-close:hover {
     color: var(--color-text);
     background: rgba(255, 255, 255, 0.06);
-  }
-
-  .modal-desc {
-    font-size: 13px;
-    color: var(--color-mid);
-    margin-bottom: 14px;
-    line-height: 1.5;
   }
 
   .form-group {

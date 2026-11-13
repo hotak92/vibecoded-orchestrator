@@ -4,7 +4,7 @@
 
 ## Why this doc exists
 
-The Vibecoded Orchestrator is AGPL-3.0. Paid modules (`vct-rl-reranker`, and future modules) ship their source as **private** containers and the public AGPL repo carries only thin HTTP adapter clients. Mistakes in this boundary are catastrophic in three independent ways:
+The Vibecoded Orchestrator is AGPL-3.0. Paid modules (future modules; the RL reranker, `vct-rl-reranker`, was the first, and since v0.2.106 it ships in this repository as a free bundled module — its examples below are historical) ship their source as **private** containers and the public AGPL repo carries only thin HTTP adapter clients. Mistakes in this boundary are catastrophic in three independent ways:
 
 - **License**: private source landing in a public AGPL commit converts that source to AGPL by accidental publication. The author's commercial licensing of the paid module is then permanently compromised.
 - **Trust**: paying customers of the paid tier expect their cost to buy something that is not freely available. A leak invalidates that.

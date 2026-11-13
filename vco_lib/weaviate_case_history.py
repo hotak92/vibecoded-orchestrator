@@ -1,0 +1,361 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""Never create a class while a delete of its case-variant is still replayable
+(v0.2.106).
+
+Weaviate names a class's index and data folder by the LOWER-CASED class name,
+and from 1.37 a start that replays a ``DELETE_CLASS`` drops that folder unless
+a later ``ADD_CLASS`` of the EXACT same spelling follows
+(:mod:`vco_lib.weaviate_raft_guard`). So "delete ``ProjectX_Kg``, create
+``Projectx_Kg``" is safe only once a raft snapshot holds the delete; until
+then every restart wipes the new class. VCO produced exactly that history
+when it re-spelled the root collections (the project name "VibeCoded
+Orchestrator" and the clone folder ``vibecoded-orchestrator`` sanitize to two
+spellings).
+
+The rule, in two halves:
+
+* every VCO path that deletes a class records the name here
+  (:func:`record_deleted`, with the raft log index the delete reached when
+  Weaviate reports it);
+* every VCO path that creates a class asks :func:`guard_create` first. When a
+  recorded delete differs from the new name only in case and Weaviate may
+  replay it (a release with the orphan drop, and no snapshot covering the
+  delete yet), the guard waits for the next snapshot (the shipped compose
+  takes one within a minute of any schema change) and refuses —
+  :class:`CaseVariantCreateRefused`, loudly — if none arrives. A covered
+  delete is forgotten.
+
+The ledger is machine state (``<vct_root_dir>/state/weaviate_deleted_classes.json``),
+keyed by the Weaviate URL. A failed ledger write never fails the delete it
+records (the delete already happened); it is reported on stderr.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterator, Optional
+
+from vco_lib import weaviate_raft_guard as _rg
+
+__all__ = [
+    "CaseVariantCreateRefused",
+    "client_url",
+    "delete_index_bounds",
+    "ledger_path",
+    "record_deleted",
+    "delete_collection",
+    "deleted_entries",
+    "deleted_names",
+    "guard_create",
+    "is_lowercased_form",
+    "lowercase_residuals",
+]
+
+#: Seconds :func:`guard_create` waits for a snapshot to cover a recorded
+#: delete. The shipped compose checks every 30-60 s; 150 s covers two checks.
+DEFAULT_WAIT_S = 150.0
+
+
+class CaseVariantCreateRefused(RuntimeError):
+    """Creating *name* now would put a live class behind a replayable delete
+    of *deleted* (same lower-cased name)."""
+
+    def __init__(self, name: str, deleted: str, reason: str) -> None:
+        self.name, self.deleted = name, deleted
+        super().__init__(
+            f"refusing to create Weaviate class {name!r}: {reason}. Weaviate stores "
+            f"{name!r} and the deleted {deleted!r} in the same lower-cased index, and from "
+            "1.37 a restart that replays the delete drops the new class's data. Make the "
+            "running Weaviate take raft snapshots (RAFT_SNAPSHOT_THRESHOLD/"
+            "RAFT_SNAPSHOT_INTERVAL — the shipped compose sets them; `python install.py "
+            "--update` recreates a VCO-managed container with them), check `python -m "
+            "vco_lib.weaviate_raft_guard status` prints 'covered: yes', and run this again.")
+
+
+def ledger_path() -> Path:
+    from vco_lib.paths import vct_root_dir  # noqa: PLC0415
+
+    return vct_root_dir() / "state" / "weaviate_deleted_classes.json"
+
+
+#: Host spellings that all name this machine's loopback interface. They are
+#: folded to one so a ``WEAVIATE_URL`` switched between ``localhost`` and
+#: ``127.0.0.1`` keeps reading the deletes recorded under the other spelling
+#: (review A-L5).
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "ip6-localhost"})
+
+
+def _key(url: str) -> str:
+    """The ledger key for a Weaviate URL: ``scheme://host:port``, lower-cased,
+    the scheme's default port made explicit and every loopback spelling folded
+    to ``127.0.0.1``. A string that does not parse as a URL keeps the old
+    trimmed, lower-cased form."""
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    raw = (url or "").strip().rstrip("/")
+    try:
+        parts = urlsplit(raw if "://" in raw else f"http://{raw}")
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return raw.lower()
+    if not host:
+        return raw.lower()
+    scheme = (parts.scheme or "http").lower()
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
+        host = "127.0.0.1"
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
+def client_url(client: Any) -> str:
+    """The HTTP URL a weaviate-client v4 *client* is connected to — the key its
+    deletes are recorded under and its creates are guarded by (review A-M2:
+    keying by the process's DEFAULT URL let a client on any other URL record
+    a delete the guard never consulted). Falls back to the resolved
+    ``WEAVIATE_URL`` only when the client exposes no URL (a test double)."""
+    conn = getattr(client, "_connection", None)
+    for value in (getattr(conn, "url", None),
+                  getattr(getattr(conn, "_connection_params", None), "_http_url", None)):
+        if isinstance(value, str) and value.strip():
+            return value
+    from vco_lib import weaviate_helpers as _wh  # noqa: PLC0415
+
+    return _wh.weaviate_url_default()
+
+
+def _load() -> dict:
+    try:
+        data = json.loads(ledger_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"version": 1, "instances": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("instances"), dict):
+        return {"version": 1, "instances": {}}
+    # Fold buckets written under an older key form (or another loopback
+    # spelling) into the normalised key; the next save persists the fold.
+    folded: dict = {}
+    for key, bucket in data["instances"].items():
+        if isinstance(bucket, dict):
+            folded.setdefault(_key(key), {}).update(bucket)
+    data["instances"] = folded
+    return data
+
+
+#: How long a ledger read-modify-write waits for another one (review L4).
+LEDGER_LOCK_WAIT_S = 30.0
+
+
+@contextmanager
+def _ledger_locked() -> Iterator[None]:
+    """Hold the ledger's sidecar lock for one read-modify-write (review L4: a
+    code-graph rebuild recording deletes while a doctor scan stores a bound
+    must not save over each other — a lost delete record makes
+    :func:`guard_create` blind for that name). Raises
+    :class:`vco_lib.atomic.LockTimeout` after :data:`LEDGER_LOCK_WAIT_S`;
+    every caller already treats a raise as "could not record"."""
+    from vco_lib.atomic import exclusive_file_lock  # noqa: PLC0415
+
+    lock = ledger_path().with_name(ledger_path().name + ".lock")
+    with exclusive_file_lock(lock, timeout_s=LEDGER_LOCK_WAIT_S):
+        yield
+
+
+def _save(data: dict) -> None:
+    from vco_lib import probe_bound  # noqa: PLC0415
+    from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
+
+    if probe_bound.cancelled():
+        return  # a doctor probe past its bound writes nothing (review C-M3)
+    path = ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def record_deleted(name: str, weaviate_url: str, *,
+                   http: Optional[_rg.HttpFn] = None, status: Optional[int] = None) -> None:
+    """Remember that VCO deleted class *name* on *weaviate_url*. Call it right
+    AFTER the delete; *status* is the DELETE's HTTP status when the caller has
+    it (a 404 removed nothing and is not recorded). Never raises."""
+    if not name or status == 404:
+        return
+    try:
+        stats = _rg.read_raft_stats(weaviate_url, http=http)
+        with _ledger_locked():
+            data = _load()
+            bucket = data["instances"].setdefault(_key(weaviate_url), {})
+            bucket[name] = {
+                "deleted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "log_index": stats.last_log_index if stats is not None else None,
+            }
+            _save(data)
+    except Exception as exc:  # noqa: BLE001 — the delete already happened
+        print(f"  ! could not record the delete of Weaviate class {name!r} in "
+              f"{ledger_path()}: {exc}", file=sys.stderr)
+
+
+def delete_collection(client: Any, name: str, weaviate_url: str) -> None:
+    """``client.collections.delete(name)`` (weaviate-client v4), recorded — the
+    one home for a bare-client class delete."""
+    client.collections.delete(name)
+    record_deleted(name, weaviate_url)
+
+
+def deleted_entries(weaviate_url: str) -> dict[str, Optional[int]]:
+    """Every class name recorded as deleted on *weaviate_url* → the raft log
+    index its delete reached (``None`` when Weaviate did not report it)."""
+    bucket = _load()["instances"].get(_key(weaviate_url)) or {}
+    return {name: (rec.get("log_index") if isinstance(rec, dict)
+                   and isinstance(rec.get("log_index"), int) else None)
+            for name, rec in sorted(bucket.items())}
+
+
+def deleted_names(weaviate_url: str) -> list[str]:
+    """Every class name recorded as deleted on *weaviate_url*."""
+    return sorted(deleted_entries(weaviate_url))
+
+
+def delete_index_bounds(weaviate_url: str, names: list[str],
+                        last_log_index: int) -> dict[str, int]:
+    """An upper bound on the raft log index of each delete in *names* whose
+    real index VCO never recorded (review A-L1).
+
+    The first reading that sees such a name stores the current
+    *last_log_index* — the delete had already happened, so its index is at
+    most that — under ``bounds`` in the ledger; later readings return the
+    stored bound. A stored bound above the current log means the log started
+    over (a new data folder), so it is replaced. Never raises: on a ledger
+    failure the current index is returned (the conservative answer)."""
+    out = {n: int(last_log_index) for n in names}
+    try:
+        with _ledger_locked():
+            data = _load()
+            bounds = data.setdefault("bounds", {})
+            if not isinstance(bounds, dict):
+                bounds = data["bounds"] = {}
+            bucket = bounds.setdefault(_key(weaviate_url), {})
+            changed = False
+            for n in names:
+                stored = bucket.get(n)
+                if isinstance(stored, int) and stored <= last_log_index:
+                    out[n] = stored
+                else:
+                    bucket[n] = int(last_log_index)
+                    changed = True
+            if changed:
+                _save(data)
+    except Exception:  # noqa: BLE001 — the bound is best-effort evidence
+        pass
+    return out
+
+
+def _forget(weaviate_url: str, names: list[str]) -> None:
+    try:
+        with _ledger_locked():
+            data = _load()
+            bucket = data["instances"].get(_key(weaviate_url)) or {}
+            for n in names:
+                bucket.pop(n, None)
+            _save(data)
+    except Exception:  # noqa: BLE001 — a stale entry only costs a later re-check
+        pass
+
+
+def guard_create(
+    name: str,
+    weaviate_url: str,
+    *,
+    http: Optional[_rg.HttpFn] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
+    wait_s: Optional[float] = None,
+    poll_s: float = 3.0,
+) -> None:
+    """Raise :class:`CaseVariantCreateRefused` when creating *name* now could
+    be undone by a replay of a recorded case-variant delete (module doc).
+    A no-op for every name with no such record."""
+    bucket = _load()["instances"].get(_key(weaviate_url)) or {}
+    prior = [n for n in bucket if n != name and n.lower() == (name or "").lower()]
+    if not prior:
+        return
+    version = _rg.read_server_version(weaviate_url, http=http)
+    if version is not None and not _rg.has_orphan_drop(version):
+        # No orphan drop on this release; VCO's move to one takes a snapshot
+        # first (weaviate_raft_guard.upgrade_check), which covers the delete.
+        return
+    indexes = [bucket[n].get("log_index") for n in prior if isinstance(bucket.get(n), dict)]
+    need: Optional[int] = (max(i for i in indexes if isinstance(i, int))
+                           if any(isinstance(i, int) for i in indexes)
+                           and all(isinstance(i, int) for i in indexes) else None)
+    sleep_fn, clock = sleep or time.sleep, monotonic or time.monotonic
+    budget = DEFAULT_WAIT_S if wait_s is None else wait_s
+    start = clock()
+    last = None
+    while True:
+        stats = _rg.read_raft_stats(weaviate_url, http=http)
+        if stats is not None:
+            last = stats
+            if need is None:
+                # The delete's index was not recorded: only a snapshot taken
+                # after NOW is known to hold it.
+                need = stats.last_log_index
+            if stats.last_snapshot_index >= need:
+                _forget(weaviate_url, prior)
+                return
+        if clock() - start >= budget:
+            break
+        sleep_fn(poll_s)
+    reason = ("Weaviate's raft statistics could not be read" if last is None else
+              f"the delete of {prior[0]!r} is not inside a raft snapshot yet (snapshot index "
+              f"{last.last_snapshot_index} < {need}) after waiting {int(budget)} s")
+    raise CaseVariantCreateRefused(name, prior[0], reason)
+
+
+def is_lowercased_form(name: str, minted: str) -> bool:
+    """True when *name* is *minted* with one or more letters lower-cased —
+    the spelling an older VCO produced for a name it now mints mixed-case.
+
+    The first character is compared case-insensitively (Weaviate capitalises a
+    class name's first letter on create, so a fully lower-cased name is stored
+    with an upper-case first letter). Every other character must be the
+    minted one or its lower-case form, and at least one must differ — so the
+    relation is one-way: the minted spelling is never the lower-cased form of
+    its own residual.
+    """
+    if not name or not minted or name == minted or len(name) != len(minted):
+        return False
+    if name[0].lower() != minted[0].lower():
+        return False
+    return all(c == m or c == m.lower() for c, m in zip(name[1:], minted[1:])) \
+        and name[1:] != minted[1:]
+
+
+def lowercase_residuals(class_names: Any, suffixes: Any) -> dict[str, list[str]]:
+    """Every live class that is the lower-cased form of a VCO-minted code-graph
+    class also present → the minted siblings it shadows (sorted).
+
+    A minted name ends in one of *suffixes* EXACTLY (``CodeFunction`` …); the
+    residual may carry the suffix in any case (``_codefunction``). Pure: the
+    caller reads the schema.
+    """
+    names = sorted({str(n) for n in class_names or () if n})
+    sfx = tuple(str(x) for x in suffixes or ())
+    by_lower: dict[str, list[str]] = {}
+    for n in names:
+        by_lower.setdefault(n.lower(), []).append(n)
+    out: dict[str, list[str]] = {}
+    for n in names:
+        if not any(n.lower().endswith(x.lower()) for x in sfx):
+            continue
+        minted = [m for m in by_lower.get(n.lower(), [])
+                  if any(m.endswith(x) for x in sfx) and is_lowercased_form(n, m)]
+        if minted:
+            out[n] = sorted(minted)
+    return out

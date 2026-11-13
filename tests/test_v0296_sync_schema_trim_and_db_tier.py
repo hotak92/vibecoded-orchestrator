@@ -872,10 +872,13 @@ class DbMiddleTierTests(_V0296TestBase):
             _kg, _dev, shared, _resolved = mod._resolve_collections()
 
         self.assertEqual(shared, self.DB_SHARED)
+        # v0.2.106: the PRIMARY role also consults the DB tier now (the sync
+        # and the doctor must read the SAME collection when the hub is down),
+        # so both roles are asked, primary first.
         self.assertEqual(
-            calls, [("p1", "shared")],
-            "the child's SHARED resolution must consult the DB tier itself, "
-            "asking for the shared role of the registered project",
+            calls, [("p1", "primary"), ("p1", "shared")],
+            "the child's resolution must consult the DB tier itself for both "
+            "roles of the registered project",
         )
 
     def test_unregistered_root_falls_back_to_the_orchestrator_root_row(self):

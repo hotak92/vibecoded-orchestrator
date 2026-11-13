@@ -42,6 +42,8 @@
 // Vocabulary is borrowed verbatim from `dual-flags.ts` on purpose: two panels
 // in one app that mean the same thing must not word it differently.
 
+import { rlDefaultLine, type RlScoringDefault } from './rl-scoring-default';
+
 /** Mirror of the Rust `ModuleEnableSource` wire shape. */
 export type ModuleEnableSource = 'project' | 'global_default' | 'system_default';
 
@@ -59,6 +61,10 @@ export interface ModuleEnableState {
    *  shipped lock (today the RL scoring lock, served from its one home
    *  `vco_lib/rl_scoring_lock.toml`). Absent from pre-v0.2.100 payloads. */
   lock_reason?: string | null;
+  /** v0.2.106 (owner 2026-11-12): for the RL reranker, what "nothing chosen"
+   *  resolves to and why (active profile, trained model bundled or not).
+   *  `null`/absent for every other module. */
+  rl_default?: RlScoringDefault | null;
 }
 
 /** The lock reason for a resolved state, or `null` when not locked. */
@@ -202,6 +208,11 @@ function cascadeLine(state: ModuleEnableState): string {
       ? 'On — following the host-wide default.'
       : 'Off — following the host-wide default.';
   }
+  if (state.rl_default != null) {
+    // The RL reranker: its default follows the bundled weights (v0.2.106).
+    // `effective` is the served answer; the wording names its cause.
+    return `${rlDefaultLine(state.rl_default)} Nothing set for this project and no host-wide default.`;
+  }
   return state.effective
     ? 'On — nothing set for this project and no host-wide default (modules default to on).'
     : 'Off — nothing set for this project and no host-wide default (this module defaults to off).';
@@ -209,15 +220,19 @@ function cascadeLine(state: ModuleEnableState): string {
 
 /**
  * What a module resolves to when no project row and no host-wide row exist.
- * `true` (fail-open) for every module except the RL reranker, which is OFF
- * (v0.2.100: RL scoring stays inactive until the model is trained).
+ * `true` (fail-open) for every module except the RL reranker, whose default
+ * follows the bundled weights (v0.2.106, owner 2026-11-12): the SERVED
+ * `RlScoringDefault` (`rl_scoring_default` command), never decided here; not
+ * loaded = off.
  *
  * MUST MATCH `vct_launcher_core::db::settings::module_enable_system_default`
- * (Rust, the resolver the hub serves); a display-only mirror, because this is
- * a pure render helper and a per-call IPC for one boolean is not worth it.
+ * (Rust, the resolver the hub serves).
  */
-export function moduleSystemDefault(moduleId: string): boolean {
-  return moduleId !== 'vct-rl-reranker';
+export function moduleSystemDefault(
+  moduleId: string,
+  rlDefault?: RlScoringDefault | null,
+): boolean {
+  return moduleId !== 'vct-rl-reranker' || rlDefault?.default_on === true;
 }
 
 /**

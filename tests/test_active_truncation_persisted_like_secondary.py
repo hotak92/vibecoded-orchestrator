@@ -133,12 +133,21 @@ def test_tagged_capture_includes_active_and_secondary_in_one_record(monkeypatch)
     adapter = _RefuseList({QWEN3_MODEL: 13_000, ARCTIC_MODEL: 3_000})
     svc = _dual_service(monkeypatch, adapter)
 
+    # DOCUMENT arm (v0.2.106): nothing is cut, so the complete record is
+    # EMPTY. Outside a row writer the refusing SECONDARY is left empty (never
+    # averaged — a row writer splits the chunk into rows instead); the active
+    # one-vector embed still covers every character.
     slots, truncated = svc.embed_text_all_configured_tagged("z" * 20_000)
+    assert "qwen3_embed" in slots and "arctic2_embed" not in slots
+    assert truncated == []
 
-    assert "qwen3_embed" in slots and "arctic2_embed" in slots
-    assert truncated == ["arctic2_embed", "qwen3_embed"], (
-        "the atomic capture must return the COMPLETE per-call record — the "
-        "ACTIVE slot's truncation included, else the store cannot persist it"
+    # QUERY arm — the one path that still embeds a leading window — fills the
+    # SAME per-call record for both slots, and both public views derive from it.
+    svc.embed_text_query_all_configured("z" * 20_000)
+    record = sorted(k for k, v in svc._last_truncated_slots.items() if v)
+    assert record == ["arctic2_embed", "qwen3_embed"], (
+        "the per-call record is COMPLETE — the ACTIVE slot's truncation "
+        "included, else the store could not persist it"
     )
     assert svc.last_active_truncated is True, (
         "the active view derives from the same record the capture returned"
@@ -167,15 +176,20 @@ def test_active_only_truncation_leaves_secondary_view_empty(monkeypatch):
     """The ACTIVE alone truncates → the record lists only it; the secondary
     view (and therefore the legacy property derived from it) stays empty.
 
-    Sizing: a 6 000-char input fits arctic's SECONDARY budget (7 065 chars,
-    so the arctic leg embeds it whole and tags nothing) while the ACTIVE
-    qwen3 runner refuses anything over 3 000 → the active shrinks alone."""
+    Sizing: a 6 000-char QUERY fits arctic's SECONDARY budget (so the arctic
+    leg embeds it whole and tags nothing) while the ACTIVE qwen3 runner
+    refuses anything over 3 000 → the active query shrinks alone. (A
+    DOCUMENT is split instead since v0.2.106, so it records nothing.)"""
     adapter = _RefuseList({QWEN3_MODEL: 3_000})
     svc = _dual_service(monkeypatch, adapter)
 
-    slots, truncated = svc.embed_text_all_configured_tagged("z" * 6_000)
+    _slots, truncated = svc.embed_text_all_configured_tagged("z" * 6_000)
+    assert truncated == []
 
-    assert truncated == ["qwen3_embed"]
+    svc.embed_text_query_all_configured("z" * 6_000)
+    assert sorted(k for k, v in svc._last_truncated_slots.items() if v) == [
+        "qwen3_embed"
+    ]
     assert svc.last_active_truncated is True
     assert svc.last_secondary_truncated == {}
 
@@ -304,12 +318,13 @@ def _patch_store(monkeypatch, tmp_path, coll, all_tag_map):
 
 
 def _big_multichunk_text() -> str:
-    # Two ~33.8k-char chunks + a ~1.4k tail under the qwen3 preset: the big
-    # leading chunks "truncate" (per the tag map), the tail does not.
+    # Two ~19.5k-char chunks + a ~1.4k tail under the qwen3 preset (v0.2.106
+    # dense budget, max 19 560 chars): the big leading chunks "truncate" (per
+    # the tag map), the tail does not.
     sentence = "The retrieval model scores each candidate node against the query. "
     return " ".join(
         f"{sentence}Item {i} details here and more words to pad this nicely."
-        for i in range(560)
+        for i in range(330)
     )
 
 
@@ -335,7 +350,7 @@ def test_store_persists_complete_record_and_derived_secondary_view(
     record (active included); ``secondary_truncated_slots`` is the same list
     with the active slot DROPPED — the R3-2 property's meaning is unchanged."""
     def all_tag_map(chunk_text: str) -> list[str]:
-        if len(chunk_text) > 20_000:
+        if len(chunk_text) > 15_000:
             return ["arctic2_embed", "qwen3_embed"]
         return []
 

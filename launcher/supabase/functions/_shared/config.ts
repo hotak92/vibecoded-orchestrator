@@ -2,9 +2,10 @@
 // Shared runtime config readers for VCO Supabase edge functions.
 //
 // Centralises env-var lookups that need shape validation + sane fallbacks
-// across multiple functions. Today only `rl-artifact-url` consumes this,
-// but `rl-latest-version` will need the same paid-image-repo string when
-// it starts emitting full pull URLs in v0.2.37.
+// across multiple functions. Its consumer is `rl-artifact-url`, the paid
+// pull-token gateway — kept deployed (v0.2.106, owner 2026-11-12) as
+// paid-module infrastructure for future paid modules; the bundled, free RL
+// reranker never calls it.
 //
 // Design notes:
 //

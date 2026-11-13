@@ -267,9 +267,11 @@ def test_codesage_num_ctx_is_the_served_window():
     assert MODEL_TOKEN_LIMITS["codesage/codesage-large-v2"] == 1_024
     assert MODEL_TOKEN_LIMITS["codesage-large-v2"] == 1_024
     # The derived entity budget (see test_code_truncation_chunking.py for the
-    # behavioural pins): 1 024 × 3.5 = 3 584 chars.
+    # behavioural pins). v0.2.106: the shared dense-content bound,
+    # 1 024 × 2.96 (measured minimum) × 0.75 = 2 273 chars — the old
+    # 1 024 × 3.5 = 3 584 measured ~118% of the window on real code.
     from claude_mcp_servers.weaviate_mcp.code_truncation import (
         _max_chars_for_model,
     )
 
-    assert _max_chars_for_model("codesage/codesage-large-v2") == 3_584
+    assert _max_chars_for_model("codesage/codesage-large-v2") == 2_273

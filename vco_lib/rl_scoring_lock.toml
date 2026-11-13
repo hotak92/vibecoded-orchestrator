@@ -44,9 +44,43 @@
 #
 # To unlock once a trained model ships: set `locked = false` (keep `reason`
 # for the record) and update the tests that pin the shipped value.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# UNLOCKED in v0.2.106 — OWNER RULINGS (2026-11-12):
+#   * the product is PER-PROJECT ONLINE adaptation (no global weights ship);
+#   * it ships OPT-IN: "for now opt-in, then we'll try to find how to make the
+#     model generalize";
+#   * the bar for a project's model to be SERVED: NDCG@10 >= +2% over plain
+#     cosine AND MRR@10 of the literally cited node >= cosine's, judged on
+#     that project's cumulative prequential record (every query scored by
+#     the model in place before it trained on it) at an anytime-valid
+#     confidence (the k-th check at 1 - 0.10 / (k (k+1))), from 300 queries
+#     and 50 citing ones on.
+#
+# What `locked = false` means now — and what it does NOT:
+#   * RL scoring's DEFAULT follows the bundled weights (owner ruling
+#     2026-11-12): with no per-project and no host-wide choice it is ON only
+#     when a trained model is bundled for the active embedding profile
+#     (`claude_mcp_servers/rl_reranker/weights/manifest.json` names a
+#     `current` for it), OFF otherwise — and none ships yet, so OFF today.
+#     The decision's one home is `vco_lib/rl_scoring_default.py` (Rust calls
+#     it: `vct-launcher-core/src/rl_scoring_default.rs`, applied as the
+#     system default of `Db::module_effective_enabled`). The user's choice
+#     always wins, on or off (launcher Modules panel / host-wide default).
+#     An unreadable manifest, an unknown profile, or a toggle a process
+#     cannot read are OFF. Toggle off = no call to the container: no rerank,
+#     no /rl_update, search order unchanged.
+#   * Toggle on = the project's citations train its own model online
+#     (`claude_mcp_servers/rl_reranker/online_learning.py`), and the
+#     container reranks that project's searches only while the model passes
+#     the bar above on the project's prequential record; otherwise it hands
+#     the search order back.
+#   * `reason` below is the pre-v0.2.106 text, kept for the record (it is
+#     only shown while `locked = true`).
+# ═══════════════════════════════════════════════════════════════════════════
 
 format_version = 1
 
-locked = true
+locked = false
 
 reason = "RL scoring stays inactive until the model is trained. Data collection continues regardless."

@@ -64,6 +64,14 @@ CLI entry::
         [--stream-progress] \\
         [--json]
 
+Supported backfill (v0.2.106) — fill only the objects that LACK the
+collection's own named-vector slot, with the model that owns that slot::
+
+    python -m vco_lib.embedding_enrichment backfill \\
+        --collection MyProject_KnowledgeGraph \\
+        [--slot arctic2_embed]   # must be the selected model's slot \\
+        [--project-root /path/to/project] [--dry-run] [--json]
+
 Output (``--json``):
 
     {
@@ -124,7 +132,6 @@ from vco_lib.child_process import last_json_object  # noqa: E402
 from vco_lib.embedding_service import (  # noqa: E402
     EmbeddingService,
     NoEmbeddingBackendError,
-    _bounded_for_model,
 )
 # W3 (v0.2.92 wiring audit): the truncation-tag merge for single-slot
 # patches — ONE shared merger (vco_lib home), so enrichment and the
@@ -173,11 +180,14 @@ BATCH_SIZE = 100
 #: regression (every object failing).
 MAX_FAILURE_DETAILS = 20
 
-#: Maximum chars of content fed into a single embed call. Matches the
-#: conservative cap used by ``migrate_to_new_embeddings.py``; keeps Ollama
-#: from choking on multi-megabyte node bodies. The exact token-aware
-#: truncation is the embedder's job — we just protect against the worst
-#: cases.
+#: Maximum chars of a row's content this backfill embeds. Keeps Ollama from
+#: choking on multi-megabyte legacy bodies. Since v0.2.106 (owner rulings
+#: "split on refusal" / "extra rows in both places") a longer row is NOT cut
+#: to a leading window any more: it is left unfilled (counted failed, with
+#: the reason) and its writer — kg-sync's active-slot gate, the code-graph
+#: walk's vector check — re-embeds the node, splitting a chunk the model
+#: refuses into rows. A row within the cap is embedded whole; one the model
+#: refuses gets no vector and takes the same writer path.
 EMBED_INPUT_CHAR_CAP = 16000
 
 
@@ -466,13 +476,15 @@ def enrich_collection_vectors(
     * Write the resulting vector to the new slot ONLY (single-slot
       update — Weaviate's ``coll.data.update(uuid=..., vector={new_slot:
       v})`` preserves every other slot's data), and — when the item's
-      vector positively came from a bounded leading window AND the row
-      already carries a complete ``truncated_slots`` record — merge that
-      verdict into the record via the shared
-      ``vco_lib.kg_truncation_tags.merge_slot_truncation`` (W3). Rows
-      predating the record, and items whose verdict is not provable, get
-      NO property patch: the slot stays out of the row's measured set and
-      reads as UNKNOWN, never a guessed False.
+      verdict is provable AND the row already carries a complete
+      ``truncated_slots`` record — merge that verdict into the record via
+      the shared ``vco_lib.kg_truncation_tags.merge_slot_truncation`` (W3).
+      Rows predating the record, and items whose verdict is not provable,
+      get NO property patch: the slot stays out of the row's measured set
+      and reads as UNKNOWN, never a guessed False. Since v0.2.106 nothing
+      is cut or averaged here: a row is embedded WHOLE, and one over
+      :data:`EMBED_INPUT_CHAR_CAP` or refused by the model is left unfilled
+      (``failed``, with the reason) for its writer to re-lay as split rows.
     * Soft-fail per object: an exception during embed OR write
       increments ``failed`` and appends a redacted detail row to
       ``failures`` (up to :data:`MAX_FAILURE_DETAILS`). The remaining
@@ -624,12 +636,20 @@ def enrich_collection_vectors(
             else embedding_service.text_vector_slot
         )
         same_active = active_slot == new_slot
-        if kind == "code" and not same_active:
+        if not same_active:
+            # v0.2.106 review C-L6: the TEXT leg too. The walk embeds with the
+            # service's own model and writes the vector under ``new_slot``; a
+            # slot of another (same-dimension) model would be filled with the
+            # wrong model's vectors and only a dimension mismatch stopped it.
+            # Every real caller (the install-time slot change, the KG model
+            # fill, the backfill verb) passes its service's own slot.
+            model = getattr(embedding_service,
+                            "code_model_id" if kind == "code" else "text_model_id", "?")
             raise SlotNotInSchemaError(
                 f"{collection_name!r}: slot {new_slot!r} is not the slot of this "
-                f"graph's selected code model ({getattr(embedding_service, 'code_model_id', '?')} → "
-                f"{active_slot!r}); a slot is only ever filled with its own "
-                "model's vectors. Select that model first."
+                f"project's selected {kind} model ({model} → {active_slot!r}); a "
+                "slot is only ever filled with its own model's vectors. Select "
+                "that model first."
             )
 
         # ── Open Weaviate client ────────────────────────────────────
@@ -712,12 +732,11 @@ def _run_enrichment_loop(
 
     pending_uuids: list[Any] = []
     pending_texts: list[str] = []
-    # W3: per-pending-item context for the truncation-tag merge — the FULL
-    # content length (``pending_texts`` holds the EMBED_INPUT_CHAR_CAP-capped
-    # slice, so the cap itself is invisible downstream) and the row's EXISTING
-    # complete ``truncated_slots`` record (None when the row predates it —
-    # those rows legitimately get NO merge; see merge_slot_truncation).
-    pending_full_lens: list[int] = []
+    # W3: per-pending-item context for the truncation-tag merge — the row's
+    # EXISTING complete ``truncated_slots`` record (None when the row predates
+    # it — those rows legitimately get NO merge; see merge_slot_truncation).
+    # Every pending text is the row's WHOLE content (v0.2.106: a row over
+    # EMBED_INPUT_CHAR_CAP is never cut — it is left to its writer below).
     pending_existing_props: list["Optional[dict]"] = []
 
     # We need a total estimate for the progress %. v4's iterator doesn't
@@ -729,43 +748,39 @@ def _run_enrichment_loop(
     def _clear_pending() -> None:
         pending_uuids.clear()
         pending_texts.clear()
-        pending_full_lens.clear()
         pending_existing_props.clear()
 
     def _item_truncation_verdict(idx: int, model_id: str) -> "Optional[bool]":
         """W3: was THIS batch item's vector embedded from a leading window?
 
-        TRI-STATE. ``True`` only when positively provable, from one of two
-        causes:
-          1. the content exceeded ``EMBED_INPUT_CHAR_CAP`` before the embed
-             (``pending_texts`` holds the capped slice); or
-          2. the shared ``_bounded_for_model`` bound — the SAME function the
-             batch legs apply internally to the SAME capped input (text via
-             ``_embed_ollama_batch_bounded``, code via
-             ``_embed_codeembed_batch_bounded``), so the pre-bound verdict is
-             EXACT for what the batch call sent.
+        Never ``True`` since v0.2.106: the row's whole content is handed in
+        (a row over ``EMBED_INPUT_CHAR_CAP`` is not embedded here at all).
 
-        Everything else is ``None`` (UNKNOWN), never ``False``. The residual
-        gap is the PER-ITEM shrink that runs after a whole-batch refusal
-        (``_embed_codeembed_one_bounded`` / ``_embed_ollama_one_bounded``):
-        the batch API returns vectors only, so a shrink applied there is
-        invisible from here. That happens routinely — the CodeEmbed batch
-        pre-bounds to ~3 684 chars, which still exceeds the measured 1 024-
-        token codesage window on much real code, so a batch carrying one
-        maximal entity degrades to per-item calls and says so in its
-        "isolating to per-item embed" warning. Returning ``False`` here
-        would turn that invisible shrink into a stored full-fidelity claim;
-        returning ``None`` leaves the slot UNMEASURED on the row, so the
-        shared reader answers UNKNOWN. This path UNDER-reports truncation by
-        construction and never over-claims fidelity.
+        * ``False`` on the Ollama and CodeEmbed batch legs (v0.2.106): they
+          embed every input WHOLE (``EmbeddingService._embed_batch_whole``) —
+          an input the model refuses gets no vector at all (the empty-vector
+          sentinel, counted failed below, re-laid as split rows by its
+          writer), never a cut or averaged one — so every item that got a
+          vector covers every character it was handed, by construction.
+        * ``None`` (UNKNOWN, never ``False``) on the OpenAI batch leg, whose
+          adapter handles its own windows and reports nothing back.
+
+        ``idx`` / ``model_id`` are kept for the call shape; the verdict no
+        longer depends on the item (the retired char cap and
+        ``_bounded_for_model`` pre-bound were what used to make it ``True``).
         """
-        if pending_full_lens[idx] > EMBED_INPUT_CHAR_CAP:
-            return True
+        del idx, model_id
         try:
-            _bounded, trunc = _bounded_for_model(pending_texts[idx], model_id)
-        except Exception:  # noqa: BLE001 — bound must never break the write
+            slot = (
+                embedding_service.code_vector_slot
+                if kind == "code"
+                else embedding_service.text_vector_slot
+            )
+        except Exception:  # noqa: BLE001 — verdict must never break the write
             return None
-        return True if trunc else None
+        if not isinstance(slot, str) or "openai" in slot:
+            return None
+        return False
 
     def _flush_batch() -> None:
         nonlocal enriched, failed, dry_run_pending
@@ -832,8 +847,18 @@ def _run_enrichment_loop(
                 continue
             vec = vectors[idx]
             if not vec:
+                # v0.2.106 ("extra rows in both places"): the batch legs embed
+                # every input whole — a row the model refuses is NOT split and
+                # averaged here (this fill cannot add rows); its writer re-lays
+                # it: kg-sync's active-slot gate / the code-graph walk's vector
+                # check re-embed that node and split the refused chunk.
                 failed += 1
-                _append_failure(failures, str(uid), "embed returned empty vector")
+                _append_failure(
+                    failures, str(uid),
+                    "no vector: the model refused this row whole or the embed "
+                    "failed; its writer (kg-sync / the code-graph walk) re-embeds "
+                    "the node and splits a refused chunk into rows",
+                )
                 continue
             # W3: merge this item's truncation verdict into the row's stored
             # record (shared merger). ``None`` = no honest merge (row has no
@@ -901,12 +926,22 @@ def _run_enrichment_loop(
                 # (not failure): some KG nodes legitimately have empty
                 # content (e.g. placeholder index pages).
                 skipped += 1
+            elif len(content) > EMBED_INPUT_CHAR_CAP:
+                # v0.2.106: never a leading-window vector — the row is left
+                # for its writer to re-embed (and split into rows if refused).
+                failed += 1
+                _append_failure(
+                    failures, str(obj.uuid),
+                    f"content is {len(content)} chars, over the "
+                    f"{EMBED_INPUT_CHAR_CAP}-char backfill cap: not cut to a "
+                    "leading window; its writer (kg-sync / the code-graph walk) "
+                    "re-embeds the node and splits a refused chunk into rows",
+                )
             else:
                 pending_uuids.append(obj.uuid)
-                pending_texts.append(content[:EMBED_INPUT_CHAR_CAP])
-                # W3: remember the uncapped length + the row's existing
-                # truncation record for the merge at flush time.
-                pending_full_lens.append(len(content))
+                pending_texts.append(content)
+                # W3: remember the row's existing truncation record for the
+                # merge at flush time.
                 _props = obj.properties if isinstance(obj.properties, dict) else None
                 pending_existing_props.append(_props)
 
@@ -1439,6 +1474,44 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Output the final report as JSON (default is JSON too).",
     )
 
+    # `backfill` — the supported "some objects lack the named vector"
+    # remedy (v0.2.106 field report: 60 shared-KG objects lacked
+    # arctic2_embed and nothing shipped could fill just those). It reuses
+    # `enrich` (UPDATE-only, skips objects that already hold the slot) and
+    # resolves the slot from the project's SELECTED model, never an
+    # arbitrary one.
+    backfill = sub.add_parser(
+        "backfill",
+        help=(
+            "Populate one collection's OWN named-vector slot on the objects "
+            "that lack it (re-embeds only those, never another model)"
+        ),
+    )
+    backfill.add_argument(
+        "--collection", required=True,
+        help="Weaviate class name to backfill (e.g. MyProject_KnowledgeGraph)",
+    )
+    backfill.add_argument(
+        "--slot", default=None,
+        help=(
+            "Optional named-vector slot. It must be the slot the selected "
+            "model writes; select that model first (launcher → Preferences "
+            "→ Embedding profile). Default: the selected model's slot."
+        ),
+    )
+    backfill.add_argument(
+        "--project-root", default=None,
+        help="Project root forwarded to EmbeddingService.for_project().",
+    )
+    backfill.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Count what would be backfilled without writing.",
+    )
+    backfill.add_argument(
+        "--json", action="store_true", default=False,
+        help="Output the report as JSON (it always is).",
+    )
+
     # `slot-counts` — read-only per-slot populated counts for one collection.
     # An operator CLI since v0.2.102 W6-J retired its last GUI consumer (the
     # model-switch modal's "keep previous model" smart default), superseded
@@ -1547,11 +1620,101 @@ def _cli_enrich(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_backfill(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.embedding_enrichment backfill ...`` (v0.2.106).
+
+    The supported remedy for a collection holding objects that lack the
+    named vector searches target (the duplicate scan used to abort on them).
+    It reuses :func:`enrich_collection_vectors` — UPDATE-only, idempotent,
+    only the rows that lack the slot — and it resolves the slot from the
+    project's SELECTED model (the embedding profile for text, the graph's
+    code-model selection for code). A ``--slot`` that is not that model's
+    slot is REFUSED: filling it would embed one model's vectors into another
+    model's space, which never happens here.
+    """
+    project_root: Optional[Path] = (
+        Path(args.project_root).resolve() if args.project_root else None
+    )
+    kind = "code" if is_code_collection(args.collection) else "text"
+    prefix, sep, _base = args.collection.rpartition("_")
+    try:
+        svc = EmbeddingService.for_project(
+            project_root=project_root,
+            codegraph_prefix=prefix if kind == "code" and sep else None,
+            code_model_role="write",
+        )
+    except Exception as exc:  # noqa: BLE001 — pre-flight, reported as JSON
+        sys.stdout.write(json.dumps(
+            {"error": type(exc).__name__, "message": str(exc)},
+            ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 1
+
+    try:
+        active_slot = (
+            svc.code_vector_slot if kind == "code" else svc.text_vector_slot
+        )
+        requested = (args.slot or "").strip() or active_slot
+        if requested != active_slot:
+            sys.stdout.write(json.dumps({
+                "error": "SlotNotInSchemaError",
+                "message": (
+                    f"{args.collection!r}: slot {requested!r} is not the slot of "
+                    f"this project's selected {kind} model "
+                    f"({getattr(svc, 'code_model_id' if kind == 'code' else 'text_model_id', '?')}"
+                    f" -> {active_slot!r}). A slot is only ever filled with its "
+                    "own model's vectors: select that model first (launcher -> "
+                    "Preferences -> Embedding profile), then re-run backfill."
+                ),
+            }, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            return 1
+        report = enrich_collection_vectors(
+            collection_name=args.collection,
+            new_slot=requested,
+            project_root=project_root,
+            dry_run=args.dry_run,
+            embedding_service=svc,
+        )
+    except (
+        CollectionNotFoundError,
+        UnknownSlotError,
+        SlotNotInSchemaError,
+        SchemaDimMismatchError,
+        NoEmbeddingBackendError,
+    ) as exc:
+        sys.stdout.write(json.dumps(
+            {"error": type(exc).__name__, "message": str(exc)},
+            ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 1
+    except Exception as exc:  # noqa: BLE001 — unexpected, surfaced cleanly
+        sys.stdout.write(json.dumps(
+            {"error": type(exc).__name__, "message": str(exc), "unexpected": True},
+            ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 2
+    finally:
+        try:
+            svc.close()
+        except Exception:  # noqa: BLE001 — teardown only
+            pass
+
+    payload = asdict(report)
+    payload["slot"] = requested
+    payload["kind"] = kind
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_argparser()
     args = parser.parse_args(argv)
     if args.cmd == "enrich":
         return _cli_enrich(args)
+    if args.cmd == "backfill":
+        return _cli_backfill(args)
     if args.cmd == "slot-counts":
         return _cli_slot_counts(args)
     parser.error(f"Unknown command: {args.cmd}")

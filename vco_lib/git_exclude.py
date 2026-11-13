@@ -79,6 +79,8 @@ __all__ = [
     "retired_exclude_entries",
     "bundle_exclude_plan",
     "append_git_info_exclude",
+    "strip_vco_blocks",
+    "vco_block_entries",
 ]
 
 
@@ -755,6 +757,99 @@ def append_git_info_exclude(
     result["action"] = "appended" if to_add else "migrated"
     result["added"] = to_add
     result["removed"] = removed
+    return result
+
+
+def vco_block_entries(manifest_rels: Iterable[str], folder: Path) -> frozenset[str]:
+    """Every entry line VCO can PROVE it wrote into an ended block of this
+    folder's exclude file: its runtime namespaces, the manifest and sidecar
+    lines, and the pattern of each path the bundle manifest records as VCO's
+    (``manifest_rels`` — the caller's evidence set). The evidence half of
+    :func:`strip_vco_blocks`."""
+    return frozenset(exclude_entries_for_created_paths(
+        manifest_rels, folder, include_manifest=True, include_vco_runtime=True,
+    )) | {_SIDECAR_EXCLUDE_LINE}
+
+
+def strip_vco_blocks(
+    folder: Path,
+    *,
+    vco_entries: Optional[Iterable[str]] = None,
+    write_bytes: Optional[Callable[[Path, bytes], object]] = None,
+) -> dict:
+    """Remove every block VCO wrote from ``<folder>/.git/info/exclude`` — the
+    unregister's half of :func:`append_git_info_exclude` (v0.2.106, "Remove
+    project").
+
+    Which lines go is :func:`_block_members`' reading, made per-line for an
+    ENDED block: its header comment run and its end marker go, and an entry
+    line goes only when it is one of ``vco_entries`` (the lines VCO can prove
+    it wrote, :func:`vco_block_entries`; ``None`` = only the runtime, manifest
+    and sidecar lines). Any other line inside the block — the user's own
+    ``/my-secret-dir/`` edited in before ``# VCO end``, a comment after the
+    entries — stays and is listed in ``kept``. A LEGACY block (no end marker)
+    keeps its own per-line inference. The blank line VCO puts above each
+    block it appends goes with it. Every other line stays, in order, with its
+    own line ending; the file itself is never deleted (git ships it).
+
+    Returns ``{"action", "removed": [stripped lines], "kept": [stripped
+    lines], "path"}``. Actions: ``stripped`` | ``noop`` | ``not_a_git_repo``
+    (no ``.git`` directory) | ``read_failed:*`` | ``write_failed:*``. Never
+    raises.
+    """
+    writer = write_bytes if write_bytes is not None else _default_write_bytes
+    known = (frozenset(vco_entries) if vco_entries is not None
+             else vco_block_entries((), folder))
+    result: dict = {"action": "not_a_git_repo", "removed": [], "kept": [], "path": ""}
+    if not (folder / ".git").is_dir():
+        return result
+    exclude_path = folder / ".git" / "info" / "exclude"
+    result["path"] = str(exclude_path)
+    try:
+        existing = exclude_path.read_bytes().decode("utf-8") if exclude_path.exists() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        result["action"] = f"read_failed:{type(e).__name__}"
+        return result
+    lines = existing.splitlines(keepends=True)
+    members, _legacy_ends = _block_members(lines)
+    if not members:
+        result["action"] = "noop"
+        return result
+    drop: set[int] = set()
+    kept_inside: list[int] = []
+    in_header = False
+    for idx in sorted(members):
+        stripped = lines[idx].strip()
+        is_header = stripped.startswith(VCO_BLOCK_MARKER) and not _is_end_marker(stripped)
+        if members[idx] != "ended":
+            drop.add(idx)  # a legacy block's own per-line inference
+        elif is_header or _is_end_marker(stripped):
+            drop.add(idx)
+            in_header = is_header
+            continue
+        elif in_header and stripped.startswith("#"):
+            drop.add(idx)  # the header comment run VCO writes after the marker
+            continue
+        elif stripped in known:
+            drop.add(idx)
+        else:
+            kept_inside.append(idx)
+        in_header = False
+    for idx in sorted(drop):
+        # The blank separator VCO writes above a block's header line.
+        if (idx > 0 and idx - 1 not in members and not lines[idx - 1].strip()
+                and lines[idx].strip().startswith(VCO_BLOCK_MARKER)
+                and not _is_end_marker(lines[idx].strip())):
+            drop.add(idx - 1)
+    result["removed"] = [lines[i].strip() for i in sorted(drop) if i in members]
+    result["kept"] = [lines[i].strip() for i in kept_inside]
+    kept = "".join(line for i, line in enumerate(lines) if i not in drop)
+    try:
+        writer(exclude_path, kept.encode("utf-8"))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+    result["action"] = "stripped"
     return result
 
 

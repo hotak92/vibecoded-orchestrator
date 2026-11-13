@@ -363,7 +363,9 @@ def test_ps1_sibling_carries_the_kill_switch():
     assert 'if ($env:VCO_STOP_FAILURE_NOTIFY -eq "0") { exit 0 }' in text
     # The kill switch sits AFTER the core run (ledger written) and BEFORE the
     # notify block.
-    core_run = text.index("& $PY -c $StopFailureCore")
+    # v0.2.106: the core runs as a temp FILE via _lib/run-python-program.ps1
+    # (Windows PowerShell 5.1 drops embedded double quotes from `-c` args).
+    core_run = text.index("Invoke-VcoPythonProgram -Python $PY -Body $StopFailureCore")
     kill_switch = text.index('VCO_STOP_FAILURE_NOTIFY -eq "0"')
     notify_call = text.index("& $PY $NotifyScript")
     assert core_run < kill_switch < notify_call

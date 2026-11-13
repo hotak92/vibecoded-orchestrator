@@ -49,6 +49,9 @@ subsystem) —
     summary_pending             ``vco_lib.summary_health``'s sidecar scan
                                 (the ``kg_summaries_degraded`` pending set;
                                 REPORTED — the module owns the lifecycle)
+    local_summary_model         ``vco_lib.local_summary_model.status`` (the
+                                user's on/off switch + whether Ollama holds
+                                the model; informational, never a problem)
 
 v0.2.92 WP-14/WP-7 — what the last five close
 ---------------------------------------------
@@ -115,6 +118,10 @@ install.py's re-probe pass runs — and one of those may poll the local hub's
 ``/api/v1/health`` on the resolved port. Loopback-only, sub-second, and the
 same verdict install.py would have reached; noted here so the "exactly one"
 sentence above stays about the DOCTOR's own probes, which it still is.
+Likewise ``local_summary_model`` (v0.2.106) asks the machine's own Ollama
+``/api/tags`` (the ``service_endpoints`` URL, bounded at 5 s, read-only)
+whether the summary model is downloaded — a local service, not the wire,
+behind the ``local_summary_status`` seam.
 """
 from __future__ import annotations
 
@@ -125,6 +132,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -252,6 +261,12 @@ from vco_lib.playwright_mcp import CID_BROWSER_MISSING as CID_PLAYWRIGHT_BROWSER
 #: Probe, entry and the cid live in :mod:`vco_lib.kg_primary_shared`.
 from vco_lib.kg_primary_shared import CID_PRIMARY_BOUND_TO_SHARED as CID_KG_PRIMARY_SHARED  # noqa: E402
 
+#: v0.2.106: Weaviate raft snapshots / the 1.37 orphan drop / the memory cap.
+#: Probes, entries and cids live in :mod:`vco_lib.weaviate_raft_guard`.
+from vco_lib.weaviate_raft_guard import CID_INDEX_MISSING as CID_WEAVIATE_INDEX_MISSING  # noqa: E402
+from vco_lib.weaviate_raft_guard import CID_REPLAY_EXPOSED as CID_WEAVIATE_REPLAY_EXPOSED  # noqa: E402
+from vco_lib.weaviate_raft_guard import CID_UNCAPPED as CID_WEAVIATE_UNCAPPED  # noqa: E402
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -262,7 +277,8 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
-    CID_KG_PRIMARY_SHARED,
+    CID_KG_PRIMARY_SHARED, CID_WEAVIATE_INDEX_MISSING, CID_WEAVIATE_REPLAY_EXPOSED,
+    CID_WEAVIATE_UNCAPPED,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -274,7 +290,8 @@ DOCTOR_SELF_RESOLVING_CIDS: tuple[str, ...] = (
     CID_DISK_SPACE_LOW, CID_KG_BINDING_EVIDENCE_MISMATCH,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED, CID_PLAYWRIGHT_BROWSER_MISSING,
-    CID_KG_PRIMARY_SHARED,
+    CID_KG_PRIMARY_SHARED, CID_WEAVIATE_INDEX_MISSING, CID_WEAVIATE_REPLAY_EXPOSED,
+    CID_WEAVIATE_UNCAPPED,
 )
 
 #: Env override for the free-space floor, in GiB (float). Default
@@ -438,6 +455,10 @@ class DoctorResolvers:
     #: injected so the summary-pending probe's tests describe a machine's
     #: sidecars with dataclasses, no filesystem.
     summary_pending: Optional[Callable[[Path], Optional[Any]]] = None
+    #: () -> :func:`vco_lib.local_summary_model.doctor_status` payload, or
+    #: None when it could not be read. Injected so the probe is driven from
+    #: a described machine — no launcher.db, no Ollama.
+    local_summary_status: Optional[Callable[[], Optional[dict]]] = None
     #: () -> list of :class:`vco_lib.launcher_cli_identity.FormerCopy`.
     #: Injected so the former-name probe is driven from a described machine
     #: without running any ``vco`` / ``vct`` it finds.
@@ -470,6 +491,21 @@ class DoctorResolvers:
     #: or None when launcher.db cannot be read (v0.2.105). Injected so the
     #: probe is driven from described bindings, no launcher.db.
     kg_primary_shared: Optional[Callable[[], Optional[list]]] = None
+    #: (folder) -> :class:`vco_lib.weaviate_raft_guard.RaftScan` or None, and
+    #: () -> ``(MemCap, runtime, limit)`` or None (v0.2.106). Injected so the
+    #: raft / memory-cap probes run from a described Weaviate, no service.
+    weaviate_raft_scan: Optional[Callable[[Path], Any]] = None
+    weaviate_mem_cap: Optional[Callable[[], Any]] = None
+
+    def resolve_weaviate_raft_scan(self, folder: Path):
+        from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+        return (self.weaviate_raft_scan or _rg.default_scan)(folder)
+
+    def resolve_weaviate_mem_cap(self):
+        from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+        return (self.weaviate_mem_cap or _rg.default_mem_cap)()
 
     def resolve_kg_primary_shared(self) -> Optional[list]:
         """Non-root projects whose primary KG binding is the shared class —
@@ -746,6 +782,17 @@ class DoctorResolvers:
 
             return DeferralReport.read(folder)
         except Exception:  # noqa: BLE001 — an unreadable ledger is "unknown"
+            return None
+
+    def resolve_local_summary_status(self) -> Optional[dict]:
+        """The local-summary-model switch + presence (soft: None on failure)."""
+        if self.local_summary_status is not None:
+            return self.local_summary_status()
+        from vco_lib import local_summary_model  # noqa: PLC0415
+
+        try:
+            return local_summary_model.doctor_status()
+        except Exception:  # noqa: BLE001 — a status that cannot be read is UNKNOWN
             return None
 
     def resolve_summary_pending(self, project_root: Path) -> Optional[Any]:
@@ -1025,9 +1072,15 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
         ]
     from vco_lib import deferral_probes
 
-    verdict = deferral_probes.run_probe(
-        "launcher_binary_stale_still_applies",
-        deferral_probes.ProbeContext(folder=folder, entry=None, extras=extras),
+    # v0.2.106: ask the DIAGNOSIS, not the deferral clear verdict. The clear
+    # probe folds "a launcher process is running, so I cannot read its
+    # compiled-in version" into ``True`` (conservative for an entry it must
+    # not retire); the doctor used to read that as "problem" and reported a
+    # stale binary every time the launcher VCO keeps running was open. A
+    # running process is not staleness: the on-disk binary matches the tree,
+    # and the running image is the launcher's own boot probe's question.
+    verdict = deferral_probes.launcher_binary_freshness(
+        deferral_probes.ProbeContext(folder=folder, entry=None, extras=extras)
     )
     if verdict is None:
         return [
@@ -1037,7 +1090,20 @@ def probe_launcher_binary_fresh(folder: Path, res: DoctorResolvers, ctx: dict) -
                 summary="launcher binary freshness could not be determined",
             )
         ]
-    if verdict:
+    if verdict == deferral_probes.LAUNCHER_RUNNING_UNVERIFIED:
+        return [
+            Finding(
+                probe="launcher_binary_fresh",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    "a launcher process is running; the binary on disk matches "
+                    "the tree, but the RUNNING image's version cannot be read "
+                    "from here — the launcher's own boot probe checks it (quit "
+                    "the launcher fully and reopen it to force that check)"
+                ),
+            )
+        ]
+    if verdict == deferral_probes.LAUNCHER_STALE:
         return [
             Finding(
                 probe="launcher_binary_fresh",
@@ -1643,6 +1709,14 @@ def _fmt_gib(n_bytes: Optional[int]) -> str:
     return f"{n_bytes / _GIB:.2f} GiB"
 
 
+def probe_local_summary_model(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """The local summary model switch and whether the model is on disk —
+    rendered by :func:`vco_lib.local_summary_model.doctor_probe` (its home)."""
+    from vco_lib import local_summary_model  # noqa: PLC0415
+
+    return local_summary_model.doctor_probe(res.resolve_local_summary_status())
+
+
 def probe_disk_space(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
     """Free space on the filesystems VCO actually writes to.
 
@@ -1735,8 +1809,12 @@ def _disk_remediation(low: list[dict], floor_gib: float) -> str:
     prune`` stays shared (the podman CLI is identical on Windows).
     """
     paths = " ".join(m["path"] for m in low)
+    # v0.2.106 (owner 2026-11-12): the setting, never an automatic skip.
+    from vco_lib.local_summary_model import disk_hint  # noqa: PLC0415
+
     tail = (
         "#   podman system prune            # DELETES unused images/layers\n"
+        + disk_hint() +
         f"# The floor is {floor_gib:g} GiB; raise or lower it with "
         f"{DISK_MIN_FREE_ENV}=<GiB>.\n"
         "# This entry CLEARS ITSELF on the next VCO run once space is back — "
@@ -4393,6 +4471,29 @@ def probe_former_launcher_cli(folder: Path, res: DoctorResolvers, ctx: dict) -> 
 CID_BUNDLES_STALE = "project_bundles_stale"
 
 
+def _stale_project_finding(row: dict) -> Optional[Finding]:
+    """The per-project finding of one STALE census row — one builder for the
+    census's final report and for its partial results (review L2)."""
+    if row.get("verdict") != "stale":
+        return None
+    changed = row.get("changed_files") or []
+    name = row.get("name") or "?"
+    return Finding(
+        probe="bundle_staleness",
+        status=STATUS_PROBLEM,
+        summary=f"{name}: {len(changed)} bundle file(s) differ from what an update would ship",
+        fix=FIX_DEFER,
+        command=("python -m vco_lib.project_init install-bundle "
+                 f"--folder \"{row.get('folder')}\" --update --json"),
+        detail={
+            "project": name,
+            "changed_files": changed,
+            "recorded": row.get("recorded"),
+            "user_modified": row.get("user_modified", 0),
+        },
+    )
+
+
 def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
     """Are any registered projects' bundles older than the running orchestrator?
 
@@ -4424,10 +4525,29 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
     if not looks_like_orchestrator_root(root):
         return []
 
-    from vco_lib import bundle_staleness
+    from vco_lib import bundle_staleness, probe_bound
+
+    # Review C-M3: one engine dry-run per project can outlast the doctor's
+    # per-check bound on a machine with many projects. The census stops
+    # starting new projects before the bound ends (leaving a margin for the
+    # project in flight) and reports what it did not reach; a census that did
+    # not reach every project writes neither its state nor the ledger.
+    bound = probe_bound.deadline()
+    census_deadline = None
+    if bound is not None:
+        span = max(0.0, bound - time.monotonic())
+        census_deadline = bound - max(5.0, 0.2 * span)
+    def _publish(row: dict) -> None:
+        # Review L2: a census the bound cancels still hands back the stale
+        # projects it found (per-project findings carry no condition id, so
+        # a partial result never clears the machine-wide entry).
+        finding = _stale_project_finding(row)
+        if finding is not None:
+            probe_bound.publish(finding)
 
     try:
-        payload = bundle_staleness.run_census(root, refresh_ledger=True)
+        payload = bundle_staleness.run_census(
+            root, refresh_ledger=True, deadline=census_deadline, on_row=_publish)
     except Exception as exc:  # noqa: BLE001 — census must never fail the pass
         return [
             Finding(
@@ -4458,6 +4578,28 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
                     "before the first launcher boot; never read as '0 stale'."
                 ),
                 detail={"registry": "unavailable"},
+            )
+        ]
+
+    not_reached = int(payload.get("not_checked") or 0)
+    if not_reached and stale == 0:
+        # Incomplete and nothing stale among the projects it reached: never
+        # an OK carrying the cid (that would CLEAR a real entry for the
+        # projects it did not look at).
+        return [
+            Finding(
+                probe="bundle_staleness",
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"bundle census: {len(rows) - not_reached} of {len(rows)} "
+                    "registered project(s) checked within the doctor's "
+                    f"per-check bound ({current} current, "
+                    f"{unknown - not_reached} undetermined); {not_reached} not "
+                    "checked. Run `python -m vco_lib.bundle_staleness` for the "
+                    "full census (no bound), or raise VCT_DOCTOR_CHECK_TIMEOUT_S"
+                ),
+                detail={"stale": 0, "unknown": unknown, "current": current,
+                        "not_checked": not_reached},
             )
         ]
 
@@ -4515,28 +4657,9 @@ def probe_bundle_staleness(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
         verdict = row.get("verdict")
         name = row.get("name") or "?"
         if verdict == "stale":
-            changed = row.get("changed_files") or []
-            findings.append(
-                Finding(
-                    probe="bundle_staleness",
-                    status=STATUS_PROBLEM,
-                    summary=(
-                        f"{name}: {len(changed)} bundle file(s) differ from "
-                        f"what an update would ship"
-                    ),
-                    fix=FIX_DEFER,
-                    command=(
-                        "python -m vco_lib.project_init install-bundle "
-                        f"--folder \"{row.get('folder')}\" --update --json"
-                    ),
-                    detail={
-                        "project": name,
-                        "changed_files": changed,
-                        "recorded": row.get("recorded"),
-                        "user_modified": row.get("user_modified", 0),
-                    },
-                )
-            )
+            stale_finding = _stale_project_finding(row)
+            if stale_finding is not None:
+                findings.append(stale_finding)
         elif verdict == "unknown":
             findings.append(
                 Finding(
@@ -4804,6 +4927,26 @@ def _kg_primary_shared_entry(finding: Finding):
     return kg_primary_shared.doctor_entry(finding)
 
 
+def probe_weaviate_raft(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.weaviate_raft_guard` (v0.2.106)."""
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    return _rg.probe_raft(folder, res, ctx)
+
+
+def probe_weaviate_mem_cap(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Shim — the probe lives in :mod:`vco_lib.weaviate_raft_guard` (v0.2.106)."""
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    return _rg.probe_mem_cap(folder, res, ctx)
+
+
+def _weaviate_entry(finding: Finding):
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    return _rg.doctor_entry(finding)
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4853,6 +4996,11 @@ PROBES: dict = {
     # self-resolving `kg_primary_bound_to_shared` (a binding changes only
     # through the launcher or an install/update, which is when this runs).
     "kg_primary_shared": (probe_kg_primary_shared, (SCOPE_FULL,)),
+    # v0.2.106: full-only — Weaviate REST reads (version, raft statistics, the
+    # schema, one shard-status call per class) and one container inspect.
+    # Doctor-owned, self-resolving cids (vco_lib.weaviate_raft_guard).
+    "weaviate_raft": (probe_weaviate_raft, (SCOPE_FULL,)),
+    "weaviate_mem_cap": (probe_weaviate_mem_cap, (SCOPE_FULL,)),
     # v0.2.102 W4-C L2: full-only — per registered project, one Weaviate
     # reachability probe + one hash query per populated collection (network
     # reads; same cost reasoning as kg_binding_evidence). REPORTED-not-owned:
@@ -4888,6 +5036,8 @@ PROBES: dict = {
     # promise is preserved trivially (it never runs at boot) and the
     # end-of-update report names the count, not just the cid.
     "summary_pending": (probe_summary_pending, (SCOPE_FULL,)),
+    # v0.2.106: informational (the switch is the user's; never a problem).
+    "local_summary_model": (probe_local_summary_model, (SCOPE_FULL,)),
     "claude_code_trust": (probe_claude_code_trust, (SCOPE_FULL,)),
     # v0.2.97: full-only — it RUNS each `vco` / `vct` on PATH (`--version`,
     # `-h`), which is more than the boot subset's file-read budget.
@@ -5061,6 +5211,98 @@ def reconcile_probe_cleared(
         return []
 
 
+#: Per-CHECK wall-clock ceiling (seconds) for one probe in :func:`run_doctor`
+#: (v0.2.106 field report: a doctor run took 14 minutes under load). There is
+#: deliberately NO whole-run cap — the owner rule is "no global timeout,
+#: per-chunk guards": each probe is bounded, a probe past the bound is reported
+#: as ``unknown`` ("not checked"), and the pass continues. ``0`` disables it.
+DEFAULT_PROBE_TIMEOUT_S = 120
+
+
+#: What to run instead when a probe's bound cancels it (review L2): the
+#: unbounded command doing the same check, named in the "not checked" line.
+PROBE_CANCEL_HINTS: dict[str, str] = {
+    "bundle_staleness": (
+        "The full census runs without a bound: python -m vco_lib.bundle_staleness"),
+}
+
+
+def probe_timeout_secs() -> int:
+    """``VCT_DOCTOR_CHECK_TIMEOUT_S`` — this run's per-check bound in seconds.
+
+    Unset/empty/non-numeric → :data:`DEFAULT_PROBE_TIMEOUT_S`; a negative
+    value clamps to ``0`` (disabled), a huge one to one hour.
+    """
+    from vco_lib.env_values import env_int  # noqa: PLC0415
+
+    return int(env_int("VCT_DOCTOR_CHECK_TIMEOUT_S", DEFAULT_PROBE_TIMEOUT_S,
+                       minimum=0, maximum=3600, clamp=True))
+
+
+def _run_probe_bounded(
+    probe_id: str, fn: Callable[..., list], folder: Path,
+    res: DoctorResolvers, ctx: dict, timeout_s: float,
+) -> list:
+    """Run one probe under its own wall-clock bound; never raises.
+
+    A probe that overruns is abandoned (a DAEMON thread, so a wedged probe
+    can neither block the remaining checks nor keep the process alive) and
+    becomes an ``unknown`` finding that says it was NOT CHECKED — never a
+    failure, because "I could not look" is not "it is broken". A probe that
+    raises keeps the pre-existing degrades-to-unknown contract.
+
+    Review C-M3: the worker runs inside :func:`vco_lib.probe_bound.bounded`.
+    A probe with a long legitimate runtime reads the deadline and stops in
+    time; when the bound is still overrun, the doctor CANCELS the probe and
+    every writer it can reach (the ledger emitter, the census state, the
+    case-history ledger) writes nothing from then on — an abandoned probe can
+    never change the ledger after the report said "not checked".
+    """
+    if timeout_s <= 0:
+        return list(fn(folder, res, ctx) or [])
+    from vco_lib import probe_bound
+
+    outcome: dict = {}
+    cancel = threading.Event()
+    until = time.monotonic() + timeout_s
+    partial: list = []
+
+    def _target() -> None:
+        try:
+            with probe_bound.bounded(until, cancel, partial):
+                outcome["findings"] = list(fn(folder, res, ctx) or [])
+        except BaseException as exc:  # noqa: BLE001 — reported, never re-raised in a thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(
+        target=_target, name=f"doctor-probe-{probe_id}", daemon=True,
+    )
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        cancel.set()
+        hint = PROBE_CANCEL_HINTS.get(probe_id)
+        done = list(partial)  # what the probe published before the bound
+        return [
+            Finding(
+                probe=probe_id,
+                status=STATUS_UNKNOWN,
+                summary=(
+                    f"not checked — exceeded the {int(timeout_s)} s per-check "
+                    "bound (raise VCT_DOCTOR_CHECK_TIMEOUT_S or re-run when "
+                    "the machine is less loaded); it was cancelled and writes "
+                    "nothing"
+                    + (f"; {len(done)} partial result(s) follow" if done else "")
+                    + (f". {hint}" if hint else "")
+                ),
+            ),
+            *done,
+        ]
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("findings", [])
+
+
 def run_doctor(
     folder: Path,
     *,
@@ -5091,11 +5333,14 @@ def run_doctor(
     ctx = dict(context or {})
     ctx["scope"] = scope
     report = DoctorReport(folder=Path(folder), scope=scope)
+    timeout_s = probe_timeout_secs()
     for probe_id, (fn, scopes) in PROBES.items():
         if scope not in scopes:
             continue
         try:
-            report.findings.extend(fn(Path(folder), res, ctx))
+            report.findings.extend(
+                _run_probe_bounded(probe_id, fn, Path(folder), res, ctx, timeout_s)
+            )
         except Exception as exc:  # noqa: BLE001 — one probe never breaks the pass
             report.findings.append(
                 Finding(
@@ -5399,6 +5644,9 @@ _ENTRY_BUILDERS: dict = {
     CID_COMPOSE_OVERRIDE_PAIR_DIVERGED: _compose_override_pair_entry,
     CID_PLAYWRIGHT_BROWSER_MISSING: _playwright_browser_entry,
     CID_KG_PRIMARY_SHARED: _kg_primary_shared_entry,
+    CID_WEAVIATE_INDEX_MISSING: _weaviate_entry,
+    CID_WEAVIATE_REPLAY_EXPOSED: _weaviate_entry,
+    CID_WEAVIATE_UNCAPPED: _weaviate_entry,
 }
 
 
@@ -5682,6 +5930,7 @@ __all__ = [
     "DISK_CRITICAL_FREE_BYTES",
     "DISK_MIN_FREE_ENV",
     "DISK_MIN_FREE_GB_DEFAULT",
+    "DEFAULT_PROBE_TIMEOUT_S",
     "DOCTOR_OWNED_CIDS",
     "DOCTOR_SELF_RESOLVING_CIDS",
     "GIT_TIMEOUT_SECONDS",
@@ -5721,6 +5970,7 @@ __all__ = [
     "main",
     "measure_disk_space",
     "parse_vct_guards",
+    "probe_timeout_secs",
     "probe_agent_model_ids",
     "probe_diagnostic_files",
     "probe_disk_space",

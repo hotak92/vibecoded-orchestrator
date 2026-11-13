@@ -11,7 +11,7 @@ citation event and write it." Called by BOTH:
 
 Honours the modularity ruling (one concern, one home) + the
 >50-lines-to-a->5k-line-file extraction rule (server.py is ~8k lines). The
-server.py-local primitives this depends on (``Chunker``, the embedding service,
+server.py-local primitives this depends on (the embedding service,
 ``_cosine``, ``_rl_is_literal_cited``, the telemetry writer) are reached via a
 lazy import of ``weaviate_mcp.server`` at call time — the same defensible
 dependency direction ``search_pipeline.py`` uses (this module lives in
@@ -21,7 +21,7 @@ MCP-tool-shape concerns + module globals).
 Signal contract (do NOT change shape): per node,
 ``cosine_sims[title] = max over answer-chunks of _cosine(answer_chunk, n_emb)``;
 ``literal_cited[title]`` via the node-identity word-boundary check;
-``compute_unified_targets`` (vendored formula) derives the binary ``cited`` map.
+``compute_unified_targets`` (the shared formula, `vco_lib/rl_training_targets.py`) derives the binary ``cited`` map.
 Tool RETURNS are already excluded upstream by the answer-window extractor.
 """
 
@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
+from typing import Callable, Optional
+
+from claude_mcp_servers.weaviate_mcp.chunking import chunk_answer_window
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,50 @@ def _answer_chunk_hash(text: str) -> str:
     one-way, so nothing reconstructs the answer from it.
     """
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+#: Per-process memo for OTHER-slot answer-chunk vectors (v0.2.106). The active
+#: slot's ``EmbeddingService.embed_text`` / ``embed_code`` already memoise per
+#: process; the other-slot embed goes straight to the backend adapter and did
+#: not, so the shared chunks of overlapping answer windows (see
+#: ``chunking.chunk_answer_window``, the shared chunker's ANSWER mode) were
+#: embedded again for every citation of one drain run.
+#: Keyed on (source, model, chunk hash); bounded FIFO like the service memo.
+_OTHER_SLOT_MEMO: "dict[tuple[str, str, str], list[float]]" = {}
+_OTHER_SLOT_MEMO_CAP = 512
+
+
+def _other_slot_memo_put(key: "tuple[str, str, str]", vec: "list[float]") -> None:
+    if len(_OTHER_SLOT_MEMO) >= _OTHER_SLOT_MEMO_CAP:
+        _OTHER_SLOT_MEMO.pop(next(iter(_OTHER_SLOT_MEMO)))
+    _OTHER_SLOT_MEMO[key] = vec
+
+
+def _embed_answer_pieces(
+    text: str,
+    embed_fn: "Callable[[str], list[float]]",
+    model_id: str,
+) -> "list[tuple[str, list[float]]]":
+    """``[(piece, vector), ...]`` for ONE answer chunk — never an averaged vector.
+
+    v0.2.106 (owner ruling 2026-11-11, "extra rows in both places"): an
+    answer chunk the model refuses whole is split into pieces through the ONE
+    row driver (``vco_lib.embed_split.embed_rows``) and each piece becomes its
+    own answer vector. The citation cosine is a MAX over answer vectors, so a
+    piece that matches a node keeps its full similarity instead of being
+    diluted in a mean of the chunk's pieces. A refusal by ``embed_fn`` (the
+    service's document legs raise it inside the driver's scope; a bare
+    adapter's overflow error is typed by ``_embed_whole_or_refuse``) splits;
+    every other error propagates to the caller's soft-fail.
+    """
+    from vco_lib.embed_split import embed_rows
+    from vco_lib.embedding_service import _embed_whole_or_refuse
+
+    rows = embed_rows(
+        [text],
+        lambda piece: _embed_whole_or_refuse(embed_fn, piece, model_id=model_id),
+    )
+    return [(row.text, row.payload) for row in rows]
 
 
 class CitationResult(dict):
@@ -100,7 +146,6 @@ def compute_citation(
     # module docstring). A failed import → soft-fail None.
     try:
         from claude_mcp_servers.weaviate_mcp.server import (
-            Chunker,
             _cosine,
             _get_embedding_service,
             _get_rl_telemetry_writer,
@@ -125,9 +170,14 @@ def compute_citation(
     is_code = ctx.get("retrieval_kind") == "code"
 
     # --- Step 1: chunk + embed the answer ---
+    # v0.2.106: the answer window is chunked by the shared chunker's ANSWER
+    # mode (``chunking.chunk_answer_window`` — dense transcript budget,
+    # content-defined boundaries), NOT by the KG document path — see that
+    # mode's comment block for the two defects this removes (every maximal
+    # chunk refused and shrunk; overlapping windows of one chat re-embedding
+    # the same text because their chunks never lined up).
     try:
-        chunker = Chunker.for_model(active_model)
-        chunks = chunker.chunk_text(answer, source_id=task_id)
+        chunks = chunk_answer_window(answer, active_model)
     except Exception as exc:  # noqa: BLE001
         logger.debug("citation_compute: chunker failed (%s)", exc)
         return None
@@ -156,13 +206,19 @@ def compute_citation(
         try:
             # RL-2b: code ctx → embed in the code model's space so the cosine
             # against the staged code-slot n_emb is same-space and meaningful.
-            vec = svc.embed_code(text) if is_code else svc.embed_text(text)
+            # v0.2.106: a refused chunk yields one vector PER PIECE.
+            pieces = _embed_answer_pieces(
+                text,
+                svc.embed_code if is_code else svc.embed_text,
+                str(getattr(svc, "code_model_id" if is_code else "text_model_id", "") or ""),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("citation_compute: chunk embed failed (%s); continuing", exc)
             continue
-        if vec:
-            answer_chunk_embs.append(vec)
-            answer_chunk_hashes.append(_answer_chunk_hash(text))
+        for piece, vec in pieces:
+            if vec:
+                answer_chunk_embs.append(vec)
+                answer_chunk_hashes.append(_answer_chunk_hash(piece))
 
     if not answer_chunk_embs:
         return None
@@ -325,7 +381,6 @@ def _write_other_slot_citation(
 
     try:
         from claude_mcp_servers.weaviate_mcp.server import (
-            Chunker,
             _cosine,
             _get_embedding_service,
             _get_rl_telemetry_writer_for,
@@ -340,11 +395,10 @@ def _write_other_slot_citation(
     if svc is None:
         return
 
-    # Chunk the answer with the OTHER model's preset, then embed each chunk in the
-    # OTHER model's space (model-aware: arctic vs qwen3 differ ~4x in chunk size).
+    # Chunk the answer to the OTHER model's window, then embed each chunk in the
+    # OTHER model's space (model-aware: arctic vs qwen3 differ ~3x in budget).
     try:
-        chunker = Chunker.for_model(other_model)
-        chunks = chunker.chunk_text(answer, source_id=f"{task_id}:{other_source}")
+        chunks = chunk_answer_window(answer, other_model)
     except Exception as exc:  # noqa: BLE001
         logger.debug("_write_other_slot_citation: chunker failed (%s)", exc)
         return
@@ -363,14 +417,29 @@ def _write_other_slot_citation(
         )
         if not text:
             continue
+
+        def _other(piece: str) -> "list[float]":
+            # Memo per PIECE (a whole chunk that fits is its own one piece).
+            key = (other_source, other_model, _answer_chunk_hash(piece))
+            cached = _OTHER_SLOT_MEMO.get(key)
+            if cached is not None:
+                return cached
+            got = _embed_text_in_other_model(svc, piece, other_source, other_model)
+            if got:
+                _other_slot_memo_put(key, got)
+            return got
+
         try:
-            vec = _embed_text_in_other_model(svc, text, other_source, other_model)
+            # v0.2.106: a chunk the OTHER model refuses whole is split into
+            # pieces, one answer vector each (never dropped, never averaged).
+            pieces = _embed_answer_pieces(text, _other, other_model)
         except Exception as exc:  # noqa: BLE001
             logger.debug("_write_other_slot_citation: chunk embed failed (%s)", exc)
             continue
-        if vec:
-            answer_chunk_embs.append(vec)
-            answer_chunk_hashes.append(_answer_chunk_hash(text))
+        for piece, vec in pieces:
+            if vec:
+                answer_chunk_embs.append(vec)
+                answer_chunk_hashes.append(_answer_chunk_hash(piece))
     if not answer_chunk_embs:
         return
 

@@ -198,7 +198,7 @@ pub fn parse_model_ensure_output(
 /// Start the background ensure; `false` when python or the install root
 /// cannot be resolved (logged — the next install run still derives the plan).
 /// The finished outcome is logged AND emitted as [`MODEL_ENSURE_EVENT`].
-fn start_model_ensure(db: &Db, app: AppHandle, project_id: Option<String>) -> bool {
+pub(crate) fn start_model_ensure(db: &Db, app: AppHandle, project_id: Option<String>) -> bool {
     let Some(root) = crate::commands::installer::resolve_install_root_sync(db) else {
         tracing::warn!("[vct] dual-flag model ensure skipped: install root not resolvable");
         return false;

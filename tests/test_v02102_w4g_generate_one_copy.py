@@ -54,7 +54,7 @@ def test_builder_owns_load_time_options_and_keep_alive():
         MODEL, prompt="p", options={"temperature": 0.3, "num_ctx": 2048, "num_gpu": 1},
     )
     assert body["options"] == {"temperature": 0.3, "num_ctx": og.GENERATE_NUM_CTX_DEFAULT}
-    assert body["keep_alive"] == "10m"
+    assert body["keep_alive"] == "45m"
     assert body["stream"] is False and "think" not in body and "system" not in body
 
 
@@ -143,7 +143,7 @@ def test_every_generate_caller_sends_one_load_identity(monkeypatch):
     identities = {name: _load_identity(fn(monkeypatch)) for name, fn in CALLERS.items()}
     assert len(set(identities.values())) == 1, identities
     model, load, keep_alive = next(iter(identities.values()))
-    assert model == MODEL and keep_alive == "10m"
+    assert model == MODEL and keep_alive == "45m"
     assert dict(load)["num_ctx"] == og.GENERATE_NUM_CTX_DEFAULT
 
 

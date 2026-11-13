@@ -306,30 +306,46 @@ def record_dismissal(
         # Delegated writer (lazy import — project_init imports THIS module):
         # ONE manifest serializer in the tree, so the on-disk byte shape
         # (indent=2, sort_keys=True, trailing newline) can never fork.
+        from vco_lib.bundle_manifest_lock import DISMISSAL_WAIT_S, bundle_manifest_lock
         from vco_lib.project_init import (
             _MANIFEST_SCHEMA_VERSION,
             _write_manifest_atomic,
         )
 
-        manifest = _read_manifest(folder)
-        dismissals = manifest.get(DISMISSALS_KEY)
-        if not isinstance(dismissals, dict):
-            dismissals = {}
-        fields = {
-            name: normalize_value((current_fields or {}).get(name))
-            for name in dismiss_key_fields(condition_id, path=path)
-        }
-        dismissals[condition_id] = {
-            "key": compute_key(condition_id, current_fields or {}, path=path),
-            "fields": fields,
-            "dismissed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        manifest[DISMISSALS_KEY] = dismissals
-        manifest.setdefault("schema_version", _MANIFEST_SCHEMA_VERSION)
-        _write_manifest_atomic(Path(folder), manifest)
-        return True
+        # Review L3: the manifest's third writer. The read-modify-write runs
+        # under the per-project lock the bundle engine and the provider
+        # switch hold, so none of the three writes back a manifest it read
+        # before another's write (a lost parked-agents registry, or a lost
+        # dismissal). Bounded: a long update makes this give up (False),
+        # never hang the dismiss command.
+        with bundle_manifest_lock(folder, timeout_s=DISMISSAL_WAIT_S):
+            return _record_dismissal_locked(
+                folder, condition_id, current_fields, path,
+                _MANIFEST_SCHEMA_VERSION, _write_manifest_atomic)
     except Exception:  # noqa: BLE001 — dismissal memory is best-effort
         return False
+
+
+def _record_dismissal_locked(folder, condition_id, current_fields, path,
+                             schema_version, write_manifest) -> bool:
+    """:func:`record_dismissal`'s read-modify-write, run under the lock."""
+    manifest = _read_manifest(folder)
+    dismissals = manifest.get(DISMISSALS_KEY)
+    if not isinstance(dismissals, dict):
+        dismissals = {}
+    fields = {
+        name: normalize_value((current_fields or {}).get(name))
+        for name in dismiss_key_fields(condition_id, path=path)
+    }
+    dismissals[condition_id] = {
+        "key": compute_key(condition_id, current_fields or {}, path=path),
+        "fields": fields,
+        "dismissed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    manifest[DISMISSALS_KEY] = dismissals
+    manifest.setdefault("schema_version", schema_version)
+    write_manifest(Path(folder), manifest)
+    return True
 
 
 __all__ = [

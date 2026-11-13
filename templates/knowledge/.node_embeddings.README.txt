@@ -43,6 +43,14 @@ One file per named-vector slot, living in `knowledge/` alongside the node
   "slot": "qwen3_embed",                 // named-vector slot these vectors fill
   "model_id": "qwen3-embedding:0.6b",    // provenance (informational)
   "dim": 1024,                           // provenance (informational)
+  "chunker_revision": "v0.2.106.1",      // REQUIRED since v0.2.106: the
+                                         //   chunker the plans were made
+                                         //   under; a file naming any other
+                                         //   revision (or none) is ignored
+                                         //   at ingest and the nodes are
+                                         //   embedded locally (v0.2.106.1
+                                         //   kept every v0.2.106 boundary;
+                                         //   only the label moved)
   "nodes": {
     "<content_signature>": {             // FULL 64-hex sha256 — see "Hash
                                          //   convention" below. NOT the
@@ -50,17 +58,33 @@ One file per named-vector slot, living in `knowledge/` alongside the node
       "total_chunks": 1,
       "chunks": [
         { "chunk_num": 1, "vector": [/* float, float, ... */] }
-      ]
+      ],
+      "splits": { "2": [3101, 2987] }   // optional (v0.2.106) — see below
     }
   }
 }
 ```
 
-Multi-chunk nodes carry one `chunks[]` entry per chunk (1-indexed `chunk_num`),
-and `total_chunks` must equal `len(chunks)`. Chunk layout mirrors what an
+Multi-chunk nodes carry one `chunks[]` entry per ROW (1-indexed `chunk_num`),
+and `total_chunks` must equal `len(chunks)`.
+
+**Split chunks (v0.2.106).** When the embedding model refuses a chunk because
+it is longer than its window, the chunk is split in two at the best boundary
+near its middle and both halves are embedded, again until every piece is
+accepted — nothing is cut off. The pieces are stored as extra rows of the same
+node. `splits` maps a chunk number of the node's chunk plan (1-based) to the
+lengths, in characters, of the pieces that chunk became; an entry without
+`splits` has one row per planned chunk. The ingest rebuilds the row texts
+from the plan and `splits` (`vco_lib.embed_split.apply_row_layout`), and a
+secondary slot's vectors are merged only when its entry has the same
+`splits`. Chunk layout mirrors what an
 install ACTIVE on that slot's model would produce (per-model presets differ:
 a node can be single-chunk in the qwen3 sidecar and multi-chunk in the
-arctic2 sidecar).
+arctic2 sidecar). Each sidecar is built with its own model alone, so no
+shipped vector is a cut or an average of pieces; an install that also writes
+a secondary slot gets that slot's shipped vectors only where the layouts are
+equal, and computes nothing for the others (a later rewrite of the node
+splits its rows for every model it writes).
 
 Node set mirrors the consumer exactly: TAG_HIERARCHY.md / VOCABULARY.md
 (sync_all_nodes EXCLUDED_FILES) and archived-class nodes (frontmatter
@@ -105,8 +129,8 @@ computing an embedding. It ingests the shipped vector via
    embedding spaces would silently corrupt cosine search — this is the
    v0.2.70 "same-active-slot, never cross-model" invariant.
 
-Additional safety: the chunk count must match (`len(chunks)` == the chunk
-count the node would produce on this install), and every vector must be a
+Additional safety: the row count must match (`len(chunks)` == the rows the
+node's chunk plan on this install yields with the entry's `splits` applied), and every vector must be a
 non-empty list of finite floats. Any guard failing → fall back to computing
 the embedding (pre-v0.2.89 behaviour). When no sidecar exists for the active
 slot, the loader returns `None` and the gate is a pure NO-OP.
@@ -128,8 +152,7 @@ python scripts/build_shipped_kg_embeddings.py --verify   # pre-tag gate (no back
 Requires local Ollama serving both models. Because knowledge is materialized
 verbatim, the shipped signature matches the installed node's → vectors are
 ingested without recompute. A model bump produces a new per-slot file; old
-slots remain valid for installs still on that model. Caveat: a token-DENSE
-node that exceeds a small model's real context window (approximation
-undercount) ships a LEADING-window vector for that slot — the same result a
-truncating-Ollama compute run produces; the generator prints every such node
-loudly at build time.
+slots remain valid for installs still on that model. A token-DENSE chunk
+that exceeds the model's real context window ships as split rows (see
+"Split chunks" above) — the same rows a local sync computes; the generator
+lists every such node at build time.

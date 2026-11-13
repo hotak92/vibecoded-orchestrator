@@ -101,7 +101,7 @@ Per-project values are the norm (RL flags like `rl_use_global` are per-project).
 
 ## First consumers (v0.2.20)
 
-1. **vct-rl-reranker** (paid module) — 3 sections + 10 controls covering all 5 kinds. See `paid-modules/vct-rl-reranker/vct-module.json`.
+1. **vct-rl-reranker** (a paid module at v0.2.20; free and bundled with the orchestrator since v0.2.106, its manifest now at `claude_mcp_servers/rl_reranker/vct-module.json`) — 3 sections + 10 controls covering all 5 kinds.
 2. **orchestrator-core** (always installed) — root `vct-module.json` gets `gui.config_tab` for KG + code-graph controls. Validates the schema generalizes beyond paid modules.
 
 ## Post-v0.2.20 evolution
@@ -191,7 +191,7 @@ The optional `polling` block converts a fire-and-forget HTTP call into a long-ru
 4. Emits `polling.progress_event` (default `module://action-progress`) on each tick.
 5. Stops when `polling.terminal_state_field` (default `$.state`) matches a value in `polling.terminal_success_values` (default `["done"]`) or `terminal_failure_values` (default `["failed", "error"]`), OR `max_attempts` (default 60) is exceeded.
 
-Canonical example — kick + polling + chained next_action (taken from the v0.2.26 manifest fixture in `manifest.rs`'s test suite, which `paid-modules/vct-rl-reranker/vct-module.json` will mirror in Phase 2):
+Canonical example — kick + polling + chained next_action (taken from the v0.2.26 manifest fixture in `manifest.rs`'s test suite, which the vct-rl-reranker manifest mirrored — its config tab now ships from `claude_mcp_servers/rl_reranker/vct-module.json`, free since v0.2.106):
 
 ```json
 {
@@ -587,7 +587,7 @@ A launcher rebuild is ONLY needed when:
 
 ## First consumers (v0.2.20)
 
-1. **vct-rl-reranker** (paid module) — 3 sections + 10 controls covering all 5 kinds. See `paid-modules/vct-rl-reranker/vct-module.json`.
+1. **vct-rl-reranker** (a paid module at v0.2.20; free and bundled with the orchestrator since v0.2.106, its manifest now at `claude_mcp_servers/rl_reranker/vct-module.json`) — 3 sections + 10 controls covering all 5 kinds.
 2. **orchestrator-core** (always installed) — root `vct-module.json` gets `gui.config_tab` for KG + code-graph controls. Validates the schema generalizes beyond paid modules.
 
 ## Related

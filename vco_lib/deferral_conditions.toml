@@ -986,6 +986,38 @@ cannot clear it), then on the current PATH. action_required: removing the copy \
 is the user's act. No dismiss_key — keeping it is a dismissal with manual \
 semantics."""
 
+[conditions.weaviate_upgrade_snapshot_refused]
+class = "action_required"
+owner = "vco_lib.weaviate_raft_guard (emitted through vco_lib.data_identity in install.py step 5 / service_lifecycle, and through vco_lib.service_adoption for hand-to-vco)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "container"]
+notes = """v0.2.106 (field report: root KG / Development / Diagrams lost their index at the first Weaviate 1.37 start and at every restart after). A recreate would MOVE Weaviate data from a release without the 1.37 orphan drop onto one with it, and VCO could not first take a raft snapshot with the OLD image (the container's version is unknown, the one-off snapshot run failed, or a data folder holds a raft log no container names). Nothing was removed or recreated. Re-detected by every install run that attempts the recreate; the run whose snapshot succeeds (or that no longer moves the data) drops it."""
+
+[conditions.weaviate_raft_replay_exposed]
+class = "action_required"
+owner = "vco_lib.doctor (probe + entry in vco_lib.weaviate_raft_guard)"
+clear_probe = "probe:py:weaviate_raft_replay_still_exposed"
+emit_surfaces = ["ledger"]
+dismiss_key = ["pairs"]
+notes = """v0.2.106. The live Weaviate's schema log is not inside a raft snapshot while VCO's records (the root's derived collection names, the deleted-class ledger of vco_lib.weaviate_case_history) show class names that differ only in case from a live class. From 1.37 the next start can drop that live class's data. Clears once a snapshot covers the log."""
+
+[conditions.weaviate_collection_index_missing]
+class = "action_required"
+owner = "vco_lib.doctor (probe + entry in vco_lib.weaviate_raft_guard)"
+clear_probe = "probe:py:weaviate_collection_index_still_missing"
+emit_surfaces = ["ledger"]
+dismiss_key = ["classes"]
+notes = """v0.2.106. Classes are in the Weaviate schema but their index is gone ("non-existing index") — the footprint of the 1.37 orphan drop. The repair (snapshot first, then drop + bootstrap-collections + kg-sync) is destructive and ordered, so it is printed, never run. Clears once every class has its index."""
+
+[conditions.weaviate_container_uncapped]
+class = "action_required"
+owner = "vco_lib.doctor (probe + entry in vco_lib.weaviate_raft_guard)"
+clear_probe = "probe:py:weaviate_container_still_uncapped"
+emit_surfaces = ["ledger"]
+dismiss_key = ["container"]
+notes = """v0.2.106 (an OOM on a maintainer machine: an adopted Weaviate with no memory limit reached 30 GB RSS). VCO sizes VCT_WEAVIATE_MEM_LIMIT only for the containers it creates; an adopted one keeps its own limit. The remedy caps it in place (`<runtime> update --memory`), never by an automatic recreate. Clears once the container has a limit."""
+
 [conditions.code_embed_image_stale]
 class = "action_required"
 owner = "vco_lib.doctor"
@@ -1172,7 +1204,10 @@ notes = "Also re-probed by the install.py re-probe pass (slot present ⇒ resolv
 
 [conditions."lowercase_codegraph_residual_*"]
 match = "glob"
-class = "action_required"
+# v0.2.106: environmental (was action_required with a printed DELETE): the
+# residual shares the canonical class's lower-cased index, so no drop of it
+# is safe — the entry describes the machine; there is nothing to run.
+class = "environmental"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
@@ -1518,6 +1553,26 @@ whole-tree runs only) resolves the row once no listed collection is still \
 owed. The bundle self-heal also resolves it when a settle finds every slot \
 complete (the instant switch back)."""
 
+[conditions.kg_secondary_backfill_pending]
+class = "auto_retryable"
+owner = "vco_lib.kg_secondary_backfill"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.106 (owner ruling 2026-11-12, "backfill once"): a SECONDARY \
+text-embedding slot is enabled (dual embeddings — `DUAL_EMBEDDING_WRITE_ALL_SLOTS` \
+plus e.g. `DUAL_EMBEDDING_ARCTIC_SECONDARY`) and one or more of the project's KG \
+collections is not stamped complete for it (`.claude/state/\
+kg-secondary-backfill.json`). Owed WORK: the stored rows get that slot's vector \
+once. Emitted by the env projection, the bundle self-heal, a scoped `kg-sync`, \
+and a whole-tree run whose secondary did not answer. `retry_action` reuses the \
+EXISTING `retry:py:kg_seed` handler: `kg-sync --all` backfills before its walk \
+(`kg_embed_model.fill_before_walk` → `kg_secondary_backfill.backfill_before_walk`: \
+one probe embed, then the UPDATE-only slot enrichment with the secondary's own \
+model; rows it refuses whole are re-laid by the walk for every model) and its \
+paired clear (`kg_secondary_backfill.after_walk`) resolves the row once every \
+configured secondary is stamped on every collection — or none is configured."""
+
 [conditions.embed_self_heal_failed]
 class = "action_required"
 owner = "vco_lib.embed_slot_fill"
@@ -1844,9 +1899,14 @@ comparison for exactly as long as the row lives (documented there as \
 transitional). Now: each half of the printed remedy stamps \
 `.claude/state/chunker-resync.json` at the one point that proves it ran (a \
 fully successful `kg-sync --all`; a completed `code-graph-analyze \
---force-recreate`), and `probe:py:chunker_resync_still_owed` clears the row \
-when BOTH name the current revision. A later revision crossing re-arms it for \
-free — the gate re-emits and the old stamps no longer match."""
+--force-recreate` or, since v0.2.106, a completed whole-repo `--force-rewalk`), \
+and `probe:py:chunker_resync_still_owed` clears the row when BOTH name the \
+current revision. A later revision crossing re-arms it for free — the gate \
+re-emits and the old stamps no longer match. v0.2.106: the update STARTS both \
+halves itself — `vco_lib.chunker_revision.kg_rechunk_owed` makes the launcher's \
+`kg-sync --check-drift` probe (`rechunk_owed`) and install.py's root seed run \
+the KG pass, and the extractor-generation rung re-walks the code graph — and \
+the printed code-graph remedy is the non-destructive `--force-rewalk`."""
 
 [conditions.project_bundles_stale]
 class = "action_required"

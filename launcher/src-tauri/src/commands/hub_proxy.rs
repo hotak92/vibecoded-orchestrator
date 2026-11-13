@@ -67,7 +67,7 @@ fn hub_client() -> Result<reqwest::Client, String> {
     vct_launcher_core::services::loopback_http::client(std::time::Duration::from_secs(8))
 }
 
-async fn hub_get(path: &str) -> Result<Value, String> {
+pub(crate) async fn hub_get(path: &str) -> Result<Value, String> {
     let port = hub_port()?;
     let token = hub_token()?;
     let client = hub_client()?;
@@ -84,6 +84,29 @@ async fn hub_get(path: &str) -> Result<Value, String> {
     resp.json::<Value>()
         .await
         .map_err(|e| format!("parse: {}", e))
+}
+
+/// POST a JSON body to the hub (same discovery + bearer as [`hub_get`]). A
+/// non-2xx reply is an `Err` carrying the hub's error envelope text, so the
+/// GUI can show the reason (e.g. Ollama refused an unload).
+pub(crate) async fn hub_post(path: &str, body: &Value) -> Result<Value, String> {
+    let port = hub_port()?;
+    let token = hub_token()?;
+    let client = hub_client()?;
+    let url = format!("http://127.0.0.1:{}/api/v1{}", port, path);
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("hub POST {}: {}", path, e))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("hub returned {}: {}", status.as_u16(), text.trim()));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("parse: {}", e))
 }
 
 #[derive(Debug, Serialize)]

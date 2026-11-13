@@ -248,7 +248,7 @@ class TestTransientKeepsRows:
             md = model_selection.render_grid()
             # Row fragments are the discriminators — the Sonnet note NAMES
             # GLM-5.3 in prose (same trap test_model_selection_grid documents).
-            assert "Kimi K3 †" in md and "| GLM-5.3 (" not in md
+            assert "Kimi K3.1 Pro †" in md and "| GLM-5.3 (" not in md
         finally:
             model_selection.set_provider_override(None)
 
@@ -352,7 +352,7 @@ class TestTemplateConditionals:
         """Machine-local budget/quota facts live in the owner's memory, not
         in the shipped grid (owner ruling 2026-10-14)."""
         grid = model_selection.load_grid()
-        kimi_notes = [n.text for n in grid.notes if "kimi-k3" in n.models]
+        kimi_notes = [n.text for n in grid.notes if "kimi-k3.1-pro" in n.models]
         assert kimi_notes
         for text in kimi_notes:
             assert "5h window" not in text
@@ -433,7 +433,7 @@ class TestRefreshEngine:
         assert result["projects"][0]["changed"] is True
         # Row fragments are the discriminators: the rendered grid's Sonnet
         # note NAMES GLM-5.3 in prose (test_model_selection_grid's own trap).
-        assert "| GLM-5.3 (" not in first and "Kimi K3 †" not in first
+        assert "| GLM-5.3 (" not in first and "Kimi K3.1 Pro †" not in first
 
         # The user adds a z.ai key; the next refresh renders the GLM rows.
         states["zai"] = model_selection.KeyState.PRESENT
@@ -488,7 +488,7 @@ class TestRefreshEngine:
         _refresh(root, db, state_path, states, monkeypatch)
         text = claude.read_text(encoding="utf-8")
         assert text.startswith(user_text)
-        assert "Kimi K3 †" in text  # the refresh DID change the managed body
+        assert "Kimi K3.1 Pro †" in text  # the refresh DID change the managed body
 
     def test_a_project_without_managed_markers_is_left_alone(
             self, tmp_path, monkeypatch):

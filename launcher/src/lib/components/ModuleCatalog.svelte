@@ -12,6 +12,7 @@
   //   currently render a busy spinner while waiting.
 
   import { onMount, onDestroy } from 'svelte';
+  import { pollWhileActive } from '$lib/window-activity';
   import { invoke } from '@tauri-apps/api/core';
   import { goto } from '$app/navigation';
   import { modules, installedIds } from '$lib/stores/modules';
@@ -89,6 +90,8 @@
     type ModuleTriChoice,
   } from '$lib/module-enable';
   import { listen as tauriListen } from '$lib/tauri';
+  // v0.2.106: what turning the RL reranker on does (opt-in, owner 2026-11-12).
+  import { rlOptInExplainer } from '$lib/rl-scoring-default';
   // v0.2.97 (lane V): the hub polls each module's `runtime.health_check`;
   // the tile shows the result as a pill (unknown is never shown as down).
   import {
@@ -362,8 +365,7 @@
   }
   $effect(() => {
     void loadHealth();
-    const handle = setInterval(() => void loadHealth(), HEALTH_REFRESH_MS);
-    return () => clearInterval(handle);
+    return pollWhileActive(loadHealth, HEALTH_REFRESH_MS);
   });
 
   // v0.2.101 (owner ruling Q4): modules whose last DB-migration apply
@@ -399,10 +401,9 @@
   }
 
   $effect(() => {
-    const handle = setInterval(() => {
+    return pollWhileActive(() => {
       now = Date.now();
     }, 60 * 1000);
-    return () => clearInterval(handle);
   });
 
   function fetchedAtIso(status: typeof mState.l0Status): string | null {
@@ -878,6 +879,9 @@
         >
       {/if}
     </p>
+    {#if rlOptInExplainer(m.id)}
+      <p class="mc-enable-line" data-testid="mc-enable-opt-in">{rlOptInExplainer(m.id)}</p>
+    {/if}
   </div>
 {/snippet}
 

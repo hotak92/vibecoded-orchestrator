@@ -6,6 +6,8 @@ keywords: ["audit report", "gap analysis", "codebase audit", "write findings", "
 tools: Read, Glob, Grep, Bash, Write, Edit
 model: haiku
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

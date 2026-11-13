@@ -148,7 +148,7 @@ def _runlist(conclusion: str, hours_ago: float, run_id: int = 424242) -> str:
 
 
 def _legs(n_success: int, n_fail: int = 0) -> str:
-    names = ["ubuntu-22.04", "ubuntu-24.04", "macos-14", "windows-latest", "fedora-40"]
+    names = ["ubuntu-22.04", "ubuntu-24.04", "macos-15", "windows-latest", "fedora-40"]
     out = [
         {"name": f"install smoke ({names[i]})", "conclusion": "success"}
         for i in range(n_success)

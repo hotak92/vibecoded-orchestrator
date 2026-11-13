@@ -66,6 +66,7 @@ OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-s
 # canonical chain (launcher keychain → shared file store). The env var and any
 # per-project binding are NOT sources: a project's key is the project's.
 from vco_lib.openai_key import resolve_openai_api_key  # noqa: E402
+from vco_lib.embed_split import ChunkOverflowError  # noqa: E402 — split-on-refusal (v0.2.106)
 
 OPENAI_API_KEY = resolve_openai_api_key()
 # Code embedding service URL (CodeSage-Large-v2 via FastAPI, or an
@@ -348,6 +349,12 @@ async def _get_all_kg_embeddings_tagged(
                 "_get_all_kg_embeddings_tagged: EmbeddingService returned no "
                 "slots; falling back to inline gather"
             )
+        except ChunkOverflowError:
+            # v0.2.106 split on refusal: the row writer asked for the refusal
+            # (``embed_split.row_split_scope``) and stores this chunk as more
+            # rows. The inline gather must NOT answer instead — it has no
+            # refusal handling and would store a different vector.
+            raise
         except Exception as e:
             server.logger.warning(
                 "_get_all_kg_embeddings_tagged via EmbeddingService failed (%s); "

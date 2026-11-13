@@ -18,15 +18,24 @@ the pipeline stays orthogonal to whether the search was BM25-hybrid,
 pure vector, with graph traversal, or a CLI near_vector); the pipeline
 owns:
 
-  1. License-tier gate (``feature_enabled("rl_retrieval")``) — free
-     tier skips the rerank-RPC but still emits telemetry.
+  1. RL scoring lock (``vco_lib/rl_scoring_lock.toml``) — while locked,
+     the rerank-RPC is skipped but telemetry is still emitted.
   2. Per-project enable toggle (hub-resolved
-     ``rl_reranker_enabled_for_project``) — owners can opt one project
-     out without revoking the license.
+     ``rl_reranker_enabled_for_project``): the user's choice (project, else
+     host-wide); with none, the bundled-weights default — on only with a
+     trained model bundled for the active profile, none ships today
+     (``vco_lib/rl_scoring_default.py``, owner 2026-11-12). Off when it
+     cannot be read. (There is no licence gate: the reranker
+     ships with the orchestrator since v0.2.106.)
   3. RL rerank RPC via the cached ``RLClient`` (one client per
      (active_embedding, project_id) — keyed so the
      ``X-VCT-Project-ID`` header routes to the right per-project model
-     head in vct-rl-reranker v0.2.10+).
+     head in vct-rl-reranker v0.2.10+). The container is called only when
+     its negotiated verdict is ``compatible`` (feature protocol, matching
+     space, and trained weights or the per-project gate); it scores from
+     ``query_emb`` + the vectors the candidates carry (``rerank_wire``) —
+     or hands the search order back while the project's own model has not
+     passed its own check.
   4. Citation-cache population (``_rl_node_content_cache`` in
      server.py) so the answer monitor can compute citations later
      without re-fetching from Weaviate.
@@ -51,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -163,7 +173,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # ---- ensure task_id ----
     task_id = req.task_id or new_task_id()
 
-    # ---- license tier gate + per-project enable toggle ----
+    # ---- scoring lock + per-project enable toggle ----
     rl_enabled = _resolve_rl_enabled()
 
     # ---- v0.2.73 Concern-A: is there ANY consumer of the citation capture? ----
@@ -175,7 +185,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # log line). Gate the whole CAPTURE — monitor spawn + citation cache +
     # pending-file staging — on "does a consumer exist?". The rerank itself
     # (``_do_rerank``, gated by ``rl_enabled``) is a SEPARATE concern and is NOT
-    # gated here: a Pro user with logging off still gets rerank.
+    # gated here: a user with logging off still gets rerank.
     capture_citations = _should_capture_citations(rl_enabled)
 
     # ---- rerank or pass through ----
@@ -188,6 +198,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             limit=req.limit,
             task_id=task_id,
             session_id=req.session_id,
+            query_emb=req.query_emb,
         )
         rl_used = reranked is not None
         ranked = reranked if reranked is not None else list(req.candidates[: req.limit])
@@ -439,7 +450,7 @@ def _drive_retention_housekeeping() -> None:
     in-flight-citation floor, same soft-fail). Project scope resolves the
     same way the writer's does (the hub ProjectConfig); resolution failure
     degrades to a global prune, matching the writer's project_id=None
-    free-tier behaviour. Never raises.
+    behaviour. Never raises.
     """
     project_id: Optional[str] = None
     try:
@@ -507,11 +518,11 @@ def _should_capture_citations(rl_enabled: bool) -> bool:
 
       * the local hub write   → needs ``not _local_logging_disabled()``
       * the upload queue       → needs ``_upload_consent_granted()``
-      * the ONLINE ``/rl_update`` training path (paid ``vct-rl-reranker``) →
-        needs ``rl_enabled`` (license tier + per-project toggle) AND the online
+      * the ONLINE ``/rl_update`` training path (``vct-rl-reranker``) →
+        needs ``rl_enabled`` (scoring lock + per-project toggle) AND the online
         training opt-out to be OFF (``not _online_training_disabled()``). The
         monitor's fire path calls ``client.rl_update_v3`` off the SAME single
-        compute (Concern-D), so an rl-enabled Pro user with local logging off
+        compute (Concern-D), so an rl-enabled user with local logging off
         still has a live consumer — UNLESS they globally/per-project disabled
         online training for performance.
 
@@ -519,8 +530,9 @@ def _should_capture_citations(rl_enabled: bool) -> bool:
     answer-embed) only when NONE of the three consumers exists.
 
     FALL OPEN: any probe import/read failure returns True (capture) so a
-    transient error never silently drops a paying user's training corpus —
-    mirrors ``_resolve_rl_enabled``'s soft-fail-to-enabled style.
+    transient error never silently drops the training corpus (logs are
+    always collected). The capture is local; whether anything is SENT to the
+    container is ``_resolve_rl_enabled``'s call, which falls closed.
     """
     try:
         from .telemetry_writer import (
@@ -565,65 +577,79 @@ def _rl_scoring_lock_reason() -> Optional[str]:
 
 
 def _resolve_rl_enabled() -> bool:
-    """Scoring lock + license-tier + per-project toggle gate. Returns True
+    """Scoring lock + per-project toggle gate. Returns True
     iff the caller should hit the RL container for rerank.
 
     The RL SCORING LOCK (v0.2.100, W5R-02, owner 2026-10-01: keep RL
     inactive until the network is trained) is checked FIRST and wins over
     everything below: explicit per-project ``true`` rows, a host-wide
-    ``true`` row, a Pro licence, and the hub-down fall-open. It gates
-    reranking only; event logging (``_retrieval_emit_has_consumer`` and the
-    citation capture) never consults it.
+    ``true`` row, and the hub-down fall-open. It gates reranking only;
+    event logging (``_retrieval_emit_has_consumer`` and the citation
+    capture) never consults it.
 
-    Below the lock, two independent gates, both falling open on resolver
-    errors:
+    Below the lock, ONE gate — the per-project enable toggle,
+    ``ProjectConfig.rl_reranker_enabled_for_project``, which the user turns
+    on per project in the launcher's Modules panel.
 
-      1. License tier — ``feature_enabled("rl_retrieval", module_id=
-         "vct-rl-reranker")``. Free → False. Pro / MAO → True. The
-         per-module overlay in ``~/.vibecoded/license_cache.json``
-         lets a user explicitly activated the paid module key reach
-         True even when the orchestrator tier is free.
-      2. Per-project enable toggle — ``ProjectConfig.
-         rl_reranker_enabled_for_project``. Owners can opt one project
-         out via the launcher GUI's per-project Modules panel without
-         revoking the license. Hub-down branch falls open (True): never
-         silently disable a paying user's reranker because the hub
-         crashed mid-session (not reached while the scoring lock is set).
+    v0.2.106 (owner rulings 2026-11-12): the hub serves the effective value —
+    the project's own choice, else the host-wide one, else the bundled-weights
+    default (on only with a trained model bundled for the active embedding
+    profile; none ships today, so off: ``vco_lib/rl_scoring_default.py``,
+    ``Db::module_effective_enabled``). A toggle this process cannot read —
+    hub down, no project config, a probe error — is OFF: the user's choice,
+    which wins over any default, cannot be confirmed. (Before v0.2.106 that branch fell open.) Off means
+    no call to the container at all: no rerank, no ``/rl_update``. The licence
+    gate that sat between lock and toggle is gone (owner 2026-11-11, "the RL
+    reranker is no more paid").
     """
     if _rl_scoring_lock_reason() is not None:
         return False
     try:
-        from VCThelpers.license import feature_enabled
-        if not feature_enabled("rl_retrieval", module_id="vct-rl-reranker"):
-            return False
-    except ImportError:
-        # VCThelpers not available (pure-free install) → no RL.
-        return False
-    except Exception as exc:
-        logger.debug("_resolve_rl_enabled: license probe raised (%s); free tier", exc)
-        return False
-    # Per-project toggle. Soft-fail to enabled.
-    try:
         cfg = _kg_server()._try_resolve_project_config()
-        if cfg is not None and not getattr(cfg, "rl_reranker_enabled_for_project", True):
-            return False
-    except Exception as exc:
-        logger.debug("_resolve_rl_enabled: per-project toggle probe raised (%s)", exc)
-    return True
+    except Exception as exc:  # noqa: BLE001 — cannot confirm the opt-in: off
+        logger.debug("_resolve_rl_enabled: per-project toggle probe raised (%s); off", exc)
+        return False
+    if cfg is None:
+        logger.debug("_resolve_rl_enabled: no project config (hub down?); RL scoring off")
+        return False
+    return getattr(cfg, "rl_reranker_enabled_for_project", False) is True
 
 
-# v0.2.75 (RL-10 completion): negotiation verdicts that REFUSE the live
-# rerank. Kept as a module constant so tests + rl-doctor copy can pin
-# against one home. Everything else — "compatible", "degraded_old_server"
-# (old container, absent /health fields: correct-by-design keep-reranking),
-# "unreachable", "disabled" — proceeds to the per-call fallback machinery.
-_NEGOTIATION_REFUSE_STATUSES = ("embedding_space_mismatch", "incompatible_new_server")
+# The ONE negotiation verdict that reranks (v0.2.106): the container speaks
+# the feature protocol, matches the embedding space AND serves trained
+# weights. Every other verdict means the container is not called at all.
+_NEGOTIATION_SCORING_STATUS = "compatible"
 
-# Attribute name used to memoise the negotiation verdict on the RLClient
-# instance. Client instances are already cached per (active_embedding,
-# project_id) in server._rl_client_instances, so "once per client instance"
-# == once per (embedding, project) pairing per process.
+# Verdicts that REFUSE the live rerank (everything but "compatible"). Kept
+# as a module constant so tests, rl-doctor and the enrichment gate pin
+# against one home.
+_NEGOTIATION_REFUSE_STATUSES = (
+    "embedding_space_mismatch",
+    "incompatible_new_server",
+    "degraded_old_server",
+    "not_trained",
+    "unreachable",
+    "disabled",
+)
+
+# Refusals that are a legitimate OFF state, not a fault: no container wired,
+# or a container without trained weights. They are not counted as rerank
+# fallbacks (pre-v0.2.106 every search of an install without a container
+# counted one — 14 794 "fallbacks" on one machine). The others are faults
+# (fixable) and are counted with their reason.
+_NEGOTIATION_OFF_STATUSES = ("disabled", "not_trained")
+
+# Verdicts that can change while the process lives (weights rotated in, a
+# container started) are re-probed after this many seconds; the rest hold
+# for the client instance's lifetime.
+_NEGOTIATION_REPROBE_STATUSES = ("not_trained", "unreachable", "degraded_old_server")
+_NEGOTIATION_REPROBE_S = 120.0
+
+# Attribute names used to memoise the negotiation verdict (and when it was
+# taken) on the RLClient instance. Client instances are already cached per
+# (active_embedding, project_id) in server._rl_client_instances.
 _NEGOTIATION_CACHE_ATTR = "_vct_cached_negotiation"
+_NEGOTIATION_CACHE_AT_ATTR = "_vct_cached_negotiation_at"
 
 
 async def _negotiate_cached(client: Any) -> Optional[Any]:
@@ -632,30 +658,40 @@ async def _negotiate_cached(client: Any) -> Optional[Any]:
     Calls ``client.negotiate()`` (ONE ``/health`` probe) the first time a
     given client instance reaches the rerank path, then memoises the
     ``NegotiationResult`` on the instance — subsequent reranks reuse the
-    verdict with zero extra probes.
+    verdict with zero extra probes. A verdict that can change while the
+    process lives (``_NEGOTIATION_REPROBE_STATUSES``: weights rotated in, a
+    container started or rebuilt) is re-probed once it is older than
+    ``_NEGOTIATION_REPROBE_S``.
 
     Returns the cached ``NegotiationResult``, or ``None`` when negotiation
-    itself failed at the transport level (``negotiate`` is contractually
-    non-raising, but we stay defensive): ``None`` means "no verdict — fall
-    OPEN to the existing per-call fallback path". The failure outcome is
-    ALSO cached (still exactly one probe per instance); a container that
-    comes up later is handled by ``cache_nodes``' own per-call retry
-    semantics, at the deliberate cost of not re-checking its embedding
-    space mid-process (an accepted trade-off: re-probing per call would
-    add up to 1 s of /health latency to every search on a down container).
+    itself raised (``negotiate`` is contractually non-raising, but we stay
+    defensive). ``None`` is no verdict: the caller does NOT rerank (it cannot
+    positively confirm the container scores). The ``None`` outcome is cached
+    too, for the client instance's lifetime.
     """
+    import time as _time
+
     sentinel = object()
     cached = getattr(client, _NEGOTIATION_CACHE_ATTR, sentinel)
     if cached is not sentinel:
-        return cached
+        status = getattr(cached, "status", "")
+        taken_at = getattr(client, _NEGOTIATION_CACHE_AT_ATTR, None)
+        stale = (
+            status in _NEGOTIATION_REPROBE_STATUSES
+            and isinstance(taken_at, (int, float))
+            and _time.monotonic() - taken_at >= _NEGOTIATION_REPROBE_S
+        )
+        if not stale:
+            return cached
     result: Optional[Any]
     try:
         result = await client.negotiate()
     except Exception as exc:  # noqa: BLE001 — negotiation must never block retrieval
-        logger.debug("_negotiate_cached: negotiate raised (%s); falling open", exc)
+        logger.debug("_negotiate_cached: negotiate raised (%s); not reranking", exc)
         result = None
     try:
         setattr(client, _NEGOTIATION_CACHE_ATTR, result)
+        setattr(client, _NEGOTIATION_CACHE_AT_ATTR, _time.monotonic())
     except Exception:  # noqa: BLE001 — a slots-only test double can't cache; still works
         pass
     return result
@@ -668,15 +704,16 @@ async def _do_rerank(
     limit: int,
     task_id: str,
     session_id: Optional[str],
+    query_emb: Optional[list[float]] = None,
 ) -> Optional[list[dict[str, Any]]]:
-    """Call RLClient.cache_nodes. Returns None on any failure so the
-    caller falls back to Weaviate order.
+    """Rerank through the container. ``None`` = not reranked (the caller
+    keeps the search order).
 
-    Note: RLClient's own ``cache_nodes`` swallows network errors
-    internally — it returns Weaviate's input order on connection-
-    refused / 5xx / disabled-mode. So None from here means a structural
-    error (client unavailable, import broken) rather than transport
-    failure.
+    The container is called ONLY when its negotiated verdict is
+    ``compatible`` (feature protocol, matching embedding space, trained
+    weights). Every other verdict skips the call; the legitimate off states
+    (no container wired, no trained weights) are not counted as fallbacks,
+    the faults are (``_record_rl_fallback``, warned once per session).
     """
     try:
         _get_rl_client = _kg_server()._get_rl_client
@@ -686,49 +723,61 @@ async def _do_rerank(
     client = _get_rl_client()
     if client is None:
         return None
-    # v0.2.75 (RL-10 completion): gate the LIVE rerank on the cached
-    # negotiation verdict. Pre-v0.2.75 ``negotiate()`` existed but had
-    # exactly ONE caller (rl-doctor) — the pipeline itself never consulted
-    # it, so an embedding-space-mismatched or newer-protocol container was
-    # still POSTed to on every search (the exact hazard RL-10 classified).
-    # Hard-refuse statuses fall back to cosine (rl_used=False) and count in
-    # the persistent RL-3 fallback counter so rl-doctor and the counter
-    # agree on WHY. ``degraded_old_server`` keeps reranking
-    # (correct-by-design: extra=allow tolerance); ``unreachable`` /
-    # ``disabled`` / a negotiation transport failure all fall OPEN to the
-    # existing per-call fallback path below — negotiation must never
-    # BLOCK retrieval, only refuse a positively-identified bad pairing.
-    neg = await _negotiate_cached(client)
-    if neg is not None and getattr(neg, "status", "") in _NEGOTIATION_REFUSE_STATUSES:
-        _record_rl_fallback(
-            f"negotiation refused: {neg.status} — {getattr(neg, 'detail', '')}"
-        )
+    if not getattr(client, "enabled", True):
+        # No container wired (no RL_SERVER_URL / RL_SERVER_PORT / hub port):
+        # nothing to call, nothing to count.
+        logger.debug("_do_rerank: RL client disabled (no container wired); search order")
         return None
-    # Pre-resolve session_id with the same 3-layer rule we use for
-    # telemetry — keeps the X-VCT-Session-ID header on cache_nodes
-    # consistent with what the telemetry envelope eventually carries.
     from .telemetry_emit import resolve_session_id
 
+    # Pre-resolve session_id with the same 3-layer rule we use for
+    # telemetry — keeps the X-VCT-Session-ID header on cache_nodes and the
+    # once-per-session fallback warning consistent with the telemetry
+    # envelope.
     resolved_session = resolve_session_id(session_id)
+    neg = await _negotiate_cached(client)
+    status = getattr(neg, "status", None) if neg is not None else None
+    if status != _NEGOTIATION_SCORING_STATUS:
+        if status in _NEGOTIATION_OFF_STATUSES:
+            logger.debug("_do_rerank: reranking off (%s); search order", status)
+        else:
+            _record_rl_fallback(
+                f"negotiation refused: {status or 'no verdict'} — "
+                f"{getattr(neg, 'detail', '') if neg is not None else 'negotiate raised'}",
+                session_id=resolved_session,
+            )
+        return None
     try:
         ranked = await client.cache_nodes(
             query=query,
             nodes=candidates,
             top_k=limit,
             task_id=task_id,
+            query_emb=query_emb,
             session_id=resolved_session,
+            include_linked=not bool(getattr(neg, "linked_slots_masked", False)),
         )
     except Exception as exc:
         logger.debug("_do_rerank: cache_nodes raised (%s)", exc)
-        _record_rl_fallback(f"cache_nodes raised: {exc}")
+        _record_rl_fallback(f"cache_nodes raised: {exc}", session_id=resolved_session)
         return None
     # v0.2.73 RL-3 / RL-1 accuracy: cache_nodes swallows transport + 4xx
-    # errors internally and returns the INPUT order — pre-RL-3 that counted
-    # as a successful rerank (rl_used=True) and the paying user's permanent
-    # cosine degradation was invisible. Read the client's per-call outcome:
-    # not-ok → treat as a fallback (rl_used=False) + count it persistently.
+    # errors internally and returns the INPUT order. Read the client's
+    # per-call outcome: not-ok → treat as a fallback (rl_used=False) + count
+    # it persistently.
     if not getattr(client, "last_call_ok", True):
-        _record_rl_fallback(getattr(client, "last_error", None) or "unknown")
+        _record_rl_fallback(
+            getattr(client, "last_error", None) or "unknown", session_id=resolved_session,
+        )
+        return None
+    # v0.2.106 per-project gate: the container handed the search order back
+    # because this project's model has not passed its own check —
+    # a healthy answer (not a fallback, not a rerank).
+    if getattr(client, "last_served", True) is False:
+        logger.debug(
+            "_do_rerank: project's model not served (%s); search order",
+            getattr(client, "last_not_served_reason", None) or "gate",
+        )
         return None
     # NEW-3 sibling (v0.2.75): count SUCCESSES next to the fallbacks so the
     # fallback RATE is computable from disk (rl-doctor reads both fields from
@@ -737,23 +786,31 @@ async def _do_rerank(
     return ranked
 
 
-def _record_rl_fallback(reason: str) -> None:
-    """v0.2.73 RL-3: persist a rerank-fallback counter + WARN once per process.
+def _record_rl_fallback(reason: str, *, session_id: Optional[str] = None) -> None:
+    """v0.2.73 RL-3: persist a rerank-fallback counter + WARN once per session.
 
     Writes ``<project_root>/.claude/state/rl_fallback_counter.json`` with
-    ``{count, success_count, last_reason, last_ts}`` so "my Pro rerank
-    silently stopped working" is diagnosable from disk (rl-doctor material,
-    RL-12). Soft-fail throughout — the counter must never break a search.
+    ``{count, success_count, last_reason, last_ts, warned_session}`` so "my
+    rerank silently stopped working" is diagnosable from disk (rl-doctor
+    material, RL-12). Soft-fail throughout — the counter must never break a
+    search.
+
+    The warning fires once per Claude session (v0.2.106): the counter file
+    remembers the session it last warned for, so the short-lived hook
+    processes — a new process per search — do not repeat it on every call.
+    Without a session id (or when the file cannot be written) it fires once
+    per process.
     """
     global _WARNED_RL_FALLBACK
-    if not _WARNED_RL_FALLBACK:
+    first_in_session = _bump_rl_counter("count", reason=reason, warn_session=session_id or None)
+    warn = first_in_session if first_in_session is not None else not _WARNED_RL_FALLBACK
+    if warn:
         _WARNED_RL_FALLBACK = True
         logger.warning(
-            "RL rerank is ENABLED for this project but fell back to cosine "
+            "RL rerank is ENABLED for this project but fell back to search "
             "order (reason: %s). Subsequent fallbacks are counted in "
             ".claude/state/rl_fallback_counter.json.", reason,
         )
-    _bump_rl_counter("count", reason=reason)
 
 
 def _record_rl_success() -> None:
@@ -793,7 +850,11 @@ def rl_counter_root() -> "Optional[str]":
     return str(found) if found is not None else None
 
 
-def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
+def _bump_rl_counter(
+    field: str,
+    reason: "Optional[str]" = None,
+    warn_session: "Optional[str]" = None,
+) -> "Optional[bool]":
     """Shared writer for the on-disk rerank outcome counter (one home).
 
     Root resolution: :func:`rl_counter_root` (shared with rl-doctor's
@@ -801,6 +862,10 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
     tmp-write-then-replace. ``reason`` (when given) updates ``last_reason``;
     ``last_ts`` always refreshes. Soft-fail throughout — the counter must
     never break a search.
+
+    ``warn_session`` (when given): returns True when the file had not yet
+    recorded a warning for that session (and records it), False when it
+    had. Returns None when no session was given or nothing was written.
     """
     try:
         import json as _json
@@ -814,7 +879,7 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
                 "CLAUDE_PROJECT_DIR/KG_BASE_DIR are unset; counter not written",
                 field,
             )
-            return
+            return None
         state_dir = _os.path.join(root, ".claude", "state")
         _os.makedirs(state_dir, exist_ok=True)
         path = _os.path.join(state_dir, "rl_fallback_counter.json")
@@ -830,6 +895,10 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
         if reason is not None:
             data["last_reason"] = str(reason)[:500]
         data["last_ts"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z", _time.localtime())
+        first_in_session: "Optional[bool]" = None
+        if warn_session:
+            first_in_session = data.get("warned_session") != warn_session
+            data["warned_session"] = warn_session
         # v0.2.92: one home for tmp+os.replace (`vco_lib` is a hard
         # dependency of every MCP process; a failure here is the
         # counter's existing debug-logged soft-fail, not a silent copy).
@@ -838,8 +907,10 @@ def _bump_rl_counter(field: str, reason: "Optional[str]" = None) -> None:
         from pathlib import Path as _Path  # noqa: PLC0415
 
         atomic_write_json(_Path(path), data, indent=None, fsync=False)
+        return first_in_session
     except Exception as exc:  # noqa: BLE001
         logger.debug("_bump_rl_counter(%s): counter write failed (%s)", field, exc)
+        return None
 
 
 _WARNED_RL_FALLBACK = False
@@ -1007,22 +1078,44 @@ def _populate_citation_cache(
             from claude_mcp_servers.rl_client.citation_pending import stage_pending
             from .telemetry_emit import resolve_session_id
 
-            # v0.2.75 P3g: read the counter from its single home (``rl_state``),
-            # not the stale re-exported ``srv._rl_call_seq`` copy.
-            try:
-                from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
-                staged_seq = getattr(_rl_state, "_rl_call_seq", None)
-            except Exception:  # noqa: BLE001 — soft-fail, staging is best-effort
-                staged_seq = getattr(srv, "_rl_call_seq", None)
-            source = "mcp" if task_type == "mcp_interactive" else "hook"
-            staged_path = stage_pending(
-                session_id=resolve_session_id(session_id or ""),
-                task_id=task_id,
-                seq=staged_seq if source == "mcp" else None,
-                query=query,
-                ctx=ctx_dict,
-                source=source,
-            )
+            staged_session = resolve_session_id(session_id or "")
+            # v0.2.106 (training-readiness survey G5): a pending file is only
+            # useful when a CHAT exists that a drain can attribute it to —
+            # either an explicit session anchor (the hook paths' VCT_SESSION_ID
+            # from the hook payload) or a Claude Code session around this
+            # process (``CLAUDE_CODE_SESSION_ID`` — exported to MCP servers and
+            # Bash-tool commands, verified v0.2.105), whose transcript a drain
+            # can hold the query against. With NEITHER (a human running
+            # ``kg-search`` in a plain shell) no answer will ever follow and
+            # no transcript can ever be attributed: the file would rot for
+            # the 7-day abandoned collector (measured: every kg_search_cli
+            # retrieval on the maintainer's install unpaired; the collector
+            # removes such files as ``no_transcript``). Stage nothing — the
+            # retrieval event still emits (query-distribution signal).
+            if staged_session or os.environ.get("CLAUDE_CODE_SESSION_ID"):
+                # v0.2.75 P3g: read the counter from its single home
+                # (``rl_state``), not the stale re-exported ``srv._rl_call_seq``
+                # copy.
+                try:
+                    from claude_mcp_servers.weaviate_mcp import rl_state as _rl_state
+                    staged_seq = getattr(_rl_state, "_rl_call_seq", None)
+                except Exception:  # noqa: BLE001 — soft-fail, staging is best-effort
+                    staged_seq = getattr(srv, "_rl_call_seq", None)
+                source = "mcp" if task_type == "mcp_interactive" else "hook"
+                staged_path = stage_pending(
+                    session_id=staged_session,
+                    task_id=task_id,
+                    seq=staged_seq if source == "mcp" else None,
+                    query=query,
+                    ctx=ctx_dict,
+                    source=source,
+                )
+            else:
+                logger.debug(
+                    "_populate_citation_cache: no chat anchor (no session id, no "
+                    "CLAUDE_CODE_SESSION_ID); pending file not staged for %s",
+                    task_id[:8],
+                )
         except Exception as exc:
             logger.debug("_populate_citation_cache: stage_pending failed (%s)", exc)
 
@@ -1227,9 +1320,17 @@ def slot_suffixed_task_id(task_id: str, embedding_source: str) -> str:
 
 #: Fields of an ACTIVE-slot log record that live in the ACTIVE embedding space
 #: (vectors, or cosines computed against active-space vectors). The dual-log
-#: twin must never carry them — they would be a qwen3-space feature inside an
-#: arctic-space sample. ``linked_type_names`` is the index-parallel label array
-#: of ``linked_embs`` and goes with it.
+#: twin must never carry them AS THE ACTIVE SPACE WROTE THEM — they would be a
+#: qwen3-space feature inside an arctic-space sample. The twin DROPS them and
+#: then re-adds the ones it has an OTHER-space source for (``emb``/``n_emb`` ←
+#: ``emb_other``, ``cos_qn`` ← ``cos_qn_other``, ``emb_truncated`` ←
+#: ``emb_other_truncated``, and since v0.2.106 ``linked_embs`` /
+#: ``linked_type_names`` ← ``linked_embs_other`` / ``linked_type_names_other`` —
+#: survey G1: the v2 net's linked slots must not be zero for every twin).
+#: ``cos_ql`` / ``cos_nl`` stay dropped: they are active-space scalars with no
+#: other-space counterpart, and the offline trainer treats them as optional.
+#: ``linked_type_names`` is the index-parallel label array of ``linked_embs``
+#: and goes with it.
 _ACTIVE_SPACE_ONLY_FIELDS = (
     "emb", "n_emb", "cos_qn", "cos_ql", "cos_nl",
     "linked_embs", "linked_type_names", "emb_truncated",
@@ -1255,9 +1356,15 @@ def _build_other_slot_log_nodes(
     active-space fields (:data:`_ACTIVE_SPACE_ONLY_FIELDS`) are dropped and
     replaced by the other slot's: ``emb`` / ``n_emb`` ← ``emb_other``,
     ``cos_qn`` ← ``cos_qn_other``, ``emb_truncated`` ← ``emb_other_truncated``
-    (only-when-known). Candidates lacking an ``emb_other`` are SKIPPED (the
-    twin only carries nodes whose other-slot vector genuinely exists — never
-    fabricates); ``tier`` keeps the candidate's ORIGINAL index, as before.
+    (only-when-known), and — v0.2.106, survey G1 — ``linked_embs`` /
+    ``linked_type_names`` ← ``linked_embs_other`` / ``linked_type_names_other``
+    (packed by the enrichment from the SAME fetched rows, same order and
+    _RL_MAX_LINKED cap, so the twin's linked slots have the active event's
+    SHAPE in the other slot's SPACE; a linked row without an other-slot
+    vector is absent, never fabricated). Candidates lacking an ``emb_other``
+    are SKIPPED (the twin only carries nodes whose other-slot vector
+    genuinely exists — never fabricates); ``tier`` keeps the candidate's
+    ORIGINAL index, as before.
     """
     base = _build_log_nodes(candidates, limit)
     if ranked is not None:
@@ -1281,6 +1388,15 @@ def _build_other_slot_log_nodes(
         cos_other = n.get("cos_qn_other")
         if cos_other is not None:
             twin["cos_qn"] = cos_other
+        # v0.2.106 (survey G1): the OTHER slot's linked-slot vectors, with the
+        # same field names the trainer reads — same packing order and cap as
+        # the active record's (the enrichment calls the ONE packer for both).
+        linked_other = n.get("linked_embs_other")
+        if linked_other:
+            twin["linked_embs"] = linked_other
+            types_other = n.get("linked_type_names_other")
+            if types_other:
+                twin["linked_type_names"] = types_other
         out.append(twin)
     return out
 

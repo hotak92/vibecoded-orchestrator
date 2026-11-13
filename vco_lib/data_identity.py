@@ -55,6 +55,7 @@ __all__ = [
     "NOTHING_TO_LOSE",
     "REFUSE_UNKNOWN",
     "REFUSE_DIFFERENT",
+    "REFUSE_RAFT",
     "CID_RECREATE_REFUSED",
     "LiveMount",
     "Effective",
@@ -73,6 +74,9 @@ PRESERVES = "preserves"
 NOTHING_TO_LOSE = "nothing_to_lose"
 REFUSE_UNKNOWN = "refuse_unknown"
 REFUSE_DIFFERENT = "refuse_different"
+#: v0.2.106: the recreate would move Weaviate data onto a release with the
+#: 1.37 orphan drop without a raft snapshot (vco_lib.weaviate_raft_guard).
+REFUSE_RAFT = "refuse_raft_snapshot"
 
 CID_RECREATE_REFUSED = "service_recreate_refused_data_unknown"
 
@@ -446,6 +450,9 @@ class GuardResult:
     row: Optional[_se.EndpointRow] = None
     #: the container runtime the guard asked (``podman`` / ``docker``)
     runtime: str = ""
+    #: v0.2.106: the ledger row of a refusal that is not about the data
+    #: location (:data:`REFUSE_RAFT`); ``deferral_entry`` returns it.
+    entry: Optional[DeferralEntry] = None
 
     @property
     def ok(self) -> bool:
@@ -453,10 +460,15 @@ class GuardResult:
 
     def deferral_entry(self, *, manual_cmd: str = "python install.py --update",
                        runtime: Optional[str] = None) -> DeferralEntry:
-        """The ``service_recreate_refused_data_unknown`` row. Its inspect
-        recipe names the runtime the guard asked (*runtime* overrides; a
-        guard that never learned one prints the placeholder, never a guess —
-        review W2R-10)."""
+        """The ledger row for this refusal: :attr:`entry` when the guard set
+        one (v0.2.106: the raft guard's ``weaviate_upgrade_snapshot_refused``
+        row, :data:`REFUSE_RAFT`), else the
+        ``service_recreate_refused_data_unknown`` row. Its inspect recipe
+        names the runtime the guard asked (*runtime* overrides; a guard that
+        never learned one prints the placeholder, never a guess — review
+        W2R-10)."""
+        if self.entry is not None:
+            return self.entry
         rt = runtime or self.runtime or "<podman|docker>"
         return DeferralEntry(
             condition_id=CID_RECREATE_REFUSED,
@@ -517,7 +529,10 @@ def guard_recreate(
     on (default *row*); *rows* the other services' rows for the ``.env``
     projection. Order: capture → early verdict → RECORD the live mount when
     the row lacks it → project the knob into ``infrastructure/.env`` →
-    ``compose config`` → verdict. Nothing is stopped or removed here.
+    ``compose config`` → verdict. Nothing is removed here; the one thing
+    that is stopped (and started again) is a Weaviate whose recreate would
+    move its data onto a release with the 1.37 orphan drop, for the raft
+    snapshot :func:`_raft_upgrade_guard` takes with its own image first.
     *compose_argv* may be a callable: it is resolved only when ``compose
     config`` actually has to run."""
     infra = Path(infra_dir)
@@ -526,6 +541,15 @@ def guard_recreate(
     result = GuardResult(service, early or "", why, live=live, mount=target, runtime=runtime,
                          row=row)
     if early is not None:
+        if early == NOTHING_TO_LOSE and service == "weaviate":
+            # v0.2.106: no container names the data, but compose may still
+            # mount a folder an older Weaviate wrote — look before creating
+            # (the installer's Python merge of the compose files; read only
+            # when the raft guard needs it).
+            from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+            _raft_upgrade_guard(result, infra, runtime, run or _tsd.run,
+                                lambda: _rg.compose_data_mount(infra.parent))
         return result
     if row is not None:
         result.row = replace(row, data_mount=target)
@@ -568,7 +592,33 @@ def guard_recreate(
                                         if service == "weaviate" else None)
     result.verdict, result.reason = recreate_preserves_data(service, effective_row, live,
                                                             result.effective)
+    _raft_upgrade_guard(result, infra, runtime, run or _tsd.run, target)
     return result
+
+
+def _raft_upgrade_guard(result: GuardResult, infra: Path, runtime: str, run: RunFn,
+                        data_mount: "Optional[dict] | Callable[[], Optional[dict]]") -> None:
+    """v0.2.106: a Weaviate recreate that would MOVE the data onto a release
+    with the 1.37 orphan drop first gets a raft snapshot taken by the old
+    image, or is refused (:func:`vco_lib.weaviate_raft_guard.upgrade_check`;
+    the old container is stopped and started again for the snapshot, never
+    removed). Turns a passing verdict into :data:`REFUSE_RAFT`."""
+    if result.service != "weaviate" or not result.ok:
+        return
+    import sys  # noqa: PLC0415
+
+    from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+    target_image = _rg.pinned_target(infra.parent)
+    verdict = _rg.upgrade_check(
+        service=result.service, live_state=result.live.state, ref=result.live.ref,
+        target_image=target_image, data_mount=data_mount, runtime=runtime, run=run,
+        log=lambda m: print(m, file=sys.stderr))
+    if verdict.ok:
+        return
+    result.verdict, result.reason = REFUSE_RAFT, verdict.reason
+    result.entry = _rg.refusal_entry(result.service, result.live.ref, verdict.reason,
+                                     runtime=runtime, target_image=target_image)
 
 
 def guard_compose_set(

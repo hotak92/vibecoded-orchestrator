@@ -130,7 +130,7 @@ license key keyed by manifest `module_id`. Examples:
 | Module                 | module_id          | keychain username           |
 |------------------------|--------------------|-----------------------------|
 | Orchestrator root tier | `__orchestrator__` | `license_key____orchestrator__` |
-| RL Reranker            | `vct-rl-reranker`  | `license_key__vct-rl-reranker`  |
+| RL Reranker (until v0.2.106; free since, no key read) | `vct-rl-reranker`  | `license_key__vct-rl-reranker`  |
 | MAO                    | `vct-mao`          | `license_key__vct-mao`          |
 
 To discover whether a per-module key is set, read the row from

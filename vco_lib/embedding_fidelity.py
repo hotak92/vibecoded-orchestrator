@@ -15,9 +15,18 @@ v0.2.92 behaviours never reached it:
   hard refusal, and ``_embed_shrinking_on_overflow`` retries under a tighter
   sub-window. On the ACTIVE slot that is a real fidelity loss on the vector
   retrieval reads, and its only disclosure was a WARNING to MCP stderr or a
-  detached kg-sync's stdout — i.e. to nobody.
-* **floor refusal** — the shrink ladder exhausted (input still refused at
-  the floor), so that slot got NO vector at all.
+  detached kg-sync's stdout — i.e. to nobody. Since v0.2.106 (split on
+  refusal) stored content is never shrunk: a refused chunk is SPLIT
+  (``vco_lib.embed_split``) into more rows of the same node or entity, every
+  row embedded whole by every model of its vector set; only a one-vector
+  consumer outside a row writer (RL regen/recovery, the migrate script, the
+  MCP backfill tool) combines piece vectors — so a shrink is now recorded
+  only for a search QUERY vector.
+* **floor refusal** — a piece still refused at the floor, so that slot got NO
+  vector at all.
+* **split** (v0.2.106) — a refused input was split and EVERY character
+  embedded. Counted apart (``note_split`` → the row's ``splits`` map), never a
+  loss, and a row holding only splits never raises the notice.
 
 kg-sync's "See ~/.claude/metrics/embedding_failures.jsonl for details."
 therefore pointed at a file those refusals never landed in.
@@ -74,22 +83,23 @@ Wiring status — read this before crediting the module
   :func:`append_outage_row` before its "No embedding backend produced a
   vector" raise, so that message's jsonl pointer is true for the
   call-time-failure population the construction-time capture never covers.
-* **Shrink / floor-refusal writers: LIVE.**
-  ``vco_lib/embedding_service.py`` reaches :func:`note_shrink` and
-  :func:`note_floor_refusal` through its guarded ``_note_fidelity`` helper,
-  called from inside ``_embed_shrinking_on_overflow`` — the ONE home all four
-  embed paths route through, so those two call sites cover primary text,
-  secondary text, active code and the CodeEmbed service leg at once.
-  ``note_shrink`` is in the LOOP, not after it, so a multi-step ladder is
-  recorded once per accepted embed with the length actually sent; both calls
-  are two dict updates and no IO, so they are safe on a per-chunk path and
-  the single summary row lands at process exit.
+* **Shrink / split / floor-refusal writers: LIVE.**
+  ``vco_lib/embedding_service.py`` reaches :func:`note_shrink`,
+  :func:`note_split` and :func:`note_floor_refusal` through its guarded
+  ``_note_fidelity`` helper: shrinks from ``_embed_shrinking_on_overflow``
+  (query vectors only since v0.2.106), splits and floor refusals from
+  ``_embed_whole_on_overflow`` (the one-vector document embeds outside a row
+  writer). ``vco_lib/embed_split.py`` records the ROW splits of the row
+  writers (kg-sync, the MCP store, the sidecar builder, ``process_documents``,
+  the code-graph analyzer) and their floor refusals. A ladder or a recursion is recorded ONCE per
+  input, with its outcome; every call is a dict update and no IO, so it is
+  safe on a per-chunk path and the single summary row lands at process exit.
 
 Re-run the check before crediting any of the above in prose — this list has
 been wrong in BOTH directions inside one release cycle (writers credited
 while unwired, then described as unwired the hour after they landed)::
 
-    grep -rnE "note_shrink|note_floor_refusal|append_outage_row" \
+    grep -rnE "note_shrink|note_split|note_floor_refusal|append_outage_row" \
         --include=*.py . | grep -v tests/
 
 Every writer named above must show a caller OUTSIDE this file. A writer with
@@ -122,7 +132,7 @@ MARKER_REL = Path(".claude") / "state" / "embedding-fidelity.seen"
 class _RunState:
     """In-memory per-process counters. One row per run, not per chunk."""
 
-    __slots__ = ("started", "shrinks", "floor_refusals")
+    __slots__ = ("started", "shrinks", "floor_refusals", "splits")
 
     def __init__(self) -> None:
         self.started = datetime.now(timezone.utc)
@@ -130,6 +140,11 @@ class _RunState:
         self.shrinks: dict[str, dict[str, int]] = {}
         # {model_id: {"count": int, "last_chars": int, "last_message": str}}
         self.floor_refusals: dict[str, dict[str, object]] = {}
+        # {model_id: {"count": int, "chars": int, "pieces": int}} — inputs the
+        # model refused whole and that were SPLIT (v0.2.106 split-on-refusal):
+        # every character still embedded, so NOT a fidelity loss. Kept apart
+        # from ``shrinks`` so the two can never be summed into one number.
+        self.splits: dict[str, dict[str, int]] = {}
 
 
 _STATE = _RunState()
@@ -156,6 +171,25 @@ def note_shrink(model_id: str, orig_chars: int, sent_chars: int) -> None:
     entry["count"] += 1
     entry["orig_chars"] += max(0, int(orig_chars))
     entry["sent_chars"] += max(0, int(sent_chars))
+
+
+def note_split(model_id: str, chars: int, pieces: int) -> None:
+    """Record that ``model_id`` refused a ``chars``-long input whole and it was
+    split into ``pieces`` accepted pieces (v0.2.106, owner ruling 2026-11-11).
+
+    Not a fidelity loss — every character reached a vector, as extra rows
+    of the same node or entity (or, for a one-vector consumer outside a row
+    writer, combined into one vector) — so it is counted
+    apart from :func:`note_shrink` and never rendered as a loss in the
+    SessionStart notice. In-memory only, like the other notes.
+    """
+    _register_atexit()
+    entry = _STATE.splits.setdefault(
+        model_id, {"count": 0, "chars": 0, "pieces": 0},
+    )
+    entry["count"] += 1
+    entry["chars"] += max(0, int(chars))
+    entry["pieces"] += max(0, int(pieces))
 
 
 def note_floor_refusal(model_id: str, chars: int, message: str) -> None:
@@ -243,7 +277,7 @@ def flush_run(*, reset: bool = True) -> bool:
     """
     # (No `global _STATE` here: this function only READS the module state;
     # the rebind happens inside `reset_run_state`, which declares its own.)
-    if not _STATE.shrinks and not _STATE.floor_refusals:
+    if not _STATE.shrinks and not _STATE.floor_refusals and not _STATE.splits:
         return False
     row = {
         "kind": KIND_SHRINK_SUMMARY,
@@ -252,6 +286,7 @@ def flush_run(*, reset: bool = True) -> bool:
         "pid": _get_pid(),
         "shrinks": _STATE.shrinks,
         "floor_refusals": _STATE.floor_refusals,
+        "splits": _STATE.splits,
     }
     path = _jsonl_path()
     try:
@@ -392,6 +427,13 @@ def _fmt_row(record: dict) -> str:
             f"  - {model}: {count} chunk(s) embedded from a leading "
             f"sub-window{pct}"
         )
+    splits = record.get("splits") or {}
+    for model in sorted(splits):
+        sp = splits[model]
+        lines.append(
+            f"  - {model}: {sp.get('count', 0)} input(s) split into "
+            f"{sp.get('pieces', 0)} piece(s) after a refusal (nothing cut off)"
+        )
     refusals = record.get("floor_refusals") or {}
     for model in sorted(refusals):
         r = refusals[model]
@@ -412,6 +454,9 @@ def render_notice(rows: list[dict], jsonl_path: Path) -> str:
     first line says so explicitly, and the notice never claims backends were
     down — they were reachable; the vectors are just leading-window ones.
     """
+    # A row that records only SPLITS describes no loss (every character was
+    # embedded), so it never raises the notice on its own.
+    rows = [r for r in rows if r.get("shrinks") or r.get("floor_refusals")]
     if not rows:
         return ""
     body = "\n".join(_fmt_row(r) for r in rows)

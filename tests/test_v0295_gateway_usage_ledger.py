@@ -567,7 +567,7 @@ class LedgerTests(unittest.TestCase):
         )
 
     def test_keep_lines_is_about_a_quarter_of_the_cap(self) -> None:
-        """The documented figure, at the shipped default: 16 868 lines.
+        """The documented figure, at the shipped default: 13 003 lines.
 
         Re-measured at v0.2.102 (review LOW H1): the constant is the LONGEST
         realistic fully-populated row across every route (776 bytes of JSON +
@@ -575,13 +575,52 @@ class LedgerTests(unittest.TestCase):
         token counts, the longest fallback label, the ``budget_tokens=``
         effort spelling), so the line count at the same quarter-cap moved
         with it. The pre-pair figure of 545 was a derived underestimate.
+        v0.2.106: the published DeepSeek flash id grew to
+        ``deepseek-v4.1-flash-1017`` (+5 bytes in each of three fields), so
+        the row is 791 + newline and the line count moved again.
+        Q7 (v0.2.106): the figure is now MEASURED from a built row with every
+        field at its maximum, v0.2.105's compaction and account fields
+        included (1007 + newline) — see the test below.
         """
         ledger = U.UsageLedger(self.path)
-        self.assertEqual(ledger._keep_lines(), 16_868)
+        self.assertEqual(ledger._keep_lines(), 13_003)
         surviving = ledger._keep_lines() * U.LEDGER_ROW_BYTES
         self.assertAlmostEqual(
             surviving / U.LEDGER_MAX_BYTES, 0.25, places=2,
         )
+
+    def test_the_row_size_constant_is_a_row_the_code_builds(self) -> None:
+        """Q7 (v0.2.106): LEDGER_ROW_BYTES is MEASURED, not derived — a row
+        :func:`build_record` builds with every field at its maximum (an upper
+        bound: the vendor-route model ids and the first-party account fields
+        never share one row), serialised by :meth:`UsageRecord.to_json`, plus
+        the newline. A new field, or a longer id in a field, fails here."""
+        from model_router.accounts import REASON_REGISTRY_UNREADABLE
+        from model_router.catalog import WINDOW_INHERITED_PREFIX
+
+        uuid = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+        record = U.build_record(
+            session=uuid, agent=uuid, parent_agent=uuid,
+            requested="claude-gw/qwen/deepseek-v4.1-flash-1017[1m]",
+            route="vendor:qwen",
+            forward="deepseek-v4.1-flash-1017",
+            stream=True, status=200,
+            totals={name: 9_999_999 for name in U.USAGE_FIELDS},
+            usage_complete=True,
+            window_actual=1_000_000,
+            window_source=WINDOW_INHERITED_PREFIX + "deepseek-v4-flash-0731",
+            now=datetime(2026, 11, 10, 23, 59, 59, tzinfo=timezone.utc),
+            one_m_client=True,
+            request_bytes=99_999_999,
+            fallback_from="vendor:qwen:deepseek-v4.1-flash-1017",
+            effort_requested="budget_tokens=8192",
+            effort_forwarded="budget_tokens=8192",
+            compaction="c" * U._COMPACTION_MAX_CHARS,
+            account="a" * 32,  # vco_lib.gateway_accounts.ID_PATTERN's maximum
+            account_source="default",
+            account_fallback=REASON_REGISTRY_UNREADABLE,
+        )
+        self.assertEqual(len(record.to_json().encode("utf-8")) + 1, U.LEDGER_ROW_BYTES)
 
     def test_a_cap_smaller_than_one_row_still_keeps_the_newest(self) -> None:
         """``keep_lines=0`` would empty the file on every write.

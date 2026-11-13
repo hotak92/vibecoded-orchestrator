@@ -6,6 +6,8 @@ keywords: ["cold email", "outbound sequence", "LinkedIn DM", "subject line", ICP
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

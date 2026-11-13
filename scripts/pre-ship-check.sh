@@ -726,7 +726,7 @@ fi
 # ── Gate 22: tri-OS install smoke green on main (v0.2.53 Track D, M-P1-8). ───
 #
 # The install-smoke-tri-os.yml workflow runs the full first-install.{sh,
-# command,bat} flow against ubuntu-22.04, ubuntu-24.04, macos-14,
+# command,bat} flow against ubuntu-22.04, ubuntu-24.04, macos-15,
 # windows-latest, and fedora-40 (matrix.target) using a fresh git clone
 # — the same code path third-party users exercise. Per
 # docs/INSTALL_ARCHITECTURE_v2.md §9.5 / §6 row M-P1-8 (Track D), no
@@ -833,7 +833,7 @@ PY
             _tri_n_fail="$(echo "$_tri_legs" | python3 -c 'import json,sys; print(sum(1 for j in json.load(sys.stdin) if j.get("conclusion") != "success"))' 2>/dev/null || echo "0")"
             if [ "$_tri_n_legs" -lt 5 ]; then
                 gate_warn "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
-                    "Run $_tri_run_id has only $_tri_n_legs install-smoke matrix legs (expected 5: ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, fedora-40)"
+                    "Run $_tri_run_id has only $_tri_n_legs install-smoke matrix legs (expected 5: ubuntu-22.04, ubuntu-24.04, macos-15, windows-latest, fedora-40)"
             elif [ "$_tri_n_fail" -gt 0 ]; then
                 gate_fail "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
                     "Run $_tri_run_id: $_tri_n_fail / $_tri_n_legs matrix legs failed. gh run view $_tri_run_id --repo $REPO"

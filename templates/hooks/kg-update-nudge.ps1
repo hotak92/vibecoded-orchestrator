@@ -513,7 +513,11 @@ sys.exit(0)
 # v0.2.102 W6-F: a non-zero exit is the BROKEN-INSTALL loud-fail (the counter
 # module missing while a transcript asked to be counted) - propagate it;
 # UserPromptSubmit treats exit 1 as non-blocking (only 2 blocks the prompt).
-& $pythonCmd -c $pythonScript
+# v0.2.106: the body runs as a temp FILE through _lib/run-python-program.ps1
+# - `& $py -c $body` loses every embedded double quote under Windows
+# PowerShell 5.1 (SyntaxError on every tool call; the nudge never fired).
+. (Join-Path $PSScriptRoot "_lib/run-python-program.ps1")
+Invoke-VcoPythonProgram -Python $pythonCmd -Body $pythonScript
 $pyRc = $LASTEXITCODE
 
 # Cleanup the temp payload file + the env vars we set (per-process, harmless

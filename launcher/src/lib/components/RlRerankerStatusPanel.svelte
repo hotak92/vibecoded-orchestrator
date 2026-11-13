@@ -36,8 +36,51 @@
   import RlRerankerDashboardWidget from './RlRerankerDashboardWidget.svelte';
   import { summarizeRlFlags } from '$lib/rl-settings-summary';
   import { summarizeCollection, type RlCollectionCounts } from '$lib/rl-collection-stat';
+  import {
+    RL_ONLINE_STATE_FIELDS,
+    summarizeOnlineState,
+    type RlOnlineStateRow,
+  } from '$lib/rl-online-state';
+  import type { ModuleEnableState } from '$lib/module-enable';
+  import { RL_RERANKER_MODULE_ID } from '$lib/rl-scoring-default';
 
   let { projectId }: { projectId: string } = $props();
+
+  // v0.2.106: is RL scoring on for this project (the opt-in toggle + the
+  // lock), and what the container's per-project gate last decided. Both
+  // read-only; `undefined` = not loaded / read failed (rendered as such).
+  let enableState = $state<ModuleEnableState | undefined>(undefined);
+  let onlineRow = $state<RlOnlineStateRow | null | undefined>(undefined);
+
+  async function loadOnline() {
+    if (!tauriAvailable() || !projectId) {
+      enableState = undefined;
+      onlineRow = undefined;
+      return;
+    }
+    try {
+      enableState = await invoke<ModuleEnableState>('module_enable_state', {
+        projectId,
+        moduleId: RL_RERANKER_MODULE_ID,
+      });
+    } catch (e) {
+      console.warn('[RlRerankerStatusPanel] enable state read failed:', e);
+      enableState = undefined;
+    }
+    try {
+      // `null` = no row yet (no online round for this project).
+      onlineRow = await invoke<RlOnlineStateRow | null>('module_db_read_row', {
+        moduleId: RL_RERANKER_MODULE_ID,
+        projectId,
+        table: 'rl_online_state',
+        key: projectId,
+        fields: [...RL_ONLINE_STATE_FIELDS],
+      });
+    } catch (e) {
+      console.warn('[RlRerankerStatusPanel] online state read failed:', e);
+      onlineRow = undefined;
+    }
+  }
 
   // The three flags. `undefined` means "not yet loaded / read failed";
   // each call is independent so partial-success states render gracefully.
@@ -107,12 +150,22 @@
   $effect(() => {
     void loadFlags();
     void loadCollection();
+    void loadOnline();
   });
 
   onMount(() => {
     void loadFlags();
     void loadCollection();
+    void loadOnline();
   });
+
+  const onlineSummary = $derived(
+    summarizeOnlineState(
+      enableState === undefined ? undefined : enableState.effective,
+      enableState === undefined ? undefined : (enableState.lock_reason ?? null),
+      onlineRow,
+    ),
+  );
 
   const flagsReady = $derived(
     useGlobal !== undefined &&
@@ -187,17 +240,17 @@
     <!-- v0.2.91 (#23 USER rider, MC-11): the two rows above describe the
          LOCAL TRAINING pipeline's write mode — whether events update the
          local model. Neither says whether reranking is influencing search
-         results, and the default flag state renders as "Online training
-         active", from which a reader can reasonably infer that it is. It is
-         not: no trained model has been produced yet, so results are
-         unaffected regardless of these rows or the module's enable switch.
-         State it here rather than leaving the inference standing. Delete
-         this note when a trained model ships. -->
-    <p class="dormant" data-testid="rl-reranking-dormant">
-      <strong>Reranking:</strong> not live yet — no trained model has been produced,
-      so search results are unaffected whatever these settings say. Event collection
-      is separate and continues regardless.
+         results. v0.2.106 (owner 2026-11-12): that is now a per-project
+         fact — the opt-in toggle, then the container's serving gate on the
+         project's own prequential record — so it is read and said here
+         (superseding the pre-v0.2.106 "not live yet" note). -->
+    <p class="dormant online-{onlineSummary.key}" data-testid="rl-reranking-state">
+      <strong>Reranking:</strong> {onlineSummary.headline}
     </p>
+    {#each onlineSummary.details as line (line)}
+      <p class="hint" data-testid="rl-online-detail">{line}</p>
+    {/each}
+    <p class="hint">Event collection is separate and continues regardless.</p>
   </div>
 </div>
 

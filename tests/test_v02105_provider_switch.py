@@ -231,8 +231,14 @@ class CliTests(_Base):
         code, out, _err = self.run_cli(
             ["set", "--vendor", "kimi", "--disabled", "--json"])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out),
-                         {"vendor": "kimi", "enabled": False, "stored": True})
+        payload = json.loads(out)
+        self.assertEqual(payload["vendor"], "kimi")
+        self.assertEqual(payload["enabled"], False)
+        self.assertEqual(payload["stored"], True)
+        # v0.2.106: a stored set carries the immediate-apply summary (the
+        # per-project park/restore report the GUI card renders).
+        self.assertIn("agents", payload)
+        self.assertEqual(payload["agents"]["vendor"], "kimi")
         self.assertEqual(mp.disabled_vendors(), frozenset({"kimi"}))
 
     def test_an_unstored_set_exits_non_zero_and_says_why(self) -> None:
@@ -532,7 +538,7 @@ class GuidanceTests(_Base):
             state_path=self.tmp / "model-guidance.json",
         )
         self.assertIn("kimi", reachable)
-        self.assertIn("Kimi K3", model_selection.render_grid(providers=reachable))
+        self.assertIn("Kimi K3.1 Pro", model_selection.render_grid(providers=reachable))
 
     def test_switching_a_provider_off_is_not_recorded_as_a_missing_key(self) -> None:
         """The record answers "does this machine hold the key" (a fact), so a

@@ -5,9 +5,10 @@
 Two owner requirements (2026-09-10/16) rest on that question and neither can
 be answered from an id string treated as opaque:
 
-* **the picker shows only the LATEST version of each family** — Fable 5.1, not
-  Fable 5 as well — so something has to know that ``claude-fable-5-1`` and
-  ``claude-fable-5`` are one family two versions apart;
+* **the picker shows only the LATEST version of each family** — Fable 5.2, not
+  Fable 5.1 or Fable 5 as well — so something has to know that
+  ``claude-fable-5-2``, ``claude-fable-5-1`` and ``claude-fable-5`` are one
+  family a version apart each;
 * **a NEW model inherits at least the window of the previous model in its
   family** until someone verifies its real one, so a model that ships tomorrow
   is not advertised at the client's conservative default merely because nobody
@@ -21,17 +22,27 @@ A structural rule cannot go stale that way: it is wrong only for an id shaped
 unlike every id either upstream has ever returned, and that case resolves to
 ``unknown``, which is the honest answer rather than a wrong one.
 
-**One shape breaks that claim today, and the owner has deferred the fix to
-0.2.97.** A FOUR-digit tail is read as a version, not a date (only an
-eight-digit segment is a date — see the date rule below), so a vendor's dated
-build ``<family>-0731`` parses as version ``(731,)`` and outranks the newer
-``<family>.1`` at ``(1,)`` under the latest-only filter: the snapshot is
-published and the current model hidden. The shipped data hit this once
-(``deepseek-v4-flash-0731``) and it is shielded for that ONE family by the
-qwen row's ``catalog_exclude_prefixes``; any future vendor snapshot reproduces
-it until the parser learns to read a valid ``MMDD`` tail as a date. So for
-dated four-digit ids the rule above IS stale-able, and per-vendor exclusion is
-the only mechanism holding.
+**One shape still parses unlike its meaning, and a catalog rule — not this
+parser — keeps it out of the picker.** A FOUR-digit tail is read as a
+version, not a date (only an eight-digit segment is a date — see the date
+rule below), so a vendor's dated build ``<family>-0731`` parses as version
+``(731,)`` and would outrank the newer ``<family>.1`` at ``(1,)`` under the
+latest-only filter. Since v0.2.106 that cannot reach a picker: every vendor
+row's LIVE list drops a dated build (:func:`is_dated_build`) before ranking
+unless the row explicitly offers that id (owner ruling 2026-09-22; the one
+offered dated build, ``deepseek-v4.1-flash-1017``, is pinned by owner
+decision 2026-11-10 and its undated sibling is curated-hidden, so the
+ordering between the two never decides what is published). This supersedes
+the per-family ``catalog_exclude_prefixes`` entry that used to shield
+``deepseek-v4-flash-0731`` alone. The parse itself is unchanged on purpose:
+reading ``MMDD`` as a date would also change which windows dated ids inherit
+on the request path (:func:`is_older_sibling`), a different decision.
+
+Non-chat ids are the other shape a catalog must not rank: an id whose
+segments name an output/input MODALITY (:data:`NON_CHAT_MODALITY_TOKENS` —
+image, video, audio, speech recognition, speech synthesis) is not a chat
+model, and :func:`is_non_chat_modality` says so by rule rather than by a
+per-vendor list of literal prefixes.
 
 The rule, in full
 -----------------
@@ -189,10 +200,58 @@ def parse_model_id(
     )
 
 
+#: Segment tokens naming a NON-CHAT modality. An id carrying one as a whole
+#: segment (``qwen-image-3.0-pro``, ``wan3.0-video``,
+#: ``qwen-audio-3.0-asr-flash``, ``qwen-audio-3.0-tts-plus``) is an image,
+#: video, voice or transcription model: a chat picker row for it answers an
+#: error. Whole segments only, so a chat model whose name merely CONTAINS one
+#: of these letters is never caught. Vision-capable CHAT models are named by
+#: their family (``deepseek-v4.1-flash`` sees images), not by these tokens.
+NON_CHAT_MODALITY_TOKENS = frozenset({"image", "video", "audio", "asr", "tts"})
+
+#: A dated build: the id ENDS in ``-MMDD`` or ``-YYYYMMDD`` (a vendor's
+#: snapshot spelling — ``deepseek-v4-pro-0813``, ``claude-3-7-sonnet-20250219``).
+#: The digits are validated as a calendar month/day by :func:`is_dated_build`,
+#: so a four-digit tail that cannot be a date (``-1399``) stays a version.
+_DATED_TAIL_RE = re.compile(r"-(?P<year>\d{4})?(?P<month>\d{2})(?P<day>\d{2})$")
+
+
+def is_dated_build(model_id: str) -> bool:
+    """Does ``model_id`` end in a valid ``-MMDD`` / ``-YYYYMMDD`` date tail?
+
+    The ``[1m]`` suffix and any vendor namespace are ignored. Month 01-12 and
+    day 01-31 are required; the year, when present, is not range-checked
+    (any four digits). Used by the catalog's dated-build rule — a vendor row
+    publishes a dated build only when it explicitly offers that id.
+    """
+    bare = parse_model_id(model_id).bare_id
+    match = _DATED_TAIL_RE.search(bare)
+    if match is None:
+        return False
+    month, day = int(match["month"]), int(match["day"])
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def is_non_chat_modality(model_id: str) -> bool:
+    """Is ``model_id`` an image / video / audio / ASR / TTS model?
+
+    True when any of its segments (split on :data:`SEGMENT_SEPARATORS`,
+    compared case-insensitively) is in :data:`NON_CHAT_MODALITY_TOKENS`.
+    """
+    bare = parse_model_id(model_id).bare_id
+    return any(
+        segment.lower() in NON_CHAT_MODALITY_TOKENS
+        for segment in _SEGMENT_RE.split(bare)
+    )
+
+
 __all__ = [
     "DATE_SEGMENT_DIGITS",
+    "NON_CHAT_MODALITY_TOKENS",
     "SEGMENT_SEPARATORS",
     "ModelIdParts",
+    "is_dated_build",
+    "is_non_chat_modality",
     "is_older_sibling",
     "parse_model_id",
 ]

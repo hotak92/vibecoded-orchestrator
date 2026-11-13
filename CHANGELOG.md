@@ -7,6 +7,801 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.106] - 2026-11-12
+
+### Added
+
+- **Skip the local summary model download — for machines short on disk.** Install and every update download one
+  local text-generation model (about 1.2 GB on a small machine, up to about 6 GB) that KG summaries fall back to when
+  Claude and the cloud tiers cannot answer. Preferences → KG Summaries now has a "Local summary model" switch (on
+  by default, so nothing changes unless you turn it off); for an install without the launcher, set
+  `VCT_LOCAL_SUMMARY_MODEL=off`, which also wins over the switch. When it is off, no install, update or model check
+  downloads that model, and summaries go straight past the local tier to the next one; embedding models are never
+  affected. Turning it off does not delete a model you already have: the same row offers "Remove the downloaded
+  model" (with a confirmation, and only when VCO runs that Ollama) and, when it is on but missing, "Download now".
+  `vco doctor` shows the setting and whether the model is on disk, and a low-disk warning now names the switch.
+  Found along the way: Preferences read the summary-model information as a refusal (the answer lacked the `ok`
+  field the launcher requires), so the "No Ollama models installed" hint showed no model list; it now does.
+
+- **A switch for automatic service restarts, in Preferences → Services.** The launcher's services watcher has been
+  configurable through the setting `launcher.services_watcher_enabled` since its first release, but no interface ever
+  wrote it. Preferences now has a Services section with "Restart stopped services automatically" (on by default). It
+  is one switch for BOTH automatic restarters — the launcher's watcher and the hub's watchdog read the same setting
+  on every check, so turning it off stands both down within half a minute, with nothing to restart. Turning it off
+  stops nothing; it only disables automatic restarts, and a service you stop from the Services page stays down
+  either way.
+
+- **Choose how long Ollama keeps a model loaded, and see what is loaded.** Preferences has a new "Ollama model
+  unloading" setting: how long an embedding or summary model stays in memory after the last VCO request that used it
+  (2, 5, 10 or 30 minutes, "as soon as idle", or a duration you type; 10 minutes when unset, as before). The background
+  hub now owns unloading for every project: it checks Ollama's list of loaded models every few seconds and unloads a
+  model once it has been idle that long, so a change applies within half a minute without restarting anything. The
+  Services page has a new "Ollama models" card listing each loaded model with its RAM and VRAM use, when the hub will
+  unload it, the recent unloads, and an "Unload now" button. VCO's requests now ask Ollama to keep a model for 45
+  minutes, so a model still unloads on its own if the hub is not running. Setting `VCO_OLLAMA_KEEP_ALIVE` yourself
+  still works and wins: the hub leaves the models loaded with your value alone (the card says so), which is also the
+  way to keep a model loaded for good (`-1`). A number such as `-1` or `3600` in that variable is now sent to Ollama
+  as a number of seconds, the form Ollama accepts. The configuration reference describes the setting, the variable and
+  how to unload a model right away.
+
+- **Remove a project right from its card on the Projects page.** Every project card except the orchestrator's own now
+  has a "Remove from VCO" button that asks "are you sure?" first. The dialog opens by saying that the project folder
+  is not deleted — it stays on disk with your files, `.env`, secrets and settings, only what VCO added is taken out,
+  and the folder can be added back with Add Project at any time — then says plainly what goes (the hooks, scripts,
+  agents, skills and other files VCO installed that you have not changed, VCO's entries in `.claude/settings.json` and
+  `.vscode/settings.json`, its working folders and `.git/info/exclude` lines, the lines VCO wrote to your env files,
+  and the project's own Weaviate collections — knowledge graph, docs, diagrams and code graph) and what stays (the
+  folder, your source code, `.env` and other values that are yours, secrets in the keychain, your own hooks, agents
+  and skills, `knowledge/` notes, `CLAUDE.md`, `CONTEXT_STATE.md`, anything you changed). Two buttons — "Yes, remove
+  from VCO" and "No" — with No focused by default; while the removal runs, Esc and clicks outside do nothing, so the
+  result always belongs to the project you confirmed. Afterwards a summary lists what was removed and names what was
+  kept because you changed it. If the removal stops, "Keep the project" is the focused choice. The top-bar project
+  list's remove action opens the same dialog (the old type-the-name step is gone). Per-option control (keep the
+  collections, keep the bundled files) stays on the project's Settings → Danger zone, whose description now matches
+  what is actually removed. A removed folder can be added again through the normal Add flow: the files VCO removed
+  come back and a file you changed before the removal stays yours. Shared collections and other projects'
+  collections are never dropped: if the launcher's project list cannot be read at that moment, no collection is
+  dropped and the summary lists them as kept, because VCO could not check that no other project uses them; it names
+  the command that drops them once you have checked (`python -m vco_lib.project_init drop-collections --name
+  <project>`), which works after the project is gone.
+
+- **The Model providers switch takes full effect at once, in both directions — no restart, no update.** Turning a
+  provider off (or back on) in Home → Model providers now applies immediately everywhere: the provider's agent
+  definitions are parked in (or restored to) `.claude/agents.disabled/` in the orchestrator root and every
+  registered project right away — through the bundle engine's own park/restore machinery, so an edited copy is
+  still left in place and a copy you parked yourself in the Agents tab is never restored — and the card says what
+  happened per project. The running model gateway follows within a couple of seconds: a switched-off provider
+  disappears from the `/v1/models` picker (its model list is not even fetched), a request naming one of its model
+  ids is refused locally with the cause and the remedy instead of being forwarded, the quota fallback ladder
+  skips it, its quota is no longer read for the usage card, and the subagent pre-flight refuses to launch its agents
+  with that same reason. Switching a provider back on whose key does not resolve keeps its definitions parked until
+  the key resolves — the bundle update's restore applies the same key check, so they come back with the first
+  update or switch after the key resolves, never before. A definition parked under an older release comes back as
+  this release's: switching Kimi back on after updating from v0.2.105 restores `kimi-implementer` and `kimi-reviewer`
+  pinned to K3.1 Pro (not the retired `claude-gw/kimi/k3[1m]`) and with the newer frontmatter keys — the switch
+  brings each restored file to the shipped version exactly as a bundle update would (a restored copy that matches
+  no version VCO shipped is backed up under `.claude/backups/bundle-adoptions/` first; if that backup cannot be
+  written the file is left as it is and the card says so), and the card says how many it brought up to date. A switch, a bundle update and a deferral
+  dismissal never write a project's manifest at the same time: the switch waits up to 20 s for a running update, and a
+  project whose update is still running is reported (run Update bundle on it afterwards — the update applies the
+  stored switch); a second update waiting for the first prints a "waiting for another bundle run" line every minute
+  and gives up after four hours with an error naming the lock, instead of waiting silently. If the launcher's
+  project list cannot be read, the card says so instead of reporting the root alone as every project. The shell form (`python -m vco_lib.model_providers set --vendor <id> --disabled`) does the
+  same apply and prints the per-project outcome.
+
+- **Remove a project from a terminal.** `vct-launcher --remove-project <id|slug|name>` (the launcher binary under
+  `launcher/dist/`) runs the same removal as the Remove button, with the same choices — your folder and files stay,
+  VCO's files and the project's own collections go — and prints the same report as JSON. `--keep-collections` keeps
+  the collections; if the removal stops on a value VCO wrote and could not remove, rerun with `--leave-unremovable` to
+  finish anyway (the dialog's "Unregister anyway"). A name two projects share is refused with both ids listed, and the
+  orchestrator's own project cannot be removed. Refresh the launcher afterwards to update its project list.
+  `vct-cli project delete <id|slug>` (the hub's `DELETE /api/v1/cli/projects/{id}`) used to delete only the database
+  row and leave every file VCO had put in the folder; it now runs this same removal — the hub hands it to the
+  launcher binary installed beside it — with the same `--keep-collections` / `--leave-unremovable` choices and the
+  same refusals. Where no launcher binary sits beside the hub, it refuses and changes nothing. Both ask first: in a
+  terminal they print what would be removed — the files VCO put in the folder, the settings files whose VCO entries
+  go, and the collections that would be dropped, from the same rules the removal applies — and remove only on `y`;
+  `--yes` removes without asking, and without a terminal and without `--yes` they refuse and change nothing, so a
+  script cannot drop a project's collections by accident. The hub enforces this too: its DELETE route refuses a
+  removal that drops collections unless the request carries `confirm=true`, which `vct-cli` sends only after your `y`
+  or `--yes` — an older `vct-cli` or a script holding the hub token gets a 400, never the destructive default
+  (`--keep-collections` needs no confirmation — it drops nothing). `vct-launcher --remove-project ... --preview`
+  prints that list as JSON and changes nothing. Only the stop on a value VCO could not remove suggests
+  `--leave-unremovable`; any other failure — say, an update holding the launcher database — says what failed. The
+  launcher binary's exit codes: 0 removed, 1 usage or lookup error, 2 the stop that names `--leave-unremovable`,
+  3 failed for another reason, 4 not confirmed; `vct-cli` maps every failure to its own exit 1 with the hub's
+  message. On Windows the launcher is a GUI binary: started from a console it asks there; started with no console
+  at all and without `--yes` it opens a console window to ask in. `vct-cli project delete` waits as long as the
+  removal runs (up to 30 minutes) and says so, instead of giving up after 15 seconds on a removal that then
+  finished; a second delete of the same project while one runs is refused; a launcher beside the hub too old to
+  know `--remove-project` is detected before anything runs; and the hub reports success only with the launcher's
+  report for that project, writing its audit row after the outcome.
+
+- **The menu bar shows when work is still running in the background.** After you close the "Update all" window (or add
+  a project), knowledge-graph syncs, code-graph builds, summary runs and project setups keep going on their own, and
+  nothing used to show it. A small pill now appears in the menu bar while any of them runs ("2 jobs running");
+  clicking it lists each one ("Alpha — building code graph (120 files)…") and opens that project's page. It disappears
+  when the last one finishes, and it also shows jobs that were already running when the launcher window opened.
+
+- **`vco doctor` reports Weaviate collections that lost their data, the replay risk, and an uncapped Weaviate.**
+  Three new findings, each with a ledger entry that clears itself: a collection the defect can hit (its name differs
+  only in case from one VCO derived or deleted) that is in the schema but whose data
+  index is gone (`weaviate_collection_index_missing`, with the only repair order that does not lose the rebuild
+  again: snapshot settings first, then drop + `bootstrap-collections` + `kg-sync`, then wait for a snapshot before
+  any restart — VCO never runs it for you); a schema history whose replay can still drop a live collection
+  (`weaviate_raft_replay_exposed`); and a Weaviate container running without a memory limit
+  (`weaviate_container_uncapped` — a container VCO adopted never got the limit VCO sizes from the host), with the
+  command that caps it in place without a recreate. Before it calls a schema history exposed, the doctor gives
+  Weaviate up to 90 s to take its next snapshot: a reading taken right after a start — the update's own doctor
+  phase — would otherwise count that start's own fresh entries, and on a default-named clone (whose derived
+  `VibecodedOrchestrator_*` names differ only in case from the live `VibeCodedOrchestrator_*` ones) report a data-loss
+  risk that does not exist. The wait prints a line while it runs, never outlives the doctor check's own deadline,
+  and does not repeat on an install whose ledger already records the exposure (or whose dismissal of it covers the
+  same collections). With the shipped snapshot settings the snapshot comes within a minute (measured on
+  1.37.18: 26-45 s after an idle restart), so a healthy install gets no entry; without them no snapshot comes and the
+  exposure is reported, and the entry clears once a snapshot holds the delete — after the recreate with the shipped
+  settings its remedy names. `python -m vco_lib.weaviate_raft_guard status` prints the
+  Weaviate version, how much of the schema history the latest snapshot holds, and which case-variant collection lost
+  its data;
+  `... snapshot --container <name>` takes the snapshot with a container's own image before a move by hand.
+
+- **Every shipped agent now runs in the background and compacts at 750k tokens.** All 23 bundled agent definitions
+  (the free set and the model-gateway lanes) and the 19 agents of the opt-in packs carry `background: true` — the agent always runs as a background task —
+  and `autoCompactWindow: 750000`, so a subagent on a model with a larger (1M) window compacts its own context at
+  750k tokens instead of growing to the main conversation's window; on a smaller window the model's own auto-compact
+  applies. A contract test fails if any shipped definition loses either key, and a delivery leg
+  proves a bundle install lands both.
+- **Subagents default to effort `medium`.** Each VCO project's `.claude/settings.json` now carries
+  `CLAUDE_CODE_SUBAGENT_EFFORT=medium` in its `env` block, so a subagent with no effort of its own (none in its
+  definition, none on the dispatch) runs at medium instead of inheriting the session's effort; the few shipped
+  agents that pin `effort: high` in their frontmatter keep it. The key is added only when absent — a value you set yourself
+  is kept — and it is never written to `~/.claude/settings.json`. "Remove from VCO" takes it out again while its
+  value is still `medium`; a value you set stays.
+
+- **An offline training pipeline for the RL reranker's shipped weights.** `claude_mcp_servers/rl_reranker/training/`
+  (kept out of the reranker image) has three tools. `python -m claude_mcp_servers.rl_reranker.training.export` reads
+  `launcher.db` read-only, one project at a time, and writes the training set as float16 vectors plus index arrays.
+  It uses the trainer's own pairing, target and soft-label rules, keeps the last copy of a duplicated event, and
+  leaves out test-fixture projects, rows with no project, and arctic dual-log twins written before the project ran
+  v0.2.101. The export contains no text, titles, project names or paths: projects appear only as a salted hash,
+  and the salt stays on the machine. `--list-projects` shows each project's row counts and whether it would be
+  exported before anything is written, and `--project` / `--exclude-project` choose. `training/FIELDS.md`, which
+  the export also copies into its output, documents every field, so a user can check an export before sharing
+  it. `shard_trainer train` trains one embedding profile from one or more exports, including exports other users
+  share. It sweeps learning rates with fixed seeds, caps any one project's share of each epoch, and applies the same
+  linked-slot masking as the server. It then measures the model against plain cosine ordering on a later time
+  window and on a project it never trained on (NDCG@10, plus MRR@10 and Recall@10 on literal citations).
+  `shard_trainer ship` writes checkpoints into `weights/` only when both qwen3 and arctic pass the unlock bar.
+- **The RL reranker learns per project, online, and is opt-in.** RL scoring is off by default. You turn it on for
+  one project in the launcher (Modules → RL Reranker), or for every project through the host-wide default; while it
+  is off, nothing is sent to the reranker container and searches keep their order. When it is on, the reranker
+  learns from that project's own citations (the search results its answers actually use) and reranks the
+  project's searches only while its model beats plain search on its own check. Every query is first scored, at the
+  first training round after it arrived, by the model in place at that round, before that model trains on it, and the check judges the project's whole record of
+  such queries: NDCG@10 must be at least 2% above plain cosine ordering and the node the answer names must rank no
+  lower than plain cosine ranks it, both on one-sided lower confidence bounds, not on the raw averages. No verdict is
+  given before the record holds 300 queries and 50 that name a node. After that every training round is a check, and
+  the k-th check runs at confidence 1 − 0.10/(k(k+1)), so all the checks together pass a model that does not meet the
+  bar with probability at most 10%. An earlier version of this check re-tested a window of the project's most recent
+  queries, held out of training, at 90% confidence after every round; on a replay of real histories it passed on
+  lucky windows, and the queries that followed a passing window showed the model ranking the cited node lower than
+  plain cosine. `/project_status`, the panel and `rl_doctor` show the record, the last check's bounds and number, and
+  what the searches the model served got (module-DB migrations `0008_rl_online_state_bounds.sql` and
+  `0009_rl_online_state_prequential.sql`). A new project starts with exactly its plain search order; when the model
+  stops passing, the order goes back to plain search order. Training runs every 32 citation events (at most 16 steps
+  of 8 queries, off the server's request loop, so searches are never held up by it) with the same objective as the
+  offline trainer. Each project's model and its state are saved in the project's own folder of the container. `rl_doctor`, the
+  container's new `/project_status` route, `/health` and the launcher's RL Reranker panel show whether the
+  project's model is used and why. `python -m claude_mcp_servers.rl_reranker.training.transfer replay` replays an
+  export through this same code. The owner chose this design on 2026-11-12, and the scoring lock is lifted for it
+  with that decision recorded in `vco_lib/rl_scoring_lock.toml`.
+- **No trained RL weights ship.** The first full run on the maintainer's data
+  (95 374 qwen3 and 78 944 arctic queries, 2.4 M labelled nodes) did not meet the unlock bar (NDCG@10 at least 2%
+  above cosine on both hold-outs, and no project worse than cosine). The qwen3 model gained 3.7% on the later time
+  window and 3.6% on the held-out project, but it was 1.8% below cosine on a second project it never saw. On that
+  project and on the held-out one, it pushed the nodes the answer cited by name down the ranking (MRR@10 0.32 →
+  0.06 on the held-out project). The arctic model gained 2.7% on the time window but lost 0.2% on the held-out
+  project. Training with a random rotation of the vectors stops the model from memorising which nodes helped, and
+  removes those regressions, but its gains are below the bar (qwen3 +1.1% / +1.6%, arctic +0.4% / −0.8%). The
+  profiles ship together, so neither ships; per-project online learning (above) is what ships instead.
+- **Tools to test whether an RL reranker transfers to projects it never saw.**
+  `python -m claude_mcp_servers.rl_reranker.training.transfer lopo` trains one fold per project with at least 3 000
+  queries, holding that project out, and also keeps the smaller judged projects out of every fold. A design passes
+  only when every fold passes the unlock bar AND every unseen project gains at least 2% on its own. `transfer adapt`
+  simulates learning per project: from a network that ranks exactly like cosine (or from the fold network that
+  never saw the project), it takes one online pass over a project's earlier queries and records NDCG@10 and MRR@10
+  on its latest quarter after each share of the stream. The trainer options gained a warm start from a checkpoint
+  or from that cosine-equivalent network (`--init`), a pull toward the starting network (`--l2sp`), node-level
+  dropout of the raw vectors (`--entity-dropout`), the smaller v1 network (`--arch v1`), model selection on a
+  held-out project (`--select-on dev`), and a gap before each later-in-time split (`--purge-hours`), because
+  consecutive queries of one task look alike and otherwise inflate the time hold-out.
+- **What the re-run found** (leave-one-project-out over the four projects of the maintainer's export, both
+  profiles, fourteen training designs): no design passes. Once memorising which nodes were useful is prevented,
+  the gain that carries to an unseen project is at most about 2% for qwen3 and 1% for arctic, and some unseen
+  project is always below cosine. The design review also found that the training target, the similarity between
+  the answer and each node, mostly measures how typical a node is of all the nodes that search returned: putting
+  those nodes first, without looking at the query at all, beats cosine by 3.4% (qwen3) and 2.4% (arctic) NDCG@10,
+  and ranks the node the answer named lower. Learning per project, starting from cosine, passed +2% after one to
+  four thousand of a project's own queries on the larger projects, and never on the smallest. The weights stay
+  unshipped.
+
+- **Turning on a secondary embedding slot now fills it for the KG rows you already have, once.** Before, a
+  secondary slot (dual embeddings, for example the arctic secondary) reached a stored row only when that row was next
+  rewritten. Now the next whole-tree KG sync gives every stored row of the project's KG, the shared KG it writes and
+  the development collection that slot's vector, in the background. It runs on launcher Sync, on an update, or through
+  the retry driver VCO starts at the next session; turning the switch on in the launcher schedules it. Only rows
+  without the vector are embedded, with the secondary's own model, and every other vector is kept. A row the secondary
+  refuses whole is stored again as finer rows that every model accepts. Completion is recorded per collection and
+  slot in `.claude/state/kg-secondary-backfill.json`, so later syncs embed nothing for it. When the secondary does not
+  answer, nothing is embedded; the ledger row `kg_secondary_backfill_pending` records the owed work and VCO retries
+  it. Turning the secondary off removes no vector, and turning it on again fills only the rows that lack it.
+
+### Changed
+
+- **The Store lists Transcrypt and VCT Coordination, both "Coming soon".** The launcher's Store page showed nine
+  hard-coded cards (the orchestrator, "Orchestrator Pro" with RL-scored retrieval, MAO and six placeholder apps). It
+  now lists the two announced products, each marked "Coming soon" with no install, buy or activate action. The
+  catalog fetch stays: a paid module published to the L0 catalog later appears after them, and its card opens the
+  Modules page, where install and licensing live. Free and bundled modules are not store items; the RL reranker is
+  managed from its Modules tile and the project's RL panel. The list is declared once, in
+  `launcher/src/lib/store-catalog.ts`.
+- **RL scoring's default follows the bundled weights.** When neither the project nor the host-wide default has a
+  choice set, RL scoring is on only if a trained model is bundled for the active embedding profile
+  (`claude_mcp_servers/rl_reranker/weights/manifest.json` names a `current` version for it), and off otherwise. No
+  trained model ships yet, so the default is off today. The user's choice always wins, on or off. A manifest that
+  cannot be read, or a profile it does not list, counts as off. The decision lives in one place,
+  `vco_lib/rl_scoring_default.py` (`python -m vco_lib.rl_scoring_default --profile <profile>`): the hub's served
+  `rl_reranker_enabled_for_project`, the launcher's module cascade, the MCP dashboard's RL switch and the
+  boot-time "enough training events" prompt all take it from there, and the launcher's RL controls say "Off — no
+  trained model bundled yet for <profile>" or "On — trained model bundled for <profile>". `rl_doctor` reports it
+  under "scoring default". `install.py` no longer writes a host-wide "off" row for the RL reranker on a fresh
+  install, because that row would keep the default off after a trained model ships. The hub and the launcher now
+  share one Rust resolver for the active embedding profile (`vct-launcher-core/src/active_embedding.rs`) instead
+  of a copy each. The bundled-model check runs Python once per profile however many requests ask at once, and
+  never on the hub's or the launcher's async workers (a hub serving `/config` keeps answering while it runs).
+- **Existing installs drop the host-wide RL "off" row the old installers wrote** (owner ruling 2026-11-12). Every
+  `install.py` run from v0.2.52 to v0.2.105 wrote a host-wide `false` for the RL reranker when none existed, which
+  would keep RL scoring off on those machines after a trained model ships. Launcher DB migration 051 removes that
+  row once, when the updated launcher or hub first opens `launcher.db`, so those installs follow the bundled-weights
+  default. A host-wide "off" you chose yourself (your latest host-wide change of the RL toggle, as recorded in the
+  launcher's audit log, set it off) stays, as do a host-wide "on", every project's own choice and every other
+  module's settings. It runs only once: a host-wide choice made afterwards, "off" included, is never removed.
+- **RL scoring needs the project's own "on".** A project whose RL toggle cannot be read (the hub is down, or no
+  project configuration was found) is now treated as off; before, it was treated as on. An older hub that does not
+  send the toggle at all also counts as off. The citation of an answer is now sent to the reranker container only
+  for a project where RL scoring is on (before, it was sent whenever a container was configured). Turning it off
+  stops both at once; the local training log is kept either way.
+- **The RL reranker trains with one objective.** The per-node online step (one update per retrieved node, `RLModel.update`)
+  and the unused offline loop that replayed it (`offline_trainer.train_epoch`) are gone. The offline trainer and the
+  server's online learning now share `claude_mcp_servers/rl_reranker/objective.py` (the loss and the model input),
+  and the training reports and the server's check share `ranking_metrics.py` (NDCG@10, MRR@10 and the +2% bar).
+  `/finetune` and Reset + offline-specialize (`offline_trainer.train`) now fit that same objective on whole queries
+  too; they trained through a loss whose pairwise term paired nodes of different queries. Their result is written
+  in the project's own folder of the container (`projects/<project_id>/`), no longer in the shared state folder.
+  `offline_trainer`'s `--batch-size`, `--lambda-rank` and `--lr-min` options configured that loss and are replaced
+  by `--batch-queries` and `--lr`.
+- **`offline_trainer`'s `--link-sim-path` option is removed.** It read a `link_similarity.json` that nothing ever
+  wrote, for a value the network does not use: since July the network's linked-node inputs are computed from the
+  stored linked vectors.
+
+- **Citation events name the labelling regime they were computed under.** v0.2.106 changed how citation labels are
+  computed (the answer window is chunked by the shared chunker's answer mode with a dense budget), so every citation
+  event now carries a `label_regime` field naming the regime, from one constant in one home. A trainer can filter or
+  weight rows across that change; every row recorded before it has no field and reads as the previous regime through
+  the shipped resolver.
+
+- **Knowledge-graph and code-graph chunks now fit the embedding model, and every install re-chunks once after this
+  update.** Chunks were sized at 4 characters per token, which is right for prose but not for JSON, code, tables or
+  non-Latin text: a full-size chunk needed up to about a third more tokens than the model accepts (qwen3-embedding,
+  snowflake-arctic-embed2, text-embedding-3-small, and CodeSage / jina for code). The model refused those chunks, and
+  the retry embedded only their first part, so the rest of the chunk never reached search. Chunks are now sized for
+  dense text (qwen3-embedding: at most 19 560 characters instead of 32 768; arctic: 7 065 instead of 12 800;
+  CodeSage: 2 273 instead of 3 584), so a long node is split into more, smaller chunks. Some text is denser still
+  (measured: JSON, minified code, base64, tables and CJK at 1.35 to 1.84 characters per token), and the model can
+  refuse a chunk even at the new size. Such a chunk is no longer cut: it is split in two at the best boundary near its
+  middle (a paragraph break, else a sentence end, a line break or a space), both halves are embedded, and a half the
+  model still refuses is split again. The pieces become extra rows of the same node, document or code entity, stored
+  in text order. This holds for every model that writes a vector for the row: if any of them refuses a chunk (the
+  active model, a secondary slot such as arctic beside qwen3, or the previous model while a model change is being
+  filled in), the chunk is split for all of them, so every row carries a whole vector from every model and no stored
+  vector is an average of pieces. A search therefore reports the piece that matched: knowledge-graph and code-graph
+  results show the matching row with its neighbours (split pieces are joined back exactly), a result over several
+  rows names the row that matched (`matched_chunk`, with `chunks_total`), and a code entity is still one result. Chunks that fit are embedded
+  exactly as before. A piece the model refuses even at 512 characters is reported and the node keeps its old rows.
+  Filling a missing vector slot on existing rows never cuts or averages either: a row the model refuses there, or one
+  longer than 16 000 characters, gets no vector and the next sync or code-graph walk splits it into rows. The query
+  enrichment that adds recent conversation to a short search query is now sized for dense text too (for
+  qwen3-embedding at most 19 560 characters instead of 36 864). What you notice: after the update VCO re-chunks your
+  knowledge graph once — the update's own KG sync re-embeds only the nodes and documents whose chunks changed (on
+  qwen3-embedding, the ones longer than about 19 500 characters; on arctic, longer than about 7 000), whose stored
+  vector covered only the start of their text, or, if you write a secondary slot, whose secondary vector may not
+  have fitted that model — and the code graph re-walks in the background and re-embeds the code entities whose
+  chunks changed or whose text may not have fitted the code model's window (every other code row only has its
+  revision number updated). Expect seconds to a few minutes with a GPU, and longer on a CPU-only machine with a large
+  knowledge graph; searches keep working meanwhile, and nothing is deleted before its new vectors are written (the
+  KG sync, the code-graph walk and the document processor now embed every row first and only then replace the old
+  ones; `store_knowledge_node` already did). The next update re-embeds nothing. The
+  `chunker_preset_overhaul_pending` entry in `UPDATE_DEFERRED.md` records the pass and clears itself when both
+  halves have run; its code-graph command is now the non-destructive `--force-rewalk` (it used to drop and rebuild
+  the code graph). The bundled pre-computed embeddings for the curated knowledge nodes were built for the new chunks
+  with the same splitting, one model at a time, so none of their vectors is cut or averaged, and they name the chunk
+  layout they were built for, so a stale set is never ingested. The known issue about the arctic secondary slot
+  embedding only the start of oversized chunks is closed by the same change.
+
+- **The RL reranker is part of the orchestrator and free.** Its server, model, trainer, maintainer scripts, tests
+  and Dockerfile now live in this repository, in `claude_mcp_servers/rl_reranker` (AGPL-3.0). It was a separately
+  distributed, licence-gated module before. The licence gate is gone everywhere: `rl_retrieval` is no longer a
+  tier feature, the retrieval pipeline and `rl-doctor` no longer ask the licence validator, the dashboard's
+  "RL-Scored Retrieval" switch is no longer Pro-only, and the root `CLAUDE.md` RL section now renders from the same
+  two gates the pipeline applies: the shipped RL scoring lock (lifted in this release for per-project online
+  learning, see Added) and the per-project RL toggle (opt-in, off by default).
+- **The RL reranker's container is built locally.** Installing or updating the "RL Reranker" module in the launcher
+  builds `localhost/vco-rl-reranker:<version>-<cpu|cuda|rocm>` from `claude_mcp_servers/rl_reranker`. This is a new
+  `container_build` install method, and nothing is pulled from a registry. The module's manifest and database
+  migrations come from the checkout, so the module's tables are now created on install (a `container_pull` install
+  never received them). The catalog card, install, update and update checks all read the module's version from the
+  checkout manifest, and an older paid-catalog record with the same id is ignored. `infrastructure/docker-compose.yml`
+  gains an `rl_reranker` service behind the `rl` profile, for a standalone build or run outside the launcher.
+- **The RL reranker's trained weights are bundled in the repository.** `claude_mcp_servers/rl_reranker/weights/
+  manifest.json` names the checkpoint shipped for each embedding profile, qwen3 and arctic. None ships yet. The image
+  build checks the manifest against the files. The server seeds its state from the checkpoint for the active
+  profile and never overwrites an existing one. With no checkpoint shipped, `/health` reports `"model": "not
+  trained"` and `trained: false`. `POST /reset {"strategy": "bundled"}` re-seeds a project from the shipped
+  checkpoint, and the module tab's two "Download default weights" buttons now use it.
+- **The paid distribution path is retired for the RL reranker.** It no longer uses the GHCR image, the paid-catalog
+  entry or the paid-module weights bucket. The launcher no longer downloads its weights after install, and the
+  daily weights poll stands down for it. The manual RL image smoke workflow now builds the image from the checkout
+  instead of pulling a private image. Only the RL module's paid catalog listing is retired: the paid-module
+  infrastructure stays for future paid modules. The edge functions (`rl-artifact-url`, `rl-latest-version`,
+  `rl-latest-weights`, with their `launcher/supabase/config.toml` stanzas and shared helpers) stay in the repository
+  and stay deployed, and so does the launcher's download machinery (`module_default_weights.rs`). The bundled
+  reranker calls none of them.
+- **The RL reranker uses the orchestrator's own logger and training-target code.** It used to carry its own copies
+  of `rl_client/rl_logger.py` and `vco_lib/rl_training_targets.py`, and the copy of the logger had fallen a full
+  schema version behind without the drift check noticing (that check skipped whenever the module was absent). It now
+  imports the originals, writes its checkpoints and logs through `vco_lib.atomic` and `vco_lib.log_setup` like the rest
+  of the orchestrator, and its default event-log path comes from the logger's own resolver. Its image copies these
+  files from where they live, building from the checkout root with a root `.dockerignore` that admits only what the
+  image needs. `scripts/sync-vendored-files.sh` and
+  `tests/test_vendored_file_sync.py` are retired, and a new test checks that the image copies every file the reranker
+  imports.
+
+- **Kimi K3.1 Pro replaces Kimi K3 on the model gateway.** The gateway's Kimi Code route now offers and forwards
+  `claude-gw/kimi/k3.1-pro` (1M context, image input), and the `kimi-implementer` and `kimi-reviewer` agents run on
+  `claude-gw/kimi/k3.1-pro[1m]`. `claude-gw/kimi/k3` is no longer offered: a request or agent definition that names
+  it, or any other Kimi id, is refused by the gateway with a message that names `claude-gw/kimi/k3.1-pro` as the id to
+  use. K3.1 Pro only works with thinking on — Kimi refuses a request that switches thinking off — so the gateway sends
+  such a request with thinking on at the lowest effort (`low`) instead of passing on an error; the access line and the
+  usage ledger show the effort that was actually sent. The KG commit reviewer's Kimi fallback moves to K3.1 Pro as
+  well. In the model-selection grid the row becomes "Kimi K3.1 Pro", re-scored from benchmark evidence (Code 7 → 8,
+  Tools 7 → 8; the † stays because every published K3.1 Pro result is at maximum effort), and its guidance adds:
+  start a new conversation on K3.1 Pro rather than switching an existing one to it. A Plus subscriber, whose plan
+  does not include the 1M window, lowers the `k3.1-pro` row to 262144 in Preferences → Chat model context.
+
+- **The DeepSeek lanes run the newer DeepSeek V4.1 Flash build.** `deepseek-implementer` and `deepseek-researcher`
+  now pin `claude-gw/qwen/deepseek-v4.1-flash-1017[1m]`, the build DeepSeek released on 2026-10-17 (same model and
+  prompt format, new weights; DeepSeek reports it better on agentic and terminal work, with shorter answers —
+  https://api-docs.deepseek.com/updates/). QwenCloud serves it and the undated `deepseek-v4.1-flash` side by side
+  without saying which weights the undated one runs, so the picker now shows the dated build and hides the undated
+  one — which still answers when named, so an agent file you have not updated yet keeps working. The model-selection
+  grid names the row "DeepSeek V4.1 Flash (1017)" and raises its Tools score from 6 to 7 on DeepSeek's own figures
+  (Terminal-Bench 4.0 31.2 to 42.3, Automation-Bench 54.8 to 60.5).
+
+- **Removing a project takes out what is VCO's, and only that.** Before, removing a project deleted the whole
+  `.claude/hooks/` and `.claude/scripts/` folders, including any script of your own in them, but left every VCO hook
+  still registered in `.claude/settings.json`, pointing at files that were gone. Now a file VCO installed is removed
+  only when it is unchanged since VCO wrote it. An agent, skill, hook or script you edited stays and is listed in the
+  result, and files of your own are never touched. VCO's hook registrations and the permission entries it added
+  come out of `.claude/settings.json`, along with its runtime folders (`.claude/state/`, `.claude/logs/`), its update
+  notes, the lines it wrote in `.git/info/exclude` (a line of your own inside VCO's block stays), the exclude
+  settings it added to `.vscode/settings.json` (the file itself goes only if VCO created it and nothing else is in
+  it) and the MCP opt-outs it wrote to `~/.claude.json`. Your hooks, your own permission entries and settings,
+  `.env`, `CLAUDE.md`, `CONTEXT_STATE.md`, `knowledge/` and VCO's update backups (which hold your earlier versions of
+  files) are kept. Nothing is ever removed through a linked folder: if `.claude` or one of its folders is a link to
+  somewhere else, what is behind the link is left alone and named in the result. If you also choose to delete the
+  project's collections, VCO now finds the ones the project actually uses, even after a rename, and never deletes
+  one another project uses. The agent definitions a provider switch parked in `.claude/agents.disabled/` go too when
+  they match a version VCO shipped (an edited one stays and is listed), so a folder added back later gets them fresh
+  instead of skipping them forever.
+- **Fable 5.2 in the model table.** Claude Code 2.1.321 makes the `fable` alias Claude Fable 5.2
+  (`claude-fable-5-2`, 1M context); the shipped model-selection grid's Fable row is renamed and re-scored from
+  benchmark evidence (Code/Debug/Review/Plan/Tools 10, Cost 2 — about $3.80 per task at medium, $9 at high, $26.5
+  at max), and its guidance now says to keep final reviews at high, not max. The gateway needs no update for the
+  new id: the structural family parser already reads `claude-fable-5-2` as the fable family's newest version, and it
+  inherits the family's 1M context window — a test pins all of that. `claude-api-run` (and the `/api-review` skill)
+  now defaults to `--model claude-fable-5-2`.
+- **Subagent guidance matches current Claude Code.** The Agent tool now takes an `effort` parameter, and a
+  subagent's shell command still running after about 3 minutes is moved to the background by the harness, with its
+  completion notification waking that subagent. Both shipped CLAUDE.md templates and the wait guard's refusal for a
+  subagent's self-wake now say so: a lane runs a long command in the foreground, lets the harness move it and ends
+  its turn. A helper a lane starts with `run_in_background` on purpose, or a subagent it spawns, may still report to
+  the root session, so the rule that a lane runs its own helpers in the foreground stays.
+
+- **Release mechanics:** version 0.2.105 → 0.2.106 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No code-graph extractor-generation rung this release: the only change on the extractor surface routes the analyzer's collection deletes through the raft-replay guard's recorder, so existing code graphs are not re-walked.
+
+### Fixed
+
+- **The launcher's Rust code follows newer cargo's build-dir layout.** Newer cargo puts test binaries in
+  `target/<profile>/build/<crate>/<hash>/out/` (nine levels below the clone) instead of `target/<profile>/deps/`.
+  The install-root walk bound (`install_root::MAX_WALK_LEVELS`, shared with the Python resolver) is now 12, and the
+  "am I a cargo test binary?" check (`hub_launcher::exe_is_test_harness`) recognises both layouts. Without that,
+  the test binary read as a shipped launcher, so the guards that keep tests from starting the hub, sweeping hub/MCP
+  processes or anchoring on the build folder stood down. Shipped layouts are unaffected.
+
+- **CI: the tri-OS install smoke runs on `macos-15`.** GitHub retired the `macos-14` runner image ("configuration
+  'macos-14-arm64-us-default' is not supported"), so the macOS leg was cancelled instantly. `macos-15` keeps the same
+  coverage (Apple Silicon, bash 3.2, `/opt/homebrew`); the pre-ship leg check follows.
+
+- **The code graph stores new entities again on Weaviate 1.37.** The analyzer writes with `replace()` and falls back
+  to `insert()` when the object does not exist yet, but it recognised "does not exist" only by the older
+  "no object with id" text. Weaviate 1.37 with weaviate-client 4.21 reports it as a 404 ("Object was not replaced"),
+  so every entity not already in the collection was dropped, and a fresh install's code graph stayed empty. The
+  check now has one home (`codegraph_guards.replace_target_missing`, status 404 or either text). Files whose writes
+  failed were already un-stamped, so the next code-graph run re-walks them and fills what was missing.
+
+- **Re-running an install that stopped early no longer flags VCO's own `.claude/settings.json` as yours.** When a
+  first install stopped after the bundle had created the orchestrator root's `settings.json` but before step 9 marked
+  it as VCO-managed, the next run treated the file as user-owned: it wrote `settings.json.vco-new` and asked you to run
+  `--adopt-project-replace-all`. The bundle manifest now records that VCO created the file (a fingerprint of
+  everything but `env`, which the env projection writes), and step 9 adopts a file that still matches: defaults filled
+  in, managed-keys marker added, no deferral. A file you edited in between keeps the user-owned path, and that
+  entry now lists the safe fixes first (add the `_vco_managed_keys` line by hand, or merge from `.vco-new`). It also
+  says what replace-all resets. `.vco-new` uses this install's collection names when the launcher database has them,
+  and says not to copy its `env` block when it does not.
+
+- **The macOS installer no longer prints "$!: unbound variable" when it opens the launcher.** The launcher was started
+  inside a subshell, so the script read an unset `$!`; macOS's bash 3.2 aborts on that under `set -u` even with a
+  default. It is now started in the script's own shell.
+
+- **A missing compose provider stops the install up front, with the command that fixes it.** Podman without
+  `podman-compose` (or a `docker-compose` for `podman compose` to delegate to), or Docker without its compose
+  plugin, passed every check and failed at step 5 with "looking up compose provider failed". `install.py` now
+  checks right after detecting the runtime (`vco_lib.compose_prereq`, over the existing
+  `compose_provider.detect`): a fresh install stops before creating the venv, an `--update` warns. The bootstrap
+  envelope gains `system.compose` and the blocking `compose_provider` prereq (also reported by `vco doctor`;
+  `--install-missing` installs it), the runtime auto-installs in `install.sh`, `install.ps1` and install.py add
+  the provider, and a step-5 failure of this kind names the per-OS remedy.
+
+- **Module commands work when a placeholder path contains a space.** The launcher resolved `{install_dir}` /
+  `{VCT_*}` / `{HOME}` into a module's `post_install` / `pre_upgrade` / `post_upgrade` / migration command and
+  only then split it into arguments, so a path such as `C:\Users\First Last` became two arguments and every such
+  command failed. The template is now split first and each argument resolved after
+  (`installer_engine::command_argv`); quoting in the template works as before.
+
+- **A Docker Hub rate limit no longer stops the install's image pull.** A pull of a Docker-Hub-served image
+  (`cr.weaviate.io`, `docker.io`) refused with `toomanyrequests` / 429 / "pull rate limit" is retried from Google's
+  Docker Hub mirror `mirror.gcr.io` with the same path and tag and tagged under the original name
+  (`compose_image_prepull.ensure_image`); a mirror image whose digest does not match the original registry's
+  readable digests is refused, an unverifiable one is accepted and reported. Step 5 now pre-pulls the services it
+  starts (a fresh install) as well as those it recreates. Other pull failures are unchanged.
+
+- **The RL reranker keeps what it learns when its container is recreated.** Its manifest mounted nothing, so each
+  project's online model and learner state (`/data/state/projects/<project_id>/`), the event logs and the global
+  model lived in the container's writable layer and were lost on every module update and every recreate. The
+  manifest (now module version 0.3.1, so an installed copy is offered the update) mounts three host directories,
+  `<vct root>/data/vct-rl-reranker/_bundled/state`, `logs` and `global` (no project slug can be `_bundled`, and
+  uninstalling with "purge data" still removes them), created by the start path. A new manifest field,
+  `runtime.image_user`, names the image's non-root user; the start paths map the host user onto it (podman 4.3 or
+  later: `--userns=keep-id:uid=…,gid=…` on Linux, macOS and Windows; an older podman such as Ubuntu 22.04's 3.4,
+  which has no `keep-id:uid=`, or one whose version cannot be read: `--userns=keep-id` plus
+  `--user <host uid>:<host gid>`; `--user <host uid>:<host gid>` for docker on Linux; nothing under Docker
+  Desktop), so the container can write those directories and the host user owns what it writes. The paid module's per-project directories (`<vct root>/data/vct-rl-reranker/<slug>/state`) are not
+  mounted, moved or deleted.
+- **Moving from the paid RL module to the bundled one cleans up after itself.** Once the bundled container is
+  running, the install removes the old registry image (every local tag of the previous manifest's image, with a plain
+  `rmi`, so an image a container still uses stays) and the launcher-placed default weights: symlinks and marked
+  copies, by `vco_lib/rl_weights_ownership.toml`. The user's own files stay. When an old data directory still holds
+  files, the install names it in an info notice, since the bundled module does not read it.
+- **The RL panel no longer shows a model as served by a container that does not hold it.** The panel reads the
+  module-DB `rl_online_state` row, which was written only after a training round, so after a recreate it could
+  still say "served". The server now rewrites the row whenever it loads a project's model.
+- **The first global retrain starts from the project's model.** With no global model yet it was meant to seed from
+  the requesting project's checkpoint, but it looked for `rl_model_<profile>.pt`, a name nothing writes, so it
+  started from a fresh model. It now seeds from that project's newest checkpoint (else the base model's), using the
+  name pattern the writers use, and never from an un-rotated `_finetuned` file.
+- **The code-graph analyzer now uses the configured Weaviate gRPC port.** It always passed port 50052, which
+  overrode `GRPC_PORT`, so an install whose Weaviate listens for gRPC on another port had the analyzer's reads go to
+  the wrong place. It now leaves the port to the shared Weaviate connection helper, which reads `GRPC_PORT`.
+- **One project's RL training no longer writes the starting model of every other project.** A project without its
+  own checkpoint loaded the shared base checkpoint and then saved its training over that same file, so every project
+  loaded afterwards started from it. A project now trains and saves under its own folder.
+- **A project's RL training step can no longer land on another project's model.** The step was started after the
+  server had finished the request and ran on whichever project's model the server had loaded by then. Training now
+  happens in rounds bound to the project they belong to.
+- **A reranker request without a project id no longer inherits the previous request's project.** The server used
+  the project of the request it had handled last as the fallback for a request without one. It now uses only the
+  container's configured project (`VCT_PROJECT_ID`), or none.
+- **The RL reranker now actually reranks.** Its server was meant to embed the query itself through a function that
+  nothing ever connected, so every search came back in its original order and the client counted a fallback each
+  time (one machine recorded 14 794 fallbacks and no reranked search). The client now sends the vectors it already
+  logs for training: the query vector and, for each result, its vector, its linked vectors and their types. They
+  travel as compact float16 data: about 0.5 MB for 30 results with 1024-dimension vectors and five linked vectors
+  each, an eighth of the same vectors written as JSON numbers. The server scores the results with its loaded model and returns the new order and the scores. It
+  builds the model input the same way the training does (a test feeds one logged search through both and compares
+  the inputs), including the arctic profile, whose linked slots stay empty as in training. A result without a vector
+  keeps its place. The server no longer embeds anything.
+- **The RL reranker is only called when it can help.** The client now calls the reranker only when its scoring lock
+  is off, the reranker is enabled for the project, a reranker container is configured, and that container reports
+  trained weights or its per-project check (see Added), the current data format and the project's embedding model.
+  A container without trained weights,
+  or no container at all, is a normal "off" state and is no longer counted as a fallback. A real failure (container
+  down, too old, wrong embedding model, timeout) keeps the original order, is counted, and logs one warning per
+  session instead of one per search. `rl_doctor` has a new "scoring state" line that says whether searches are
+  reranked and, if not, which of these conditions stops it.
+- **Shipped RL weights are no longer hidden by an untrained local checkpoint.** At startup the RL server used to
+  load the checkpoint whose file name sorted last, and the `rl_model_<profile>_local.pt` it writes when nothing has
+  shipped sorts after every versioned file, so an install kept its untrained model after new weights shipped. The
+  bundled checkpoint now wins over a local one with no training history or an older base version. A local
+  checkpoint is kept when it has its own training on top of the current bundled version, or when its base is newer.
+  The same rule applies to each project's own checkpoint. Checkpoints now record their base version and the
+  training steps applied on top of it (older checkpoints count as having no history). Which local files count as the
+  user's own comes from `vco_lib/rl_weights_ownership.toml`. That table now holds the launcher's existing
+  "Download default weights" rule (a symlink or a copy with a `.vct-managed` marker is the orchestrator's and can be
+  replaced, any other file is the user's and is kept), and the launcher reads it from there instead of its own
+  copy.
+
+- **Dual-log twins now carry the other embedding slot's linked-node vectors.** The second (other-slot) retrieval event
+  that dual logging writes for every search previously dropped the linked context entirely, so the second model's
+  training samples always had five empty linked inputs while an install with that model active would have filled
+  them. The enrichment now packs the other slot's linked vectors from the same already-fetched rows — same order and
+  same cap as the active event's — and the twin event carries them under the field names the trainer reads. Vectors
+  from the active embedding space still never appear in a twin, and a linked row without an other-slot vector is
+  skipped rather than fabricated.
+
+- **The citation drain stops re-visiting files whose chat ended without a locatable transcript.** A pending citation
+  whose owning chat ended, but whose transcript is not in this project's transcripts folder, could never be scored
+  (by the same-folder rule) — yet every drain run re-claimed it, re-read it and left it again, keeping the session's
+  end marker alive, until the abandoned-file collector removed it a week later. The finalize pass now removes such a
+  file and records it as unscored immediately, exactly as the collector would, so the end marker clears and later
+  drain runs stop paying for it.
+
+- **The `kg-search` CLI no longer stages a pending citation file when no chat is around.** A search run in a plain
+  shell (no session id and no Claude Code session in the environment) has no transcript a drain could ever attribute
+  it to, so its staged file could only sit for a week until the collector removed it. Such a run stages nothing now;
+  its retrieval event is still emitted as before. A search run from inside a Claude Code session (including through
+  the Bash tool) still stages, and is paired by the drain against that session's transcript.
+
+- **Citations of retrievals made by subagents and worktree lanes are scored against their own transcript.** A
+  staged retrieval now records the exact transcript of the chat that made it: the main chat's own transcript, or a
+  subagent's own transcript (even though a subagent's hook events name the parent's). The drain scores the citation
+  against exactly that file, whichever drain handles it, so a chat whose transcript sits in a different transcripts
+  folder from the draining chat's is no longer removed as unscored, and a subagent launched by a workflow (whose
+  transcript sits one level deeper) is found. A recorded transcript that no longer exists means the citation is
+  recorded as unscored; no other transcript stands in for it. Retrievals whose chat cannot be known when they are
+  staged (the MCP server and the `kg-search` CLI are not told which chat calls them) keep the existing rule: the chat
+  whose transcript holds the query. A `kg-search` run by a lane inside a git worktree now stages its file in the
+  chat's project, where that chat's drains look, instead of nowhere (a worktree outside the project) or inside the
+  worktree (a worktree under the project's `.claude/worktrees/`). Files staged before this release are handled as
+  before. The unscored-citation log now names the recorded transcript, if any.
+
+- **Stopping a service for maintenance now actually keeps it down.** The launcher's services watcher ignored the
+  shared pause marker the hub's watchdog honors: about 30 seconds after you stopped Weaviate from the Services page,
+  the launcher restarted it AND deleted the pause marker — mid-copy volume backups were ruined by the container
+  coming back. Both automatic restarters now follow one rule, read through the one shared helper: a service with a
+  pause marker is skipped (the watcher logs a `skipped_paused` row instead of restarting), and no automatic restart
+  ever clears a marker — the watcher's restart goes through a separate path that never touches it. Only an explicit
+  user action (Start or Restart from the GUI or CLI) clears a pause. The Services page and the troubleshooting guide
+  now document the supported backup path: stop from the Services page, copy, Start; a stop from a terminal still
+  looks like a crash to VCO and is restarted.
+
+- **Windows: every `.ps1` hook's embedded Python now actually runs.** Users on Windows 11 saw
+  `kg-update-nudge exit=1 ... SyntaxError: unterminated string literal` logged for every tool call: Claude Code
+  runs `.ps1` hooks with Windows PowerShell 5.1, whose `python -c <body>` argument passing drops embedded double
+  quotes, so each hook's multi-line Python program was truncated at its first `"` — the KG-update nudge, the
+  update-deferral surface, the retrieval-health line, the stop-failure ledger/notification, the session work
+  counter and the async dispatcher's routing never fired. All of these bodies now run through one shared helper
+  (`_lib/run-python-program.ps1`) that writes the program to a private temp file and runs that, which no command
+  line can corrupt — identical behaviour on Windows PowerShell 5.1 and pwsh 7.
+
+- **Weaviate 1.37 no longer wipes a collection at every restart.** A field report: after the move to Weaviate
+  1.37.18 the orchestrator's knowledge-graph, docs and diagrams collections kept their schema but lost their data
+  at the first start, and again at every restart after they were rebuilt. The cause is upstream (a draft report is
+  ready): a small install never takes a raft snapshot, so Weaviate replays its whole schema history at every start,
+  and from 1.37 a replayed collection delete drops the data of a LIVE collection whose name differs only in letter
+  case (VCO's v0.2.88 re-spelling of the root collections, `VibecodedOrchestrator_*` → `VibeCodedOrchestrator_*`,
+  left exactly that history). Four changes end it. The shipped compose now has Weaviate take a schema snapshot
+  within a minute of any schema change (`RAFT_SNAPSHOT_THRESHOLD`, `RAFT_SNAPSHOT_INTERVAL`), and a running
+  VCO-managed container without them is recreated with them like any other config drift. Before VCO moves a data
+  folder from Weaviate 1.28 or older to a newer release — `python install.py --update`, `service_endpoints
+  hand-to-vco`, the session hooks' restart of a stopped container, a port move, the launcher's volume migration — it
+  first runs the OLD image once on the same data until a snapshot holds the whole history, then starts the old
+  container again; if that cannot be done, or the version that last wrote the data is not known, the container is
+  left as it is and
+  `weaviate_upgrade_snapshot_refused` says why. VCO no longer creates a collection while a delete of the same name
+  in other letter case could still be replayed (it waits for the next snapshot, else refuses loudly), and the
+  residual-lowercase-collection notice no longer prints a `DELETE` (Weaviate keeps both spellings in one index, so
+  deleting either removes the data of both). That notice could never appear before: its test asked for a name that
+  was all lower-case and ended in a mixed-case suffix such as `CodeFunction`. It now reports a code-graph collection
+  that is the lower-cased spelling of a live collection VCO named (for example `Myproject_codefunction` beside
+  `MyProject_CodeFunction`). Checked against throwaway containers: on 1.37.18 the case-variant
+  history loses the live data at the next restart; with the snapshot settings it survives; a 1.28.4 folder with
+  that history loses its data at the first 1.37.18 start, and keeps it (also across a restart) when VCO's snapshot
+  ran first.
+
+- **`hand-to-vco` no longer dies on a Windows console before it stops anything.** Its progress line carries an arrow,
+  and a cp1252 console refused to encode it: the exception escaped the progress line and aborted the hand-over
+  midway through the stop step. CLI output now goes through the one console-safe writer, which transliterates a
+  character the stream cannot encode and never lets a failed write abort the operation. The same writer is used by
+  the adoption flow every message it prints.
+
+- **"PowerShell 5.1+ is required" no longer fires on a slow answer.** The Windows install gate asked PowerShell for
+  its version with an 8-second bound and read a timeout as "not installed", refusing a healthy install under load. A
+  failed attempt (a timeout, an error or an unreadable answer) is now retried once with a longer bound, and the three
+  outcomes are kept apart: missing (refuse), too old (refuse, naming the version found), and did not answer (a
+  warning that says the version could not be confirmed — never a refusal). A `pwsh` that does not answer beside an
+  old Windows PowerShell is "could not confirm", not "too old": every `pwsh` is PowerShell 6 or later.
+
+- **A hub-down `kg-sync --all` reads the project's own collection.** On an update window the sync fell back to the
+  `KG_COLLECTION` environment value, while the doctor read the launcher's binding: the sync found notes in the
+  shared class and reported them "already current" while the doctor reported the same notes disk-only. Both now use
+  the same rule — the launcher binding — when the hub cannot answer. A folder the launcher has not registered (added
+  by CLI, or mid-move) keeps its `KG_COLLECTION` value: only the machine-wide shared class falls back to the
+  orchestrator root's binding, never the root's own primary class.
+
+- **The end-of-sync summary refresh shows its progress instead of sitting silent.** The generator already printed one
+  line per node, but the sync captured its output and forwarded nothing, so a working refresh could look like a
+  28-minute hang. Its lines are now streamed to the terminal and a heartbeat line appears every two minutes; there is
+  still no whole-run cap (each generator call keeps its own bound).
+
+- **The duplicate scan skips objects that lack the named vector instead of failing.** A named-vector slot can be
+  reported with an empty vector for an object that never got one; the scanner counted the slot as present, and one
+  such object aborted the whole scan with "vector not found for target". Only a non-empty vector now counts. A new
+  `python -m vco_lib.embedding_enrichment backfill --collection <name>` fills just the objects that lack the
+  collection's own slot, reusing the existing update-only fill; a `--slot` that is not the selected model's slot is
+  refused, so a slot is never filled with another model's vectors.
+
+- **A failed code-graph catch-up run always leaves its reason in the log.** A run that failed four times left a
+  0-byte log, so the only evidence was the backoff file. The runner now writes a start line and a final
+  `outcome=<reason>` line on every path, and a log that cannot be written is mirrored to stderr instead of being
+  swallowed.
+
+- **`vco doctor` no longer calls a running launcher "stale", and no single check can stall the report.** A launcher
+  process being open was folded into "problem"; that state is now reported as not-checked ("the running image's
+  version cannot be read from here"), because a running binary is not a stale one. Each check also has its own
+  wall-clock bound (`VCT_DOCTOR_CHECK_TIMEOUT_S`, default 120 s): a check that overruns is reported as "not checked",
+  never as a failure, and the rest of the report still runs. A check that overruns is cancelled: it writes nothing
+  afterwards (no ledger entry added or cleared behind the report). The bundle census stops starting projects before
+  the bound ends and names the ones it did not reach; a census that did not reach every project leaves the ledger
+  alone (`python -m vco_lib.bundle_staleness` runs the full census without a bound). A census the bound cancels
+  still lists the stale projects it had found, and its "not checked" line names that command.
+
+- **The metrics migration compares content, not byte counts.** Two files holding the same rows with different line
+  endings (or a BOM), or a row appended by another writer during the copy, were reported as a failed copy with a
+  byte difference. The comparison now normalizes line endings and encoding and warns only when a source row is
+  actually missing or the destination lost lines.
+
+- **`py-compile-check` runs on `Edit` as well as `Write`.** It was registered on `Write` only, so a Python change
+  made with the Edit tool was never compiled and its edit-outcome record said "no checker". Both settings templates
+  register it on `Edit|Write`, and a bundle update moves an existing project's `Write` group to `Edit|Write` (a
+  group that also holds your own hook keeps its matcher); the hook's own `.py` filter is unchanged. Where the
+  project's settings do not run it on `Edit` — such a group of your own, or the hook switched off in the launcher —
+  an Edit's outcome record says "no checker" at once instead of waiting 20 s for a result no hook writes.
+
+- **The launcher's system-tray icon was an empty square on Windows.** The tray was created with a tooltip and a menu
+  but never an image, so the slot showed "VibeCoded Tools Launcher" over a blank square and a user could not tell the
+  launcher was running. It now uses the bundled default window icon (`icons/icon.ico` on Windows, the bundled PNG on
+  Linux and macOS); a build without one falls back to the launcher's 32×32 icon built into the binary, so the tray
+  always has an image.
+
+- **The launcher's test build compiles on Windows again.** Two tests that need Unix-only features (a shell-script
+  stand-in for the container runtime, and creating a symbolic link) now run on Linux and macOS only, so `cargo check
+  --tests` no longer stops on Windows.
+
+- **An update whose install step failed no longer looks finished.** When `install.py` failed after the update had
+  already downloaded the new source, the launcher recorded the failure in the update notes but its update badge still
+  said "up to date" (the source was current, and when the version number had not changed nothing else differed). The
+  badge and Preferences → Updates now read that record and offer "Finish Update", which runs the install step again
+  without downloading anything; the record clears when the install step succeeds.
+
+- **The update window's progress bar follows the real steps.** It sat at 50 % for the whole install step and stayed
+  there after the install had finished. It now moves with the installer's own step counter, never goes backwards, and
+  each step after the install (refresh, vct-hub, launcher binary check, recording the update, restart) moves it
+  further; before, the vct-hub step showed 97 % and the later binary check 96 %.
+
+- **"Legacy code-graph collections" offers Re-analyze only where it is needed.** It listed every registered project
+  for a re-analysis whenever old `ClaudeOrchestrator_*` classes existed, including projects that already have their
+  code graph under their own name. It now lists only projects with no code-graph data under their current name, and
+  the window no longer opens by itself when none needs it.
+
+- **Error messages show above an open dialog.** An error raised while a dialog was open (for example a failed "Let VCO
+  manage it" hand-over on the Services page) appeared behind the dialog's blurred backdrop, where it could not be read
+  or dismissed. Notifications now always appear above whatever dialog is open, on every page; the hand-over failure is
+  also shown as one.
+
+- **The model picker no longer offers models that cannot chat, or old dated builds.** QwenCloud's model list now
+  carries an image model (`qwen-image-3.0-pro`), a video model and a dated build (`deepseek-v4-pro-0813`) that the
+  picker would have shown as chat models — picking one ended in an error, or in an older snapshot instead of the
+  current model. The gateway now leaves out, for every vendor, any model whose name marks it as image, video, audio,
+  speech-recognition or speech-synthesis, and any dated build (a name ending in a month-day or full date) unless
+  VCO offers that exact build on purpose. z.ai's `glm-5.3-flashx` and `glm-5.3-flashx-legal` — the same model as
+  `glm-5.3-flash`, served faster at pay-as-you-go prices and not part of the GLM Coding Plan — are neither offered
+  nor sent on; asking for one by name gets a clear refusal that suggests `glm-5.3-flash`.
+
+- **The old inline syntax-check hooks are removed from your settings.** Early releases registered a `py_compile`
+  one-liner on every Python write (in two successive forms, Linux and Windows) and a later one replaced it with the
+  named `py-compile-check` hook, but projects that received an old form kept it, so it kept running beside the new
+  hook — the oldest form printed "Syntax error" on every write. A bundle update now takes every old form out — and
+  removing a project removes them too. A command of your own that differs from them, even by one character, is left
+  where it is.
+
+- **The update report no longer claims some of your hooks run twice when they do not.** When VCO could not fold a
+  duplicate hook group it listed every group sharing a matcher, including groups holding only your own scripts. It
+  now lists a group only when one of its commands actually runs a hook VCO ships (a command that only mentions the
+  hook's path, such as `test -x` or `cat`, does not count) and another group on the same trigger runs the same hook,
+  and it says that hook can run twice. Groups of your own are left alone and not mentioned.
+
+- **A code-graph walk skipped because another walk was already running is no longer reported as failed.** The log
+  read "skipping this run (no twin walks)" and then "reported terminal 'failed'" for a project whose graph was in
+  fact being rebuilt by the other walk, and when two update resyncs started for one project the second one took over
+  the first one's progress entry, so a walk that succeeded was later shown as "died before completing". Now a
+  second walk never takes over the entry of a walk that is still running, so the running walk reports its own real
+  outcome; a skipped run's own entry is finished as "skipped", shown as an informational skip with the reason, never
+  as a failure. A real analyzer failure is still reported failed. If the launcher's background service is older than
+  this release and does not know "skipped" yet, the entry says "failed" with the same reason instead of "died".
+
+- **The RL citation drain no longer re-embeds the same chat text for every retrieval, and its chunks fit the
+  embedding model.** A field report from a CPU-only machine showed an embedding burst about every 30 minutes of work,
+  each leaving a "shrink" row of 90-190k characters in `embedding_failures.jsonl`. The source is the Stop-hook
+  citation drain, which embeds the up to 25 000-token answer window that follows each staged retrieval. It chunked
+  that window with the knowledge-graph chunker's document path, whose chunks are sized for prose and so were refused
+  by the model on tool-call and code text and retried shorter (the tail of each chunk was lost), and whose
+  boundaries depend on where the window starts, so the overlapping windows of one chat never shared a chunk and the
+  same text was embedded once per retrieval (one run on a test machine embedded 44 windows). The shared chunker
+  (`claude_mcp_servers/weaviate_mcp/chunking.py`) now has an answer-window mode beside its document path: answer
+  chunks are sized to the model's window for dense text, and their boundaries are chosen by the content itself, so
+  overlapping windows produce the same chunks and the embed cache reuses them. (The knowledge-graph and document
+  chunking changed separately in this release, on purpose — see "Knowledge-graph and code-graph chunks now fit the
+  embedding model" under Changed.) A dual-model citation chunks the answer once per
+  model with that model's budget; the second-model embedding is cached per process. In a 40-retrieval test the text
+  sent to the model drops by about two thirds, and no chunk exceeds the model window. The citation drain is unrelated
+  to v0.2.105's commit, merge and pull catch-up for the code graph, which embeds only changed code and skips
+  unchanged entries.
+
+- **An idle launcher window no longer keeps several CPU cores busy.** A field report from a 20-core Windows machine
+  showed the launcher's WebView2 process at about 17% of total CPU with the launcher idle. The Home page's background
+  glow drifted forever, and every frame of that drift redrew two large blurs and re-blurred every glass card above
+  them. The glow now drifts only while you are using the window and holds still after a minute without input (the
+  next mouse move or key press resumes it); loading spinners are not affected. WebView2 is also never told when the launcher window is minimised, so animations and
+  polling went on for a window nobody could see: the launcher now notices a minimised or hidden window, pauses every
+  animation and skips its periodic checks (the change poller, the restart banner, the subscription usage card, the
+  Services page, the module health refresh and the banners' clocks) until the window is shown again, then
+  refresh once. The restart banner also no longer redraws when its five-second check returns the same answer.
+
+- **The weaviate-kg MCP server no longer outlives the Claude Code session that started it.** A field report from a
+  machine short of memory showed MCP servers that missed the 30-second connect timeout staying alive after Claude
+  Code gave up on them. VCO's server could do the same in two ways: when its stdin closed while a tool call was still
+  waiting on a slow Weaviate or Ollama request, the process waited for that request before exiting; and when the
+  session that started it went away without closing the pipe, nothing noticed at all (on Windows the server runs under
+  the virtual environment's `python.exe` launcher, which stays alive as long as the server, so watching it never
+  fired). The server now exits within five seconds of the session that started it exiting, looking past that launcher
+  on Windows. When its stdin closes it exits once the tool call that is running returns, giving background work it
+  started at most 30 more seconds; a tool call still blocked on a slow request is not cut short, so a closed session
+  is ended by the five-second check instead. Telemetry that is written at exit is still written, within 10 seconds.
+
+### Security
+
+- **The RL reranker refuses a project id that could name a path outside its data.** The container used the
+  `X-VCT-Project-ID` header verbatim as a directory and log-file name, relying on the client to sanitize it; any
+  other caller could send `../..` and have it create directories and read checkpoints outside `/data/state`. Every
+  route now answers 400 to a header that fails the project-id rule (letters, digits, `-`, `_`, 1..64), and so does
+  `/global/retrain` for such an id in its body. The rule has one home, `rl_client.rerank_wire.sanitize_project_id`,
+  which the client also uses; it now uses `fullmatch`, so an id with a trailing newline no longer passes.
+- **Request-named weights files are contained and read only from the roots' directory listings.** `/rotate_weights`
+  and `/finetune` resolve the path (`..` and symlinks removed) before checking it lies under `/data/state` or
+  `/data/global`, and load the checkpoint through a path rebuilt from the directory entries, so only a file that
+  exists there can be read. One helper module serves every such path: `vco_lib/safe_paths.py` (shipped in the image).
+- **Checkpoints are read in one place, with `weights_only=True`.** `rl_model.load_checkpoint` refuses a `.pt` that
+  carries a pickled callable instead of running it; every checkpoint VCO writes still loads.
+- **Request- and file-derived values are logged on one line.** The reranker logs project ids, paths, type names and
+  checkpoint fields through `vco_lib.log_setup.log_safe`, which spells out CR, LF and control characters; it is the
+  model gateway's former `_log_safe`, moved so both use the same rule.
+- **The code-embedding service no longer returns exception text.** `/health` and the 503 on `/embed` and
+  `/api/embeddings` report a model-load failure as a fixed sentence plus an error id; the full error is in the
+  service log under that id.
+- **Tests compare hosts exactly.** Assertions that a text or command names `api.anthropic.com`, `mirror.gcr.io`,
+  `aur.archlinux.org` or `alpinelinux.org` now extract the hostnames and compare them (`tests/common/hosts.py`)
+  instead of matching a substring. The product code they cover already compared registry hosts exactly.
+
 ## [0.2.105] - 2026-10-30
 
 ### Added
@@ -81,6 +876,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clipboard routine as the notification bell's Copy, and the text it copies is built by one tested helper.
 
 ### Changed
+
+- **The reranker server no longer takes `--ollama-url` / `OLLAMA_URL`.** Since it started scoring the vectors the
+  client sends (`rl_client/rerank_wire.py`, protocol v2) the server embeds nothing and has no Ollama to reach, so
+  the option was unread. It is removed from the server's command line and from the standalone compose service's
+  environment; every other consumer of `OLLAMA_URL` (the embedding services, the weaviate-kg MCP, the code-embed
+  container) is unchanged.
+
+- **The RL reranker image is rebuilt when it is missing or built for the wrong graphics variant.** The image is
+  built locally at install/update; if it was pruned afterwards, or the machine's graphics profile changed (a GPU
+  added or removed), every later start of the module just failed. The start path now checks whether the exact image
+  the start would run exists locally and, when it does not, rebuilds it from the checkout with the same build step
+  the installer uses, logging and auditing the rebuild before starting the container.
+
+- **`rl_doctor` finds the reranker through the hub.** It resolved the container's address from environment variables
+  only, while the search pipeline also falls back to the hub-resolved `rl_server_port` — so on a default install
+  (where those variables are deliberately not set for the MCP) the doctor said "container not wired" while searches
+  were talking to the container. Both now resolve through one shared function, with the same precedence:
+  environment variables first, then the hub-resolved port.
+
+- **The shipped knowledge-graph node about RL retrieval no longer describes a paid module.** The reranker ships with
+  VCO (free, no licence) since this release; the node still said it was Pro-tier, licence-gated and distributed as a
+  paid container image with weekly weight rotation. The node now describes what ships: the source in the public
+  repository, the locally built image, the bundled weights and the shipped scoring lock that keeps reranking off
+  until trained weights exist.
+
+- **Test isolation: `VCT_AGENT_ID` no longer leaks between tests, and the root-identity hook test no longer stages
+  real citation files into the checkout.** The context router writes `VCT_AGENT_ID` straight into the environment on
+  every run, so one in-process test left it set and every later citation-staging test tagged its files with that
+  test's agent id — the same leak class as `VCT_TRANSCRIPT_PATH`, fixed the same way (cleared before and after every
+  test; `VCT_BRIEF_TOOL_USE_ID`, written by the same step, is cleared with it). Separately, the hook-identity test
+  that runs the real retrieval pipeline with the orchestrator root as its project (a lane worktree when the suite
+  runs there) staged a fixture-named pending-citation file into that root's `.claude/state/rl_pending` on every run —
+  found as leftovers in every lane worktree; the shared test harness now skips the pending-file staging for runs that
+  do not assert it.
 
 - **The post-commit knowledge-graph reviewer keeps only the latest status.** When a decision is refined commit after commit, the reviewer used to append one `## Status after <commit>` section per commit, so a node collected a chain of sections — each right for its commit, every later one superseded — and readers landed on the stale statements first. Now, when a new commit supersedes what the reviewer's own earlier sections say, it CONSOLIDATES them into one `## Current state (consolidated <date>)` section (and updates that section on the next round instead of adding a second one): every still-true statement is carried over word for word, each statement that is no longer true is quoted on a `Superseded: <old commit> → <new commit> (<date>): <statement>` line, and one `Superseded:` step line per folded section keeps the history visible. Which sections are the reviewer's own is RECORDED when the reviewer makes its own commit — a fingerprint of each section it wrote, kept in `.claude/state/` — never guessed from commit titles or `git blame`: a section can be folded only while its text still matches the fingerprint the reviewer recorded (line endings and trailing blank lines are normalized for the fingerprint) and that commit is still in your history. A node you created but never committed is never treated as the reviewer's. Anything else stays append-only exactly as before: your own lines anywhere in the node, a section you added a line to, a section the reviewer annotated one of your lines in, a commit you amended or rebased, a commit of yours titled `kg-sync:`. A write that drops any statement without carrying it over or quoting it as superseded is reverted whole. Commits that land while a review is running no longer start a second, concurrent review: they join a queue, and the running review covers them in follow-up passes (up to 8 commits per pass, each with its diff, and the nodes citing any of their files are listed). A queued commit leaves the queue only after a pass covering it finished, so a crash or a failed pass loses nothing; the few reasons a commit is dropped without review (it is the reviewer's own commit, git can no longer read it, three passes failed, more than 200 are waiting, no reviewer model was available for the run) are each written to the reviewer log, one line per commit. A queued copy of the run's own commit is never reviewed twice, and a crashed heartbeat leaves no temp file behind. The running review keeps its lock fresh, so it is never taken over while alive; a lock left by a crashed run is taken over by exactly one later run. If the lock or queue cannot be used at all (permissions, a read-only disk), the reviewer says so in its log, on stderr and in the chat's alerts, and still reviews the commit.
 

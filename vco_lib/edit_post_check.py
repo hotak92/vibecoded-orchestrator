@@ -12,8 +12,9 @@ Pieces (each has exactly one home here):
 
 * **Coverage** — :data:`CHECKERS` says which shipped PostToolUse checker
   covers which ``(tool, file suffix)``. Today that is only
-  ``py-compile-check`` (``Write`` of a ``*.py`` file; its settings matcher is
-  bare ``Write`` and the ``.py`` gate lives in the hook). There is no ruff,
+  ``py-compile-check`` (``Edit`` or ``Write`` of a ``*.py`` file; its
+  settings matcher is ``Edit|Write`` and the ``.py`` gate lives in the
+  hook). There is no ruff,
   cargo or tsc PostToolUse checker in the shipped settings. A file no
   checker covers gets ``post_check = {"status": "no_signal", "reason":
   "no_checker"}`` at once, without any wait. A file outside the project
@@ -63,6 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -108,14 +110,23 @@ class Checker:
     name: str
     tools: Tuple[str, ...]
     suffixes: Tuple[str, ...]
+    #: the hook script(s) whose PostToolUse registration runs it
+    scripts: Tuple[str, ...] = ()
 
 
 #: The coverage table. MUST MATCH the checker hooks: ``py-compile-check``
-#: is registered on bare ``Write`` in both settings templates and gates on
+#: is registered on ``Edit|Write`` in both settings templates and gates on
 #: ``.py`` itself (pinned by tests/test_v02102_w6pchk_edit_post_check.py).
+#: v0.2.106: ``Edit`` was missing, so a Python change made with the Edit
+#: tool was never compiled and its edit_outcome row read ``no_checker``.
 CHECKERS: Tuple[Checker, ...] = (
-    Checker(name="py_compile", tools=("Write",), suffixes=(".py",)),
+    Checker(name="py_compile", tools=("Write", "Edit"), suffixes=(".py",),
+            scripts=("py-compile-check.sh", "py-compile-check.ps1")),
 )
+
+#: The project settings files whose ``hooks`` Claude Code merges (the
+#: user-scope file is not VCO's to register in).
+_SETTINGS_FILES = ("settings.json", "settings.local.json")
 
 
 # ── keys and paths ─────────────────────────────────────────────────────────
@@ -183,6 +194,77 @@ def covering_checker(tool_name: str, file_path: str, project_root: str) -> Optio
         if tool_name in checker.tools and file_path.endswith(checker.suffixes):
             return checker.name
     return None
+
+
+def _matcher_selects(matcher: Any, tool_name: str) -> bool:
+    """Claude Code's matcher rule for one tool: empty / ``*`` match every
+    tool, a plain ``A|B`` list matches its names, anything else is a regex."""
+    if matcher in (None, "", "*"):
+        return True
+    if not isinstance(matcher, str):
+        return False
+    if re.fullmatch(r"[A-Za-z0-9_|]+", matcher):
+        return tool_name in matcher.split("|")
+    try:
+        return re.fullmatch(matcher, tool_name) is not None
+    except re.error:
+        return False
+
+
+def registered_for(checker_name: str, tool_name: str, project_root: str) -> Optional[bool]:
+    """Whether the project's settings actually RUN *checker_name* on
+    *tool_name* — a ``PostToolUse`` group whose matcher selects the tool and
+    which holds the checker's hook script. ``None`` when no settings file
+    could be read (the caller then keeps the table's answer).
+
+    Review L9: two installed shapes do not run py-compile-check on an Edit —
+    a ``Write`` group that also carries the user's own hook (the matcher
+    migration leaves a mixed group alone) and a hook disabled in the launcher
+    (its registration is removed). Without this read each ``.py`` Edit there
+    started a poller that waited the whole window for a record no hook writes
+    and logged ``no_signal/timeout``.
+
+    Review L3: the files are JSONC (comments are supported everywhere VCO
+    reads settings), so the read goes through :mod:`vco_lib.jsonc_edit` —
+    with strict ``json.loads`` a commented ``settings.json`` was silently
+    SKIPPED and a readable ``settings.local.json`` (VCO writes one in every
+    project) then answered ``False``, turning every checked edit into
+    ``no_signal/no_checker``. An EXISTING file that cannot be parsed answers
+    ``None`` (keep the table's answer): skipping it and answering ``False``
+    from another file is how the regression read."""
+    from vco_lib.hook_retirements import vco_hook_script_identity  # noqa: PLC0415
+    from vco_lib.jsonc_edit import load_object  # noqa: PLC0415
+
+    checker = next((c for c in CHECKERS if c.name == checker_name), None)
+    if checker is None:
+        return False
+    read_any = False
+    unreadable = False
+    for leaf in _SETTINGS_FILES:
+        path = Path(project_root) / ".claude" / leaf
+        if not path.is_file():
+            continue
+        try:
+            loaded = load_object(path)
+        except Exception:  # noqa: BLE001 — treated as unparseable below
+            loaded = None
+        if loaded is None:
+            unreadable = True
+            continue
+        read_any = True
+        data, _raw = loaded
+        groups = ((data.get("hooks") or {}).get("PostToolUse") or []) \
+            if isinstance(data, dict) and isinstance(data.get("hooks"), dict) else []
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict) or not _matcher_selects(group.get("matcher"), tool_name):
+                continue
+            for hook in group.get("hooks") or []:
+                cmd = hook.get("command") if isinstance(hook, dict) else None
+                if isinstance(cmd, str) and vco_hook_script_identity(cmd) in checker.scripts:
+                    return True
+    if unreadable:
+        return None
+    return False if read_any else None
 
 
 # ── producer side (the checker hooks) ──────────────────────────────────────
@@ -483,6 +565,8 @@ def record_edit_outcome(*, project_root: str, session_id: str, agent_id: str,
                                     post_check=post_check)
 
     checker = covering_checker(tool_name, file_path, project_root)
+    if checker is not None and registered_for(checker, tool_name, project_root) is False:
+        checker = None  # the table covers it, the settings never run it (review L9)
     if checker is None:
         row["payload"] = _payload(no_checker_post_check())
         emit_edit_outcome(row, emit)

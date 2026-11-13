@@ -40,7 +40,7 @@ use vct_launcher_core::services::install_root;
 /// v0.2.100 WP-02 (AD-2): a thin shim over
 /// `vct_launcher_core::services::install_root::resolve_with_store` — the ONE
 /// resolver (launcher.db cache first, kept only when it still passes
-/// `check_install_status`; then an exe walk bounded to 8 levels and
+/// `check_install_status`; then an exe walk bounded to `install_root::MAX_WALK_LEVELS` levels and
 /// identity-checked by `looks_like_orchestrator_root` AND the
 /// `vct-module.json` id). While `install.py --update` holds launcher.db
 /// (`db.is_update_standby()`) it answers from the process-level cache and
@@ -972,6 +972,13 @@ pub struct UpdateStatus {
     /// finishing (or aborting) the merge is the remedy.
     #[serde(default)]
     pub binary_ahead_of_install: bool,
+    /// NEW v0.2.106: the last launcher-driven `install.py --update` failed
+    /// after the git operation had advanced the tree (the root ledger carries
+    /// `update_install_phase_failed`). Always implies `install_stale`; it is
+    /// carried separately so the badge can say "the last update did not
+    /// finish" when the version strings agree and git reports nothing behind.
+    #[serde(default)]
+    pub install_incomplete: bool,
 }
 
 /// Check for updates across all three signals (git, manifest, binary).
@@ -1194,7 +1201,12 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     // It self-clears: install.py rebuilds the manifest from a literal dict and
     // does not carry the flag over, so the next real installer run drops it.
     let post_source_only = install_manifest_flag(&p, "post_source_only");
+    // v0.2.106: the THIRD trigger, and the only one a current launcher still
+    // produces — the last launcher-driven install.py run failed after the git
+    // operation advanced the tree (see `install_phase_failed_recorded`).
+    let install_incomplete = install_phase_failed_recorded(&p);
     let install_stale = post_source_only
+        || install_incomplete
         || (!source_version.is_empty()
             && !installed_version.is_empty()
             && source_version != installed_version);
@@ -1249,6 +1261,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         head_detached,
         merge_in_progress,
         binary_ahead_of_install,
+        install_incomplete,
     })
 }
 
@@ -1560,7 +1573,7 @@ pub fn detect_existing_install_root() -> Option<String> {
 //
 //   1. Look up `launcher.install_path` in app_state. If set AND the path
 //      still passes `check_install_status`, return it.
-//   2. Walk up from `current_exe()` (at most 8 levels) to the nearest
+//   2. Walk up from `current_exe()` (at most `install_root::MAX_WALK_LEVELS` levels) to the nearest
 //      identity-confirmed orchestrator clone (markers AND a
 //      `vct-module.json` with id `orchestrator`). On a hit, write it back
 //      to app_state so step 1 picks it up next time.
@@ -15764,15 +15777,18 @@ MemAvailable:   23456789 kB
                 head_detached: false,
                 merge_in_progress: true,
                 binary_ahead_of_install: true,
+                install_incomplete: true,
             };
-            // An older backend's payload = today's minus the two new keys.
+            // An older backend's payload = today's minus the new keys.
             let mut v = serde_json::to_value(&full).unwrap();
             let obj = v.as_object_mut().unwrap();
             assert!(obj.remove("merge_in_progress").is_some());
             assert!(obj.remove("binary_ahead_of_install").is_some());
+            assert!(obj.remove("install_incomplete").is_some());
             let st: UpdateStatus = serde_json::from_value(v).expect("older payload parses");
             assert!(!st.merge_in_progress);
             assert!(!st.binary_ahead_of_install);
+            assert!(!st.install_incomplete);
             // And the round trip keeps them when present.
             let back: UpdateStatus =
                 serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
@@ -17209,6 +17225,71 @@ severity_max: critical\n\
     // suite's PATH-shim idiom. Guarded with GLOBAL_ENV_MUTEX (via
     // `with_env_vars`) because it mutates PATH process-globally.
     // ------------------------------------------------------------------
+    // v0.2.106: a half-finished update must badge even when the versions
+    // agree and git is current (field report: install.py failed after the
+    // pull of a same-version commit; the launcher said "up to date").
+    mod install_incomplete_tests {
+        use super::super::*;
+        use std::fs;
+
+        fn same_version_install(dir: &Path) {
+            fs::write(dir.join("vct-module.json"), r#"{"version": "0.2.105"}"#).unwrap();
+            fs::create_dir_all(dir.join("state")).unwrap();
+            fs::write(
+                dir.join("state").join("install-manifest.json"),
+                r#"{"installed": true, "version": "0.2.105"}"#,
+            )
+            .unwrap();
+        }
+
+        fn write_ledger(dir: &Path, cid: &str) {
+            let ctx = dir.join(".claude").join("context");
+            fs::create_dir_all(&ctx).unwrap();
+            fs::write(
+                ctx.join("UPDATE_DEFERRED.json"),
+                format!(
+                    "{{\"schema_version\":1,\"generated_at\":\"t\",\"severity_max\":\"critical\",\
+                     \"entries\":[{{\"condition_id\":\"{cid}\",\"title\":\"T\",\"detected\":\"D\",\
+                     \"why_deferred\":\"W\",\"command_to_apply\":\"cmd\",\"severity\":\"critical\",\
+                     \"kg_node_refs\":[],\"detected_at\":\"2026-11-06T00:00:00Z\"}}]}}"
+                ),
+            )
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_recorded_install_phase_failure_badges_install_stale() {
+            let tmp = tempfile::tempdir().unwrap();
+            same_version_install(tmp.path());
+            write_ledger(tmp.path(), UPDATE_INSTALL_PHASE_FAILED_CID);
+            let status = check_for_updates(tmp.path().to_str().unwrap().to_string())
+                .await
+                .unwrap();
+            assert!(
+                status.install_incomplete,
+                "the ledger's update_install_phase_failed row must reach the badge"
+            );
+            assert!(
+                status.install_stale,
+                "a half-finished update must offer the install-only finish even when the \
+                 version strings agree"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_healthy_same_version_install_is_not_stale() {
+            let tmp = tempfile::tempdir().unwrap();
+            same_version_install(tmp.path());
+            // Another condition in the ledger must not light the badge.
+            write_ledger(tmp.path(), "kg_sync_no_embedding_backend");
+            let status = check_for_updates(tmp.path().to_str().unwrap().to_string())
+                .await
+                .unwrap();
+            assert!(!status.install_incomplete);
+            assert!(!status.install_stale);
+        }
+    }
+
     mod remote_check_health_tests {
         use super::super::*;
 

@@ -235,31 +235,50 @@ def test_rl6_rl9_citation_riders_optional():
 # ---------------------------------------------------------------------------
 
 
+_DIM = 8
+
+
 def _client_with_status(status: int, tmp_base_url="http://127.0.0.1:9"):
-    """RLClient wired to a stub httpx client returning `status`."""
-    from claude_mcp_servers.rl_client.client import RLClient
+    """RLClient wired to a stub httpx client: POST answers `status` (200 =
+    a scored answer in request order); /health reports a trained, protocol-2
+    container so the pipeline's negotiation gate lets the POST through."""
+    from claude_mcp_servers.rl_client.client import PROTOCOL_VERSION, RLClient
 
     class _Resp:
-        status_code = status
-        text = "env-pin mismatch" if status == 409 else "err"
+        def __init__(self, code, payload):
+            self.status_code = code
+            self.text = "env-pin mismatch" if code == 409 else "err"
+            self._payload = payload
 
         def json(self):
-            return {"top_k": [{"title": "NodeA"}]}
+            return self._payload
 
     class _Stub:
-        async def post(self, url, json=None, headers=None, timeout=None):
-            return _Resp()
+        async def get(self, url, timeout=None):
+            return _Resp(200, {"ok": True, "model": "RLModel loaded", "trained": True,
+                               "protocol_version": PROTOCOL_VERSION,
+                               "embedding_dim": _DIM, "embedding_space": "qwen3"})
 
-    return RLClient(base_url=tmp_base_url, client=_Stub())
+        async def post(self, url, json=None, headers=None, timeout=None):
+            n = len((json or {}).get("nodes") or [])
+            return _Resp(status, {"scored": True, "order": list(range(n)),
+                                  "scores": [0.5] * n})
+
+    return RLClient(base_url=tmp_base_url, client=_Stub(), text_dim=_DIM,
+                    active_embedding="qwen3")
+
+
+def _vec_nodes(*titles):
+    return [{"title": t, "emb": [0.1] * _DIM} for t in titles]
 
 
 def test_rl3_4xx_sets_last_error_and_falls_back(caplog):
     import logging as _logging
 
     client = _client_with_status(409)
-    nodes = [{"title": "NodeA"}, {"title": "NodeB"}]
+    nodes = _vec_nodes("NodeA", "NodeB")
     with caplog.at_level(_logging.WARNING, logger="claude_mcp_servers.rl_client.client"):
-        out = asyncio.run(client.cache_nodes("q", nodes, 2, task_id="t"))
+        out = asyncio.run(client.cache_nodes("q", nodes, 2, task_id="t", query_emb=[0.1] * _DIM))
     assert out == nodes[:2]
     assert client.last_call_ok is False
     assert "409" in (client.last_error or "")
@@ -267,16 +286,17 @@ def test_rl3_4xx_sets_last_error_and_falls_back(caplog):
     # Second 4xx degrades to debug (no second WARNING).
     caplog.clear()
     with caplog.at_level(_logging.WARNING, logger="claude_mcp_servers.rl_client.client"):
-        asyncio.run(client.cache_nodes("q", nodes, 2, task_id="t2"))
+        asyncio.run(client.cache_nodes("q", nodes, 2, task_id="t2", query_emb=[0.1] * _DIM))
     assert not [r for r in caplog.records if "REFUSED" in r.message]
 
 
 def test_rl3_success_sets_last_call_ok():
     client = _client_with_status(200)
-    out = asyncio.run(client.cache_nodes("q", [{"title": "NodeA"}], 1, task_id="t"))
+    nodes = _vec_nodes("NodeA")
+    out = asyncio.run(client.cache_nodes("q", nodes, 1, task_id="t", query_emb=[0.1] * _DIM))
     assert client.last_call_ok is True
     assert client.last_error is None
-    assert out == [{"title": "NodeA"}]
+    assert out == nodes and out[0] is nodes[0]
 
 
 def test_rl3_pipeline_reports_rl_used_false_on_container_refusal(tmp_path, monkeypatch):
@@ -288,7 +308,11 @@ def test_rl3_pipeline_reports_rl_used_false_on_container_refusal(tmp_path, monke
     client = _client_with_status(409)
 
     async def _inner():
-        req = _make_request()
+        req = _make_request(candidates=[
+            {"title": "NodeA", "score": 0.91, "emb": [0.1] * _DIM},
+            {"title": "NodeB", "score": 0.74, "emb": [0.2] * _DIM},
+            {"title": "NodeC", "score": 0.55, "emb": [0.3] * _DIM},
+        ])
         with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=True), \
              patch("claude_mcp_servers.weaviate_mcp.server._get_rl_client",
                    return_value=client), \
@@ -1131,7 +1155,7 @@ def test_nemb_dedup_legacy_jsonl_writer_dedups_too():
 
 def test_nemb_dedup_written_event_is_consumable_by_offline_trainer_field():
     """Contract anchor: the offline trainer reads the node vector via
-    `node.get("emb")` (paid-modules/vct-rl-reranker/offline_trainer.py
+    `node.get("emb")` (claude_mcp_servers/rl_reranker/offline_trainer.py
     `extract_samples` + `train_epoch`). Assert the written v3 event exposes the
     vector under exactly that key for both the KG (dual-key) and code
     (n_emb-only) shapes — so nothing the trainer needs is lost by the dedup."""

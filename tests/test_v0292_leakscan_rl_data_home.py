@@ -253,7 +253,7 @@ def test_source_contains_no_home_reconstruction_in_executable_code():
 
 
 # ---------------------------------------------------------------------------
-# The vendored-standalone contract (the file ships inside a container image)
+# The standalone contract (the file is copied into the RL reranker image)
 # ---------------------------------------------------------------------------
 
 
@@ -278,11 +278,9 @@ def _standalone_copy_without_vco_lib():
 def test_module_imports_and_logs_with_an_explicit_path_without_vco_lib(
     tmp_path: Path,
 ):
-    """The vendored copy runs in a container image that has no ``vco_lib``.
-
-    ``paid-modules/vct-rl-reranker/rl_logger.py`` must stay byte-identical to
-    this file (``tests/test_vendored_file_sync.py``) and that copy exists
-    *solely because the container image must build standalone*. So the
+    """The module also runs in the RL reranker's container image, which
+    carries no ``vco_lib.paths`` (the image COPIES this file; see
+    ``claude_mcp_servers/rl_reranker/Dockerfile``). So the
     ``vco_lib`` import lives INSIDE the resolver: importing the module, the
     serialization helpers, and an explicitly-pathed logger all keep working
     with no ``vco_lib`` present. Only taking the default needs it.

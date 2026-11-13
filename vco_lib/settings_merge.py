@@ -60,7 +60,9 @@ import re
 from typing import Any, Optional
 
 from vco_lib.hook_retirements import (
+    KIND_COMMAND,
     PRIOR_SHIPPED_SHAPES,
+    RETIRED_REGISTRATIONS,
     hook_command_key,
     match_prior_shipped_shape,
     migrate_group_matcher,
@@ -69,6 +71,7 @@ from vco_lib.hook_retirements import (
     scrub_retired_registrations,
     vco_hook_script_arguments,
     vco_hook_script_identity,
+    vco_hook_scripts_run,
     vco_shipped_hook_scripts,
 )
 from vco_lib.hooks_settings import normalize_matcher
@@ -81,7 +84,7 @@ from vco_lib.parked_hooks import (
     live_hook_registrations,
 )
 
-__all__ = ["merge_hooks_block", "smart_merge_settings"]
+__all__ = ["merge_hooks_block", "smart_merge_settings", "strip_shipped_hooks"]
 
 
 def _entry_cmds(entry: Any) -> list[str]:
@@ -277,7 +280,10 @@ def merge_hooks_block(
     (the current template's, a prior shipped shape's, or a retired script's)
     — containing a shipped script is not enough. A group holding ANY other
     command is the user's and is left byte-for-byte, reported through
-    ``duplicate_groups`` instead of changed. See that function's docstring for the fold, its ordering, and
+    ``duplicate_groups`` instead of changed — but only when it really doubles
+    a VCO hook another group also runs (v0.2.106: a group of the project's own
+    scripts shares a matcher without running anything twice, and is not
+    reported). See that function's docstring for the fold, its ordering, and
     the redundant all-source (``*`` / absent matcher) legacy groups.
     """
     out, scrub_removals = scrub_retired_registrations(user_hooks)
@@ -641,6 +647,14 @@ def _shipped_spellings(template_hooks: dict) -> dict[str, set[str]]:
       argument. Its shipped keys are not recorded anywhere, so its signature
       set is EMPTY: such a handler may sit in a foldable group, but its keys
       never count as provably VCO's.
+    * (v0.2.106) every WHOLE COMMAND a retirement row declares VCO's
+      (``KIND_COMMAND`` rows — inline one-liners with no hook script to key
+      on, e.g. the retired inline ``py_compile`` entry). Its target is
+      already ``normalize_command`` form; it is re-keyed through
+      :func:`_spelling_key` so both sides share one normalisation. This is
+      what lets the unregister path
+      (:func:`strip_shipped_hooks`) take such a registration out through the
+      SAME table the update's scrub reads — no second list.
     """
     spell: dict[str, set[str]] = {}
     prefixes: dict[str, set[str]] = {}
@@ -664,6 +678,11 @@ def _shipped_spellings(template_hooks: dict) -> dict[str, set[str]]:
     for name in vco_shipped_hook_scripts():
         for prefix in prefixes.get(name.rsplit(".", 1)[-1], ()):
             spell.setdefault(_spelling_key(f"{prefix}.claude/hooks/{name}"), set())
+    for row in RETIRED_REGISTRATIONS:
+        if row.kind == KIND_COMMAND:
+            key = _spelling_key(row.target)
+            if key:
+                spell.setdefault(key, set())
     return spell
 
 
@@ -742,6 +761,41 @@ def _survivor(handlers: list, spell: dict[str, set[str]]) -> Optional[dict]:
     return custom[0][0] if custom else handlers[0]
 
 
+def _command_run_keys(
+    command: Any, shipped_scripts: set, spell: dict[str, set[str]],
+) -> set:
+    """The run keys of ONE hook command for the duplicate REPORT (v0.2.106).
+
+    A key is an identity VCO itself owns — a shipped hook-script basename the
+    command actually RUNS (:func:`vco_hook_scripts_run`: the identity's anchor
+    walk, which also sees a wrapped form such as ``MY_FLAG=1 bash …/x.sh`` or
+    ``my-wrap.sh && bash …/x.sh``, but never a path that is only an argument —
+    ``test -x …/x.sh`` runs nothing), or, for a retired inline registration
+    with no script, the whole-command spelling (:func:`_spelling_key`). A
+    command of the user's own yields nothing, which is what keeps their
+    groups out of the report. Never used by a fold decision (those stay
+    spelling-exact)."""
+    if not isinstance(command, str) or not command:
+        return set()
+    ran = {name for name in vco_hook_scripts_run(command) if name in shipped_scripts}
+    if ran:
+        return {("script", name) for name in ran}
+    key = _spelling_key(command)
+    return {("command", key)} if key and key in spell else set()
+
+
+def _group_run_keys(entry: Any, shipped_scripts: set, spell: dict[str, set[str]]) -> set:
+    """Every run key a group's commands contribute (see
+    :func:`_command_run_keys`)."""
+    keys: set = set()
+    if not isinstance(entry, dict):
+        return keys
+    for h in entry.get("hooks", []):
+        cmd = h.get("command") if isinstance(h, dict) else None
+        keys |= _command_run_keys(cmd, shipped_scripts, spell)
+    return keys
+
+
 def _fold_duplicate_shipped_groups(
     event: str, entries: list, template_entries: Any,
     spell: dict[str, set[str]], records: Optional[list],
@@ -785,7 +839,13 @@ def _fold_duplicate_shipped_groups(
        SessionStart `startup`), no longer on every resume / clear / compact.
     3. NEVER the user's — a group holding ANY other command is left
        byte-for-byte, and reported through ``records`` (``kept_user_command``)
-       so the update summary can say why the duplicate is still there. Every
+       ONLY when it really doubles a VCO hook: one of its commands runs a
+       hook script VCO ships or once shipped (or is a retired inline
+       registration) that ANOTHER group in the same firing context also runs
+       (v0.2.106, :func:`_command_run_keys`). A group holding nothing but the
+       user's own scripts shares a matcher but runs nothing twice — it is
+       left alone and NOT reported, because the report drives a "those hooks
+       now run twice" warning the user must be able to trust. Every
        decision taken is appended to ``records`` (``None`` = report nothing).
 
     Inputs are not mutated: a folded group is a new dict, and a trimmed legacy
@@ -901,7 +961,24 @@ def _fold_duplicate_shipped_groups(
         if isinstance(entry, dict):
             m = normalize_matcher(entry)
             per_matcher[m] = per_matcher.get(m, 0) + 1
-    for entry in out:
+    # v0.2.106 (F2): what each group RUNS, in the module's own identity — a
+    # hook-script basename VCO ships or once shipped (current template, prior
+    # shipped shape, retired script), or a retired inline command's whole
+    # spelling. This is what separates a REAL double run from two groups that
+    # merely share a matcher while one of them holds only the user's scripts.
+    shipped_scripts = set(vco_shipped_hook_scripts())
+    for key in spell:
+        ident = vco_hook_script_identity(key)
+        if ident:
+            shipped_scripts.add(ident)
+    group_runs = [_group_run_keys(entry, shipped_scripts, spell) for entry in out]
+
+    def _fires_with(a: str, b: str) -> bool:
+        """Two groups share a firing context: same matcher, or one of them is
+        the legacy every-source form (``*`` / absent)."""
+        return a == b or a in legacy_forms or b in legacy_forms
+
+    for i, entry in enumerate(out):
         if not isinstance(entry, dict) or _entry_is_shipped(entry, spell):
             continue
         matcher = normalize_matcher(entry)
@@ -913,7 +990,24 @@ def _fold_duplicate_shipped_groups(
             matcher in legacy_forms and len(out) > 1)
         if not looks_duplicate:
             continue
-        user_cmds = [c for c in _entry_cmds(entry) if _spelling_key(c) not in spell]
+        # v0.2.106 (F2): report a group only when it contains a command that
+        # RUNS a VCO-shipped hook another group also runs — i.e. that hook
+        # really would run twice. The v0.2.105 report listed every group that
+        # merely shoved the same matcher; measured on the owner's v0.2.105
+        # "Update all" report most of the named groups held ONLY the
+        # project's own scripts (`memory-consolidation-trigger.sh`, …), which
+        # VCO never shipped and which run once. Those are not reported.
+        others: set = set()
+        for j, other in enumerate(out):
+            if j != i and isinstance(other, dict) \
+                    and _fires_with(matcher, normalize_matcher(other)):
+                others |= group_runs[j]
+        doubled = group_runs[i] & others
+        if not doubled:
+            continue
+        user_cmds = [
+            c for c in _entry_cmds(entry)
+            if _command_run_keys(c, shipped_scripts, spell) & doubled]
         if user_cmds:
             _record("kept_user_command", matcher, commands=user_cmds)
     return out
@@ -1067,3 +1161,64 @@ def _without_kept_out(event: str, t_entries: Any, keep_out: Any) -> list:
         elif kept:
             result.append({**t_entry, "hooks": kept})
     return result
+
+
+def strip_shipped_hooks(
+    user_hooks: Any, template_hooks: list, *, keep: Any = None,
+) -> tuple[Any, list[dict]]:
+    """``user_hooks`` without the registrations VCO shipped — the unregister's
+    half of the hooks merge (v0.2.106, "Remove project").
+
+    A handler goes only when its command's spelling EQUALS one VCO ships or
+    once shipped (:func:`_shipped_spellings` over every ``template_hooks``
+    block passed — the current templates; the prior shapes, retired scripts
+    and retired inline commands come with it). That is the same exact
+    identity the merge folds on, so a command that merely RUNS a shipped
+    script (``my-backup.sh && bash …/x.sh``), a shipped command with an
+    argument of the user's, and every command of the user's own stay
+    byte-for-byte, in their groups. A group left with no handler goes, and an
+    event left with no group.
+
+    ``keep(command) -> bool`` keeps a shipped handler anyway — the caller
+    keeps the registration of a hook script it did not delete (the user
+    changed it), so the script still runs.
+
+    Returns ``(new_hooks, removed)`` — ``removed`` is one ``{"event",
+    "matcher", "command"}`` record per handler taken out. Inputs are not
+    mutated; a non-dict ``user_hooks`` comes back as it is.
+    """
+    if not isinstance(user_hooks, dict):
+        return user_hooks, []
+    spell: dict[str, set[str]] = {}
+    for block in template_hooks:
+        if isinstance(block, dict):
+            for key, sigs in _shipped_spellings(block).items():
+                spell.setdefault(key, set()).update(sigs)
+    removed: list[dict] = []
+    out: dict = {}
+    for event, entries in user_hooks.items():
+        if not isinstance(entries, list):
+            out[event] = entries
+            continue
+        kept_entries: list = []
+        for entry in entries:
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(inner, list):
+                kept_entries.append(entry)
+                continue
+            kept = []
+            for h in inner:
+                cmd = h.get("command") if isinstance(h, dict) else None
+                if (_spelling_key(cmd) in spell
+                        and not (keep is not None and keep(cmd))):
+                    removed.append({"event": event, "matcher": normalize_matcher(entry),
+                                    "command": cmd})
+                    continue
+                kept.append(h)
+            if len(kept) == len(inner):
+                kept_entries.append(entry)
+            elif kept:
+                kept_entries.append({**entry, "hooks": kept})
+        if kept_entries:
+            out[event] = kept_entries
+    return out, removed

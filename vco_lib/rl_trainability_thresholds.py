@@ -15,11 +15,11 @@ script + the offline trainer + V52-T's post-deploy smoke test all read
 from one place. Adjusting any threshold here propagates to every
 consumer on the next launch.
 
-Why a separate file from ``rl_training_targets.py``: that file is
-byte-identical-vendored to ``paid-modules/vct-rl-reranker/_training_targets.py``
-(the test in ``tests/test_vendored_file_sync.py`` enforces drift-free).
-Adding non-formula constants would burden every future training-formula
-edit with a sync chore. The thresholds are a separate concern (corpus
+Why a separate file from ``rl_training_targets.py``: that file is COPIED into
+the RL reranker's container image (``claude_mcp_servers/rl_reranker/
+Dockerfile``), which carries only the ``vco_lib`` modules the reranker
+imports. Keeping non-formula constants out of it keeps the image's slice of
+``vco_lib`` to the training formula alone. The thresholds are a separate concern (corpus
 health gating, not the training formula itself) so they live in their
 own module.
 

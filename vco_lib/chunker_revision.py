@@ -277,6 +277,53 @@ def resync_still_owed(folder: Path) -> Optional[bool]:
     return not all(stamps.get(half) == current for half in RESYNC_HALVES)
 
 
+#: The ledger condition the revision gate emits. One name for the readers
+#: in this module; the emitter (``project_init``) and the sync script carry
+#: the same literal, pinned by the registry (``deferral_conditions.toml``).
+RESYNC_CID = "chunker_preset_overhaul_pending"
+
+
+def kg_rechunk_owed(folder: Path) -> Optional[bool]:
+    """Does ``folder`` still owe the KG half of a chunker re-sync?
+
+    v0.2.106 (owner ruling "fix + re-embed": every install re-chunks its KG
+    ONCE after updating). The re-chunk is an ordinary hash-gated
+    ``kg-sync --all`` run while the ledger carries :data:`RESYNC_CID` — the
+    entry arms the per-node plan comparison, so only nodes whose stored plan
+    differs from the current chunker re-embed, and a clean run stamps the KG
+    half (:func:`record_resync_half`). What was missing is a TRIGGER: the
+    content-hash drift scan cannot see a boundary change (the text did not
+    change), so neither update path ever started that run on its own. This
+    is the question both of them now ask — the launcher's bundle update
+    through ``kg-sync --check-drift`` (``rechunk_owed`` on its sentinel) and
+    ``install.py``'s root seed.
+
+    Returns:
+        True  — the ledger carries the entry AND the KG half is not recorded
+                at the current revision: a whole-tree pass is owed.
+        False — no entry (nothing crossed), or the KG half already ran under
+                the current revision. A second update therefore does nothing.
+        None  — could not look (revision, ledger or stamp file unreadable).
+                Callers treat it as "not owed": an unreadable state must not
+                start a re-embed on every update.
+    """
+    current = current_revision()
+    if not current:
+        return None
+    try:
+        from vco_lib.deferral_report import DeferralReport
+
+        pending = DeferralReport.read(Path(folder)).has_condition(RESYNC_CID)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if not pending:
+        return False
+    stamps = read_resync_stamps(folder)
+    if stamps is None:
+        return None
+    return stamps.get("kg") != current
+
+
 def resync_commands(folder: Path, tail_comment: str) -> str:
     """The ONE re-chunk remediation the chunker deferral emits.
 
@@ -290,17 +337,24 @@ def resync_commands(folder: Path, tail_comment: str) -> str:
     v0.2.46 SEMVER-boundary sibling emitter was retired in v0.2.103, owner
     decision 2026-10-15 — superseded by the revision-keyed paths.)
 
-    Shape (v0.2.92, BLOCKER-2 + the R42 portability sweep):
+    Shape (v0.2.92, BLOCKER-2 + the R42 portability sweep; v0.2.106):
 
-    * ``--from-resolver`` on the analyzer. ``--force-recreate`` DROPS the five
-      ``<prefix>_Code*`` classes, and without an identity flag the analyzer's
-      last resolution rung is the folder BASENAME (``.claude/env`` is
-      shell-sourced for hooks, not for the terminal the user pastes this into)
-      — which rebuilds the wrong family for any moved/renamed project and, on
-      a basename collision, drops ANOTHER project's code graph. This is the
-      flag the per-edit hooks and the launcher already use;
-      ``vco_lib.codegraph_drop_guard`` is the run-time backstop for the case
-      where the hub is down and ``--from-resolver`` itself falls back.
+    * ``--force-rewalk``, NOT ``--force-recreate`` (v0.2.106). The re-chunk
+      the code-graph half needs is a walk that re-plans every entity with the
+      current chunker — ``--force-rewalk`` bypasses the per-file gate, and the
+      per-entity / per-chunk content hashes then re-embed exactly the entities
+      whose chunks changed. ``--force-recreate`` bought the same re-chunk by
+      DROPPING the five ``<prefix>_Code*`` classes first: the graph was empty
+      until the rebuild finished, and gone if it failed. A completed
+      whole-repo force re-walk stamps the half (``codegraph_deferrals.
+      record_successful_walk``), so this command retires the entry too — and
+      the extractor-generation rung a chunker bump carries runs that walk in
+      the background on update, so usually nobody has to.
+    * ``--from-resolver`` on the analyzer. Without an identity flag the
+      analyzer's last resolution rung is the folder BASENAME (``.claude/env``
+      is shell-sourced for hooks, not for the terminal the user pastes this
+      into) — which walks the wrong family for any moved/renamed project.
+      This is the flag the per-edit hooks and the launcher already use.
     * Absolute wrapper paths via :mod:`vco_lib.remedy_shell` instead of
       ``cd <folder>`` + relative paths. The old form was POSIX-only three
       times over (``cd`` with an unquoted path, a ``.claude/scripts/`` wrapper
@@ -316,16 +370,19 @@ def resync_commands(folder: Path, tail_comment: str) -> str:
     )
     cg = remedy_shell.script_invocation(
         folder, ".claude/scripts/code-graph-analyze",
-        remedy_shell.quote(str(folder)), "--from-resolver", "--force-recreate",
+        remedy_shell.quote(str(folder)), "--from-resolver", "--force-rewalk",
     )
     return (
-        "# Re-chunk this project's KG:\n"
+        "# Re-chunk this project's KG (content-hash gated: only entries whose\n"
+        "# chunks changed re-embed; nothing is deleted before its new vectors\n"
+        "# are written):\n"
         f"{kg}\n"
         "\n"
-        "# Re-chunk this project's code graph (drop + rebuild the 5 Code*\n"
-        "# classes so every entity re-embeds). --from-resolver makes the\n"
-        "# analyzer target THIS project's bound collections instead of\n"
-        "# deriving them from the folder name:\n"
+        "# Re-chunk this project's code graph: re-walk every file (nothing is\n"
+        "# dropped; entities whose chunks changed re-embed, the rest are\n"
+        "# hash-skipped). --from-resolver makes the analyzer target THIS\n"
+        "# project's bound collections instead of deriving them from the\n"
+        "# folder name:\n"
         f"{cg}\n"
         "\n"
         f"{tail_comment}"

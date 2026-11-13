@@ -30,7 +30,8 @@ use super::Db;
 /// design rationale.
 pub const MODULE_ENABLED_FOR_PROJECT_KEY: &str = "enabled_for_project";
 
-/// Module id of the RL reranker (the only module whose system default is OFF).
+/// Module id of the RL reranker (the only module whose system default is not
+/// the fail-open `true`).
 pub const RL_RERANKER_MODULE_ID: &str = "vct-rl-reranker";
 
 /// What a module resolves to when NEITHER a per-project row NOR a host-wide
@@ -39,15 +40,21 @@ pub const RL_RERANKER_MODULE_ID: &str = "vct-rl-reranker";
 /// `true` (fail-open) for every module: a corrupted or never-seeded setting
 /// must not silently disable a module the user expects to work.
 ///
-/// `false` for the RL reranker. v0.2.100, owner 2026-10-01: RL scoring stays
-/// inactive until the network is trained, so "nothing set anywhere" must mean
-/// OFF. Relying on `install.py` to seed a host-wide `false` row is not enough:
-/// it deliberately skips the seed once `rl_events` holds >= 500 rows (so the
-/// GUI can prompt), which left exactly the installs with the most data
-/// resolving to ON. This gates RERANKING only: event collection never
-/// consults the enable cascade (see the "WHAT THIS GATES" note below).
-pub fn module_enable_system_default(module_id: &str) -> bool {
-    module_id != RL_RERANKER_MODULE_ID
+/// For the RL reranker it is `rl_default_on`: v0.2.106, owner ruling
+/// 2026-11-12, "RL scoring default follows the bundled weights" — ON only
+/// when a trained model is bundled for the active embedding profile, OFF
+/// otherwise (no model ships today). The decision is
+/// `vco_lib/rl_scoring_default.py`, reached through
+/// [`crate::rl_scoring_default`] ([`Db::rl_scoring_default`]). An explicit
+/// per-project or host-wide row always wins over it. This gates RERANKING
+/// only: event collection never consults the enable cascade (see the "WHAT
+/// THIS GATES" note below).
+pub fn module_enable_system_default(module_id: &str, rl_default_on: bool) -> bool {
+    if module_id == RL_RERANKER_MODULE_ID {
+        rl_default_on
+    } else {
+        true
+    }
 }
 
 impl Db {
@@ -287,7 +294,8 @@ impl Db {
     /// 2. Else if a GLOBAL row exists (`project_id IS NULL`), return
     ///    its boolean value (same fail-open contract).
     /// 3. Else return the system default: `true` (fail-open), except the RL
-    ///    reranker, which is `false` ([`module_enable_system_default`]).
+    ///    reranker, whose default follows the bundled weights
+    ///    ([`module_enable_system_default`], [`Db::rl_scoring_default`]).
     ///
     /// This is the function the hub resolver should call when deciding
     /// `rl_reranker_enabled_for_project`. The legacy
@@ -298,6 +306,20 @@ impl Db {
         &self,
         project_id: &str,
         module_id: &str,
+    ) -> Result<bool, String> {
+        self.module_effective_enabled_with(project_id, module_id, || {
+            self.rl_scoring_default().default_on
+        })
+    }
+
+    /// [`Db::module_effective_enabled`] with the RL reranker's "nothing
+    /// chosen" default injected (asked for only when both tiers are empty and
+    /// the module is the RL reranker), so both defaults stay testable.
+    pub fn module_effective_enabled_with(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        rl_default_on: impl FnOnce() -> bool,
     ) -> Result<bool, String> {
         // Step 1: per-project row (explicit override).
         if let Some(value) =
@@ -313,8 +335,53 @@ impl Db {
         if let Some(b) = self.module_global_enabled(module_id)? {
             return Ok(b);
         }
-        // Step 3: system default (fail-open, except the RL reranker: OFF).
-        Ok(module_enable_system_default(module_id))
+        // Step 3: system default (fail-open, except the RL reranker: the
+        // bundled-weights default).
+        let rl_default = module_id == RL_RERANKER_MODULE_ID && rl_default_on();
+        Ok(module_enable_system_default(module_id, rl_default))
+    }
+
+    /// RL scoring's "nothing chosen" default for the ACTIVE embedding profile
+    /// (v0.2.106, owner 2026-11-12): ON only when a trained model is bundled
+    /// for it. One Python decision, cached per profile
+    /// ([`crate::rl_scoring_default::rl_scoring_default_for`]).
+    ///
+    /// BLOCKING on a cold cache (a Python spawn): async callers use
+    /// [`Db::rl_scoring_default_async`] and the `*_async` resolvers below.
+    pub fn rl_scoring_default(&self) -> crate::rl_scoring_default::RlScoringDefault {
+        crate::rl_scoring_default::rl_scoring_default_for(
+            &crate::active_embedding::resolve_active_embedding(self),
+        )
+    }
+
+    /// [`Db::rl_scoring_default`] for async callers: a cold cache is probed
+    /// on the blocking pool, never on an async worker (review W5 M1).
+    pub async fn rl_scoring_default_async(&self) -> crate::rl_scoring_default::RlScoringDefault {
+        crate::rl_scoring_default::rl_scoring_default_async(
+            crate::active_embedding::resolve_active_embedding(self),
+        )
+        .await
+    }
+
+    /// [`Db::module_effective_enabled`] for async callers: the explicit
+    /// tiers are read first, and the bundled-weights default is asked for
+    /// (off the async workers) only when neither tier has a row and the
+    /// module is the RL reranker — the same cascade, one home
+    /// ([`Db::module_effective_enabled_with`]).
+    pub async fn module_effective_enabled_async(
+        &self,
+        project_id: &str,
+        module_id: &str,
+    ) -> Result<bool, String> {
+        let default_on = if module_id == RL_RERANKER_MODULE_ID
+            && self.get_setting(project_id, module_id, MODULE_ENABLED_FOR_PROJECT_KEY)?.is_none()
+            && self.module_global_enabled(module_id)?.is_none()
+        {
+            self.rl_scoring_default_async().await.default_on
+        } else {
+            false
+        };
+        self.module_effective_enabled_with(project_id, module_id, || default_on)
     }
 }
 
@@ -332,8 +399,21 @@ impl Db {
     /// Whether RL SCORING (reranking) is on for `project_id`: the shipped
     /// lock first, then the enable cascade. This is what the hub's `/config`
     /// serves as `rl_reranker_enabled_for_project`.
+    ///
+    /// BLOCKING on a cold default cache; the hub's async `/config` handler
+    /// calls [`Db::rl_scoring_enabled_for_project_async`].
     pub fn rl_scoring_enabled_for_project(&self, project_id: &str) -> Result<bool, String> {
         self.rl_scoring_enabled_with_lock(project_id, crate::rl_scoring_lock::rl_scoring_lock())
+    }
+
+    /// [`Db::rl_scoring_enabled_for_project`] for async callers: the
+    /// bundled-weights default (needed only when no row exists) is resolved
+    /// off the async workers, single-flight per profile.
+    pub async fn rl_scoring_enabled_for_project_async(&self, project_id: &str) -> Result<bool, String> {
+        if crate::rl_scoring_lock::rl_scoring_lock().is_some() {
+            return Ok(false);
+        }
+        self.module_effective_enabled_async(project_id, RL_RERANKER_MODULE_ID).await
     }
 
     /// [`Db::rl_scoring_enabled_for_project`] with an explicit lock, so both
@@ -343,10 +423,22 @@ impl Db {
         project_id: &str,
         lock: Option<&str>,
     ) -> Result<bool, String> {
+        self.rl_scoring_enabled_with(project_id, lock, || self.rl_scoring_default().default_on)
+    }
+
+    /// [`Db::rl_scoring_enabled_for_project`] with the lock AND the
+    /// bundled-weights default injected: an explicit row (project, else
+    /// host-wide) wins in both directions; with none, `rl_default_on`.
+    pub fn rl_scoring_enabled_with(
+        &self,
+        project_id: &str,
+        lock: Option<&str>,
+        rl_default_on: impl FnOnce() -> bool,
+    ) -> Result<bool, String> {
         if lock.is_some() {
             return Ok(false);
         }
-        self.module_effective_enabled(project_id, RL_RERANKER_MODULE_ID)
+        self.module_effective_enabled_with(project_id, RL_RERANKER_MODULE_ID, rl_default_on)
     }
 }
 
@@ -387,12 +479,13 @@ pub enum ModuleEnableSource {
     /// No per-project row; the host-wide default row supplied it.
     GlobalDefault,
     /// Neither tier had a row; the system default answered (fail-open `true`,
-    /// except the RL reranker, which is OFF — see [`module_enable_system_default`]).
+    /// except the RL reranker, whose default follows the bundled weights —
+    /// see [`module_enable_system_default`]).
     SystemDefault,
 }
 
 /// Resolved enable state of one module for one project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ModuleEnableState {
     /// The explicit per-project row, if one exists. `None` = inheriting.
     pub explicit: Option<bool>,
@@ -412,6 +505,11 @@ pub struct ModuleEnableState {
     /// value that applies again once unlocked — so a control must render the
     /// lock FIRST and never show `effective` as the live state while it is set.
     pub lock_reason: Option<&'static str>,
+    /// v0.2.106 (owner 2026-11-12): for the RL reranker, what "nothing
+    /// chosen" resolves to and why — the active embedding profile and
+    /// whether a trained model is bundled for it. `None` for every other
+    /// module (their system default is the fail-open `true`).
+    pub rl_default: Option<crate::rl_scoring_default::RlScoringDefault>,
 }
 
 impl Db {
@@ -425,6 +523,37 @@ impl Db {
         &self,
         project_id: &str,
         module_id: &str,
+    ) -> Result<ModuleEnableState, String> {
+        let rl_default =
+            (module_id == RL_RERANKER_MODULE_ID).then(|| self.rl_scoring_default());
+        self.resolve_module_enable_with(project_id, module_id, rl_default)
+    }
+
+    /// [`Db::resolve_module_enable`] for async callers (the launcher's
+    /// `module_enable_state` command): the RL default — reported even when a
+    /// row decides, because the control words its "default" text from it — is
+    /// resolved off the async workers.
+    pub async fn resolve_module_enable_async(
+        &self,
+        project_id: &str,
+        module_id: &str,
+    ) -> Result<ModuleEnableState, String> {
+        let rl_default = if module_id == RL_RERANKER_MODULE_ID {
+            Some(self.rl_scoring_default_async().await)
+        } else {
+            None
+        };
+        self.resolve_module_enable_with(project_id, module_id, rl_default)
+    }
+
+    /// [`Db::resolve_module_enable`] with the RL default injected (`None` for
+    /// a module other than the RL reranker; for the RL reranker `None` reads
+    /// as "not confirmed" = OFF).
+    pub fn resolve_module_enable_with(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        rl_default: Option<crate::rl_scoring_default::RlScoringDefault>,
     ) -> Result<ModuleEnableState, String> {
         // Malformed values fail open to `true` in BOTH tiers, exactly as the
         // legacy readers do — a corrupted row must never silently disable a
@@ -440,7 +569,10 @@ impl Db {
             (Some(b), _) => (b, ModuleEnableSource::Project),
             (None, Some(b)) => (b, ModuleEnableSource::GlobalDefault),
             (None, None) => (
-                module_enable_system_default(module_id),
+                module_enable_system_default(
+                    module_id,
+                    rl_default.as_ref().is_some_and(|d| d.default_on),
+                ),
                 ModuleEnableSource::SystemDefault,
             ),
         };
@@ -450,6 +582,7 @@ impl Db {
             effective,
             source,
             lock_reason: crate::rl_scoring_lock::module_effect_lock(module_id),
+            rl_default: if module_id == RL_RERANKER_MODULE_ID { rl_default } else { None },
         })
     }
 }
@@ -1498,9 +1631,11 @@ mod enable_toggle_tests {
             "an explicit per-project row beats the global default"
         );
 
-        // Every other module keeps the fail-open default.
-        assert!(module_enable_system_default("vct-coordination"));
-        assert!(!module_enable_system_default(m));
+        // Every other module keeps the fail-open default; the RL reranker's
+        // is the bundled-weights default it is handed.
+        assert!(module_enable_system_default("vct-coordination", false));
+        assert!(!module_enable_system_default(m, false));
+        assert!(module_enable_system_default(m, true));
     }
 
     /// F-4 at the GLOBAL layer: `module_set_global_enabled` is DELETE+INSERT
@@ -1670,9 +1805,10 @@ mod enable_toggle_tests {
         );
     }
 
-    /// v0.2.100 W5R-02: the shipped RL scoring lock forces scoring OFF over
-    /// an explicit per-project `true` AND a host-wide `true`, leaves both rows
-    /// exactly as stored, and is what the GUI state reports.
+    /// v0.2.100 W5R-02: a set RL scoring lock forces scoring OFF over an
+    /// explicit per-project `true` AND a host-wide `true` and leaves both
+    /// rows exactly as stored. v0.2.106: the shipped table is UNLOCKED
+    /// (owner 2026-11-12, opt-in), so the shipped path follows the rows.
     #[test]
     fn rl_scoring_lock_overrides_rows_without_touching_them() {
         let (db, pid) = db_with_project("lock");
@@ -1681,10 +1817,10 @@ mod enable_toggle_tests {
         db.module_set_global_enabled(m, true).unwrap();
 
         let lock = crate::rl_scoring_lock::rl_scoring_lock();
-        assert!(lock.is_some(), "v0.2.100 ships locked");
-        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "locked => scoring off");
+        assert!(lock.is_none(), "v0.2.106 ships unlocked (opt-in)");
+        assert!(db.rl_scoring_enabled_for_project(&pid).unwrap(), "unlocked => the row applies");
         assert!(db.rl_scoring_enabled_with_lock(&pid, None).unwrap(), "unlocked => the row applies");
-        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("r")).unwrap());
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("r")).unwrap(), "locked => off");
 
         // Rows are user data: unchanged by the lock.
         assert_eq!(
@@ -1700,6 +1836,76 @@ mod enable_toggle_tests {
 
         // Other modules are never locked.
         assert_eq!(db.resolve_module_enable(&pid, "vct-coordination").unwrap().lock_reason, None);
+    }
+
+    /// v0.2.106 (owner 2026-11-12, "for now opt-in"): with the lock lifted,
+    /// RL scoring is still OFF until the user turns it on for the project —
+    /// no rows, or a host-wide `false`, resolve to off; an explicit
+    /// per-project `true` turns it on for that project only.
+    #[test]
+    fn rl_scoring_is_opt_in_per_project_with_the_lock_lifted() {
+        let (db, pid) = db_with_project("optin");
+        let m = RL_RERANKER_MODULE_ID;
+        assert!(crate::rl_scoring_lock::rl_scoring_lock().is_none());
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "no rows => off");
+        db.module_set_global_enabled(m, false).unwrap();
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "host-wide off => off");
+        db.module_write_enabled_for_project(&pid, m, Some(true)).unwrap();
+        assert!(db.rl_scoring_enabled_for_project(&pid).unwrap(), "the user's opt-in => on");
+        db.module_write_enabled_for_project(&pid, m, Some(false)).unwrap();
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "turned off again => off");
+    }
+
+    /// v0.2.106 (owner ruling 2026-11-12): with nothing chosen, RL scoring
+    /// follows the bundled weights for the active profile — ON when a trained
+    /// model is bundled, OFF without one. An explicit choice wins both ways.
+    #[test]
+    fn rl_scoring_default_follows_the_bundled_weights() {
+        let (db, pid) = db_with_project("bundled");
+        let m = RL_RERANKER_MODULE_ID;
+        let bundled = || true;
+        let none = || false;
+
+        // Nothing chosen: the default decides.
+        assert!(db.rl_scoring_enabled_with(&pid, None, bundled).unwrap(), "bundled => on");
+        assert!(!db.rl_scoring_enabled_with(&pid, None, none).unwrap(), "no model => off");
+        assert!(db.module_effective_enabled_with(&pid, m, bundled).unwrap());
+        assert!(!db.module_effective_enabled_with(&pid, m, none).unwrap());
+
+        let st = db
+            .resolve_module_enable_with(
+                &pid,
+                m,
+                Some(crate::rl_scoring_default::RlScoringDefault::bundled("qwen3")),
+            )
+            .unwrap();
+        assert!(st.effective, "the GUI state follows the bundled default");
+        assert_eq!(st.source, ModuleEnableSource::SystemDefault);
+        assert_eq!(st.rl_default.as_ref().map(|d| d.profile.as_str()), Some("qwen3"));
+        let st = db.resolve_module_enable_with(&pid, m, None).unwrap();
+        assert!(!st.effective, "an unconfirmed default is OFF");
+
+        // The lock still wins over a bundled default.
+        assert!(!db.rl_scoring_enabled_with(&pid, Some("r"), bundled).unwrap());
+
+        // A host-wide choice wins over the default, both ways.
+        db.module_set_global_enabled(m, false).unwrap();
+        assert!(!db.rl_scoring_enabled_with(&pid, None, bundled).unwrap(), "host-wide off beats bundled");
+        db.module_set_global_enabled(m, true).unwrap();
+        assert!(db.rl_scoring_enabled_with(&pid, None, none).unwrap(), "host-wide on without weights");
+        db.module_clear_global_enabled(m).unwrap();
+
+        // The project's own choice wins over the default, both ways.
+        db.module_write_enabled_for_project(&pid, m, Some(false)).unwrap();
+        assert!(!db.rl_scoring_enabled_with(&pid, None, bundled).unwrap(), "explicit off beats bundled");
+        db.module_write_enabled_for_project(&pid, m, Some(true)).unwrap();
+        assert!(db.rl_scoring_enabled_with(&pid, None, none).unwrap(), "explicit on without weights => on");
+
+        // Other modules never consult the RL default.
+        assert!(db
+            .module_effective_enabled_with(&pid, "vct-coordination", || panic!("not asked"))
+            .unwrap());
+        assert_eq!(db.resolve_module_enable(&pid, "vct-coordination").unwrap().rl_default, None);
     }
 }
 

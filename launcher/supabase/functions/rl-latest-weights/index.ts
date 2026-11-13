@@ -8,6 +8,11 @@
 // button on first install, when the user has never had a .pt before
 // and there is no `current_weights_version` to compare against.
 //
+// v0.2.106 (owner 2026-11-12): kept deployed as paid-module infrastructure
+// for future paid modules. The RL reranker is bundled and free now and the
+// launcher never calls this function for it; only the RL module's paid
+// catalog listing was retired.
+//
 // Both endpoints query the SAME `paid_module_releases` table and reuse
 // the SAME private storage bucket. The split exists because the two
 // callers have different intents and contracts:

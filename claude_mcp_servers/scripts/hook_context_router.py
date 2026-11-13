@@ -1201,6 +1201,26 @@ def _write_warm_held(project_root: str, key: str, held: List[Dict]) -> None:
         pass  # the RL label for an unseen retrieval is lost; the cache is not
 
 
+def _set_staging_transcript_env(transcript_path: str, agent_id: str) -> None:
+    """Export this run's exact staging transcript (``VCT_TRANSCRIPT_PATH``,
+    read by ``citation_pending.stage_pending``) or pop it when it is not
+    known — one rule, ``citation_pending.staging_transcript_for``. A failed
+    import pops it (the file is then staged without a path, as before)."""
+    try:
+        from claude_mcp_servers.rl_client.citation_pending import (
+            TRANSCRIPT_ENV,
+            staging_transcript_for,
+        )
+    except Exception:  # noqa: BLE001 — never break the run for RL staging
+        os.environ.pop("VCT_TRANSCRIPT_PATH", None)
+        return
+    own = staging_transcript_for(transcript_path, agent_id)
+    if own:
+        os.environ[TRANSCRIPT_ENV] = own
+    else:
+        os.environ.pop(TRANSCRIPT_ENV, None)
+
+
 def _promote_warm_held(project_root: str, key: str) -> None:
     """An interactive run served cache entry ``key``: if the L4 warmer held a
     citation ctx for it, stage it NOW — through the module attribute, so the
@@ -1246,6 +1266,8 @@ def _promote_warm_held(project_root: str, key: str) -> None:
             continue
         kwargs = dict(kwargs)
         kwargs.pop("agent_id", None)
+        # v0.2.106: the transcript is this run's too (VCT_TRANSCRIPT_PATH).
+        kwargs.pop("transcript_path", None)
         kwargs["session_id"] = session
         kwargs["project_root"] = project_root
         try:
@@ -1985,6 +2007,14 @@ def _main(argv: List[str]) -> int:
         os.environ["VCT_AGENT_ID"] = agent_id
     else:
         os.environ.pop("VCT_AGENT_ID", None)
+    # v0.2.106 (owner ruling R7-3): the EXACT transcript of the chat making
+    # this call — the main chat's own, or the subagent's own file beside the
+    # parent's (a subagent's payload carries the PARENT's transcript_path) —
+    # recorded by stage_pending in the pending file, so the drain scores the
+    # citation against exactly that file wherever its transcripts folder is
+    # (a worktree lane's included). Same per-run discipline as VCT_AGENT_ID:
+    # set from this payload or popped, never inherited.
+    _set_staging_transcript_env(transcript_path, agent_id)
     # W6-C2 fix round (review R4c-8): the `agent` surface retrieves for a
     # subagent that does not exist yet (PreToolUse:Agent), so its staged
     # citation carries the CALLER's tag. Mark it with the Agent call's

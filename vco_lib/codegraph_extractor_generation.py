@@ -187,8 +187,31 @@ logger = logging.getLogger(__name__)
 #:          salted with its link set (``link_salt``), so later key edits
 #:          re-walk exactly the files whose links changed, without another
 #:          rung. ``CODEGRAPH_EMBED_REVISION`` is NOT bumped.
+#: 0.2.106 — the code-entity CHUNKING changed (owner ruling 2026-11-11, "fix +
+#:          re-embed"): ``code_truncation._max_chars_for_model`` and the
+#:          chunker presets are clamped to the model's dense-content budget
+#:          (``chunking.dense_char_budget``; CodeSage 3 584 → 2 273 chars for
+#:          a whole entity, 921 → 568 units per part; jina 7 168 → 3 532),
+#:          because the old budgets measured 118-136% of the served window on
+#:          dense code and the service refused them, dropping the tail.
+#:          Unchanged source now yields different chunk rows for every entity
+#:          above the new budget, and the per-file gate skips unchanged files
+#:          — so the forced re-walk is what delivers it. The per-entity /
+#:          per-chunk content hashes re-embed only entities whose chunks
+#:          changed; nothing is dropped first. A completed whole-repo re-walk
+#:          also records the code-graph half of the
+#:          ``chunker_preset_overhaul_pending`` re-sync
+#:          (``codegraph_deferrals.record_successful_walk``).
+#:          ``CODEGRAPH_EMBED_REVISION`` went 1 → 2 in the same release for a
+#:          separate reason (owner ruling 2026-11-11, "extra rows in both
+#:          places"): a chunk a model refuses is now split into more rows, and
+#:          a content-unchanged row whose text MAY have been refused before
+#:          (cut to a leading window, or averaged — neither marked the row)
+#:          must re-embed once. This re-walk is what visits those rows; every
+#:          row whose text provably fits every model is only stamped
+#:          (``codegraph_guards.may_have_been_refused``).
 EXTRACTOR_GENERATION_BUMPS: tuple[str, ...] = (
-    "0.2.92", "0.2.93", "0.2.94", "0.2.102", "0.2.105",
+    "0.2.92", "0.2.93", "0.2.94", "0.2.102", "0.2.105", "0.2.106",
 )
 
 #: Releases DELIBERATELY not added to the ladder, each with the evidence that
@@ -374,6 +397,11 @@ EXTRACTOR_GENERATION_RUNG_REASONS: dict[str, str] = {
     "0.2.105": (
         "indexed .tweakers, .ini and .json config files (keys with their "
         "values) and linked them to the code that reads them"
+    ),
+    "0.2.106": (
+        "re-chunked code entities to fit the embedding model's window on "
+        "dense code, and stores a chunk the model refuses as more rows "
+        "(no entity's tail is dropped or averaged any more)"
     ),
 }
 

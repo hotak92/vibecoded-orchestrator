@@ -274,11 +274,11 @@
   },
   "knowledge/concepts/launcher-paid-modules-schema.md": {
     "title": "Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)",
-    "description": "This schema extends the profiles table with a JSONB column to track user-owned add-on modules like Telegram or Discord.\nIt uses a flexible key-value structure to avoid database migrations when new modules are introduced.\nA GIN index enables efficient querying of module entitlements while triggers prevent direct client writes.\nThe design supports Lemon Squeezy webhooks for purchase persistence and evolved runtime validation flows.",
-    "summary": "The `profiles.paid_modules` JSONB column in the Supabase `profiles` table tracks user-owned add-on modules (e.g., Telegram, Discord) using a flexible, GIN-indexed schema to avoid per-column migrations. While the original single-endpoint `validate-module` design utilizing this column is superseded by a three-endpoint architecture (`validate-tier`, `rl-artifact-url`, `module-catalog`) where entitlements of truth reside in `tier_cache.module_licenses`, the `paid_modules` column remains relevant for org-side persistence and Lemon Squeezy webhook integration. The schema includes triggers to prevent direct client writes, service-role RPCs (`upsert_paid_module`, `remove_paid_module`) for managing license metadata, and an `active_paid_modules` view for analytics. The commercial flow involves Lemon Squeezy webhooks populating the column on purchase, followed by launcher-side validation and installation, with deferred tasks including multi-machine enforcement and the deployment of the launcher-side `validate-module` endpoint.",
-    "generated_at": "2026-07-20T18:51:45.217837+00:00",
-    "content_hash": "1798d513249840dd",
-    "total_chunks": 1
+    "description": "The `profiles.paid_modules` schema extends the `profiles` table with a JSONB column to track user entitlements for specific add-on modules like Telegram or Discord. This design utilizes a single column keyed by module slug rather than individual columns, allowing flexible storage of activation metadata such as license keys and expiration dates without requiring database migrations for new modules. A GIN index is created on the column to enable efficient querying of these entitlements. While the runtime validation flow has evolved to use separate endpoints and server-side checks, this schema remains relevant for persisting ownership data triggered by Lemon Squeezy webhooks.",
+    "summary": "This schema extends the `profiles` table with a `paid_modules` JSONB column to track per-user entitlements for add-on modules like Telegram via a GIN-indexed structure, protected by triggers that restrict mutations to service-role RPCs (`upsert_paid_module`, `remove_paid_module`) called by the `lemon-squeezy-webhook` edge function; the single `validate-module` runtime check it was designed for was never deployed (runtime licensing uses `validate-tier` + `module-catalog`, kept as infrastructure for future paid modules).",
+    "generated_at": "2026-11-12T14:10:48.968454+00:00",
+    "content_hash": "8ffb3f1a0e66402b",
+    "backend": "ollama"
   },
   "knowledge/concepts/merchant-of-record-vs-stripe-for-indies.md": {
     "title": "Merchant of Record vs Stripe for Indies",
@@ -310,7 +310,7 @@
     "description": "This framework allows installed modules to declare configuration tabs in a JSON manifest without bundling custom Svelte components or rebuilding the launcher.\nKey features include zero extra builds per module, type-safe Rust validation of the manifest structure, and built-in mouseover tooltips for every control.\nPaid and free module authors use it to expose settings in the launcher sidebar by defining a `gui.config_tab` block in their `vct-module.json`.\nIt matters because it enforces a secure Tauri security model by avoiding dynamic JS loads while providing a consistent, extensible UI palette.",
     "summary": "The Module-Contributed GUI Tabs Framework (v0.2.20+) allows installed modules to declare configuration tabs via a `gui.config_tab` JSON block in their manifest, enabling the launcher to render UI without bundling Svelte components or rebuilding the binary. This schema-rendered approach was chosen over webview-bundling or external executables to ensure zero extra builds, type safety, built-in tooltips, and adherence to Tauri security models. The framework supports five control kinds (Checkbox, MultiSelect, Button, Select, Info), each requiring a tooltip, with state persisted in a `module_settings` table keyed by project, module, and control ID. The launcher dynamically merges exposed tabs into the sidebar, soft-failing on broken manifests. Key evolutions include `show_in_sidebar: false` (v0.2.23) to support embedded tabs in per-project settings, scope refactoring of the orchestrator-core (v0.2.25), and a major schema expansion in v0.2.26 introducing a declarative dispatcher and new control kinds to accommodate future paid modules without requiring launcher rebuilds.",
     "generated_at": "2026-07-20T18:52:03.082444+00:00",
-    "content_hash": "354a8adf8fed1e4c",
+    "content_hash": "5d92486380a02407",
     "total_chunks": 1
   },
   "knowledge/concepts/motion-principles-for-ui.md": {
@@ -380,15 +380,6 @@
     "generated_at": "2026-10-30T05:54:18.603406+00:00",
     "backend": "ollama",
     "content_hash": "78bd4dba9b4bfefc",
-    "total_chunks": 1
-  },
-  "knowledge/concepts/orchestrator-rl-retrieval.md": {
-    "title": "Orchestrator RL Retrieval",
-    "description": "The RL retrieval system is a pro-tier reinforcement-learning reranker that wraps Weaviate searches, over-fetching candidates and reranking based on learned relevance signals with continuous online training. Each project gets an isolated RL server instance with project-specific port allocation (stored in settings.json, not hardcoded); the systemd unit requires PYTHONPATH configuration and per-project log paths. License validation gates the feature—`feature_enabled(\"rl_retrieval\")` returns false on free tier or after >3 days offline, gracefully falling back to Weaviate cosine ranking; paid versions ship in GHCR containers pulled via short-lived tokens with weekly model-weight rotation for anti-piracy. Critical for users needing improved search relevance; per-project isolation prevents cross-project citation-pattern leakage and ensures different projects' neural networks don't interfere.",
-    "summary": "The RL retrieval system reranks Weaviate search results using a reinforcement-learning layer trained on project-specific citation patterns, with each project assigned an isolated server instance to prevent cross-project mode-collapse. Distribution gates the paid feature through per-user pull tokens from a GHCR container image with 15-minute TTL and weekly model-weight rotation as an anti-piracy mechanism.",
-    "generated_at": "2026-10-15T09:37:54.678183+00:00",
-    "backend": "cli",
-    "content_hash": "fb6ebad72d808782",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-security.md": {
@@ -597,12 +588,11 @@
   },
   "knowledge/concepts/score-driven-retrieval-tiers.md": {
     "title": "Score-Driven Retrieval Tiers",
-    "description": "Score-Driven Retrieval Tiers is a per-result verbosity policy that adjusts content depth based on relevance score, replacing uniform detail parameters across all search results. It defines five score-based tiers (discard <0.42, summary 0.42–0.55, single_chunk 0.55–0.65, three_chunks 0.65–0.75, full ≥0.75) implemented in Weaviate MCP's hybrid_search, semantic_graph_search, and search_code_graph with calibrated, env-tunable thresholds. Connected graph nodes always render at summary tier regardless of score to avoid latency overhead. This adaptive approach prevents token waste on low-relevance results while giving top hits rich context, eliminating redundant re-calls and maintaining consistency across the pre-edit hook and API callers.",
-    "summary": "Score-driven retrieval tiers automatically adjust per-result verbosity across five tiers (discard <0.42, summary 0.42–0.55, single_chunk 0.55–0.65, three_chunks 0.65–0.75, full ≥0.75) based on normalized relevance scores, replacing prior uniform detail returns. Implemented in Weaviate MCP's hybrid_search and semantic_graph_search, the system allocates token budget to high-relevance hits while marginal results contribute only summaries, optimizing both cost and quality.",
-    "generated_at": "2026-10-14T02:52:04.526109+00:00",
-    "backend": "cli",
-    "content_hash": "1ea16f9c13b669bd",
-    "total_chunks": 1
+    "description": "Score-Driven Retrieval Tiers is a per-result verbosity policy that dynamically adjusts the content returned for each search hit based on its relevance score. This approach replaces the previous uniform detail parameter to ensure highly relevant nodes receive rich content while marginal nodes are limited to brief summaries or filtered out entirely. The system categorizes results into five tiers ranging from `discard` for scores below 0.42 to `full` for scores at or above 0.75, with specific thresholds for summary, single chunk, and multi-chunk outputs. Implemented in the Weaviate MCP server and applied across hybrid search, semantic graph search, and code graph search hooks, this mechanism optimizes token usage and prevents agents from wasting context budget on low-value results.",
+    "summary": "Score-Driven Retrieval Tiers dynamically adjusts search result verbosity based on normalized relevance scores (0–1), filtering out hits below 0.42 and scaling content from summaries to full nodes (up to 7 chunks) for scores ≥0.75. This policy, implemented in the Weaviate MCP server via `hybrid_search` and `semantic_graph_search`, optimizes token usage by replacing uniform `detail` parameters with score-calibrated tiers defined in `_TIER_THRESHOLDS`.",
+    "generated_at": "2026-11-12T07:26:40.527400+00:00",
+    "content_hash": "793f73dec1a81ef9",
+    "backend": "ollama"
   },
   "knowledge/concepts/semantic-search.md": {
     "title": "Semantic Search",
@@ -934,5 +924,13 @@
     "generated_at": "2026-07-20T18:58:01.192051+00:00",
     "content_hash": "5afa0e65da462d91",
     "total_chunks": 1
+  },
+  "knowledge/concepts/orchestrator-rl-retrieval.md": {
+    "title": "Orchestrator RL Retrieval",
+    "description": "Orchestrator RL Retrieval is a free, open-source reinforcement learning reranking system that enhances Weaviate search results by reordering candidates based on learned relevance signals. The system wraps knowledge graph queries by over-fetching vectors from Weaviate, sending them to a locally built container for reranking, and logging all retrieval events for continuous model training. Deployment involves a single global container per machine that serves multiple projects with isolated models to prevent cross-project data leakage, utilizing specific environment overrides and scoring gates to control activation. This architecture matters because it eliminates licensing barriers and paid tiers while ensuring strict data isolation, making it suitable for environments requiring transparent, self-hosted AI retrieval without external registry dependencies.",
+    "summary": "Orchestrator RL Retrieval is a free, AGPL-3.0 licensed reinforcement learning reranker that wraps Weaviate searches by over-fetching candidates and reordering them based on project-specific models trained on local citation patterns. The system enforces strict cross-project isolation by storing distinct models per project under `state/projects/<project_id>/` and builds its container locally from `claude_mcp_servers/rl_reranker/Dockerfile` without registry pulls or license gates.",
+    "generated_at": "2026-11-12T14:10:59.149077+00:00",
+    "content_hash": "5541cde7711ab01d",
+    "backend": "ollama"
   }
 }

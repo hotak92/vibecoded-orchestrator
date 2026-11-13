@@ -57,6 +57,7 @@ from .vendors import (
     AnthropicFamily,
     CLAUDE_ID_MARKERS,
     Vendor,
+    offered_ids,
 )
 
 #: Claude Code's 1M-context-variant suffix.
@@ -192,7 +193,7 @@ def _known_ids(
         # list nor a declared/hidden id makes another id safe to forward.
         ids = set(vendor.verified_ids)
     else:
-        ids = {*vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids}
+        ids = set(offered_ids(vendor))
         if extra is not None:
             ids.update(extra.get(vendor.vendor_id, ()))
     retired = {i.strip().lower() for i in vendor.retired_ids}
@@ -213,22 +214,35 @@ def _suggest(
     extra: Optional[Mapping[str, Collection[str]]],
     one_m: bool,
 ) -> tuple[str, ...]:
-    """The closest known ids across every row, spelled with their namespace."""
+    """The closest known ids across every row, spelled with their namespace.
+
+    v0.2.106 (Q8): an id the picker OFFERS leads an id the row only keeps
+    routable by name (``catalog_hide_ids`` — curated out of the picker, such
+    as a superseded undated build): a correction should point at what the
+    user can actually pick. Within each tier the similarity order stands.
+    """
     spelled: dict[str, str] = {}
+    hidden: set[str] = set()
     for vendor in vendors.values():
+        row_hidden = {i.strip().lower() for i in vendor.catalog_hide_ids if i}
         for model_id in _known_ids(vendor, extra):
             full = f"{vendor.namespace}{model_id}"
+            if model_id not in spelled and model_id in row_hidden:
+                hidden.add(model_id)
             spelled.setdefault(model_id, with_1m(full) if one_m else full)
     lowered = remainder.lower()
     # Exact bare match under another row first (a missing/extra namespace
-    # segment is the commonest slip), then the fuzzy neighbours.
-    ranked: list[str] = [spelled[lowered]] if lowered in spelled else []
+    # segment is the commonest slip), then the fuzzy neighbours; then every
+    # offered id before every hidden one (a stable partition, so the
+    # exact-then-similarity order holds within each tier).
+    order: list[str] = [lowered] if lowered in spelled else []
     for bare in difflib.get_close_matches(
-        lowered, list(spelled), n=MAX_SUGGESTIONS, cutoff=SUGGESTION_CUTOFF,
+        lowered, list(spelled), n=max(1, len(spelled)), cutoff=SUGGESTION_CUTOFF,
     ):
-        if spelled[bare] not in ranked:
-            ranked.append(spelled[bare])
-    return tuple(ranked[:MAX_SUGGESTIONS])
+        if bare not in order:
+            order.append(bare)
+    order = [b for b in order if b not in hidden] + [b for b in order if b in hidden]
+    return tuple(spelled[b] for b in order[:MAX_SUGGESTIONS])
 
 
 def _unknown_for_vendor(
@@ -240,6 +254,19 @@ def _unknown_for_vendor(
     one_m: bool,
 ) -> RouteError:
     suggestions = _suggest(remainder, vendors, extra, one_m)
+    if vendor.forward_verified_only:
+        # This row serves its verified ids and nothing else, so they ARE the
+        # answer to "what did you mean" — even when the refused spelling is
+        # too unlike them for the fuzzy match (a retired ``k3`` against the
+        # offered ``k3.1-pro``). They lead; the fuzzy neighbours fill the rest.
+        own = tuple(
+            with_1m(f"{vendor.namespace}{i}") if one_m
+            else f"{vendor.namespace}{i}"
+            for i in sorted(_known_ids(vendor, extra))
+        )
+        suggestions = tuple(dict.fromkeys(
+            (*own, *suggestions),
+        ))[:max(MAX_SUGGESTIONS, len(own))]
     hint = (
         " Did you mean " + " or ".join(repr(s) for s in suggestions) + "?"
         if suggestions else ""

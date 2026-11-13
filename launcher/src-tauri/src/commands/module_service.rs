@@ -88,6 +88,13 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 
 /// Default canonical endpoint. Manifest's
 /// `install.container.rotate_weights_endpoint` overrides this.
+///
+/// v0.2.106: the function stays deployed as paid-module infrastructure
+/// (owner 2026-11-12). Its two callers never reach it for the
+/// bundled RL reranker: the daily poll stands down for bundled modules
+/// (`spawn_daily_weights_poll`), and the weights-available probe
+/// (`module_default_weights`) only runs for a manifest that carries a
+/// download-weights action, which the bundled one does not.
 pub const DEFAULT_RL_LATEST_VERSION_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-latest-version";
 
@@ -337,6 +344,38 @@ pub async fn start_container_for_module_with_gpu_mode(
     db: &Db,
 ) -> Result<String, String> {
     let podman = detect_container_runtime().await?;
+    // v0.2.106: a container_build module's image is local-only — rebuild it
+    // through the shared ensure step when it is missing or was never built
+    // for this start's GPU variant. Same build the installer runs, one
+    // implementation (`vct_launcher_core::services::container_build`),
+    // also applied by the hub's two start paths.
+    if manifest.install.method == crate::manifest::InstallMethod::ContainerBuild {
+        match vct_launcher_core::services::container_build::ensure_bundled_image(
+            manifest, gpu_mode, &podman,
+        )
+        .await
+        {
+            Ok((_, vct_launcher_core::services::container_build::EnsureImageOutcome::Rebuilt)) => {
+                tracing::info!(
+                    module_id = %manifest.id,
+                    "[module_service] bundled image was missing; rebuilt from the checkout \
+                     before start"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    module_id = %manifest.id,
+                    error = %e,
+                    "[module_service] bundled image rebuild for start failed"
+                );
+                return Err(format!(
+                    "module {}: the bundled image is missing and could not be rebuilt: {}",
+                    manifest.id, e
+                ));
+            }
+        }
+    }
     let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
     launch_prepared_start(manifest, ctx, project, rl_port, prepared, &SystemContainerCli).await
 }
@@ -1160,7 +1199,7 @@ pub(crate) async fn auto_migrate_per_project_to_global_with(
         if matches!(
             manifest.runtime.r#type.as_str(),
             "container" | "service"
-        ) && manifest.install.method == InstallMethod::ContainerPull
+        ) && manifest.install.method.runs_container_image()
         {
             match ops.start_global(&manifest, db).await {
                 Ok(name) => {
@@ -2931,7 +2970,7 @@ where
         // declaring a long-running (`container` | `service`) runtime
         // are auto-resumed. Older / non-container modules (git_clone,
         // local) and on-demand runtime types are excluded.
-        let is_container_distributed = manifest.install.method == InstallMethod::ContainerPull
+        let is_container_distributed = manifest.install.method.runs_container_image()
             && matches!(manifest.runtime.r#type.as_str(), "container" | "service");
         if !is_container_distributed {
             continue;
@@ -3143,6 +3182,20 @@ where
     // managed-connection close the update pipeline does for the
     // install.py window. See `update_gate::skip_if_update_in_progress`.
     if crate::commands::update_gate::skip_if_update_in_progress("module_service_poll") {
+        return;
+    }
+
+    // v0.2.106: SUPERSEDED for the RL reranker — it is a bundled module now
+    // (`bundled_modules`): its trained weights ship in the repository and
+    // inside the image the launcher builds, so there is no remote weights
+    // channel to poll (owner ruling 2026-11-11 retired the paid-module
+    // weights bucket for it). The RL reranker is the only module this sweep
+    // serves, so the sweep stands down whenever it is bundled.
+    if crate::commands::bundled_modules::is_bundled(RL_RERANKER_MODULE_ID) {
+        tracing::debug!(
+            "[module_service] daily weights poll: {} is bundled (weights ship in the image) — skipping",
+            RL_RERANKER_MODULE_ID
+        );
         return;
     }
 
@@ -3822,6 +3875,8 @@ mod tests {
                     pull_token_method: "POST".into(),
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
+                    build_context: None,
+                    dockerfile: None,
                 }),
                 scope: crate::manifest::InstallScope::PerProject,
             },
@@ -3856,6 +3911,7 @@ mod tests {
                 min_gpu_vram_gb: None,
                 gpu_optional: true,
                 gpu_image_variants: None,
+                image_user: None,
                 log_path_template: None,
                 container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
                 image_ref: Some("{install.container.image}:{install.container.tag}".into()),

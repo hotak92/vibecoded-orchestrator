@@ -569,6 +569,11 @@ _PINNED_LOCALHOST_KEYS: tuple[tuple[str, str], ...] = (
     ("WEAVIATE_GRPC_PORT", _UNROUTABLE_PORT_STR),
     ("OLLAMA_URL", _fixture_guard.UNROUTABLE_SENTINEL_URL),
     ("VCT_HUB_PORT", _UNROUTABLE_PORT_STR),
+    # v0.2.106: the RL reranker server (claude_mcp_servers/rl_reranker, now in
+    # this repository) reaches the hub through its own full-URL default,
+    # `http://127.0.0.1:7700` — the LIVE hub — read at import into
+    # `rl_server._HUB_BASE_URL`, so it is pinned here at import too.
+    ("VCT_HUB_BASE_URL", _fixture_guard.UNROUTABLE_SENTINEL_URL),
 )
 
 if not _ALLOW_REAL_STATE:
@@ -763,6 +768,12 @@ def pytest_configure(config):
         "allow_real_model_cli: W-MODEL-CLI opt-in — this test may spawn the "
         "REAL model CLI (e.g. `claude`); makes real, possibly paid, calls.",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_raft_guard: v0.2.106 — run the REAL "
+        "vco_lib.weaviate_raft_guard.upgrade_check (every other test gets the "
+        "stub from _stub_weaviate_raft_upgrade_check).",
+    )
 
 
 @pytest.fixture
@@ -820,6 +831,25 @@ def fake_claude_cli(tmp_path, monkeypatch) -> _FakeClaudeCli:
     monkeypatch.setenv("VCO_FAKE_CLAUDE_LOG", str(log))
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
     return _FakeClaudeCli(bindir, log)
+
+
+@pytest.fixture(autouse=True)
+def _stub_weaviate_raft_upgrade_check(request, monkeypatch):
+    """v0.2.106: every Weaviate recreate asks
+    ``vco_lib.weaviate_raft_guard.upgrade_check`` whether it moves the data
+    onto a release with the 1.37 orphan drop — which inspects (and may stop
+    and run) containers through the injected ``run``. Tests about the OTHER
+    recreate rules describe their machine with fakes that know nothing of
+    that check, so they get a stub answering "not needed". The guard's own
+    tests (tests/test_v02106_weaviate_raft_guard.py) carry the
+    ``real_raft_guard`` marker and run the real function, including through
+    every caller (data_identity, service_adoption)."""
+    if request.node.get_closest_marker("real_raft_guard") is None:
+        from vco_lib import weaviate_raft_guard as _rg
+
+        monkeypatch.setattr(_rg, "upgrade_check", lambda **_kw: _rg.UpgradeVerdict(
+            _rg.NOT_NEEDED, "stubbed by tests/conftest.py"))
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -890,6 +920,18 @@ def _claude_project_dir_pin_for(test_file: str) -> "str | None":
 
 if not _ALLOW_REAL_STATE:
     os.environ["CLAUDE_PROJECT_DIR"] = str(_SCRATCH_PROJECT_DIR)
+
+# v0.2.106: the AMBIENT `KG_BASE_DIR` goes too, at import, so the suite sees
+# what CI sees (no such key). A Claude Code chat exports it — its project's
+# settings `env` — into every Bash command, pytest included, and the pending
+# citation queue stages a retrieval made without `CLAUDE_PROJECT_DIR` under
+# that project (`citation_pending._chat_project_root`): with the key left in
+# place, a test that removes `CLAUDE_PROJECT_DIR` (the opt-out files above,
+# or a `monkeypatch.delenv`) staged its fixture files into the developer's
+# REAL project queue (found 2026-11-11). Tests that need the key set
+# it themselves (monkeypatch / `child_env`, which pins its own sentinel).
+if not _ALLOW_REAL_STATE:
+    os.environ.pop("KG_BASE_DIR", None)
 
 
 # Files that isolate the state dir THEMSELVES and must not have `VCT_STATE_DIR`
@@ -2324,6 +2366,40 @@ def _pin_claude_project_dir(request):
             os.environ.pop("CLAUDE_PROJECT_DIR", None)
         else:
             os.environ["CLAUDE_PROJECT_DIR"] = prev
+
+
+@pytest.fixture(autouse=True)
+def _drop_agent_run_env():
+    """v0.2.106: `VCT_AGENT_ID` (and `VCT_BRIEF_TOOL_USE_ID`, the same
+    per-run discipline) is written straight into `os.environ` by the context
+    router on every run (one run per process in production), so a test that
+    drives `router.main` in-process leaves it set and every later
+    `stage_pending` of the suite tags its pending file with that test's
+    agent id — the same leak class as `VCT_TRANSCRIPT_PATH` (the fixture
+    below). Cleared before and after every test."""
+    os.environ.pop("VCT_AGENT_ID", None)
+    os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
+    try:
+        yield
+    finally:
+        os.environ.pop("VCT_AGENT_ID", None)
+        os.environ.pop("VCT_BRIEF_TOOL_USE_ID", None)
+
+
+@pytest.fixture(autouse=True)
+def _drop_staging_transcript_env():
+    """v0.2.106: `VCT_TRANSCRIPT_PATH` is the per-run channel through which
+    the context router hands `citation_pending.stage_pending` its chat's
+    transcript. The router writes it straight into `os.environ` (one run per
+    process in production), so a test that drives `router.main` in-process
+    would leave it set, and every later `stage_pending` of the suite would
+    record that test's (soon deleted) transcript. Cleared before and after
+    every test."""
+    os.environ.pop("VCT_TRANSCRIPT_PATH", None)
+    try:
+        yield
+    finally:
+        os.environ.pop("VCT_TRANSCRIPT_PATH", None)
 
 
 @pytest.fixture(autouse=True)

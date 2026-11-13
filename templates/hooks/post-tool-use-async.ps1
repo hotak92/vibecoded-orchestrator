@@ -294,7 +294,12 @@ print(is_commit)
 '@
     # No 2>$null: the gate's loud line (vco_lib unresolvable) must reach
     # the dispatcher log, mirroring the .sh sibling.
-    $fields = @(& $PY -c $parseSrc $TmpInput)
+    # v0.2.106: the body runs as a temp FILE through
+    # _lib/run-python-program.ps1 - `& $PY -c $parseSrc` loses every
+    # embedded double quote under Windows PowerShell 5.1 (SyntaxError on
+    # every dispatched tool call). The payload keeps riding $TmpInput.
+    . (Join-Path $ScriptDir "_lib/run-python-program.ps1")
+    $fields = @(Invoke-VcoPythonProgram -Python $PY -Body $parseSrc -Arguments @($TmpInput))
     $ToolName = if ($fields.Count -ge 1) { [string]$fields[0] } else { "" }
     $IsGitCommit = if ($fields.Count -ge 2) { [string]$fields[1] } else { "0" }
 

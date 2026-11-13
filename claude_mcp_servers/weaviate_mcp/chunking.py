@@ -11,11 +11,22 @@ Unified chunking implementation with:
   (``CHUNK_TOKEN_POLICY_CEILING``), which the EMBEDDING model's own input
   window (its ``num_ctx`` in MODEL_TOKEN_LIMITS, D16) may only clamp
   FURTHER DOWNWARD — never a chat model's context, never the capacity
-  alone
+  alone — and, since v0.2.106, by the model's DENSE-content budget
+  (:func:`dense_char_budget`: the window at the MEASURED-MINIMUM
+  chars/token, from the one ratio table in ``vco_lib.embedding_service``),
+  so no chunk exceeds its model's window on JSON, code or other dense text
 - Flexible metadata support
 - Document and generic text chunking
+- The ANSWER-WINDOW mode (v0.2.106): the same dense-content budget +
+  content-defined-boundaries entry point for RL citation answer windows
+  (``chunk_answer_window`` / ``answer_chunk_budget`` below). The KG /
+  document path's boundaries changed in the same release (owner ruling
+  2026-11-11, "fix + re-embed"): ``_CHUNKER_REVISION`` moved to
+  ``v0.2.106`` and every install re-chunks its KG once — see the revision
+  history below and ``tests/test_v02106_shared_chunker_one_home.py``.
 """
 
+import hashlib
 import re
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
@@ -236,9 +247,16 @@ CHARS_PER_TOKEN_CODE: float = 3.5   # source code; denser than prose
 # part (3 684 chars) does NOT reliably fit the served 1 024-token window
 # on real code, and the margin is NOT a guarantee for the code tier. What
 # makes an over-dense part honest is the CodeEmbed service REFUSING it
-# (HTTP 400, W1) and the caller shrinking on that refusal
-# (`_embed_shrinking_on_overflow`), which tags the result — the same net
-# `truncate: false` provides on the Ollama side.
+# (HTTP 400, W1) and the caller handling that refusal — since v0.2.106 by
+# splitting the part into more chunk rows of the entity (the analyzer's row
+# scope, `vco_lib.embed_split`), so nothing is cut off and no row is an
+# averaged vector — the same net `truncate: false` provides on the Ollama side.
+#
+# v0.2.106: this margin is no longer the only bound. The model-aware presets
+# are ALSO clamped to ``dense_char_budget`` (the measured-minimum
+# chars/token bound with a 25% margin), which is tighter than this one for
+# every registered model — so the measured overflow above (and the 2.30 /
+# 2.547 text-model minima) no longer depends on the shrink net.
 #
 # ONE HOME: this is the only declared num_ctx safety margin in the tree —
 # vco_lib/query_enrichment.py imports it (its former private
@@ -420,6 +438,38 @@ def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
 # tests/test_deferral_command_argparse_sweep.py.)
 #
 # Revision history:
+#   v0.2.106.1 (2026-11-11, owner ruling "extra rows in both places"): NO
+#     boundary change — every plan chunk is identical to v0.2.106. The bump is
+#     the one-time DELIVERY signal for the split-rows heal: a refused chunk is
+#     now split into rows for EVERY model of the row's vector set (active,
+#     enabled secondaries, the fill's carry), where the first split-on-refusal
+#     build averaged a refusing SECONDARY's (or carry's) piece vectors into
+#     one vector and recorded nothing on the row. The crossing arms
+#     ``sync_knowledge_graph._split_rows_heal_reason``, which re-lays exactly
+#     the rows holding such a slot whose model may have refused one of the
+#     node's chunks (``embedding_service.text_may_exceed_window``); every
+#     other node keeps skipping. An install crossing from v0.2.92.1 pays one
+#     crossing, not two.
+#   v0.2.106 (2026-11-11, owner ruling "fix + re-embed" — dense budget):
+#     every model-aware preset is ALSO clamped to the model's dense-content
+#     budget (``dense_char_budget`` = embedding_service's measured-minimum
+#     chars/token bound, conservative=True), and the packer sizes a chunk on
+#     its joined text instead of summing per-sentence floors. Effective max
+#     (counter units → chars): qwen3-embedding 8 192 → 4 890 (19 560 chars),
+#     arctic 3 200 → 1 766 (7 065), text-embedding-3-small 6 400 → 3 532
+#     (14 129), jina-v2-base-code 1 600 → 883 (3 532), CodeSage 921 → 568
+#     (2 273). The old maxima measured 122-136% of their windows on dense
+#     text (JSON, code, base64, CJK); the runner refused them and the shrink
+#     ladder embedded a leading sub-window, so the chunk's tail never reached
+#     its vector. (Content denser still is refused even at the new size; it
+#     is split on refusal — ``vco_lib.embed_split`` — never cut.) The code-entity budget (``code_truncation``) moved to the
+#     same bound, so the code graph re-chunks too (extractor-generation rung
+#     0.2.106 delivers it).
+#     BOUNDARY IMPACT: nodes above the new single-chunk threshold re-chunk
+#     into more, smaller chunks — nothing is dropped. Delivery: the bundle
+#     gate emits ``chunker_preset_overhaul_pending``, and the update's own
+#     KG pass (launcher drift probe / install.py) re-chunks exactly the
+#     nodes whose plan changed, once.
 #   v0.2.92.1 (2026-09-05, wiring-audit W1 — CodeSage served-window
 #     correction): MODEL_TOKEN_LIMITS["codesage-large-v2"] 2 048 → 1 024.
 #     The 2 048 was the model's ARCHITECTURAL cap (config.json
@@ -483,7 +533,7 @@ def query_prefix_for_model(model_name: str, task: "str | None" = None) -> str:
 #   v0.2.47.5 (2026-06-04): re-cast as num_ctx (was: model architectural max).
 #     Quadrupled qwen3 chunks (1500 → 13500 max tokens). 5-tier presets.
 #   pre-v0.2.47.5: 3-tier presets, MODEL_TOKEN_LIMITS = model architectural max.
-_CHUNKER_REVISION: str = "v0.2.92.1"
+_CHUNKER_REVISION: str = "v0.2.106.1"
 
 
 # Default chunking presets by model class.
@@ -495,7 +545,8 @@ _CHUNKER_REVISION: str = "v0.2.92.1"
 # v0.2.47 RL-7.5 tunings (user-locked 2026-06-04):
 #   * xsmall_context: (170, 400, 330)        ~512  num_ctx (smallest model class)
 #   * small_context:  (550, 1600, 1100)      ~2k   num_ctx (jina, codesage;
-#                                                codesage @ 1 024 num_ctx clamps to (550, 921, 921))
+#                                                codesage @ 1 024 num_ctx clamps to (550, 921, 921);
+#                                                v0.2.106 dense budget → (550, 568, 568))
 #   * medium_context: (1100, 3200, 2500)     ~4k   num_ctx (arctic2)
 #   * large_context:  (2200, 6400, 4600)     ~8k   num_ctx (openai)
 #   * xlarge_context: (4600, 13500, 9500)    ~16k+ num_ctx (qwen3-embedding @ 10k)
@@ -540,7 +591,9 @@ def chunking_preset_for_model(model_name: str) -> tuple[int, int, int]:
     unknown 8k-class models" guessed large, which over-fills any unknown
     model with a smaller real window.)
     """
-    return _preset_for_limit(_num_ctx_for_model(model_name))
+    return _preset_for_limit(
+        _num_ctx_for_model(model_name), _dense_budget_units(model_name)
+    )
 
 
 def _num_ctx_for_model(model_name: str) -> "int | None":
@@ -560,9 +613,70 @@ def _num_ctx_for_model(model_name: str) -> "int | None":
     return limit
 
 
-def _preset_for_limit(limit: "int | None") -> tuple[int, int, int]:
+def dense_char_budget(model_name: str) -> int:
+    """Characters of DENSE content that fit ``model_name``'s window (0 = unknown).
+
+    The ONE dense-content budget every chunk-sizing path uses since v0.2.106
+    (owner ruling 2026-11-11): the KG / document presets (via
+    :func:`_preset_for_limit`), the code-entity budget
+    (``code_truncation._max_chars_for_model``) and the answer-window mode
+    (:func:`answer_chunk_budget`). It IS
+    ``vco_lib.embedding_service._char_budget_for_model(conservative=True)``
+    — ``num_ctx × measured-minimum chars/token × (1 − 0.25)`` from the one
+    ratio table the shrink ladder uses; this function adds no second table.
+
+    Why the chunker needs it: the presets count ``len // CHARS_PER_TOKEN_TEXT``
+    (4 chars per token), right for prose and wrong for JSON, code, base64 or
+    CJK. Measured (v0.2.106): a max-packed qwen3 chunk of 32 768 chars is
+    ~12 864 tokens at the measured 2.547 chars/token against a 10 240 window
+    (126%), arctic ~5 565 of 4 096 (136%), CodeSage parts ~1 246 of 1 024
+    (122%). The runner refuses those (``truncate: false``) and the shrink
+    ladder embeds a leading sub-window — the chunk's tail never reaches its
+    vector. A chunk sized to this budget fits the window on the first try for
+    content as dense as the measured minimum, with the 25% margin on top.
+
+    Returns 0 for a model with no registered window (MODEL_TOKEN_LIMITS miss):
+    the caller keeps its own unknown-model rule. A REGISTERED model whose
+    budget comes back 0 means the ratio home could not see the window — a
+    broken install or import identity — and raises rather than silently
+    sizing chunks without the bound.
+    """
+    if _num_ctx_for_model(model_name or "") is None:
+        return 0
+    # vco_lib is part of every healthy install (the embedding service that
+    # embeds these chunks lives there); a failed import is a broken install
+    # and propagates. Imported lazily: vco_lib.embedding_service imports THIS
+    # module inside its own functions, and a top-level import would be a cycle.
+    from vco_lib.embedding_service import _char_budget_for_model
+
+    budget = int(_char_budget_for_model(model_name, conservative=True))
+    if budget <= 0:
+        raise RuntimeError(
+            f"dense chunk budget for registered model {model_name!r} resolved "
+            "to 0 — vco_lib.embedding_service could not resolve its window "
+            "(broken install, or a second checkout's chunking on sys.path)"
+        )
+    return budget
+
+
+def _dense_budget_units(model_name: str) -> "int | None":
+    """:func:`dense_char_budget` in the chunker's counter unit (None = unknown)."""
+    chars = dense_char_budget(model_name)
+    return chars // CHARS_PER_TOKEN_TEXT if chars > 0 else None
+
+
+def _preset_for_limit(
+    limit: "int | None", dense_units: "int | None" = None,
+) -> tuple[int, int, int]:
     """Map a ``num_ctx`` to its chunking preset tier, clamped to the policy
-    ceiling and the window — whichever is TIGHTER.
+    ceiling, the window and the model's dense-content budget — whichever is
+    TIGHTEST.
+
+    ``dense_units`` (v0.2.106) is :func:`dense_char_budget` in counter units
+    (``chars // CHARS_PER_TOKEN_TEXT``); ``None`` means "no dense bound
+    known" and keeps the pre-v0.2.106 clamp. The model-aware resolvers
+    (:func:`chunking_preset_for_model` / :func:`chunking_preset_for_models`)
+    always pass it for a registered model.
 
     R39 (2026-09-04): the chunk-size ceiling is a RETRIEVAL-QUALITY policy
     (``CHUNK_TOKEN_POLICY_CEILING``, deliberately below the models'
@@ -594,6 +708,8 @@ def _preset_for_limit(limit: "int | None") -> tuple[int, int, int]:
         int(limit * (1 - _BUDGET_SAFETY_MARGIN_RATIO)),
         CHUNK_TOKEN_POLICY_CEILING,
     )
+    if dense_units is not None and dense_units > 0:
+        budget = min(budget, dense_units)
     return (min(min_t, budget), min(max_t, budget), min(target_t, budget))
 
 
@@ -636,13 +752,14 @@ def chunking_preset_for_models(model_names: "list[str]") -> tuple[int, int, int]
     tuple, so the tightest actual context window governs even when two models map
     to the same tier.
     """
-    known_ctxs = [
-        ctx for ctx in (_num_ctx_for_model(name) for name in model_names)
-        if ctx is not None
+    known = [
+        name for name in model_names if _num_ctx_for_model(name) is not None
     ]
-    if not known_ctxs:
+    if not known:
         return _preset_for_limit(None)
-    return _preset_for_limit(min(known_ctxs))
+    ctxs = [_num_ctx_for_model(name) or 0 for name in known]
+    dense = [u for u in (_dense_budget_units(name) for name in known) if u]
+    return _preset_for_limit(min(ctxs), min(dense) if dense else None)
 
 
 class Chunker:
@@ -770,7 +887,15 @@ class Chunker:
         return chunks
 
     def _split_text(self, text: str) -> List[str]:
-        """Split text into chunks respecting boundaries"""
+        """Split text into chunks respecting boundaries.
+
+        v0.2.106: a chunk is sized on its JOINED text (separators included),
+        never on a sum of per-sentence counts. Summing floors under-counted
+        every sentence by up to 3 chars plus its joining space — a run of
+        3-char sentences counted 0 and packed without bound — so a chunk
+        could pass ``max_tokens`` and, with it, the dense budget the preset
+        is clamped to.
+        """
         chunks = []
         current_chunk = ""
         current_tokens = 0
@@ -791,7 +916,10 @@ class Chunker:
                     chunks.append(sub_chunk)
                 continue
 
-            potential_tokens = current_tokens + sentence_tokens
+            potential_tokens = (
+                (len(current_chunk) + 1 + len(sentence)) // CHARS_PER_TOKEN_TEXT
+                if current_chunk else sentence_tokens
+            )
 
             if potential_tokens > self.max_tokens:
                 if current_chunk:
@@ -821,7 +949,6 @@ class Chunker:
         """Split text on double newlines"""
         chunks = []
         current = ""
-        current_tokens = 0
 
         paragraphs = text.split('\n\n')
 
@@ -832,23 +959,24 @@ class Chunker:
                 if current:
                     chunks.append(current)
                     current = ""
-                    current_tokens = 0
 
                 char_limit = self.max_tokens * CHARS_PER_TOKEN_TEXT
                 for i in range(0, len(para), char_limit):
                     chunks.append(para[i:i+char_limit])
                 continue
 
-            potential_tokens = current_tokens + para_tokens
+            # v0.2.106: sized on the JOINED text (see ``_split_text``).
+            potential_tokens = (
+                (len(current) + 2 + len(para)) // CHARS_PER_TOKEN_TEXT
+                if current else para_tokens
+            )
 
             if potential_tokens > self.max_tokens:
                 if current:
                     chunks.append(current)
                 current = para
-                current_tokens = para_tokens
             else:
                 current += "\n\n" + para if current else para
-                current_tokens = potential_tokens
 
         if current:
             chunks.append(current)
@@ -870,3 +998,130 @@ def chunk_text(
     """Convenience function to chunk text"""
     chunker = Chunker(min_tokens=min_tokens, max_tokens=max_tokens)
     return chunker.chunk_text(text, source_id, metadata)
+
+
+# ─── Answer-window mode (v0.2.106) ─────────────────────────────────────────
+#
+# The ONE home for chunking an RL citation ANSWER WINDOW — a MODE of this
+# shared chunker, not a second module (owner ruling 2026-11-11). It shares
+# the KG / document path's dense budget (``dense_char_budget``, applied to
+# the presets since v0.2.106) and adds an entry point for transcript-shaped
+# text whose boundary requirements differ:
+#
+# 1. **Its budget must assume dense content.** Before v0.2.106 the KG presets
+#    sized chunks at CHARS_PER_TOKEN_TEXT (4) chars per token — right for
+#    prose, wrong for the answer window's tool-call JSON, code and paths. Until v0.2.105 the
+#    citation drain chunked the window with ``Chunker.for_model``, whose
+#    prose-sized chunks (up to 32 768 chars for qwen3-embedding) overflowed
+#    the model window on dense text, so almost every maximal chunk was
+#    REFUSED (``truncate: false``) and went down the shrink ladder: a wasted
+#    embed round trip per chunk, the tail of every chunk never embedded, and
+#    one ``shrink_summary`` row per drain run in ``embedding_failures.jsonl``
+#    (field report: rows every ~30 min with 90-190k characters shrunk). The
+#    answer-window budget is therefore the model's DENSE-content bound —
+#    ``vco_lib.embedding_service._char_budget_for_model(conservative=True)``,
+#    the same measured-minimum chars/token figure the shrink ladder itself
+#    falls back to, so a chunk fits the window on the first attempt (the
+#    ladder stays as the net for denser-than-measured text).
+# 2. **Its boundaries must not depend on where the window starts.** A chat
+#    stages a pending citation for EVERY retrieval, and their answer windows
+#    overlap almost entirely. A greedy packer started at a different offset
+#    never re-aligns, so every window produced chunks no other window had
+#    and the per-process embed memo never hit. This mode splits the window
+#    into paragraphs (a longer one is cut into budget-sized pieces measured
+#    from ITS OWN start) and closes a chunk after a piece whose content
+#    hash selects it as a cut point — a cut therefore depends only on the
+#    text around it, so two overlapping windows produce identical chunks
+#    from their first shared cut onwards and those chunks hit the memo.
+#
+# The hash is ``hashlib.blake2b`` (stable across processes — Python's
+# ``hash()`` is salted per process and would defeat a persistent comparison).
+
+#: A piece closes its chunk when ``blake2b(piece) % CUT_MODULUS == 0`` (and
+#: the chunk has reached :data:`MIN_CHUNK_FRACTION` of the budget). 4 keeps
+#: chunks a few paragraphs long on transcript text, so the max-over-chunks
+#: cosine sees passages, not single lines.
+CUT_MODULUS = 4
+
+#: A content-defined cut is taken only once the open chunk holds at least this
+#: fraction of the budget — without it a run of short paragraphs would yield a
+#: stream of one-line chunks (more embed calls, noisier cosine maxima). The
+#: floor is measured from the chunk's own start, so it does not re-introduce a
+#: dependence on where the WINDOW started: once two windows share a cut, every
+#: later decision is a function of the same text.
+MIN_CHUNK_FRACTION = 0.25
+
+# Paragraph = text up to and including a run of blank-line newlines. The
+# lookbehind split keeps the separator on the left piece, so
+# "".join(paragraphs) == the input byte for byte.
+_PARAGRAPH_SPLIT = re.compile(r"(?<=\n\n)(?=[^\n])|(?<=\r\n\r\n)(?=[^\r\n])")
+
+#: Fallback budget for a model with no registered window (chars). Matches the
+#: smallest registered dense bound's order of magnitude rather than guessing
+#: high: an over-estimate here is the defect this mode exists to remove.
+_FALLBACK_BUDGET_CHARS = 2000
+
+
+def answer_chunk_budget(model_id: str) -> int:
+    """Character budget for one ANSWER-mode chunk embedded by ``model_id``.
+
+    The dense-content (measured-minimum chars/token) bound of the model's
+    window (MODEL_TOKEN_LIMITS ``num_ctx``), from the ONE dense table the
+    shrink ladder uses (``vco_lib.embedding_service``). A model the table
+    does not know gets :data:`_FALLBACK_BUDGET_CHARS`.
+    """
+    # The ONE dense budget (``dense_char_budget``), shared with the KG
+    # presets and the code-entity budget. A broken install raises there, and
+    # the caller's soft-fail turns that into "no citation".
+    budget = dense_char_budget(model_id or "")
+    return budget if budget > 0 else _FALLBACK_BUDGET_CHARS
+
+
+def _is_cut(piece: str) -> bool:
+    digest = hashlib.blake2b(piece.encode("utf-8", "surrogatepass"), digest_size=4)
+    return int.from_bytes(digest.digest(), "big") % CUT_MODULUS == 0
+
+
+def _pieces(text: str, budget: int) -> List[str]:
+    """Paragraphs of ``text``, each at most ``budget`` chars (a longer one is
+    cut at budget-sized offsets from its own start)."""
+    out: List[str] = []
+    for para in _PARAGRAPH_SPLIT.split(text):
+        if not para:
+            continue
+        for start in range(0, len(para), budget):
+            out.append(para[start:start + budget])
+    return out
+
+
+def chunk_answer_window(answer: str, model_id: str) -> List[str]:
+    """Split an RL citation ``answer`` window into content-defined chunks
+    that fit ``model_id``'s dense-content budget (ANSWER mode).
+
+    Every returned chunk is at most :func:`answer_chunk_budget` characters
+    and carries non-whitespace text; concatenating the chunks
+    (whitespace-only ones included) reproduces ``answer``. Deterministic for
+    a given input and budget, across processes. Dual embeddings: call this
+    once PER MODEL with that model's id — two models whose budgets give
+    identical chunks produce identical chunk lists (so their content hashes
+    pair for cross-slot dedup), otherwise each keeps its own chunks.
+    """
+    if not answer:
+        return []
+    budget = answer_chunk_budget(model_id)
+    min_len = max(1, int(budget * MIN_CHUNK_FRACTION))
+    chunks: List[str] = []
+    current: List[str] = []
+    size = 0
+    for piece in _pieces(answer, budget):
+        if size and size + len(piece) > budget:
+            chunks.append("".join(current))
+            current, size = [], 0
+        current.append(piece)
+        size += len(piece)
+        if size >= min_len and _is_cut(piece):
+            chunks.append("".join(current))
+            current, size = [], 0
+    if current:
+        chunks.append("".join(current))
+    return [c for c in chunks if c.strip()]

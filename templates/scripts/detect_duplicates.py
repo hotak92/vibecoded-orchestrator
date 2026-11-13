@@ -418,10 +418,21 @@ class DuplicateDetector:
         if vector is None:
             return ()
         if isinstance(vector, dict):
-            return tuple(str(name) for name in vector.keys())
+            # v0.2.106 field defect: a slot KEY can be present with an EMPTY
+            # vector (the REST payload reports every declared named vector for
+            # an object that never got one). Counting keys made this probe
+            # believe the target slot WAS present, so the vanished-node guard
+            # re-raised and ONE such object aborted the whole scan with
+            # "nearObject params: vector not found for target: arctic2_embed"
+            # (60 shared-KG objects lacked that slot). Only a NON-EMPTY value
+            # proves the slot is populated — the same rule
+            # `vco_lib.embed_slot_fill.sample_slot_population` applies.
+            return tuple(
+                str(name) for name, value in vector.items() if value
+            )
         # weaviate-client 4.x returns a bare list for a class with one
         # UNNAMED vector — the pseudo-slot spelling, see the docstring.
-        return ("",)
+        return ("",) if vector else ()
 
     def close(self):
         """Close Weaviate connection"""

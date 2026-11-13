@@ -1153,18 +1153,29 @@ def plan_move(
 
 
 def registered_projects(db_path: Optional[Path] = None) -> list[dict]:
-    """Every registered project row. Read-only (``mode=ro``).
+    """Every registered project row. Read-only (``mode=ro``). ``[]`` when the
+    database cannot be read — see :func:`registered_projects_or_none` for a
+    caller that must tell the two apart.
 
     Lives in the ENGINE rather than in the CLI because the launcher drives the
     same planning step through ``--phase plan``: one producer, so a GUI
     preview and a CLI ``--dry-run`` can never disagree about what a move would
     do.
     """
+    rows = registered_projects_or_none(db_path)
+    return rows if rows is not None else []
+
+
+def registered_projects_or_none(db_path: Optional[Path] = None) -> Optional[list[dict]]:
+    """:func:`registered_projects`, but ``None`` — not ``[]`` — when the
+    database could not be opened or read (v0.2.106, review C-L1), so a caller
+    that acts on "every project" can tell "no projects" from "could not read
+    the list"."""
     from vco_lib.launcher_db_reader import _open_db_readonly
 
     conn = _open_db_readonly(db_path)
     if conn is None:
-        return []
+        return None
     try:
         return [
             {
@@ -1178,7 +1189,7 @@ def registered_projects(db_path: Optional[Path] = None) -> list[dict]:
             )
         ]
     except Exception:  # noqa: BLE001
-        return []
+        return None
     finally:
         conn.close()
 

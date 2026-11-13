@@ -29,8 +29,9 @@ from model_router.routing import ONE_M_SUFFIX
 
 
 from tests.common.qwen_catalog import (  # noqa: E402
-    QWEN_CHAT_EIGHT,
-    QWEN_EXCLUDED_SIX,
+    QWEN_CHAT_IDS,
+    QWEN_EXCLUDED,
+    QWEN_HIDDEN_IDS,
     QWEN_RETIRED,
     QWEN_LIVE_MODELS,
     assert_matches_shipped_row,
@@ -756,9 +757,9 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(full_catalog.sources["qwen"], cat.SOURCE_DECLARED)
 
     def test_the_shipped_static_ids_are_exactly_the_live_chat_set(self) -> None:
-        """The declared fallback is curated from the same probe: the fifteen
-        live ids minus the six excluded (five non-chat modalities plus the
-        dated deepseek snapshot) and the retired glm-5.2, with no drift in either direction — a
+        """The declared fallback is curated from the same probe: the twenty
+        live ids (2026-11-10) minus the ten excluded (eight non-chat ids and
+        two un-offered dated builds) and the retired glm-5.2, with no drift in either direction — a
         stale fallback would silently differ from the list the
         endpoint actually serves."""
         assert_matches_shipped_row(self, VENDORS["qwen"])
@@ -808,19 +809,16 @@ class CatalogExcludePrefixTests(unittest.IsolatedAsyncioTestCase):
                     e.id for e in catalog.entries
                     if e.id.startswith("claude-gw/qwen/")
                 }
-                chat = {"claude-gw/qwen/" + m for m in QWEN_CHAT_EIGHT}
-                hidden_two = {
-                    "claude-gw/qwen/qwen3.7-plus",
-                    "claude-gw/qwen/deepseek-v4-pro",
-                }
-                self.assertTrue(published <= chat - hidden_two, published - chat)
+                chat = {"claude-gw/qwen/" + m for m in QWEN_CHAT_IDS}
+                hidden_three = {"claude-gw/qwen/" + m for m in QWEN_HIDDEN_IDS}
+                self.assertTrue(published <= chat - hidden_three, published - chat)
                 if catalog_filter == cat.CATALOG_FILTER_ALL:
-                    self.assertEqual(published, chat - hidden_two,
-                                     "all minus the curated-hidden two")
-                for hid in hidden_two:
+                    self.assertEqual(published, chat - hidden_three,
+                                     "all minus the curated-hidden three")
+                for hid in hidden_three:
                     self.assertIn(hid, catalog.hidden)
                 listed = published | set(catalog.hidden)
-                for excluded in (*QWEN_EXCLUDED_SIX, *QWEN_RETIRED):
+                for excluded in (*QWEN_EXCLUDED, *QWEN_RETIRED):
                     for spelling in (
                         excluded,
                         f"claude-gw/qwen/{excluded}",
@@ -903,13 +901,15 @@ class CatalogExcludePrefixTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_empty_exclude_tuple_is_a_no_op(self) -> None:
         """The default: odd-shaped ids pass through untouched. The shipped
         standard-path row declares no exclusions either — its live list is
-        the truth filter's business, not a prefix filter's."""
+        the truth filter's business, not a prefix filter's. (``wan2.7-turbo``
+        rather than an ``-image`` id: since v0.2.106 a modality segment is
+        dropped by rule whatever the prefixes say — ``_exclude_by_rule``.)"""
         self.assertEqual(ACME.catalog_exclude_prefixes, ())
         self.assertEqual(VENDORS["zai"].catalog_exclude_prefixes, ())
         service = _service(
             responses={
                 "acme.example": {"data": [
-                    {"id": "auto"}, {"id": "wan2.7-image"}, {"id": "acme-1"},
+                    {"id": "auto"}, {"id": "wan2.7-turbo"}, {"id": "acme-1"},
                 ]},
             },
             clock=_Clock(),
@@ -920,7 +920,7 @@ class CatalogExcludePrefixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.sources["acme"], cat.SOURCE_LIVE)
         ids = sorted(e.id for e in catalog.entries if e.id.startswith("claude-acme/"))
         self.assertEqual(
-            ids, ["claude-acme/acme-1", "claude-acme/auto", "claude-acme/wan2.7-image"],
+            ids, ["claude-acme/acme-1", "claude-acme/auto", "claude-acme/wan2.7-turbo"],
         )
 
 

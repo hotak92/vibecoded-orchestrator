@@ -62,8 +62,12 @@ pub const ORCHESTRATOR_MODULE_ID: &str = "orchestrator";
 /// Ancestor levels the exe walk inspects, starting at the exe's parent.
 /// Covers the shipped dist layout (`<root>/launcher/dist/<arch>/exe`, level
 /// 3), the cargo layout (`<root>/launcher/src-tauri/target/<profile>/exe`,
-/// level 4) and a macOS `.app` inside dist (level 6) with headroom.
-pub const MAX_WALK_LEVELS: usize = 8;
+/// level 4), a macOS `.app` inside dist (level 6), and newer cargo's test
+/// binaries under `target/<profile>/build/<crate>/<hash>/out/` (level 9 —
+/// CI 2026-11-12: 8 left every root-resolving test without a clone), with
+/// headroom. The identity check (`id == "orchestrator"`), not the bound,
+/// is what keeps a foreign ancestor out.
+pub const MAX_WALK_LEVELS: usize = 12;
 
 // ─── identity ────────────────────────────────────────────────────────────
 

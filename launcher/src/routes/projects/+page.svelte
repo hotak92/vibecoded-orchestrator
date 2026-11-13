@@ -16,6 +16,11 @@
   import { invoke, tauriAvailable } from '$lib/tauri';
   import Toast from '$lib/components/Toast.svelte';
   import ProjectCard from '$lib/components/ProjectCard.svelte';
+  // v0.2.106: the ONE shared Remove flow — opened from each card's Remove
+  // button. Rendered once at page level, so there is exactly one dialog no
+  // matter how many cards are on screen.
+  import ProjectRemoveFlow from '$lib/components/ProjectRemoveFlow.svelte';
+  import type { RemoveTarget } from '$lib/components/ProjectRemoveFlow.svelte';
   import UpdateAllProjectsModal from '$lib/components/UpdateAllProjectsModal.svelte';
   import {
     buildFolderMissingMap,
@@ -179,6 +184,15 @@
   // button itself shows the busy label.
   let updatingId = $state<string | null>(null);
 
+  // ─── Remove project (v0.2.106, shared flow) ────────────────────────────
+  //
+  // The card's Remove button only opens the ONE shared confirm flow
+  // (ProjectRemoveFlow) — it never unregisters on its own. The flow clears
+  // `removingProject` itself on No / completion; the store update it
+  // performs on success makes the projects-set effect above re-take the
+  // census, so a removed project's chip cannot linger.
+  let removingProject = $state<RemoveTarget | null>(null);
+
   async function runRowUpdate(id: string) {
     if (updatingId !== null) return;
     updatingId = id;
@@ -306,6 +320,7 @@
             active={active?.id === p.id}
             folderMissing={folderMissingMap[p.id] === true}
             onOpen={open}
+            onRemove={(proj) => (removingProject = proj)}
           />
           <div class="pl-cell-chips">
             <BundleStalenessChip {census} projectId={p.id} />
@@ -341,6 +356,9 @@
     </div>
   {/if}
 </div>
+
+<!-- v0.2.106: the ONE shared Remove flow for every card on this page. -->
+<ProjectRemoveFlow bind:project={removingProject} />
 
 <style>
   .pl-page { padding: 24px; max-width: 1200px; margin: 0 auto; }

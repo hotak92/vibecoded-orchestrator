@@ -42,7 +42,8 @@ from __future__ import annotations
 #: mechanical-edits brief). The set is now eight; the retired files are
 #: orphan-cleaned on the next bundle update (modified copies are kept).
 #:
-#: v0.2.102: the kimi-vendor block (Kimi K3, `claude-gw/kimi/k3[1m]`) adds an
+#: v0.2.102: the kimi-vendor block (Kimi K3 then; K3.1 Pro, `claude-gw/kimi/k3.1-pro[1m]`,
+#: since the owner ruling of 2026-11-10) adds an
 #: implementer and a reviewer, and the owner effort rulings add the
 #: high-effort siblings `glm-implementer-high` (z.ai) and
 #: `qwen-implementer-high` (qwen vendor, run by QwenCloud at its xhigh tier)

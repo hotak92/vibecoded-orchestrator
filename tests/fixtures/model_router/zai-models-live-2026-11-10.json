@@ -1,0 +1,77 @@
+{
+ "object": "list",
+ "data": [
+  {
+   "id": "glm-4.5",
+   "object": "model",
+   "created": 1780000000,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-4.5-air",
+   "object": "model",
+   "created": 1780086400,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-4.6",
+   "object": "model",
+   "created": 1780172800,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-4.7",
+   "object": "model",
+   "created": 1780259200,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5",
+   "object": "model",
+   "created": 1780345600,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5-turbo",
+   "object": "model",
+   "created": 1780432000,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5.1",
+   "object": "model",
+   "created": 1780518400,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5.2",
+   "object": "model",
+   "created": 1780604800,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5.3",
+   "object": "model",
+   "created": 1780691200,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5.3-flash",
+   "object": "model",
+   "created": 1780777600,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5.3-flashx",
+   "object": "model",
+   "created": 1780864000,
+   "owned_by": "z-ai"
+  },
+  {
+   "id": "glm-5.3-flashx-legal",
+   "object": "model",
+   "created": 1780950400,
+   "owned_by": "z-ai"
+  }
+ ]
+}

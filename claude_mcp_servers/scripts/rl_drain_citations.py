@@ -27,8 +27,12 @@ every staged pending file belonging to the session it:
      subagent's SubagentStop drain, the main chat's SessionEnd drain
      (``--session-end``), or any later drain finalizing a session whose end
      was recorded. A citation is scored only against its own chat's
-     transcript (same transcripts folder); a file whose chat cannot be
-     found stays unscored and is logged, never scored against another.
+     transcript: since v0.2.106 the EXACT file recorded at staging
+     (``transcript_path``, owner ruling R7-3 — a worktree lane's, or a chat
+     whose transcripts folder differs from the draining chat's, included);
+     for a file staged without one (the MCP / CLI paths, older files), the
+     same-folder rule. A file whose chat cannot be found stays unscored and
+     is logged, never scored against another.
   7. Garbage-collects only PROVABLY abandoned files (transcript idle for
      ``RL_CITATION_ABANDONED_DAYS``, default 7 days, and no live owner):
      each is scored first when its transcript is readable, else recorded
@@ -383,7 +387,11 @@ def drain_session(
     Same chat only (owner ruling R7-3): a file with a session id belongs to
     that session's drains alone; a file staged without one (the MCP path)
     belongs to the chat whose transcript holds its query
-    (:func:`_query_in_transcript`). Other sessions' files are touched only by
+    (:func:`_query_in_transcript`). A file that recorded its chat's exact
+    transcript at staging (v0.2.106, ``citation_pending.TRANSCRIPT_PATH_KEY``)
+    is scored against exactly that file by whichever pass handles it, and
+    is never attributed to another chat by its query; a recorded file that
+    is gone means unscoreable, never a stand-in. Other sessions' files are touched only by
     two passes, and only against their OWN transcripts (same folder, never a
     search): the finalize pass, for sessions whose end was recorded, and the
     collector, for provably abandoned files (``collect_abandoned``). No pass
@@ -427,6 +435,7 @@ def drain_session(
         record_unscored,
         collect_abandoned,
         pending_dir,
+        staged_transcript,
     )
 
     started = time.time()
@@ -471,21 +480,39 @@ def drain_session(
             _cli_by_id[key] = find_cli_kg_queries(messages) if messages else frozenset()
         return _query_in_transcript(messages, kg_positions, query, _cli_by_id[key])
 
+    def _recorded_elsewhere(payload: object, tp: str) -> bool:
+        """Whether ``payload`` recorded its chat's transcript at staging and
+        it is NOT ``tp`` (or is gone). Such a file belongs to that recorded
+        chat alone: no query-in-transcript attribution may hand it to the
+        chat of ``tp`` (owner ruling R7-3)."""
+        recorded = staged_transcript(payload)
+        if recorded is None:
+            return False
+        return not tp or os.path.normpath(recorded) != os.path.normpath(tp)
+
     def _answer_source(payload: dict) -> str:
         """The transcript of the chat that staged ``payload`` — the agent's
-        stamped transcript, else the agent transcript beside its session's,
-        else its session's transcript in this drain's transcripts folder; a
-        file with no session id is this drain's chat only when this chat's
-        transcript holds its query (so the collector sees that chat as live).
-        ``""`` when that chat cannot be found."""
+        stamped transcript, else the EXACT transcript recorded at staging
+        (v0.2.106, owner ruling R7-3: authoritative — a recorded file that
+        is gone resolves to ``""``, never to a stand-in), else (a file staged
+        before v0.2.106) the agent transcript beside its session's, or its
+        session's transcript in this drain's transcripts folder; a file with
+        no session id is this drain's chat only when this chat's transcript
+        holds its query (so the collector sees that chat as live). ``""``
+        when that chat cannot be found."""
         file_session = str(payload.get("session_id") or "")
         file_agent = str(payload.get("agent_id") or "")
+        recorded = staged_transcript(payload)
         if file_agent:
             stamped = str(payload.get("agent_transcript_path") or "")
             if stamped:
                 return stamped
+            if recorded is not None:
+                return recorded
             sess = session_transcript_for(known, file_session) if file_session else ""
             return agent_transcript_for(sess, file_agent) if sess else ""
+        if recorded is not None:
+            return recorded
         if file_session:
             return session_transcript_for(known, file_session)
         messages, kg_positions = _load(known)
@@ -502,8 +529,9 @@ def drain_session(
         file can sit under the MCP monitor's claim while its chat's SessionEnd
         drain lists the folder; without this, no drain ever attributed it
         again and the collector logged it ``no_transcript``."""
-        if not isinstance(payload, dict) or payload.get("session_id") or payload.get("agent_id"):
-            return "", ""
+        if (not isinstance(payload, dict) or payload.get("session_id")
+                or payload.get("agent_id") or staged_transcript(payload) is not None):
+            return "", ""  # its own chat is named (session / agent / recorded path)
         query = str(payload.get("query") or "")
         for sid in ended_sessions(project_root):
             tp = session_transcript_for(known, sid)
@@ -578,6 +606,7 @@ def drain_session(
             payload = read_pending_header(f)
             if (isinstance(payload, dict) and not payload.get("session_id")
                     and not payload.get("agent_id")
+                    and not _recorded_elsewhere(payload, tp)
                     and _holds_query(messages, kg_positions,
                                              str(payload.get("query") or ""))):
                 return True
@@ -620,10 +649,15 @@ def drain_session(
                 continue  # another chat's file: never scored here (R7-3)
             if agent_id and peek_agent != agent_id:
                 continue
+            if agent_id and _recorded_elsewhere(peek, known):
+                continue  # recorded for another transcript than this agent's
         else:
             if peek_agent and peek_agent != agent_id:
                 continue
-            if not _answer_source(peek):
+            if staged_transcript(peek) is not None:
+                if _recorded_elsewhere(peek, known):
+                    continue  # its recorded chat is another one (R7-3)
+            elif not _answer_source(peek):
                 continue  # not this chat's retrieval (its query is not here)
         if (not agent_id and peek_agent and not peek.get("agent_transcript_path")
                 and not session_end):
@@ -683,7 +717,11 @@ def drain_session(
                 # main chat's window until the session ends.
                 final_window = session_end or payload.get(AGENT_WINDOW_FINAL_KEY) is not False
             else:
-                answer_source = known
+                # v0.2.106 (R7-3): the transcript recorded at staging, when
+                # there is one — exactly that file ("" when it is gone: left,
+                # never scored against a stand-in); else this drain's own.
+                recorded = staged_transcript(payload)
+                answer_source = recorded if recorded is not None else known
                 final_window = session_end
             messages, kg_positions = _load(answer_source)
 
@@ -726,9 +764,38 @@ def drain_session(
                         continue  # unreadable: the collector records it
                     source = _answer_source(payload)
                     if not source:
-                        logger.info(
-                            "rl_drain_citations: %s ended but its transcript is "
-                            "not found; the citation stays unscored", path.name)
+                        # v0.2.106 (training-readiness survey G5): the owning
+                        # chat ENDED and its transcript is not locatable (same
+                        # folder only, owner ruling R7-3) — under that ruling
+                        # no later drain and no collector pass can ever score
+                        # this file, yet the old "leave it" path re-visited it
+                        # on EVERY drain (measured: 1 084 "transcript is not
+                        # found" retries in one project's drain log) until the
+                        # 7-day collector removed it unscored anyway. Remove +
+                        # record it NOW, exactly as the collector would, so the
+                        # session's end marker can be cleared and later drains
+                        # stop paying for it. Guarded on ``known`` (a drain
+                        # without its own transcript cannot conclude anything
+                        # about other folders) and on the file being that
+                        # session's OWN (a session id in the payload); a file
+                        # staged WITHOUT a session id may still belong to a
+                        # live chat elsewhere, so it keeps the old leave rule.
+                        if (
+                            known
+                            and str(payload.get("session_id") or "") == sid
+                        ):
+                            summary["finalized_unscored"] += 1
+                            delete_pending(claimed)
+                            record_unscored(
+                                path.parent, path.name, payload, "no_transcript",
+                                when="session_ended",
+                            )
+                            claimed = None
+                        else:
+                            logger.info(
+                                "rl_drain_citations: %s ended but its transcript "
+                                "is not found; the citation stays unscored",
+                                path.name)
                         continue
                     if _finalize_claimed(path, claimed, payload, source, ""):
                         claimed = None
@@ -745,6 +812,7 @@ def drain_session(
                     peek = read_pending_header(path)
                     if (not isinstance(peek, dict) or peek.get("session_id")
                             or peek.get("agent_id")
+                            or _recorded_elsewhere(peek, sess_tp)
                             or not _holds_query(
                                 sess_msgs, sess_kg, str(peek.get("query") or ""))):
                         continue  # not this ended chat's retrieval
@@ -755,6 +823,7 @@ def drain_session(
                         payload = read_pending_header(claimed)
                         if (not isinstance(payload, dict) or payload.get("session_id")
                                 or payload.get("agent_id")
+                                or _recorded_elsewhere(payload, sess_tp)
                                 or not _holds_query(
                                     sess_msgs, sess_kg, str(payload.get("query") or ""))):
                             continue  # re-staged as someone else's meanwhile

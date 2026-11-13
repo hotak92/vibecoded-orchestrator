@@ -477,6 +477,7 @@ fn make_runtime_block_minimal() -> RuntimeBlock {
         min_gpu_vram_gb: None,
         gpu_optional: false,
         gpu_image_variants: None,
+        image_user: None,
         log_path_template: None,
         container_name_template: None,
         image_ref: None,
@@ -495,6 +496,8 @@ fn make_container_install_block(tag_from_version: bool, _tag_ref: Option<&str>) 
         pull_token_method: "POST".into(),
         rotate_weights: false,
         rotate_weights_endpoint: None,
+        build_context: None,
+        dockerfile: None,
     }
 }
 

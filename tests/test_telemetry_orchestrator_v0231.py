@@ -50,7 +50,7 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
             status_code = 200
             text = ""
             def json(self):
-                return {"top_k": [{"title": "N1", "score": 0.9}]}
+                return {"scored": True, "order": [0], "scores": [0.9]}
 
         class _FakeClient:
             async def post(self, url, json=None, headers=None, timeout=None):
@@ -63,19 +63,21 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
                 pass
 
         rl = RLClient(
-            text_dim=1024,
+            text_dim=4,
             active_embedding="qwen3",
             base_url="http://127.0.0.1:0",
             client=_FakeClient(),
         )
+        nodes = [{"title": "N1", "score": 0.5, "emb": [0.5] * 4}]
         result = _run(rl.cache_nodes(
             query="q",
-            nodes=[{"title": "N1", "score": 0.5}],
+            nodes=nodes,
             top_k=1,
             task_id="task-xyz",
             session_id="claude-session-abc",
+            query_emb=[1.0] * 4,
         ))
-        self.assertEqual(result, [{"title": "N1", "score": 0.9}])
+        self.assertEqual(result, nodes)
         self.assertEqual(captured["json"]["session_id"], "claude-session-abc")
 
     def test_session_id_defaults_to_empty(self):
@@ -88,7 +90,7 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
             status_code = 200
             text = ""
             def json(self):
-                return {"top_k": []}
+                return {"scored": True, "order": [0], "scores": [0.5]}
 
         class _FakeClient:
             async def post(self, url, json=None, headers=None, timeout=None):
@@ -99,9 +101,10 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
             async def aclose(self):
                 pass
 
-        rl = RLClient(base_url="http://127.0.0.1:0", client=_FakeClient())
+        rl = RLClient(base_url="http://127.0.0.1:0", client=_FakeClient(), text_dim=4)
         _run(rl.cache_nodes(
-            query="q", nodes=[], top_k=1, task_id="t",
+            query="q", nodes=[{"title": "N", "emb": [0.5] * 4}], top_k=1, task_id="t",
+            query_emb=[1.0] * 4,
         ))
         self.assertIn("session_id", captured["json"])
         self.assertEqual(captured["json"]["session_id"], "")

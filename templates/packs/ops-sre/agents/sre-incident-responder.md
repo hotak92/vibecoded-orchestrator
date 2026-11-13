@@ -6,6 +6,8 @@ keywords: [paged, "on-call", "incident commander", "status page", "war room", "h
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
 model: opus
 effort: high
+background: true
+autoCompactWindow: 750000
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---

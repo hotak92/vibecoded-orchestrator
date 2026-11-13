@@ -6,6 +6,8 @@ keywords: [brand identity, logomark, wordmark, typography system, brand guidelin
 tools: Read, Write, Edit, Glob, Grep, WebFetch
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

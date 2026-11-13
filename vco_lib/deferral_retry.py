@@ -2004,6 +2004,15 @@ def session_start_owed_check(folder: Path, *, python: str = "") -> list[str]:
     except Exception:  # noqa: BLE001 — detection must never block the check
         pass
     try:
+        # v0.2.106 ("backfill once"): a secondary text-embedding slot enabled
+        # since the last stamp is scheduled HERE (a file read of the project
+        # env + its stamp; no Weaviate call), so this same spawn backfills it.
+        from vco_lib.kg_secondary_backfill import schedule_for_folder
+
+        schedule_for_folder(Path(folder))
+    except Exception:  # noqa: BLE001 — detection must never block the check
+        pass
+    try:
         owed = owed_condition_ids(Path(folder))
     except Exception:  # noqa: BLE001
         return []

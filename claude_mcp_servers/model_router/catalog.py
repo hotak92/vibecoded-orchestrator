@@ -79,7 +79,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Optional, Sequence
+from typing import Awaitable, Callable, Collection, Mapping, Optional, Sequence
 
 # ``ONE_M_WINDOW`` (what the client budgets for an id carrying ``[1m]``, and
 # the threshold at which a row EARNS that suffix) lives with the table that
@@ -88,13 +88,20 @@ from typing import Awaitable, Callable, Mapping, Optional, Sequence
 # duplication the modularity rule forbids. Re-exported in ``__all__`` below,
 # so every existing `catalog.ONE_M_WINDOW` reader is unaffected.
 from .context_table import ONE_M_WINDOW, ContextTable
-from .model_family import ModelIdParts, is_older_sibling, parse_model_id
+from .model_family import (
+    ModelIdParts,
+    is_dated_build,
+    is_non_chat_modality,
+    is_older_sibling,
+    parse_model_id,
+)
 from .routing import ONE_M_SUFFIX, advertised_id, with_1m
 from .vendors import (
     DEFAULT_ANTHROPIC_VERSION,
     OAUTH_BETA,
     AnthropicFamily,
     Vendor,
+    offered_ids,
     vendor_display_name,
 )
 
@@ -130,11 +137,17 @@ SOURCE_STATIC = "static"
 SOURCE_DECLARED = "declared"
 SOURCE_UNFETCHED = "unfetched"
 SOURCE_EMPTY = "unavailable"
+#: The vendor the USER switched off in the launcher (Home → Model providers,
+#: v0.2.106): no rows, and its upstream model list is not even fetched — a
+#: switched-off subscription is never called for it. Recorded as the family's
+#: source so a short picker answers "the user switched it off", not "the
+#: gateway lost it".
+SOURCE_PROVIDER_OFF = "provider-off"
 
 #: Publish only the newest version of each model family. The owner's
-#: requirement (2026-09-10): a picker that lists Fable 5.1 AND Fable 5 AND
-#: three superseded versions of one vendor model is a list to read past, not
-#: a list to choose from.
+#: requirement (2026-09-10): a picker that lists Fable 5.2 AND Fable 5.1 AND
+#: Fable 5 AND three superseded versions of one vendor model is a list to
+#: read past, not a list to choose from.
 CATALOG_FILTER_LATEST = "latest"
 
 #: Publish every version both upstreams return. The escape hatch for the case
@@ -959,6 +972,38 @@ def _exclude_by_prefix(
     )
 
 
+def _exclude_by_rule(
+    entries: tuple[CatalogEntry, ...],
+    vendor: Vendor,
+) -> tuple[CatalogEntry, ...]:
+    """Drop LIVE ids that are non-chat modalities or un-offered dated builds.
+
+    The two RULES behind the per-vendor prefix list, so an id nobody has
+    written down yet is still caught (v0.2.106: a shipped vendor's live list
+    of 2026-11-10 carried an image model and two dated builds that no prefix
+    named):
+
+    * a **non-chat modality** (:func:`model_router.model_family.is_non_chat_modality`
+      — image, video, audio, ASR, TTS) is never a chat row;
+    * a **dated build** (:func:`model_router.model_family.is_dated_build` —
+      an ``-MMDD`` / ``-YYYYMMDD`` tail) is a snapshot, curated out of every
+      vendor picker (owner ruling 2026-09-22) UNLESS the row explicitly
+      offers that exact id (:func:`model_router.vendors.offered_ids`) — the
+      owner's way to pin one build on purpose.
+
+    Same contract as :func:`_exclude_by_prefix`: fetched entries only (the
+    row's declared ids are never second-guessed), and an excluded id is
+    neither published nor reported hidden. First-party ids never pass through
+    here — Anthropic's dated ids are its real model names.
+    """
+    offered = offered_ids(vendor)
+    return tuple(
+        entry for entry in entries
+        if not is_non_chat_modality(entry.id)
+        and not (is_dated_build(entry.id) and entry.id.lower() not in offered)
+    )
+
+
 @dataclass
 class _FamilyCache:
     entries: tuple[CatalogEntry, ...] = ()
@@ -1305,6 +1350,8 @@ class CatalogService:
             entries = _exclude_by_prefix(
                 entries, vendor.catalog_exclude_prefixes,
             )
+        if entries:
+            entries = _exclude_by_rule(entries, vendor)
         if entries and vendor.retired_ids:
             retired = {i.lower() for i in vendor.retired_ids}
             entries = tuple(
@@ -1337,6 +1384,7 @@ class CatalogService:
         catalog_filter: str = DEFAULT_CATALOG_FILTER,
         window_rows: str = DEFAULT_WINDOW_ROWS,
         user_agent: Optional[str] = None,
+        disabled_vendors: Collection[str] = frozenset(),
     ) -> CatalogUnion:
         """Build the picker list.
 
@@ -1382,10 +1430,16 @@ class CatalogService:
         (a cache hit makes none), so the gateway's own fetch reaches the
         vendor as the client it is acting for. ``None`` sends no header and
         leaves the HTTP library's default in place.
+
+        ``disabled_vendors`` (v0.2.106) is the launcher provider switch's
+        off-list: those vendors publish NO rows and are not even fetched —
+        the family is recorded with :data:`SOURCE_PROVIDER_OFF` so a short
+        picker is attributable. First-party rows are never affected.
         """
         sources: dict[str, str] = {}
         entries: list[CatalogEntry] = []
         hidden: list[str] = []
+        off = frozenset(disabled_vendors)
 
         # Every family is fetched CONCURRENTLY. Sequentially, each stalling
         # vendor added its own timeout to the picker's wait — two vendors down
@@ -1397,7 +1451,10 @@ class CatalogService:
         # answer with a fallback family instead of raising (that is what their
         # ``source`` field records), so an exception here would be a defect
         # worth surfacing rather than a vendor being down.
-        vendors = list(self._vendors.values())
+        vendors = [v for v in self._vendors.values() if v.vendor_id not in off]
+        for skipped in self._vendors.values():
+            if skipped.vendor_id in off:
+                sources[skipped.vendor_id] = SOURCE_PROVIDER_OFF
         first, *vendor_families = await asyncio.gather(
             self._anthropic_entries(),
             *(self._vendor_entries(vendor, user_agent) for vendor in vendors),
@@ -1544,6 +1601,7 @@ __all__ = [
     "SOURCE_EMPTY",
     "SOURCE_DECLARED",
     "SOURCE_LIVE",
+    "SOURCE_PROVIDER_OFF",
     "SOURCE_STATIC",
     "SOURCE_UNFETCHED",
     "STATIC_CATALOG_PATH",

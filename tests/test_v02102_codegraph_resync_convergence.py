@@ -1252,16 +1252,28 @@ class _DemoteColl:
         return iter(self.rows)
 
 
+def _current_revision() -> int:
+    """The revision the audit treats as current when no analyzer file is
+    resolvable (``codegraph_resync._FALLBACK_EMBED_REVISION``, which MUST match
+    the analyzer constant — 2 since v0.2.106's split rows)."""
+    from vco_lib import codegraph_resync as cr
+
+    return cr._FALLBACK_EMBED_REVISION
+
+
+_CUR = _current_revision()
+
+
 def _demote_world():
     fn = _DemoteColl("Acme_CodeFunction", [
-        ("no-vector", {"embed_revision": 1}, {}),
-        ("empty-slot", {"embed_revision": 1}, {"codesage_embed": []}),
-        ("has-vector", {"embed_revision": 1}, {"codesage_embed": [0.1]}),
-        ("other-slot-only", {"embed_revision": 1}, {"qwen3_embed": [0.2]}),
+        ("no-vector", {"embed_revision": _CUR}, {}),
+        ("empty-slot", {"embed_revision": _CUR}, {"codesage_embed": []}),
+        ("has-vector", {"embed_revision": _CUR}, {"codesage_embed": [0.1]}),
+        ("other-slot-only", {"embed_revision": _CUR}, {"qwen3_embed": [0.2]}),
         ("already-stale", {"embed_revision": 0}, {}),
-        ("unjudgeable", {"embed_revision": 1}, None),
+        ("unjudgeable", {"embed_revision": _CUR}, None),
     ])
-    mod = _DemoteColl("Acme_CodeModule", [("mod-no-vec", {"embed_revision": 1}, {})],
+    mod = _DemoteColl("Acme_CodeModule", [("mod-no-vec", {"embed_revision": _CUR}, {})],
                       slots=("qwen3_embed",))  # undeclared active slot → skipped
     colls = {"Acme_CodeFunction": fn, "Acme_CodeModule": mod}
     return _purge_client(colls), fn, mod
@@ -1277,7 +1289,7 @@ def test_vectorless_audit_demotes_only_current_rows_missing_the_active_slot():
     assert sorted(fn.updates) == ["empty-slot", "no-vector", "other-slot-only"]
     assert fn.iter_kwargs == [["codesage_embed"]]
     assert mod.updates == [], "a class without the slot cannot gain it by re-embedding"
-    assert {r.uuid: r.properties["embed_revision"] for r in fn.rows}["has-vector"] == 1
+    assert {r.uuid: r.properties["embed_revision"] for r in fn.rows}["has-vector"] == _CUR
 
 
 def test_vectorless_audit_is_one_time_per_key_and_resumable():
@@ -1290,7 +1302,7 @@ def test_vectorless_audit_is_one_time_per_key_and_resumable():
         "Acme", slot_resolver=lambda: "codesage_embed", client=client)
     assert first == {"demoted": 2, "failed": 1}
     assert audits.recorded_key(audits.AUDIT_VECTORLESS, "Acme") is None, "partial ≠ done"
-    assert cr.vectorless_audit_owed("Acme", 1)
+    assert cr.vectorless_audit_owed("Acme", _CUR)
 
     fn.fail.clear()
     fn.updates.clear()
@@ -1298,8 +1310,8 @@ def test_vectorless_audit_is_one_time_per_key_and_resumable():
         "Acme", slot_resolver=lambda: "codesage_embed", client=client)
     assert fn.updates == ["no-vector"], "the re-run touches only what is left"
     assert second == {"demoted": 1, "failed": 0}
-    assert audits.recorded_key(audits.AUDIT_VECTORLESS, "Acme") == "codesage_embed@1"
-    assert not cr.vectorless_audit_owed("Acme", 1)
+    assert audits.recorded_key(audits.AUDIT_VECTORLESS, "Acme") == f"codesage_embed@{_CUR}"
+    assert not cr.vectorless_audit_owed("Acme", _CUR)
 
     fn.updates.clear()
     assert cr._maybe_run_vectorless_audit(
@@ -1762,6 +1774,82 @@ def test_second_driver_for_the_same_project_skips(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="flock-based claims are POSIX")
+def test_a_driver_claim_skip_closes_its_own_row_as_skipped(monkeypatch, tmp_path):
+    """v0.2.106 fix round 1 (U1-1): the driver-claim skip posts ``skipped``
+    for its own pid (a no-op on a current hub, which refused the twin's
+    registration; on an older hub it replaces the sweep's "died" verdict).
+    RED-PROOF TARGET: delete the ``_report_skip_to_hub`` call in the
+    ``LockTimeout`` branch → no report."""
+    from vco_lib import codegraph_resync as cr
+
+    reports: list = []
+    monkeypatch.setattr(cr, "_report_terminal_to_hub",
+                        lambda *a, **k: reports.append((a, k)))
+    monkeypatch.setattr(cr, "_run_resync_and_verify_slotted", lambda *a, **k: 17)
+    proc, line = _claim_holder(
+        tmp_path, cr._driver_claim_lock_path("Acme Projects"), "30")
+    assert line == "held"
+    try:
+        assert cr.run_resync_and_verify("Acme Projects", tmp_path, tmp_path / "a.py") == 0
+    finally:
+        proc.kill()
+        proc.wait(10)
+    assert [(a[0], a[1]) for a, _k in reports] == [("Acme Projects", "skipped")]
+    assert "skipped, not failed" in reports[0][1]["error_message"]
+    reports.clear()
+    # Leave-alone: with the claim free the driver runs and posts no skip.
+    assert cr.run_resync_and_verify("Acme Projects", tmp_path, tmp_path / "a.py") == 17
+    assert reports == []
+
+
+def _http_error(code: int, body: bytes):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    return urllib.error.HTTPError("http://h/x", code, "x", Message(), io.BytesIO(body))
+
+
+def test_an_older_hub_refusing_skipped_gets_failed_with_the_same_reason(monkeypatch):
+    """U1-5 version skew: a pre-v0.2.106 hub answers ``skipped`` with 400
+    ``invalid_status``; the driver retries ONCE as ``failed`` with the same
+    reason, so the row says why instead of the sweep's "died before
+    completing". Leave-alone: any other refusal, or a refused non-skip
+    status, is not retried. RED-PROOF TARGET: drop the retry → one post."""
+    from vco_lib import codegraph_resync as cr
+
+    posts: list = []
+
+    def _old_hub(project, payload, path_suffix=""):
+        posts.append(dict(payload))
+        if payload["status"] == "skipped":
+            raise _http_error(400, b'{"error":"invalid_status"}')
+        return types.SimpleNamespace(status=200)
+
+    monkeypatch.setattr(cr, "_hub_post_codegraph_build", _old_hub)
+    cr._report_skip_to_hub("P", "/r", "another walk is running")
+    assert [p["status"] for p in posts] == ["skipped", "failed"]
+    assert posts[1]["error_message"] == "another walk is running"
+
+    def _refusing(code: int, body: bytes):
+        def _post(project, payload, path_suffix=""):
+            posts.append(dict(payload))
+            raise _http_error(code, body)
+        return _post
+
+    posts.clear()
+    monkeypatch.setattr(cr, "_hub_post_codegraph_build", _refusing(404, b"not found"))
+    cr._report_skip_to_hub("P", "/r", "x")
+    assert len(posts) == 1, "a 404 (no /terminal route) is the soft skip, never a retry"
+
+    posts.clear()
+    monkeypatch.setattr(cr, "_hub_post_codegraph_build",
+                        _refusing(400, b'{"error":"invalid_status"}'))
+    cr._report_terminal_to_hub("P", "failed", error_message="x")
+    assert len(posts) == 1, "only a refused 'skipped' falls back"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock-based claims are POSIX")
 def test_a_driver_for_a_different_project_is_not_blocked(monkeypatch, tmp_path):
     from vco_lib import codegraph_resync as cr
 
@@ -2151,15 +2239,17 @@ def test_resync_driver_walk_refusal_posts_a_terminal_hub_report(
     assert "already running" in capsys.readouterr().out
 
     # Exactly ONE terminal report, posted by the refusal branch: status
-    # "failed" (the only honest terminal vocabulary the hub's /terminal
-    # route accepts for a run that did not complete) with the refusal as
-    # its error message, so the row does not read as a silent death.
+    # "skipped" (v0.2.106 — the NON-failure terminal state the hub's
+    # /terminal route accepts for a run a healthy twin made unnecessary; a
+    # "failed" here painted a red row for a project whose graph was being
+    # rebuilt) with the refusal as its reason, so the row does not read as
+    # either a silent death or an error.
     assert len(seen["terminal"]) == 1, (
         f"the walk-refusal branch must post exactly one terminal report, "
         f"got {seen['terminal']!r}")
     args, kwargs = seen["terminal"][0]
     assert args[0] == "Acme Projects"
-    assert args[1] == "failed"
+    assert args[1] == "skipped"
     assert "already running" in (kwargs.get("error_message") or "")
     assert kwargs.get("files_analyzed") == 0
 
@@ -2172,6 +2262,30 @@ def test_resync_driver_walk_refusal_posts_a_terminal_hub_report(
         "the ordinary path still posts its own terminal report")
     _args2, kwargs2 = seen["terminal"][1]
     assert "already running" not in (kwargs2.get("error_message") or "")
+
+
+def test_a_genuine_analyzer_failure_still_reports_failed(
+        monkeypatch, tmp_path, capsys):
+    """The LEAVE-ALONE half of the twin-walk skip: a run that actually ran
+    and failed must still finalize the build row ``failed``. v0.2.106 only
+    reclassified the twin-walk refusal (``WalkAlreadyRunning``), never the
+    analyzer's own non-zero exit. RED-PROOF TARGET: broadening the skip
+    status to the ordinary exit path turns this red."""
+    import subprocess
+    from types import SimpleNamespace
+
+    from vco_lib import codegraph_resync as cr
+
+    seen = _stub_driver_walk_gates(monkeypatch)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: seen["runs"].append(a) or SimpleNamespace(returncode=3))
+    rc = cr._run_resync_and_verify_slotted(
+        "Acme Projects", tmp_path, tmp_path / "a.py")
+    assert rc == 0, "the driver's own exit stays 0 on a walk it could not converge"
+    statuses = [args[1] for args, _kw in seen["terminal"]]
+    assert "failed" in statuses, f"a real failure is still failed: {seen['terminal']!r}"
+    assert "skipped" not in statuses
 
 
 def test_retry_code_graph_walk_goes_through_the_walk_claim(monkeypatch, tmp_path):

@@ -7,10 +7,11 @@ end-to-end on a live machine — the Claude OAuth passthrough, the Z.ai/GLM
 subscription route, and the QwenCloud Token Plan route (owner order
 2026-09-21; the pay-as-you-go QwenCloud endpoint is deliberately absent until
 its model list is extracted and proven — see the ``qwen`` row) — and the Kimi
-Code subscription route (owner order 2026-10-07, K3 only). That last row was
-written from the vendor's docs and then probed live the same day (endpoint,
-auth, model list); every field cites its source, and the row says in place
-which claim still waits on a live probe (the model echo). OpenRouter, the
+Code subscription route (owner order 2026-10-07; since the owner ruling of
+2026-11-10, K3.1 Pro only — it replaces K3). That last row was written from
+the vendor's docs and then probed live (endpoint, auth, model list, 2026-10-07;
+the K3.1 Pro id and its thinking-only rule, 2026-11-10); every field cites its
+source, and the row says in place which claim still waits on a live probe. OpenRouter, the
 Moonshot pay-as-you-go platform and the mainland-China Kimi endpoint are NOT
 shipped, not even as disabled rows: a disabled row is untested code shipped
 as config.
@@ -245,7 +246,10 @@ class Vendor:
             :func:`model_router.routing._vendor_route`): every other id —
             even one the vendor's own list carries, and even one inside a
             ``bare_id_prefixes`` family — is refused locally like an unknown
-            id, and only verified ids are offered as suggestions. Without the
+            id, and only verified ids are offered as suggestions — always
+            including this row's own verified ids when the refused id is
+            under its namespace or bare-id family, however unlike the
+            refused spelling they are (``k3`` -> ``k3.1-pro``). Without the
             flag ``verified_ids`` narrows the PICKER only (the zai shape, whose
             endpoint 400s a nonsense name). :func:`validate_registry` requires
             a non-empty ``verified_ids`` on a flagged row.
@@ -351,7 +355,14 @@ VENDORS: Mapping[str, Vendor] = {
         # different model is the alias trap wearing a list.
         verified_ids=("glm-5.3", "glm-5.3-flash"),
         # The owner retired glm-5.2 in v0.2.100: only glm-5.3 is provided.
-        retired_ids=("glm-5.2",),
+        # glm-5.3-flashx / glm-5.3-flashx-legal (owner 2026-11-10) are the
+        # glm-5.3-flash weights served faster at pay-as-you-go prices, and
+        # NOT on the GLM Coding Plan this row serves (z.ai docs
+        # https://docs.z.ai/guides/vlm/glm-5.3-flash: "GLM-5.3-FlashX is not
+        # yet available on the plan"). The live list carries both; retired
+        # here so they are neither published nor forwarded: the row offers
+        # only what the plan serves.
+        retired_ids=("glm-5.2", "glm-5.3-flashx", "glm-5.3-flashx-legal"),
         # Probed live 2026-09-23: 5h (unit 3, number 5) and weekly (unit 6,
         # number 1) windows, both type CREDIT_LIMIT. The endpoint is
         # undocumented and its schema changed during 2026 (older answers
@@ -390,19 +401,33 @@ VENDORS: Mapping[str, Vendor] = {
         catalog_url=(
             "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/models"
         ),
-        # The live list carries non-chat ids (probe 2026-09-22: two
-        # qwen-audio voice rows, two wan image rows, and the "auto" router
-        # alias; qwen-asr listed for the shape the vendor's docs describe).
-        # A chat picker row that answers an error is the deprecated-model
-        # trap worn by a different list, so these never become rows.
-        # Exclusion applies to the LIVE list only — the curated static_ids
-        # below need no filter.
-        # Dated deepseek flash snapshots are curated out (owner ruling
-        # 2026-09-22): the versioned line (deepseek-v4.1-flash) is the
-        # published flash; the prefix matches only dated builds, never it.
-        catalog_exclude_prefixes=("qwen-audio", "qwen-asr", "wan", "auto",
-                                "deepseek-v4-flash-"),
-        catalog_hide_ids=("qwen3.7-plus", "deepseek-v4-pro"),
+        # The live list carries non-chat ids (probe 2026-11-10: three
+        # qwen-audio voice/ASR rows, qwen-image-3.0-pro, two wan image rows,
+        # wan3.0-video, and the "auto" router alias). A chat picker row that
+        # answers an error is the deprecated-model trap worn by a different
+        # list, so these never become rows. Since v0.2.106 two RULES in the
+        # catalog do most of this for every vendor row
+        # (catalog._exclude_by_rule): a non-chat modality segment
+        # (image/video/audio/asr/tts) and a dated build (-MMDD/-YYYYMMDD
+        # tail) the row does not offer — the latter is the owner's
+        # 2026-09-22 ruling that dated snapshots never reach the picker
+        # (deepseek-v4-flash-0731, deepseek-v4-pro-0813 on that list). What
+        # is left here is what no rule can recognise: the "auto" router
+        # alias, and "wan" — the vendor's whole image/video family (every
+        # member is non-chat; the rule already catches today's ids, the
+        # prefix keeps a future member with an unrecognised modality name
+        # out). LIVE list only — the curated static_ids below need no filter.
+        catalog_exclude_prefixes=("auto", "wan"),
+        # deepseek-v4.1-flash (undated) is hidden since v0.2.106 (owner
+        # 2026-11-10): QwenCloud serves it AND the dated build
+        # deepseek-v4.1-flash-1017 separately (live probes echo each id), and
+        # does not document which weights the undated id serves — so the
+        # dated id is the published DeepSeek flash (DeepSeek changelog
+        # https://api-docs.deepseek.com/updates/, 2026-10-17: V4.1-Flash
+        # upgraded to V4.1-Flash-1017, same architecture/prompt format, new
+        # weights). Hidden, not retired: an agent file still pinned to the
+        # undated id keeps answering until its bundle update.
+        catalog_hide_ids=("qwen3.7-plus", "deepseek-v4-pro", "deepseek-v4.1-flash"),
         # The owner retired glm-5.2 in v0.2.100 (every route): the live list
         # still carries it, the gateway neither publishes nor routes it.
         retired_ids=("glm-5.2",),
@@ -413,15 +438,17 @@ VENDORS: Mapping[str, Vendor] = {
         # undocumented one.
         alias_trap=False,
         # The keyless / fetch-failed fallback, live-verified against the
-        # compatible-mode list (probe 2026-09-22): the fifteen live ids minus
-        # the six excluded (five non-chat modalities plus the dated deepseek
-        # flash snapshot, owner-curated out) and glm-5.2 (retired, below). Publishing trims two more via
-        # catalog_hide_ids below. validate_registry requires static_ids on
-        # a catalog_url row.
+        # compatible-mode list (probe 2026-11-10): the twenty live ids minus
+        # the eight non-chat ids, the two un-offered dated builds and the
+        # retired glm-5.2. Publishing trims three more via catalog_hide_ids
+        # above. deepseek-v4.1-flash-1017 is listed HERE, which is what makes
+        # it an offered id the dated-build rule keeps (owner 2026-11-10: the
+        # one approved dated build). validate_registry requires static_ids
+        # on a catalog_url row.
         static_ids=(
             "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
-            "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash",
-            "deepseek-v4-pro",
+            "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash", "deepseek-v4-pro",
         ),
         # No quota_url: the Token Plan is monthly credits with no endpoint
         # and no quota headers (probed 2026-09-23), so usage shows the
@@ -450,7 +477,8 @@ VENDORS: Mapping[str, Vendor] = {
         partial_message_start_usage=True,
     ),
     # Kimi Code — the Kimi membership's coding subscription (owner order
-    # 2026-10-07). Docs read 2026-10-07; the pages:
+    # 2026-10-07; K3.1 Pro replaces K3 by owner ruling 2026-11-10). Docs read
+    # 2026-10-07, the models page re-read 2026-11-10; the pages:
     #   overview   https://www.kimi.com/code/docs/
     #   models     https://www.kimi.com/code/docs/kimi-code/models.html
     #   Claude Code https://www.kimi.com/code/docs/third-party-tools/claude-code.html
@@ -459,6 +487,11 @@ VENDORS: Mapping[str, Vendor] = {
     # LIVE-PROBED 2026-10-07 with the owner's key (coordinator probe): the
     # messages endpoint, both auth headers, the model list, a Cloudflare
     # user-agent gate and a wildcard alias — each noted at its field below.
+    # LIVE-PROBED 2026-11-10 (coordinator + lane probes, owner's key, client
+    # user-agent): /v1/models lists six ids incl. ``k3.1-pro`` (display "K3.1
+    # Pro", context_length 1048576, supports_image_in true, think_efforts
+    # low/high/max default high); POST /v1/messages with ``k3.1-pro`` answers
+    # 200 with thinking on and 400 with thinking disabled (see effort.py).
     "kimi": Vendor(
         vendor_id="kimi",
         display_suffix=" · Kimi Code subscription",
@@ -498,20 +531,21 @@ VENDORS: Mapping[str, Vendor] = {
         # so resolving it would send a platform key to the coding endpoint —
         # or borrow a project's own platform key for VCO's use.
         secret_keys=("kimi_api_key", "KIMI_API_KEY"),
-        # ``k3`` typeable without the namespace. Any other ``k3…`` id lands
-        # on this row and is refused there with ``claude-gw/kimi/k3`` as the
-        # suggestion (``forward_verified_only``) — rather than falling
+        # ``k3.1-pro`` typeable without the namespace. Any other ``k3…`` id —
+        # ``k3`` itself included, offered until the 2026-11-10 ruling — lands
+        # on this row and is refused there with ``claude-gw/kimi/k3.1-pro`` as
+        # the suggestion (``forward_verified_only``) rather than falling
         # through to the generic unknown-model refusal.
         bare_id_prefixes=("k3",),
         # ``GET <upstream>/v1/models`` answers an OpenAI-style
         # ``{"data": [...]}`` list (live 200, 2026-10-07) — the envelope the
         # catalog already parses — so the row rides the ordinary LIVE path.
         # Its ``context_length`` is read as the publisher's window
-        # (``CatalogService._parse_models``), below the cited seed row for k3
-        # — which states the same 1048576 the live list reports (live
-        # /v1/models probe 2026-10-07). ``supports_image_in`` (true for k3)
-        # and ``think_efforts`` (low/high/max, default high) are not read;
-        # the seed row and effort.py record them.
+        # (``CatalogService._parse_models``), below the cited seed row for
+        # k3.1-pro — which states the same 1048576 the live list reports
+        # (live /v1/models probe 2026-11-10). ``supports_image_in`` (true for
+        # k3.1-pro) and ``think_efforts`` (low/high/max, default high) are not
+        # read; the seed row and effort.py record them.
         catalog_path="/v1/models",
         # Claude Code is told to set ANTHROPIC_API_KEY (Claude Code page,
         # step 3), which it sends as ``X-Api-Key``. Live 2026-10-07: the
@@ -533,29 +567,38 @@ VENDORS: Mapping[str, Vendor] = {
         # router's: ``forward_verified_only`` below forwards only the
         # verified id and refuses everything else locally; the honest-naming
         # guard additionally refuses any Claude-marked id, as for every
-        # vendor. One further DOCUMENTED substitution the gateway cannot
-        # see: with thinking turned OFF the vendor answers k3 requests with
-        # K2.8 Preview without thinking ("关闭 thinking 后路由到 K2.8 Preview
-        # 无思考版"); the live list reports k3's thinking as "only" (always
-        # on), which suggests the off switch does not apply to k3 — UNVERIFIED.
+        # vendor. Thinking OFF: for the K3 series the vendor answers with
+        # K2.8 Preview without thinking (a silent substitution); for the K3.1
+        # Pro series it REFUSES ("关闭思考的请求会被拒绝", models page
+        # 2026-11-10; live 2026-11-10: HTTP 400 "K3.1 Pro does not support
+        # disabled thinking mode"). The gateway never forwards a PARSED
+        # k3.1-pro request with thinking off: effort.py's k3.1-pro row
+        # (``thinking_off_effort``) sends it with thinking on at low. A body
+        # past ``rewrite_buffer_bytes`` (32 MiB default) is streamed through
+        # unparsed and unshaped, as for every rule (review B-L2).
         alias_trap=True,
         forward_verified_only=True,
-        # OWNER RULING 2026-10-07: the gateway offers K3 ONLY ("only need
-        # K3"). The vendor serves four ids (models page, "共 4 个模型 ID"; the
-        # live list carries the same four). ``k3`` is the one offered and
-        # the one forwarded; ``k3-256k`` (the same model at a 256K window,
-        # "K3 的 256K 上下文版本"), ``kimi-for-coding`` (K2.8 Preview) and
-        # ``kimi-for-coding-highspeed`` (K2.7 Code HighSpeed) are WITHHELD
-        # from the picker (reported in ``_vct_catalog_hidden``; the
-        # VCT_MODEL_GATEWAY_CATALOG=all knob does not bring them back) and
-        # REFUSED by the router (``forward_verified_only``). "Verified" here
-        # means the owner's scope ruling plus the vendor's own list and docs
-        # naming k3 as K3 — it cannot mean "answered as itself", because this
-        # endpoint echoes any name (see alias_trap).
-        verified_ids=("k3",),
+        # OWNER RULING 2026-11-10: "Kimi K3.1 Pro REPLACES K3 in VCO" — the
+        # gateway forwards ``k3.1-pro`` ONLY, and ``k3`` is no longer offered
+        # (it replaced the 2026-10-07 ruling "only need K3"). The vendor
+        # serves six ids (models page 2026-11-10, "目前提供 6 个模型"; the
+        # live list carries the same six): ``k3.1-pro`` is the one offered
+        # and the one forwarded; ``k3.1-pro-highspeed`` (same model, "约为普速
+        # 版两倍" usage), ``k3``, ``k3-256k``, ``kimi-for-coding`` (K2.8
+        # Preview) and ``kimi-for-coding-highspeed`` (K2.7 Code HighSpeed)
+        # are WITHHELD from the picker (reported in ``_vct_catalog_hidden``;
+        # the VCT_MODEL_GATEWAY_CATALOG=all knob does not bring them back)
+        # and REFUSED by the router (``forward_verified_only``), each refusal
+        # naming ``claude-gw/kimi/k3.1-pro``. "Verified" here means the
+        # owner's ruling plus the vendor's own list and docs naming k3.1-pro
+        # as K3.1 Pro — it cannot mean "answered as itself", because this
+        # endpoint echoes any name (see alias_trap). The docs also advise a
+        # NEW session rather than switching a K3 conversation to K3.1 Pro
+        # (cache and reasoning-chain effects) — guidance, not a gateway rule.
+        verified_ids=("k3.1-pro",),
         # No static_ids: a standard-discovery row's keyless / fetch-failed
         # fallback is the shipped snapshot (``static_catalog.json``, family
-        # ``kimi``: the ids the live list carried on 2026-10-07), served
+        # ``kimi``: the ids the live list carried on 2026-11-10), served
         # under the ``static`` source and narrowed by verified_ids like a
         # live answer.
         # LIVE-PROBED 2026-10-07 with the owner's key (coordinator probe):
@@ -725,13 +768,7 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "or has surrounding whitespace — matching is exact, so "
                     "it would retire nothing, silently",
                 )
-            offered = {
-                i.lower() for i in (
-                    *vendor.static_ids, *vendor.verified_ids,
-                    *vendor.catalog_hide_ids,
-                )
-            }
-            if retired.lower() in offered:
+            if retired.lower() in offered_ids(vendor):
                 raise RegistryError(
                     f"vendor {key!r}: retired_ids entry {retired!r} is also "
                     "declared as served (static/verified/hidden) — an id "
@@ -771,6 +808,24 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "Claude marker, so the truth filter would keep the one "
                     "id the honest-naming guard refuses",
                 )
+
+
+def offered_ids(vendor: Vendor) -> frozenset[str]:
+    """The ids this row EXPLICITLY declares it serves, lower-cased.
+
+    ``static_ids`` + ``verified_ids`` + ``catalog_hide_ids`` (hidden is
+    "routable by name"). One home for the question three readers ask: the
+    registry gate (an id cannot be both offered and retired), the router's
+    known-id set, and the catalog's dated-build rule (a dated build reaches
+    the picker only when the row offers it by name).
+    """
+    return frozenset(
+        model_id.strip().lower()
+        for model_id in (
+            *vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids,
+        )
+        if model_id and model_id.strip()
+    )
 
 
 def vendor_display_name(vendor: Vendor) -> str:
@@ -862,6 +917,7 @@ __all__ = [
     "VENDORS",
     "Vendor",
     "context_overflow_maximum",
+    "offered_ids",
     "validate_registry",
     "vendor_display_name",
 ]

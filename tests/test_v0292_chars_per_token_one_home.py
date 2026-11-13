@@ -89,8 +89,15 @@ def test_the_sites_read_the_home():
     assert embedding_service._chars_per_token_text() == chunking.CHARS_PER_TOKEN_TEXT
     assert query_enrichment._approx_chars_per_token() == chunking.CHARS_PER_TOKEN_TEXT
     assert embedding_service._CHARS_PER_TOKEN == chunking.CHARS_PER_TOKEN_TEXT  # PEP 562 alias
-    assert code_truncation._max_chars_for_model("jina-embeddings-v2-base-code") == int(
-        chunking._num_ctx_for_model("jina-embeddings-v2-base-code") * chunking.CHARS_PER_TOKEN_CODE
+    # v0.2.106: a registered code model's budget is the tighter of the
+    # chars-per-token estimate and the shared dense bound (which binds);
+    # an unregistered model still reads CHARS_PER_TOKEN_CODE from the home.
+    assert code_truncation._max_chars_for_model("jina-embeddings-v2-base-code") == min(
+        int(chunking._num_ctx_for_model("jina-embeddings-v2-base-code") * chunking.CHARS_PER_TOKEN_CODE),
+        chunking.dense_char_budget("jina-embeddings-v2-base-code"),
+    )
+    assert code_truncation._max_chars_for_model("not-a-registered-code-model") == int(
+        code_truncation._DEFAULT_TOKEN_LIMIT * chunking.CHARS_PER_TOKEN_CODE
     )
     # The wave-later importers (register #50 extension).
     assert answer_window._chars_per_token_text() == chunking.CHARS_PER_TOKEN_TEXT

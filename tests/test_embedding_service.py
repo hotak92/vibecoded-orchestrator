@@ -2774,13 +2774,15 @@ class ArcticSecondaryFanoutTests(unittest.TestCase):
         self.assertFalse(trunc3)
         self.assertEqual(sub3, big)
 
-    def test_oversized_chunk_tags_arctic_secondary_active_full_fidelity(self):
-        """WP-O rework RED-PROOF (tagged-degradation + active fidelity): a chunk
-        larger than arctic's num_ctx must (a) tag arctic2_embed in
-        last_secondary_truncated, (b) embed the arctic secondary from a BOUNDED
-        sub-window, while (c) the ACTIVE qwen3 slot is embedded from the FULL text.
-        Reverting `_bounded_for_secondary` to pass the full text to every secondary
-        would clear the tag → this fails.
+    def test_oversized_chunk_splits_arctic_secondary_active_full_fidelity(self):
+        """WP-O rework + v0.2.106 ("extra rows in both places"): a chunk
+        larger than arctic's char-budget ESTIMATE must (a) NOT tag
+        arctic2_embed — (b) the arctic secondary is attempted WHOLE, in one
+        call (it used to be one bounded leading sub-window, then pieces within
+        the budget averaged into one vector; a model that accepts the text
+        now gets the text), while (c) the ACTIVE qwen3 slot is embedded from
+        the FULL text in one call. A real refusal splits the chunk into rows
+        inside a row writer (tests/test_v02106_split_on_refusal.py).
         """
         from vco_lib.embedding_service import _CHARS_PER_TOKEN
         with _EnvIsolation(), patch.dict(
@@ -2797,10 +2799,10 @@ class ArcticSecondaryFanoutTests(unittest.TestCase):
             )
             # A chunk sized to qwen3's xlarge budget (well over arctic's 4096 ctx).
             big = "word " * (5000 * _CHARS_PER_TOKEN)  # far over arctic's char budget
-            captured: dict[str, int] = {}
+            captured: dict[str, list[int]] = {}
 
             def _embed(model, text, *a, **k):
-                captured[model] = len(text)
+                captured.setdefault(model, []).append(len(text))
                 return [0.1, 0.2, 0.3]
             svc.ollama.embed.side_effect = _embed
             try:
@@ -2811,20 +2813,13 @@ class ArcticSecondaryFanoutTests(unittest.TestCase):
             # Both slots written.
             self.assertIn("qwen3_embed", slots)
             self.assertIn("arctic2_embed", slots)
-            # (a) arctic slot tagged truncated.
-            self.assertTrue(
-                truncated.get("arctic2_embed"),
-                "an oversized chunk must tag arctic2_embed as secondary-truncated",
-            )
-            # (b) arctic embedded from a BOUNDED sub-window (< full text).
-            arctic_len = captured[ARCTIC_SECONDARY_MODEL]
-            self.assertLess(
-                arctic_len, len(big),
-                "arctic secondary must embed a bounded sub-window, not the full chunk",
-            )
+            # (a) nothing was cut, so nothing is tagged.
+            self.assertFalse(truncated.get("arctic2_embed"))
+            # (b) arctic attempted whole, once — no estimate pre-split.
+            self.assertEqual(captured[ARCTIC_SECONDARY_MODEL], [len(big)])
             # (c) the ACTIVE qwen3 slot saw the FULL text (fidelity ≥ single-write).
             self.assertEqual(
-                captured[DEFAULT_TEXT_MODEL], len(big),
+                captured[DEFAULT_TEXT_MODEL], [len(big)],
                 "the ACTIVE slot must embed the FULL chunk — its fidelity must never "
                 "drop below single-write (no-functionality-loss rule)",
             )

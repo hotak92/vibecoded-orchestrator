@@ -1,0 +1,33 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+-- Copyright (c) 2026 VibeCoded Tools
+-- vct-rl-reranker module — migration 0003 (v0.2.7, hotfixed in v0.2.8)
+-- Add weights_version column to rl_weights_state.
+--
+-- v0.2.8 HOTFIX (2026-05-31): the original v0.2.7 0003 also tried to
+-- ADD COLUMN embedding_source, but that column was already declared in
+-- 0002's CREATE TABLE (as part of the composite primary key). On any
+-- fresh module install the original 0003 would fail with
+-- "duplicate column name: embedding_source", rolling back the
+-- transaction and bailing the rest of the migration chain. v0.2.7 was
+-- shipped but the launcher's module_db_migrations table on dogfood
+-- machines shows zero RL rows applied — confirming no install actually
+-- progressed past this point. So changing 0003's SQL here is safe:
+-- (a) on dogfood machines the original 0003 never applied, so there's
+-- no sha-mismatch to fire; (b) the original launcher tx rollback means
+-- weights_version wasn't added either, so the column add below is
+-- still needed.
+--
+-- Context (per rl-v0.2.6-post-install-feedback-2026-05-24.md R5):
+-- v0.2.6's rl_weights_state.local_version was written as the arch_version
+-- string ("v2") because no weights_version field existed on the checkpoint.
+-- v0.2.7 introduced weights_version (semver of the trained checkpoint,
+-- e.g. "0.2.6") as first-class checkpoint metadata. Container reads it
+-- on _try_load and writes it here for the dashboard to display.
+--
+-- embedding_source already exists from 0002 — it's part of the table's
+-- composite primary key (project_id, embedding_source).
+--
+-- Owner: vct-rl-reranker (namespace "rl").
+-- Forward-only. SHA256 pinned in module_db_migrations on apply.
+
+ALTER TABLE rl_weights_state ADD COLUMN weights_version TEXT NOT NULL DEFAULT '';

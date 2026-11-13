@@ -95,17 +95,23 @@ def _arctic_secondary_service(monkeypatch, stub: _StubOllama) -> EmbeddingServic
 
 
 def test_tagged_returns_truncated_slot_atomically(monkeypatch):
-    """A chunk larger than arctic's num_ctx budget → the arctic secondary is
-    embedded from a sub-window and ``embed_text_all_configured_tagged`` reports
-    ``arctic2_embed`` truncated, in the SAME return as the vectors."""
+    """A chunk larger than arctic's num_ctx budget: since v0.2.106 the arctic
+    secondary is embedded as pieces within the budget and combined, so
+    ``embed_text_all_configured_tagged`` reports NO truncated slot in the
+    SAME return as the vectors. The capture itself stays atomic: the QUERY
+    fan-out, which still sub-windows, leaves ``arctic2_embed`` in the record
+    the next tagged capture resets."""
     stub = _StubOllama()
     svc = _arctic_secondary_service(monkeypatch, stub)
     big = "x" * (_ARCTIC_CHAR_BUDGET + 5000)  # exceeds arctic, within qwen3
+    svc.embed_text_query_all_configured(big)
+    assert svc._last_truncated_slots.get("arctic2_embed") is True
     slots, truncated = svc.embed_text_all_configured_tagged(big)
     assert "qwen3_embed" in slots, "active slot always written"
     assert "arctic2_embed" in slots, "arctic secondary written"
-    assert truncated == ["arctic2_embed"], (
-        "the arctic secondary was sub-windowed → tagged truncated atomically"
+    assert truncated == [], (
+        "split on refusal: the arctic secondary embedded every character, "
+        "and the capture describes THIS call, not the earlier query"
     )
 
 
@@ -223,14 +229,16 @@ def _big_multichunk_text() -> str:
     # arctic's num_ctx (so its arctic secondary truncates) and the small trailing
     # chunk fits (so its arctic secondary does NOT) — a mixed corpus that PROVES
     # per-chunk partitioning.
-    # 560 items (defect-1 bound, v0.2.92): chunks are ≈ 33.8k / 33.6k / 1.4k
-    # chars — the first two exceed arctic's 7 065-char budget (truncated),
-    # the 1.4k tail fits (full fidelity). At the previous 640 items the tail
-    # was 11.2k chars and ALSO exceeded the budget, collapsing the partition.
+    # 330 items (v0.2.106 dense chunk budget — qwen3 chunks max 19 560
+    # chars): chunks are ≈ 19.5k / 19.6k / 1.4k chars — the first two exceed
+    # arctic's 7 065-char budget (truncated), the 1.4k tail fits (full
+    # fidelity). (Under the v0.2.92 presets 560 items gave 33.8k / 33.6k /
+    # 1.4k; at 560 items today the tail is 10.1k and ALSO exceeds the budget,
+    # collapsing the partition.)
     sentence = "The retrieval model scores each candidate node against the query. "
     return " ".join(
         f"{sentence}Item {i} details here and more words to pad this nicely."
-        for i in range(560)
+        for i in range(330)
     )
 
 

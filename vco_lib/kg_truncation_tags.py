@@ -66,10 +66,13 @@ So the answerable set is stored explicitly:
 * the reader treats a slot absent from the list as UNKNOWN.
 
 The residual honest gap this leaves is UNDER-reporting, never
-over-claiming: e.g. the enrichment batch flush can prove a leading window
-from the shared ``_bounded_for_model`` pre-bound, but cannot see the
-per-item shrink that happens after a whole-batch refusal — so it passes
-``None`` there and the slot reads UNKNOWN instead of a wrong ``False``.
+over-claiming: e.g. the enrichment batch flush proves a leading window only
+from its own char cap, and since v0.2.106 proves ``False`` on the Ollama and
+CodeEmbed legs (they embed every input whole; a refused one gets no vector
+and is re-laid as split rows by its writer) — but the OpenAI leg reports
+nothing back, so it
+passes ``None`` there and the slot reads UNKNOWN instead of a wrong
+``False``.
 
 Hard constraints this module enforces (W3 brief):
 
@@ -223,7 +226,7 @@ def merge_slot_truncation(
         slot: The slot whose vector this patch writes.
         truncated: The patch's OWN verdict — see the table above. ``True``
             only when the caller positively knows the embedded text was a
-            leading sub-window (its own char cap, or the shared
+            leading sub-window (its own char cap, or a query's
             ``_bounded_for_model`` bound); ``False`` only when it positively
             knows the FULL text was embedded; ``None`` otherwise.
         active_text_slot: The ACTIVE text slot NAME, used to derive the

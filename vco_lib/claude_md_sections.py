@@ -34,11 +34,14 @@ UUID, so explicit rows never reached the render).
     "not installed here" (plan risk 7: the binary is not probed — the hook
     is a documented no-op without it).
 ``rl_retrieval``
-    the paid RL module is enabled — the SAME call the retrieval pipeline
-    gates on (``VCThelpers.license.feature_enabled("rl_retrieval",
-    module_id="vct-rl-reranker")``, ``claude_mcp_servers/rl_client/
-    search_pipeline.py``), so the section and the behaviour it describes can
-    not drift apart.
+    RL reranking is active for the folder — the SAME two gates the retrieval
+    pipeline applies (``claude_mcp_servers/rl_client/search_pipeline.py::
+    _resolve_rl_enabled``), in the same order: the shipped scoring lock
+    (``vco_lib/rl_scoring_lock.toml``; locked = off, definitively) and then
+    the folder's ``rl_reranker_enabled_for_project`` toggle served by the hub
+    (``vco_lib.project_config.resolve``). So the section and the behaviour it
+    describes cannot drift apart. v0.2.106: there is no licence gate any more
+    (the reranker ships with VCO), so no licence is probed.
 
 ``provider_zai`` / ``provider_qwen`` / ``provider_kimi`` / ``provider_glm``
     (v0.2.103, plan item 12) the provider-conditional prose of the project
@@ -61,10 +64,10 @@ and never raises — a failed probe is one stderr line, the same shape as
 extracts the conditional-tag names a template actually carries, and a caller
 that holds the template text passes them as ``needed``. A probe skipped
 because the document has no tag for it cannot change the output, and one
-probe is NOT free to run speculatively: the license validator behind
-``rl_retrieval`` resolves the machine's license key and may contact the
-licensing backend, so running it for a template with no RL section would put
-a network-shaped side effect into every project render. ``needed=None`` (the
+probe is NOT free to run speculatively: once the scoring lock lifts, the
+``rl_retrieval`` probe asks the local hub for the folder's project config, so
+running it for a template with no RL section would put a hub round-trip into
+every project render. ``needed=None`` (the
 default) probes everything and is what a caller without the template text
 uses.
 """
@@ -129,11 +132,6 @@ _SETTINGS_REL = Path(".claude") / "settings.json"
 #: ``hooks`` tree (the shipped registration commands name the hook script;
 #: the launcher's toggle removes the entry when the hook is disabled).
 _LEAN_CTX_HOOK_MARKER = "lean-ctx-rewrite"
-
-#: The per-module license id the RL pipeline itself passes (one call shape,
-#: so a per-module RL key unlocks the section exactly when it unlocks the
-#: reranking).
-_RL_MODULE_ID = "vct-rl-reranker"
 
 #: Conditional-tag names a template carries. Deliberately LOOSER than the
 #: renderer's whole-line grammar (``project_init.render_conditional_blocks``):
@@ -298,24 +296,33 @@ def _provider_renders(folder: Path, vendors: tuple[str, ...], *,
     return any(v in reachable for v in vendors)
 
 
-def _rl_renders() -> bool:
-    """Is the paid RL reranking module enabled on this machine's license?
+def _rl_renders(folder: Path) -> bool:
+    """Is RL reranking active for ``folder``?
 
-    The SAME call the retrieval pipeline gates on, so the section describes
-    exactly the behaviour the pipeline will have. An unavailable validator is
-    a broken install on a root that ships it — the conservative direction
-    keeps the text.
+    The pipeline's own gates in the pipeline's order (see the module
+    docstring): a set scoring lock is a definitive "no"; below it the hub's
+    per-project toggle decides, and only an explicit ``True`` is on — the
+    pipeline's opt-in rule (v0.2.106, owner 2026-11-12). A probe that cannot
+    answer renders the section (the conservative direction of this module:
+    a failed detection never hides text).
     """
     try:
-        from VCThelpers.license import feature_enabled
-    except Exception as exc:  # noqa: BLE001 — import-guarded by design (plan D2)
-        _warn(f"license validator unavailable: {exc} — rendering the RL section")
+        from vco_lib.rl_scoring_lock import rl_scoring_lock_reason
+
+        if rl_scoring_lock_reason() is not None:
+            return False
+    except Exception as exc:  # noqa: BLE001 — a probe answers, it never raises
+        _warn(f"RL scoring-lock probe failed: {exc} — rendering the RL section")
         return True
     try:
-        return bool(feature_enabled(RL_RETRIEVAL, module_id=_RL_MODULE_ID))
-    except Exception as exc:  # noqa: BLE001 — a probe answers, it never raises
-        _warn(f"RL license probe failed: {exc} — rendering the RL section")
+        from vco_lib import project_config
+
+        cfg = project_config.resolve(folder)
+    except Exception as exc:  # noqa: BLE001 — hub down / not registered
+        _warn(f"RL per-project toggle probe failed for {folder}: {exc} — "
+              "rendering the RL section")
         return True
+    return getattr(cfg, "rl_reranker_enabled_for_project", False) is True
 
 
 def active_sections(
@@ -363,7 +370,7 @@ def active_sections(
     if LEAN_CTX in probe and _lean_ctx_renders(folder):
         sections.add(LEAN_CTX)
 
-    if RL_RETRIEVAL in probe and _rl_renders():
+    if RL_RETRIEVAL in probe and _rl_renders(folder):
         sections.add(RL_RETRIEVAL)
 
     for feature_id, vendors in PROVIDER_FEATURES.items():

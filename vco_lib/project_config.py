@@ -565,23 +565,21 @@ class ProjectConfig:
     #: v0.2.49 Stream B — per-project enable toggle for the RL Reranker
     #: (a global-scope module). Source: hub reads
     #: ``module_settings(project_id, "vct-rl-reranker", "enabled_for_project")``
-    #: and exposes the resolved bool here. Default ``True`` when no row
-    #: exists (fail-open: a corrupted setting never silently disables
-    #: a module the user expects to work).
+    #: and exposes the resolved bool here.
     #:
-    #: Consumer: ``claude_mcp_servers/weaviate_mcp/server.py::
-    #: _rl_cache_and_rerank`` reads this and short-circuits the rerank
-    #: request when ``False`` — search returns base cosine order
-    #: instead. The server-side telemetry path
-    #: (``/data/logs/rl_events_<slug>.jsonl``) is untouched: that file
-    #: is written by the RL container itself, not by the MCP, so
-    #: disabling the client gate cannot drop training events.
+    #: v0.2.106 (owner rulings 2026-11-12): the hub serves the EFFECTIVE
+    #: value — the user's choice, else the bundled-weights default (on only
+    #: with a trained model bundled for the active profile:
+    #: ``vco_lib/rl_scoring_default.py``). This field's own default is
+    #: ``False``: an absent field (a hub that predates it) cannot confirm the
+    #: user's choice, which wins over the default, so it must not turn on a
+    #: feature. (Before v0.2.106 the default was a fail-open ``True``.)
     #:
-    #: Pre-v0.2.49 hubs paired with v0.2.49+ clients omit the field;
-    #: the parser back-fills with ``True`` so old hubs don't crash new
-    #: clients. Declared last to keep frozen-dataclass init signature
-    #: backward-compat.
-    rl_reranker_enabled_for_project: bool = True
+    #: Consumer: ``claude_mcp_servers/rl_client/search_pipeline.py::
+    #: _resolve_rl_enabled`` (the rerank AND the answer monitor's
+    #: ``/rl_update``): ``False`` = no call to the container; search keeps
+    #: its order. Event LOGGING never reads it.
+    rl_reranker_enabled_for_project: bool = False
     #: V52-AA (v0.2.52) — per-project RL Reranker container port. Source:
     #: hub reads ``module_ports(project_id, "vct-rl-reranker", port)``
     #: (canonical SoT since migration 017 / v0.2.26) and exposes the
@@ -1542,14 +1540,12 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             code_graph_extra_paths=_parse_extra_codegraph_paths(
                 body.get("code_graph_extra_paths", []),
             ),
-            # v0.2.49 Stream B additive field — pre-v0.2.49 hubs omit it;
-            # default ``True`` matches the hub-side fail-open default
-            # (`Db::module_is_enabled_for_project` returns true on absent
-            # row) and the launcher GUI's "no opinion = enabled" UX. Old
-            # hubs paired with new clients see the default; new hubs
-            # paired with old clients have the field silently ignored.
-            rl_reranker_enabled_for_project=bool(
-                body.get("rl_reranker_enabled_for_project", True)
+            # v0.2.49 Stream B additive field. v0.2.106: OPT-IN (owner
+            # 2026-11-12) — only an explicit ``true`` from the hub turns RL
+            # scoring on; an absent field (older hub) or a non-bool is off,
+            # matching the hub's system default for this module.
+            rl_reranker_enabled_for_project=(
+                body.get("rl_reranker_enabled_for_project", False) is True
             ),
             # V52-AA (v0.2.52) additive field — pre-V52-AA hubs omit it;
             # default ``None`` matches the Rust handler's

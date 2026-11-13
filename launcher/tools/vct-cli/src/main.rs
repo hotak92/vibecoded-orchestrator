@@ -120,8 +120,24 @@ enum ProjectCmd {
         id_or_slug: String,
         new_name: String,
     },
-    /// Delete a project (id or slug).
-    Delete { id_or_slug: String },
+    /// Remove a project from VCO (id or slug) — the same removal as the
+    /// launcher's "Remove from VCO": VCO's files and settings entries leave
+    /// the folder, the project's own collections are dropped, and the folder
+    /// and your own files stay. Shows what it would remove and asks y/N
+    /// first; without a terminal it needs --yes.
+    Delete {
+        id_or_slug: String,
+        /// Keep the project's Weaviate collections.
+        #[arg(long)]
+        keep_collections: bool,
+        /// Finish even when a value VCO wrote could not be removed (the
+        /// removal lists each one to clean by hand).
+        #[arg(long)]
+        leave_unremovable: bool,
+        /// Remove without asking (needed when not run from a terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Print info for a single project (id or slug).
     Show { id_or_slug: String },
 }
@@ -269,6 +285,10 @@ enum CodegraphCmd {
 struct Hub {
     base: String,
     client: reqwest::blocking::Client,
+    /// For the project removal and its preview, which the hub runs to the
+    /// end — up to `REMOVE_PROJECT_LIMIT` (1800 s) in `vct-hub cli_api.rs`
+    /// (review M1: the 15 s client gave up on removals that then finished).
+    long_client: reqwest::blocking::Client,
     /// Bearer token read from `<vct_root_dir>/hub.token`. `None` when
     /// the file is missing or empty — we still try the request (so
     /// `health` and other unauthenticated endpoints keep working) but
@@ -280,20 +300,10 @@ impl Hub {
     fn new(port_override: Option<u16>) -> Result<Self> {
         let port = resolve_port(port_override)?;
         let base = format!("http://127.0.0.1:{}/api/v1", port);
-        // MUST MATCH `vct_launcher_core::services::loopback_http` (the one
-        // loopback-client rule; this crate is a separate workspace without
-        // that dependency, and its client is blocking): the request carries
-        // the hub bearer token to 127.0.0.1, so no proxy — reqwest does not
-        // exempt loopback from HTTP_PROXY — and no redirects. Pinned by
-        // `tests::the_hub_client_never_goes_through_a_proxy`.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("build http client")?;
+        let client = loopback_client(std::time::Duration::from_secs(15))?;
+        let long_client = loopback_client(REMOVE_WAIT)?;
         let token = resolve_token();
-        Ok(Self { base, client, token })
+        Ok(Self { base, client, long_client, token })
     }
 
     fn url(&self) -> &str {
@@ -400,16 +410,50 @@ impl Hub {
         serde_json::from_str(&resp_body).with_context(|| format!("decode {}", path))
     }
 
-    fn delete_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+    /// DELETE with the long client: the hub answers when the removal ENDS.
+    fn delete_json_long<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let url = format!("{}{}", self.base, path);
         let (status, body) = self.send_with_stale_token_retry(|tok| {
-            Self::with_auth_token(self.client.delete(&url), tok)
+            Self::with_auth_token(self.long_client.delete(&url), tok)
         })?;
         if !status.is_success() {
             return Err(anyhow!("hub error {}: {}", status, body));
         }
         serde_json::from_str(&body).with_context(|| format!("decode {}", path))
     }
+
+    /// GET with the long client (the removal preview runs two Python calls).
+    fn get_json_long<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
+        let url = format!("{}{}", self.base, path);
+        let (status, body) = self.send_with_stale_token_retry(|tok| {
+            Self::with_auth_token(self.long_client.get(&url), tok)
+        })?;
+        if !status.is_success() {
+            return Err(anyhow!("hub error {}: {}", status, body));
+        }
+        serde_json::from_str(&body).with_context(|| format!("decode {}", path))
+    }
+}
+
+/// How long `project delete` waits for the hub: its removal bound
+/// (`REMOVE_PROJECT_LIMIT`, 1800 s, in `vct-hub cli_api.rs`) plus a margin
+/// for the launcher's start and the answer.
+const REMOVE_WAIT: std::time::Duration = std::time::Duration::from_secs(1800 + 120);
+
+/// The one loopback client rule of this crate, at a given timeout.
+// MUST MATCH `vct_launcher_core::services::loopback_http` (the one
+// loopback-client rule; this crate is a separate workspace without that
+// dependency, and its client is blocking): the request carries the hub
+// bearer token to 127.0.0.1, so no proxy — reqwest does not exempt loopback
+// from HTTP_PROXY — and no redirects. Pinned by
+// `tests::the_hub_client_never_goes_through_a_proxy`.
+fn loopback_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build http client")
 }
 
 /// Read the auth token from `<VCT_STATE_DIR or ~/.vct>/hub.token`.
@@ -598,6 +642,72 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
     Ok(())
 }
 
+/// The hub path for `project delete`: the hub runs the launcher's full
+/// removal (`DELETE /cli/projects/{id}`), and the two flags travel as its
+/// `keep_collections` / `leave_unremovable` query options. `confirmed` is
+/// the hub's own guard (review L7, owner ruling 2026-11-11): a removal that
+/// DROPS the collections is refused unless the request says the caller asked
+/// first — vct-cli sends `confirm=true` only after the y answer or `--yes`.
+fn delete_project_path(
+    id_or_slug: &str,
+    keep_collections: bool,
+    leave_unremovable: bool,
+    confirmed: bool,
+) -> String {
+    let mut path = format!("/cli/projects/{}", id_or_slug);
+    let mut opts: Vec<&str> = Vec::new();
+    if keep_collections {
+        opts.push("keep_collections=true");
+    }
+    if leave_unremovable {
+        opts.push("leave_unremovable=true");
+    }
+    if confirmed {
+        opts.push("confirm=true");
+    }
+    if !opts.is_empty() {
+        path.push('?');
+        path.push_str(&opts.join("&"));
+    }
+    path
+}
+
+/// The hub path of the removal preview (`GET`, changes nothing).
+fn preview_path(id_or_slug: &str, keep_collections: bool) -> String {
+    let mut path = format!("/cli/projects/{}/removal-preview", id_or_slug);
+    if keep_collections {
+        path.push_str("?keep_collections=true");
+    }
+    path
+}
+
+/// Owner ruling 2026-11-11 (review L7): `project delete` asks unless
+/// `--yes`, and refuses without a terminal — never a silent drop. MUST MATCH
+/// `confirm_mode` in `launcher/src-tauri/src/remove_project_cli.rs` (this
+/// crate is a separate workspace; the rule is three lines).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteConfirmation {
+    Go,
+    Ask,
+    Refuse,
+}
+
+fn delete_confirmation(yes: bool, interactive: bool) -> DeleteConfirmation {
+    if yes {
+        DeleteConfirmation::Go
+    } else if interactive {
+        DeleteConfirmation::Ask
+    } else {
+        DeleteConfirmation::Refuse
+    }
+}
+
+/// Only an explicit y / yes confirms. MUST MATCH `is_yes` in
+/// `launcher/src-tauri/src/commands/projects_v2/removal_preview.rs`.
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -652,8 +762,48 @@ fn project(hub: &Hub, cmd: ProjectCmd) -> Result<()> {
             let v: serde_json::Value = hub.patch_json(&format!("/cli/projects/{}", id_or_slug), &body)?;
             print_json(&v)
         }
-        ProjectCmd::Delete { id_or_slug } => {
-            let v: serde_json::Value = hub.delete_json(&format!("/cli/projects/{}", id_or_slug))?;
+        ProjectCmd::Delete { id_or_slug, keep_collections, leave_unremovable, yes } => {
+            use std::io::IsTerminal;
+            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+            match delete_confirmation(yes, interactive) {
+                DeleteConfirmation::Go => {}
+                DeleteConfirmation::Refuse => {
+                    return Err(anyhow!(
+                        "not removing {}: this is not an interactive terminal, so vct-cli cannot \
+                         ask first, and the removal drops the project's collections unless \
+                         --keep-collections is given. Nothing was changed. Run it from a \
+                         terminal to see what would be removed, or add --yes",
+                        id_or_slug
+                    ));
+                }
+                DeleteConfirmation::Ask => {
+                    let v: serde_json::Value =
+                        hub.get_json_long(&preview_path(&id_or_slug, keep_collections))?;
+                    let text = v["preview"]["text"].as_str().unwrap_or("");
+                    let name = v["preview"]["project_name"].as_str().unwrap_or(&id_or_slug);
+                    eprint!("{}Remove {:?} from VCO? [y/N] ", text, name);
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).context("read the answer")?;
+                    if !is_yes(&answer) {
+                        return Err(anyhow!("not removed; nothing was changed"));
+                    }
+                }
+            }
+            eprintln!(
+                "Removing {} — this can take several minutes on a large project (the hub \
+                 waits up to 30 minutes for it); do not start another removal of it meanwhile.",
+                id_or_slug
+            );
+            // Past this point the removal was confirmed (`--yes`, or a y at
+            // the prompt): the hub's own guard gets `confirm=true` (L7).
+            let v: serde_json::Value = hub.delete_json_long(&delete_project_path(
+                &id_or_slug,
+                keep_collections,
+                leave_unremovable,
+                true,
+            ))?;
             print_json(&v)
         }
         ProjectCmd::Show { id_or_slug } => {
@@ -903,6 +1053,109 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use std::collections::BTreeMap;
+
+    /// v0.2.106 Q5: `project delete` runs the launcher's full removal through
+    /// the hub; its flags reach the hub as query options. Review L7: the
+    /// caller's "I asked first" travels as `confirm=true` — sent only after
+    /// the y answer or `--yes` (the one caller passes `true` exactly then).
+    #[test]
+    fn project_delete_flags_become_the_hubs_query_options() {
+        assert_eq!(delete_project_path("alpha", false, false, false), "/cli/projects/alpha");
+        assert_eq!(
+            delete_project_path("alpha", true, true, false),
+            "/cli/projects/alpha?keep_collections=true&leave_unremovable=true"
+        );
+        assert_eq!(
+            delete_project_path("alpha", false, false, true),
+            "/cli/projects/alpha?confirm=true"
+        );
+        assert_eq!(
+            delete_project_path("alpha", true, false, true),
+            "/cli/projects/alpha?keep_collections=true&confirm=true"
+        );
+        let cli = Cli::try_parse_from(["vct-cli", "project", "delete", "alpha", "--keep-collections"])
+            .expect("parses");
+        match cli.command {
+            TopCommand::Project { cmd: ProjectCmd::Delete { keep_collections, leave_unremovable, yes, .. } } => {
+                assert!(keep_collections && !leave_unremovable && !yes);
+            }
+            _ => panic!("parsed into another verb"),
+        }
+        let cli = Cli::try_parse_from(["vct-cli", "project", "delete", "alpha", "--yes"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            TopCommand::Project { cmd: ProjectCmd::Delete { yes: true, .. } }
+        ));
+        assert_eq!(preview_path("alpha", false), "/cli/projects/alpha/removal-preview");
+        assert_eq!(
+            preview_path("alpha", true),
+            "/cli/projects/alpha/removal-preview?keep_collections=true"
+        );
+    }
+
+    /// Owner ruling 2026-11-11 (review L7): ask unless --yes; refuse without
+    /// a terminal; only an explicit yes confirms.
+    #[test]
+    fn project_delete_asks_unless_yes_and_refuses_without_a_terminal() {
+        assert_eq!(delete_confirmation(true, false), DeleteConfirmation::Go);
+        assert_eq!(delete_confirmation(false, true), DeleteConfirmation::Ask);
+        assert_eq!(delete_confirmation(false, false), DeleteConfirmation::Refuse);
+        assert!(is_yes("y\n") && is_yes("YES") && !is_yes("") && !is_yes("n"));
+    }
+
+    /// Review M1: the removal waits as long as the hub's removal bound, not
+    /// the 15 s of the other calls. A hub that answers after the short
+    /// client's timeout is still heard by the long one.
+    #[test]
+    fn the_removal_outwaits_the_short_timeout() {
+        assert!(REMOVE_WAIT >= std::time::Duration::from_secs(1800));
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                );
+            }
+        });
+        let short = loopback_client(std::time::Duration::from_millis(500)).unwrap();
+        assert!(short.delete(format!("http://127.0.0.1:{}/x", port)).send().is_err());
+        let long = loopback_client(std::time::Duration::from_secs(10)).unwrap();
+        let r = long.delete(format!("http://127.0.0.1:{}/x", port)).send().expect("waited");
+        assert!(r.status().is_success());
+    }
+
+    /// Review M1, end to end: the hub answers the removal after 16 s — past
+    /// the 15 s every other call allows — and `project delete`'s request
+    /// still gets the answer (it used to print "Cannot reach launcher hub"
+    /// for a removal that then finished).
+    #[test]
+    fn project_delete_hears_a_removal_that_outlasts_fifteen_seconds() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_secs(16));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                );
+            }
+        });
+        let hub = Hub::new(Some(port)).expect("client");
+        let v: serde_json::Value = hub
+            .delete_json_long(&delete_project_path("alpha", false, false, true))
+            .expect("the removal's answer arrives after 16 s");
+        assert_eq!(v["ok"], true);
+    }
 
     /// `cli_verbs.json` is the command tree other checks read without
     /// building this crate (tests/test_v0297_cli_program_names.py uses it to

@@ -84,7 +84,24 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: the child's whole process GROUP (os.killpg) — a POSIX-only primitive with
 #: no .ps1 sibling (tests/test_v02105_gateway_account_refresh.py; the Windows
 #: spawn shape is unit-tested by test_windows_spawns_the_cli_without_a_console_window).
-NON_CONVENTION_BASELINE = 188
+#: 188 -> 189 (v0.2.106 wave-1 fix round, recorded in the v0.2.106 fix2
+#: round): the code-graph resync driver-claim skip test holds the claim from a
+#: helper process through ``fcntl.flock`` — a POSIX-only primitive with no
+#: .ps1 sibling (tests/test_v02102_codegraph_resync_convergence.py,
+#: test_a_driver_claim_skip_closes_its_own_row_as_skipped).
+#: 189 -> 191 (v0.2.106 perf lane): tests/test_v02106_mcp_stdio_lifetime.py's
+#: two process tests SIGKILL a parent and wait for its reparented child /
+#: read /proc zombie state — POSIX-only primitives with no .ps1 sibling; the
+#: Windows parent-handle arm is unit-tested with a fake kernel32
+#: (test_parent_watch_windows_arm_reads_the_parent_handle).
+#: 191 -> 192 (v0.2.106 fix4): tests/test_v0292_wp4_orphan_fail_open.py now
+#: installs a real bundle and stats pre-tool-use.sh's POSIX mode bits (0o700)
+#: instead of scanning source — file modes do not exist on Windows.
+#: 192 -> 193 (v0.2.106 rlgate): tests/rl_reranker/test_startup_weights_precedence.py
+#: ::test_a_symlinked_checkpoint_is_managed creates a symlink, which needs a
+#: privilege Windows runners lack — a POSIX-only primitive, no .ps1 sibling; the
+#: marker/plain ownership classes were split out and run on Windows too.
+NON_CONVENTION_BASELINE = 193
 
 
 # -- which conditions skip on Windows --------------------------------------

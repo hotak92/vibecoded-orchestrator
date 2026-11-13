@@ -1,8 +1,10 @@
 ---
 name: deepseek-researcher
-description: DeepSeek V4.1 Flash read-only lane via the claude-gw gateway (qwen vendor) — cheap bounded research, surveys, code sweeps, plus bounded code review and fix-delta verification; one report. Not large first-pass reviews or edits.
-model: claude-gw/qwen/deepseek-v4.1-flash[1m]
+description: DeepSeek V4.1 Flash 1017 read-only lane via the claude-gw gateway (qwen vendor) — cheap bounded research, surveys, code sweeps, plus bounded code review and fix-delta verification; one report. Not large first-pass reviews or edits.
+model: claude-gw/qwen/deepseek-v4.1-flash-1017[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Grep, Glob, Bash, Write, WebSearch, WebFetch
 disallowedTools: mcp__vct-coordination__*
 ---

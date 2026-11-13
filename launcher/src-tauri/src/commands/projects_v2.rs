@@ -1263,6 +1263,14 @@ pub(crate) async fn apply_post_bundle_steps(
                  re-embeds, and it runs once (the run stamps itself).",
                 project_id, scanned
             ),
+            KgSyncSpawnReason::RechunkOwed { scanned } => tracing::info!(
+                "[vct] kg-sync spawned for {} — Weaviate holds every one of \
+                 {} node(s), but the chunker revision changed and this \
+                 project's KG has not been re-chunked under it. The pass \
+                 re-embeds only nodes whose chunks changed (content-hash \
+                 gated) and runs once (the run stamps itself).",
+                project_id, scanned
+            ),
         }
     }
     if matches!(kg_decision, KgSyncDecision::Spawn(_)) {
@@ -4766,22 +4774,26 @@ pub async fn switch_project_host_v2(
 /// the launcher never touched the user's folder). Splits the operation
 /// into two independent, opt-out-able layers:
 ///
-///   * `purge_launcher_files` (default ON): surgical removal of
-///     launcher-managed paths from `<folder>/`. Leaves user-owned content
-///     (agents, skills, CONTEXT_STATE, CLAUDE.md, source code, user-added
-///     `.env` keys) intact. See `purge_launcher_files_from_project` for
-///     the precise allowlist + deletelist.
+///   * `purge_launcher_files` (default ON): removal of what is VCO's from
+///     `<folder>/` and nothing else (v0.2.106 owner request: "Remove
+///     project" keeps `.env`, secrets, settings and every file that is not
+///     purely VCO's). A shipped file goes only while its bytes equal what the
+///     bundle manifest recorded — an agent, skill, hook or script the user
+///     changed stays and is listed in `files_kept_modified`; files VCO never
+///     shipped are never touched. See `vco_lib.unregister_files`.
 ///   * `purge_collections` (default OFF): drop the project's OWN
-///     Weaviate collections (`<Project>_KnowledgeGraph`,
-///     `<Project>_Development`). Shared collections are NEVER touched.
+///     Weaviate collections (KG, Development, Diagrams, the code-graph
+///     classes, and the classes its launcher rows bind). Shared collections,
+///     and any class another registered project uses, are NEVER touched.
 ///     OFF by default because collections can always be rebuilt from
 ///     `/knowledge` + source code via `install-bundle --update`.
 ///
-/// User-decision audit trail (2026-05-06):
-///   * (i) agents/skills are PRESERVED even though they're bundle-
-///     installed — users edit them and treat them as user content.
-///   * (ii) `.claude/scripts/` IS purged — these are launcher-managed
-///     and re-shipped on every bundle install.
+/// User-decision audit trail:
+///   * 2026-05-06 (i) agents/skills were PRESERVED whole and (ii)
+///     `.claude/scripts/` + `.claude/hooks/` purged whole. Superseded in
+///     v0.2.106 by the per-file evidence rule above (owner request): an
+///     untouched shipped agent is VCO's and goes, an edited one stays, and a
+///     user's own script under `.claude/scripts/` is no longer deleted.
 ///
 /// ONE set of defaults (review R6 F46): the struct-level `#[serde(default)]`
 /// fills a missing field from [`Default`], so `options: null` (`None` →
@@ -4830,12 +4842,28 @@ impl Default for UnregisterOptions {
 /// they just stay empty. The UI relies on `len()` to decide whether to
 /// surface a section in the toast.
 #[derive(Debug, Clone, Serialize, Default)]
+// camelCase: the hub reads this report's id as `projectId`
+// (vct_launcher_core::removal_report::REMOVAL_REPORT_PROJECT_ID_KEY, the ONE
+// spelling both sides share — v0.2.106 review H1). MUST MATCH that constant;
+// `the_report_names_its_project_id_in_camel_case` pins it against the real
+// serialization.
 #[serde(rename_all = "camelCase")]
 pub struct UnregisterReport {
     pub project_id: String,
     pub project_name: String,
-    /// Relative paths actually removed from `<folder>/`.
+    /// Relative paths actually removed from `<folder>/` — only what VCO can
+    /// prove is its own (v0.2.106, `vco_lib.unregister_files`).
     pub files_purged: Vec<String>,
+    /// Files VCO shipped that the user changed since, so they were kept.
+    pub files_kept_modified: Vec<String>,
+    /// `<rel> — <reason>` for everything else left in place (VCO's update
+    /// backups, a setting a user may also have chosen, a list VCO cannot tell
+    /// from the user's). Names only.
+    pub kept_as_yours: Vec<String>,
+    /// VCO's entries removed from files that stay — hook registrations and
+    /// permission entries in `.claude/settings.json`, its `.git/info/exclude`
+    /// blocks, the MCP opt-outs it wrote to `~/.claude.json`. Names only.
+    pub settings_entries_removed: Vec<String>,
     /// Canonical keys removed from any of the env surfaces (`.env`,
     /// `.claude/env`, `.claude/settings.json` `env` block, plus any
     /// pre-existing `.vscode/settings.json` `claude-code.env` block —
@@ -5014,49 +5042,6 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
 /// `unregister_canonical_keys_match_install_canonical_keys` below.
 pub(crate) static UNREGISTER_CANONICAL_ENV_KEYS: std::sync::LazyLock<Vec<&'static str>> =
     std::sync::LazyLock::new(|| CANONICAL_INSTALL_ENV_KEYS.to_vec());
-
-/// Project-folder paths the launcher OWNS and will recursively delete on
-/// unregister when `purge_launcher_files: true`. Each entry is RELATIVE
-/// to the project root.
-///
-/// Audit trail (decisions documented 2026-05-06):
-///   * `.claude/hooks/` (incl. `_lib/`) — entirely launcher-managed,
-///     re-shipped on every bundle install. Decision (ii).
-///   * `.claude/scripts/` — same. Decision (ii).
-///   * `infrastructure/docker-compose*.yml` / `podman-compose*.yml` —
-///     copied verbatim from the orchestrator's `infrastructure/` tree
-///     by the bundle install. Bug-for-bug rebuildable.
-///
-/// Paths NOT in this list (preserved by default):
-///   * `.claude/env` — surgically edited by `surgically_strip_env_surfaces`
-///     (managed-block excision + canonical-key strip). User-added
-///     exports OUTSIDE the managed block survive unregister/re-register
-///     cycles. (Regression fix 2026-05-09: prior behaviour deleted the
-///     whole file, destroying user content the audit confirmed users
-///     could realistically add since `tools/claude` sources this file.)
-///   * `.claude/agents/`, `.claude/skills/` — decision (i): user content
-///     even though bundle-installed.
-///   * `.claude/CONTEXT_STATE.md`, `.claude/MEMORY.md`, `.claude/context/`
-///     — user working memory.
-///   * `.claude/settings.json` — surgically edited (env block only).
-///   * `CLAUDE.md`, `.env` (user keys), source code, `.git/`, `.venv/`.
-pub(crate) const UNREGISTER_PURGE_PATHS: &[&str] = &[
-    ".claude/hooks",
-    ".claude/scripts",
-    // Launcher-managed install manifest (written by
-    // vco_lib.project_init at install time; tracks bundle version,
-    // shipped-file hashes for self-merge, and install ledger). It's
-    // pure launcher metadata — no user content lives here. Without
-    // this entry the file persisted across unregister + re-register
-    // and confused future installs. Follow-up #12 (CONTEXT_STATE).
-    ".claude/.vco-manifest.json",
-    "infrastructure/docker-compose.yml",
-    "infrastructure/docker-compose.gpu.yml",
-    "infrastructure/docker-compose.amd-rocm.yml",
-    "infrastructure/podman-compose.yml",
-    "infrastructure/podman-compose.gpu.yml",
-    "infrastructure/podman-compose.amd-rocm.yml",
-];
 
 /// Canonical keys whose VALUE is a secret, so unregister removes them only on
 /// value evidence, never by name (v0.2.97): a `GITHUB_TOKEN` the user typed
@@ -5357,10 +5342,14 @@ pub(crate) fn report_left_secret_values(reply: &serde_json::Value) -> Option<Str
 
 // The unregister-flow env-key strippers + launcher-file purge were
 // extracted verbatim to the `unregister_strip` submodule in v0.2.77 Part 7d.
-// The facade re-exports every symbol; UNREGISTER_PURGE_PATHS stays here and
-// is pulled into the submodule via `super::`.
+// The facade re-exports every symbol. Since v0.2.106 the file purge is the
+// Python `vco_lib.unregister_files purge` (no fixed path list any more).
 mod unregister_strip;
 pub(crate) use unregister_strip::*;
+// v0.2.106 (review L7): what a Remove WOULD remove, for the terminal's
+// "are you sure?" (`vct-launcher --remove-project`, `vct-cli project delete`).
+mod removal_preview;
+pub(crate) use removal_preview::*;
 
 /// Soft-fail subprocess driver: drop a project's owned Weaviate
 /// collections via `python -m vco_lib.project_init drop-collections`.
@@ -5370,7 +5359,19 @@ pub(crate) use unregister_strip::*;
 /// failure) — drop failures NEVER block the rest of the unregister.
 /// A Weaviate-down condition becomes a warning the UI displays in the
 /// "Unregister complete with warnings" toast.
-async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>) {
+///
+/// v0.2.106: `--project-id` makes the drop cover the classes this project's
+/// launcher rows bind (not only the name-derived ones) and keep every class
+/// another registered project uses, each reported in `kept` (a warning
+/// here). Runs before the project row is deleted, so the rows are readable.
+///
+/// `dry_run` (v0.2.106, review L7): `--dry-run` — nothing is dropped and the
+/// first element lists what WOULD be dropped (the terminal Remove's preview).
+async fn drop_owned_collections(
+    project_name: &str,
+    project_id: &str,
+    dry_run: bool,
+) -> (Vec<String>, Vec<String>) {
     let mut dropped: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -5422,9 +5423,14 @@ async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>
         "drop-collections",
         "--name",
         project_name,
+        "--project-id",
+        project_id,
         "--json",
-    ])
-    .current_dir(&orch_root)
+    ]);
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.current_dir(&orch_root)
     .stdin(std::process::Stdio::null());
 
     #[cfg(windows)]
@@ -5468,7 +5474,20 @@ async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>
                     ));
                 }
             }
-            if !out.status.success() && warnings.is_empty() {
+            // Kept classes and the checks it could not run are not failures:
+            // after the error check above, so they never mask an exit code.
+            let errors_reported = warnings.len();
+            for k in v.get("kept").and_then(|x| x.as_array()).into_iter().flatten() {
+                let coll = k.get("collection").and_then(|c| c.as_str()).unwrap_or("?");
+                let why = k.get("reason").and_then(|c| c.as_str()).unwrap_or("?");
+                warnings.push(format!("collection {} kept: {}", coll, why));
+            }
+            for n in v.get("notes").and_then(|x| x.as_array()).into_iter().flatten() {
+                if let Some(s) = n.as_str() {
+                    warnings.push(format!("drop-collections: {}", s));
+                }
+            }
+            if !out.status.success() && errors_reported == 0 {
                 warnings.push(format!(
                     "drop-collections exit {} (no JSON errors[]; stderr: {})",
                     out.status,
@@ -5502,16 +5521,21 @@ async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>
 ///   * Change-log entry.
 ///
 /// Conditional on `options.purge_launcher_files` (default true):
-///   * Recursive removal of `UNREGISTER_PURGE_PATHS` from `<folder>/`.
 ///   * Surgical strip of canonical env keys from all four env surfaces
 ///     (`.env`, `.claude/env`, `.claude/settings.json` `env`,
 ///     `.vscode/settings.json` `claude-code.env`). User-added keys at
 ///     the same level survive.
+///   * Removal of what is VCO's from `<folder>/` (`vco_lib.unregister_files
+///     purge`): untouched shipped files, VCO's hook registrations and
+///     permission entries, its runtime files and `.git/info/exclude`
+///     blocks — and the MCP opt-outs it wrote to `~/.claude.json`. What the
+///     user changed or owns is kept and listed in the report.
 ///
 /// Conditional on `options.purge_collections` (default false):
 ///   * Drop the project's own Weaviate collections via
-///     `python -m vco_lib.project_init drop-collections`. Shared
-///     collections are NEVER touched.
+///     `python -m vco_lib.project_init drop-collections --project-id`.
+///     Shared collections, and any class another project uses, are NEVER
+///     touched.
 ///
 /// Returns an `UnregisterReport` summarising what happened. Soft-fail
 /// at every step: per-file / per-surface / Weaviate failures become
@@ -5524,10 +5548,22 @@ pub async fn delete_project_v2(
     options: Option<UnregisterOptions>,
     db: State<'_, Db>,
 ) -> Result<UnregisterReport, String> {
+    unregister_project(db.inner(), &id, options.unwrap_or_default()).await
+}
+
+/// v0.2.106: the ONE implementation of "Remove from VCO", shared by the GUI
+/// command above and the terminal command `vct-launcher --remove-project`
+/// (`lib.rs::handle_remove_project_cli`). The two surfaces differ only in how
+/// they obtain the `Db` handle and print the report.
+pub(crate) async fn unregister_project(
+    db: &Db,
+    id: &str,
+    opts: UnregisterOptions,
+) -> Result<UnregisterReport, String> {
+    let id = id.to_string();
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
     // launcher.db, instead of `no such table` from the stand-in connection.
     db.ensure_live()?;
-    let opts = options.unwrap_or_default();
 
     // Read the row first so we have the project name for collection
     // drop AND so we never run a partial unregister against a missing
@@ -5565,6 +5601,7 @@ pub async fn delete_project_v2(
             unregister_purge_folder(
                 folder,
                 |f| surgically_strip_env_surfaces_checked(vco_root.as_deref(), f, Some(&id)),
+                |f| purge_launcher_files_from_project(vco_root.as_deref(), f),
                 &mut report,
                 opts.leave_unremovable,
                 &crate::paths::vct_root_dir(),
@@ -5579,11 +5616,37 @@ pub async fn delete_project_v2(
                 row.folder_path
             ));
         }
+        // 1c. The per-project MCP opt-outs VCO wrote into `~/.claude.json`
+        //     (v0.2.106): exactly the names the launcher DB says it disabled
+        //     — read before the row (and its permission rows) go. A name the
+        //     user disabled through Claude Code itself stays.
+        match crate::commands::project_state_cmd::disabled_mcp_names(&db, &id) {
+            Ok(names) => match crate::mcp_registration::remove_project_disabled_mcps(
+                &crate::mcp_registration::user_claude_json(),
+                folder,
+                &names,
+            ) {
+                Ok(gone) if !gone.is_empty() => report.settings_entries_removed.push(format!(
+                    "~/.claude.json disabledMcpServers for this folder: {}",
+                    gone.join(", ")
+                )),
+                Ok(_) => {}
+                Err(e) => report.warnings.push(format!(
+                    "could not remove the MCP opt-outs VCO wrote to ~/.claude.json: {}",
+                    e
+                )),
+            },
+            Err(e) => report.warnings.push(format!(
+                "could not read which MCP servers VCO disabled for this project, so \
+                 ~/.claude.json was left as it is: {}",
+                e
+            )),
+        }
     }
 
     // Step 2: collection drop (default OFF, opt-in).
     if opts.purge_collections {
-        let (dropped, drop_warnings) = drop_owned_collections(&row.name).await;
+        let (dropped, drop_warnings) = drop_owned_collections(&row.name, &row.id, false).await;
         report.collections_dropped = dropped;
         report.warnings.extend(drop_warnings);
     }
@@ -5662,6 +5725,7 @@ pub async fn delete_project_v2(
             "purge_launcher_files": opts.purge_launcher_files,
             "purge_collections": opts.purge_collections,
             "files_purged_count": report.files_purged.len(),
+            "files_kept_modified_count": report.files_kept_modified.len(),
             "keys_purged_from_env_count": report.keys_purged_from_env.len(),
             "collections_dropped_count": report.collections_dropped.len(),
             "warnings_count": report.warnings.len(),
@@ -6233,6 +6297,35 @@ pub(crate) fn is_orchestrator_root_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.2.106 (review H1): the removal report's wire shape ────────────
+
+    /// The hub (`vct-hub cli_api`) decides a delegated removal succeeded by
+    /// reading the project id out of this struct's JSON. Both sides spell
+    /// the key through ONE constant; this test proves the REAL serialization
+    /// carries it (a rename of the field or the serde rule fails here and in
+    /// the hub at once, never silently).
+    #[test]
+    fn the_report_names_its_project_id_in_camel_case() {
+        let report = UnregisterReport {
+            project_id: "p1".to_string(),
+            project_name: "Alpha".to_string(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(
+            value[vct_launcher_core::removal_report::REMOVAL_REPORT_PROJECT_ID_KEY],
+            serde_json::json!("p1"),
+            "the hub reads the id under this exact key: {}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
+        // The snake-case spelling must NOT appear — a reader written against
+        // it (the v0.2.106 H1 bug) sees no report at all.
+        assert!(value.get("project_id").is_none());
+        // And the GUI's mirror keys stay camelCase too (it reads filesPurged).
+        assert!(value.get("filesPurged").is_some());
+        assert!(value.get("files_purged").is_none());
+    }
 
     // ─── v0.2.97: bundle_materialization registry write (act + soft-fail) ─
 
@@ -9275,35 +9368,51 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// `test_unregister_default_purges_hooks_scripts_compose_keeps_agents_skills`
-    ///
-    /// The headline default-mode test: write a fully-populated fake project
-    /// folder and assert the surgical purge removes EXACTLY what's in
-    /// `UNREGISTER_PURGE_PATHS` and preserves the user-content allowlist.
+    /// Write `files` under `folder` and a bundle manifest recording each as
+    /// shipped (its sha256), the shape `vco_lib.project_init` writes.
+    fn ship_for_unregister(folder: &Path, files: &[(&str, &str)]) {
+        use sha2::Digest;
+        let mut recorded = serde_json::Map::new();
+        for (rel, body) in files {
+            let path = folder.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+            let sha = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+            recorded.insert((*rel).to_string(), serde_json::json!({"sha256": sha}));
+        }
+        std::fs::write(
+            folder.join(".claude/.vco-manifest.json"),
+            serde_json::json!({"schema_version": 2, "files": recorded}).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// v0.2.106 "Remove project", end to end through the ONE Python purge:
+    /// untouched shipped files (hooks, scripts, agents, compose copies) and
+    /// the manifest go; a shipped agent the user edited, the user's own
+    /// agent, skill and script, CONTEXT_STATE, MEMORY, context notes,
+    /// CLAUDE.md, source, settings.json and `.env` stay. Red-proof: pass the
+    /// pre-v0.2.106 wholesale `.claude/scripts` delete → `my-tool.sh` gone.
     #[test]
-    fn unregister_default_purges_hooks_scripts_compose_keeps_agents_skills() {
+    fn unregister_default_removes_only_what_is_vcos() {
         let (_guard, id, tmp, projected) = registered_for_strip("default");
         let kg = projected["KG_COLLECTION"].as_str().unwrap().to_string();
-
-        // Populate launcher-managed paths (must be removed).
-        std::fs::create_dir_all(tmp.join(".claude/hooks/_lib")).unwrap();
-        std::fs::write(tmp.join(".claude/hooks/pre-tool.sh"), "echo").unwrap();
-        std::fs::write(tmp.join(".claude/hooks/_lib/util.sh"), "echo").unwrap();
-        std::fs::create_dir_all(tmp.join(".claude/scripts")).unwrap();
-        std::fs::write(tmp.join(".claude/scripts/code-graph-analyze"), "#!/bin/bash").unwrap();
+        ship_for_unregister(
+            &tmp,
+            &[
+                (".claude/hooks/pre-tool.sh", "echo"),
+                (".claude/hooks/_lib/util.sh", "echo"),
+                (".claude/scripts/code-graph-analyze", "#!/bin/bash"),
+                (".claude/agents/code-reviewer.md", "shipped agent"),
+                (".claude/agents/planner.md", "shipped planner"),
+                ("infrastructure/docker-compose.yml", "version: '3'\n"),
+            ],
+        );
+        std::fs::write(tmp.join(".claude/agents/planner.md"), "my edits").unwrap();
+        std::fs::write(tmp.join(".claude/scripts/my-tool.sh"), "echo mine").unwrap();
         std::fs::write(tmp.join(".claude/env"),
             "# vco-managed-begin\nexport KG_COLLECTION=\"X_KnowledgeGraph\"\n# vco-managed-end\n",
         ).unwrap();
-        // Launcher install manifest (per follow-up #12).
-        std::fs::write(tmp.join(".claude/.vco-manifest.json"),
-            r#"{"bundle_version":"0.1.6","installed_at":"2026-05-07T00:00:00Z"}"#,
-        ).unwrap();
-        std::fs::create_dir_all(tmp.join("infrastructure")).unwrap();
-        std::fs::write(tmp.join("infrastructure/docker-compose.yml"), "version: '3'\n").unwrap();
-        std::fs::write(tmp.join("infrastructure/podman-compose.gpu.yml"), "version: '3'\n").unwrap();
-
-        // Populate user-content paths (must survive).
-        std::fs::create_dir_all(tmp.join(".claude/agents")).unwrap();
         std::fs::write(tmp.join(".claude/agents/my-agent.md"), "user agent").unwrap();
         std::fs::create_dir_all(tmp.join(".claude/skills/foo")).unwrap();
         std::fs::write(tmp.join(".claude/skills/foo/SKILL.md"), "user skill").unwrap();
@@ -9313,87 +9422,43 @@ mod tests {
         std::fs::write(tmp.join(".claude/context/notes.md"), "user notes").unwrap();
         std::fs::write(tmp.join("CLAUDE.md"), "project instructions").unwrap();
         std::fs::write(tmp.join("main.py"), "print('hi')").unwrap();
-        // .claude/settings.json with mixed canonical + user env keys.
         std::fs::write(tmp.join(".claude/settings.json"),
-            serde_json::json!({"env": {"KG_COLLECTION": kg, "USER_VAR": "keep"}, "hooks": {}}).to_string()
+            serde_json::json!({"env": {"KG_COLLECTION": kg, "USER_VAR": "keep"}, "model": "mine"}).to_string()
         ).unwrap();
-        // .env with VCO's block + a user key.
         std::fs::write(tmp.join(".env"), format!(
             "{}USER_API_KEY=secret\n",
             vco_env_block("KG_COLLECTION=X_KnowledgeGraph\nPROJECT_NAME=X\n")
         )).unwrap();
 
-        // Run both purges (separately — drives identical to delete_project_v2).
         let (keys_purged, env_warnings) = surgically_strip_env_surfaces(None, &tmp, Some(&id));
-        let (files_purged, file_warnings) = purge_launcher_files_from_project(&tmp);
-
-        // No warnings on a clean folder.
+        let purged = purge_launcher_files_from_project(None, &tmp);
         assert!(env_warnings.is_empty(), "env warnings: {:?}", env_warnings);
-        assert!(file_warnings.is_empty(), "file warnings: {:?}", file_warnings);
+        assert!(purged.warnings.is_empty(), "file warnings: {:?}", purged.warnings);
 
-        // Launcher-managed paths gone.
-        assert!(!tmp.join(".claude/hooks").exists(), "hooks/ should be purged");
-        assert!(!tmp.join(".claude/scripts").exists(), "scripts/ should be purged");
-        // .claude/env is preserved as of 2026-05-09 (non-destructive
-        // unregister): the file survives but the launcher-managed
-        // BEGIN/END block is excised and any stray canonical keys
-        // outside the block are stripped.
-        assert!(
-            tmp.join(".claude/env").exists(),
-            ".claude/env should be preserved (managed block excised, user-added exports survive)",
-        );
-        let env_after = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
-        assert!(
-            !env_after.contains("KG_COLLECTION="),
-            "managed-block KG_COLLECTION export must be excised on unregister: {}",
-            env_after,
-        );
-        assert!(
-            !tmp.join(".claude/.vco-manifest.json").exists(),
-            ".vco-manifest.json should be purged"
-        );
-        assert!(!tmp.join("infrastructure/docker-compose.yml").exists());
-        assert!(!tmp.join("infrastructure/podman-compose.gpu.yml").exists());
-
-        // User content survives.
-        assert!(tmp.join(".claude/agents/my-agent.md").exists(), "agents preserved");
-        assert!(tmp.join(".claude/skills/foo/SKILL.md").exists(), "skills preserved");
-        assert!(tmp.join(".claude/CONTEXT_STATE.md").exists(), "CONTEXT_STATE preserved");
-        assert!(tmp.join(".claude/MEMORY.md").exists(), "MEMORY preserved");
-        assert!(tmp.join(".claude/context/notes.md").exists(), "context/ preserved");
-        assert!(tmp.join("CLAUDE.md").exists(), "CLAUDE.md preserved");
-        assert!(tmp.join("main.py").exists(), "source code preserved");
-        assert!(tmp.join(".claude/settings.json").exists(), "settings.json preserved");
-        assert!(tmp.join(".env").exists(), ".env preserved");
-
-        // .env user keys preserved, canonical removed.
+        for gone in [".claude/hooks", ".claude/scripts/code-graph-analyze",
+                     ".claude/agents/code-reviewer.md", ".claude/.vco-manifest.json",
+                     "infrastructure/docker-compose.yml"] {
+            assert!(!tmp.join(gone).exists(), "{} should be removed", gone);
+            assert!(purged.removed.iter().any(|p| p.starts_with(gone)), "{} reported: {:?}", gone, purged.removed);
+        }
+        assert_eq!(purged.kept_modified, vec![".claude/agents/planner.md".to_string()]);
+        for kept in [".claude/agents/planner.md", ".claude/scripts/my-tool.sh",
+                     ".claude/agents/my-agent.md", ".claude/skills/foo/SKILL.md",
+                     ".claude/CONTEXT_STATE.md", ".claude/MEMORY.md", ".claude/context/notes.md",
+                     "CLAUDE.md", "main.py", ".claude/settings.json", ".env"] {
+            assert!(tmp.join(kept).exists(), "{} must stay", kept);
+        }
+        let env_after = std::fs::read_to_string(tmp.join(".claude/env")).unwrap_or_default();
+        assert!(!env_after.contains("KG_COLLECTION="), "{}", env_after);
         let env = std::fs::read_to_string(tmp.join(".env")).unwrap();
-        assert!(env.contains("USER_API_KEY=secret"), ".env user key preserved");
-        assert!(!env.contains("KG_COLLECTION="), ".env canonical removed");
-        assert!(!env.contains("PROJECT_NAME="), ".env canonical removed");
-
-        // settings.json: env block surgically edited.
-        let s_raw = std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap();
-        let s: serde_json::Value = serde_json::from_str(&s_raw).unwrap();
-        assert_eq!(s["env"]["USER_VAR"], "keep", "user env key preserved");
-        assert!(s["env"].get("KG_COLLECTION").is_none(), "canonical env key removed");
-        // Non-env top-level fields (hooks etc.) preserved.
-        assert!(s.get("hooks").is_some());
-
-        // Reported sets contain the right entries.
-        assert!(files_purged.iter().any(|p| p == ".claude/hooks"));
-        assert!(files_purged.iter().any(|p| p == ".claude/scripts"));
-        // .claude/env is NOT in files_purged anymore (preserved on
-        // unregister; see managed-block excision above).
-        assert!(
-            !files_purged.iter().any(|p| p == ".claude/env"),
-            "files_purged must not include .claude/env: {:?}",
-            files_purged,
-        );
-        assert!(files_purged.iter().any(|p| p == "infrastructure/docker-compose.yml"));
+        assert!(env.contains("USER_API_KEY=secret") && !env.contains("KG_COLLECTION="));
+        let s: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(s["env"]["USER_VAR"], "keep");
+        assert!(s["env"].get("KG_COLLECTION").is_none());
+        assert_eq!(s["model"], "mine");
         assert!(keys_purged.contains(&"KG_COLLECTION".to_string()));
         assert!(keys_purged.contains(&"PROJECT_NAME".to_string()));
-
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -9601,21 +9666,23 @@ SHARED_KG_OPT_OUT=false\n"),
         let tmp = std::env::temp_dir().join(format!(
             "vct-unreg-idempotent-{}", uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(tmp.join(".claude/hooks")).unwrap();
-        std::fs::write(tmp.join(".claude/hooks/x.sh"), "echo").unwrap();
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        ship_for_unregister(&tmp, &[(".claude/hooks/x.sh", "echo")]);
         std::fs::write(tmp.join(".env"),
             format!("{}USER_KEY=keep\n", vco_env_block("KG_COLLECTION=X_KnowledgeGraph\n"))).unwrap();
 
         // First run: should remove.
         let (keys1, w1a) = surgically_strip_env_surfaces(None, &tmp, None);
-        let (files1, w1b) = purge_launcher_files_from_project(&tmp);
+        let p1 = purge_launcher_files_from_project(None, &tmp);
+        let (files1, w1b) = (p1.removed, p1.warnings);
         assert!(w1a.is_empty() && w1b.is_empty());
         assert!(!keys1.is_empty());
         assert!(!files1.is_empty());
 
         // Second run: nothing left to remove.
         let (keys2, w2a) = surgically_strip_env_surfaces(None, &tmp, None);
-        let (files2, w2b) = purge_launcher_files_from_project(&tmp);
+        let p2 = purge_launcher_files_from_project(None, &tmp);
+        let (files2, w2b) = (p2.removed, p2.warnings);
         assert!(w2a.is_empty(), "second-run env warnings: {:?}", w2a);
         assert!(w2b.is_empty(), "second-run file warnings: {:?}", w2b);
         assert!(keys2.is_empty(), "second-run keys: {:?}", keys2);
@@ -9685,7 +9752,8 @@ SHARED_KG_OPT_OUT=false\n"),
         ));
         // Don't create it.
         let (keys, w_env) = surgically_strip_env_surfaces(None, &tmp, None);
-        let (files, w_file) = purge_launcher_files_from_project(&tmp);
+        let p = purge_launcher_files_from_project(None, &tmp);
+        let (files, w_file) = (p.removed, p.warnings);
         assert!(keys.is_empty());
         assert!(files.is_empty());
         assert!(w_env.is_empty(), "env warnings on missing folder: {:?}", w_env);

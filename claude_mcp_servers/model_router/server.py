@@ -150,7 +150,10 @@ import aiohttp
 from aiohttp import web
 
 from . import __version__
+from . import provider_switch
 from vco_lib.gateway_accounts import PRIMARY_ID as PRIMARY_ACCOUNT_ID
+# One log line per record: the one home of the CR/LF/control-char rule.
+from vco_lib.log_setup import log_safe as _log_safe
 
 from .accounts import (
     AccountChoice,
@@ -1402,16 +1405,20 @@ async def vendor_keys_handler(request: web.Request) -> web.Response:
 
         {"model": <id>, "route": "vendor" | "anthropic" | "refused",
          "vendor": <vendor id or null>, "state": resolved | cached | stale |
-         missing | pending, "usable": bool, "transient": bool,
+         missing | pending | disabled, "usable": bool, "transient": bool,
          "problem": <text built from key NAMES and store paths, or null>}
 
     ``usable`` is true when a key is in hand (``stale`` included — that key
     is served), false only on a DEFINITE miss; a transient failure or a
     resolution still running reads ``usable: null`` (unknown — the caller
-    must not refuse on it). The key VALUE never appears: :class:`KeyResult`
-    is read for its state, never serialised. Host-token authorised and
-    loopback-only like ``/usage``. A miss here runs the same resolution a
-    request would — including the v0.2.105 hub revive when the hub refuses.
+    must not refuse on it). A vendor switched off in the launcher (Home →
+    Model providers) answers ``state: "disabled"`` with ``usable: false``
+    BEFORE any key read (v0.2.106 — the switch is a definite "cannot", and a
+    switched-off subscription is never probed for it). The key VALUE never
+    appears: :class:`KeyResult` is read for its state, never serialised.
+    Host-token authorised and loopback-only like ``/usage``. A miss here runs
+    the same resolution a request would — including the v0.2.105 hub revive
+    when the hub refuses.
     """
     gateway: Gateway = request.app[APP_KEY]
     started = time.monotonic()
@@ -1434,6 +1441,19 @@ async def vendor_keys_handler(request: web.Request) -> web.Response:
         return web.json_response(base)
     vendor = decision.vendor
     base.update(route="vendor", vendor=vendor.vendor_id)
+    # v0.2.106: a vendor the user switched OFF (launcher Home → Model
+    # providers) is answered at once — ``usable: false`` with the switch as
+    # the problem, so the subagent pre-flight refuses the launch with the
+    # cause AND the remedy, and the key is never even probed (a switched-off
+    # subscription must not be read for it).
+    if vendor.vendor_id in provider_switch.disabled_vendors():
+        base.update(
+            state="disabled",
+            usable=False,
+            problem=provider_switch.refusal_text(
+                vendor.vendor_id, vendor_display_name(vendor)),
+        )
+        return web.json_response(base)
     try:
         result = await asyncio.wait_for(
             asyncio.shield(gateway.keys.aresolve(vendor)),
@@ -1490,12 +1510,18 @@ async def models_handler(request: web.Request) -> web.Response:
     client_user_agent = request.headers.get(USER_AGENT_HEADER) or None
     if usage_labels:
         gateway.usage_windows.request_refresh(client_user_agent)
+    # v0.2.106: vendors the user switched OFF (launcher Home → Model
+    # providers) leave the picker entirely — no rows, and their upstream model
+    # list is not even fetched (a switched-off subscription is never called
+    # for it). TTL-cached, fail-open: an unreadable setting hides nothing.
+    switched_off = provider_switch.disabled_vendors()
     table = gateway.context.current()
     catalog = await gateway.catalog.union(
         table=table,
         catalog_filter=gateway.config.catalog_filter,
         window_rows=gateway.config.window_rows,
         user_agent=client_user_agent,
+        disabled_vendors=switched_off,
     )
     entries = catalog.entries
     if usage_labels:
@@ -1509,11 +1535,16 @@ async def models_handler(request: web.Request) -> web.Response:
         # Named in the SAME line as the counts, because "the picker is short"
         # and "the gateway hid some rows" are the same observation and
         # reading them from two places is how they get blamed on each other.
+        # A vendor hidden by the PROVIDER SWITCH is named too (its source is
+        # recorded as provider-off), for exactly the same reason.
         (
             f", {len(catalog.hidden)} hidden by "
             f"catalog={gateway.config.catalog_filter}"
             f"/rows={gateway.config.window_rows}"
             if catalog.hidden else ""
+        ) + (
+            f", providers switched off: {','.join(sorted(switched_off))}"
+            if switched_off else ""
         ),
     )
     return web.json_response(
@@ -2097,37 +2128,6 @@ def _translate_context_overflow(
     )
 
 
-def _log_safe(value: object) -> str:
-    """``value`` rendered so it can never be more than part of ONE log line.
-
-    A log line is a record with a shape, so a value that carries a newline
-    does not merely look odd in it — it ENDS that record and writes the next
-    one itself, and the next one can read ``requested='claude-opus-5'
-    route=native status=200`` for a call that never happened. Control
-    characters do the same job more quietly: a CR rewinds the line on a
-    terminal, an ESC can repaint what is already on it.
-
-    So CR and LF become the two characters that SPELL them, and every other
-    non-printable becomes ``\\xNN`` / ``\\uNNNN``. The value stays readable —
-    a forged id reads as an id with a ``\\n`` in it, which is itself the
-    evidence that someone tried — while the record stays one line. A value
-    that was never hostile passes through unchanged, which is why this can
-    sit on the shared builder instead of at every call site.
-    """
-    text = (
-        str(value)
-        .replace("\r\n", "\\r\\n")
-        .replace("\r", "\\r")
-        .replace("\n", "\\n")
-    )
-    return "".join(
-        ch
-        if ch.isprintable()
-        else (f"\\x{ord(ch):02x}" if ord(ch) < 0x100 else f"\\u{ord(ch):04x}")
-        for ch in text
-    )
-
-
 #: The access-line field for a request whose image blocks could not be
 #: counted — an unparseable body, a body past the rewrite buffer, or a defect
 #: in the counter. It is a VALUE, not an omission: "carried no image" reads
@@ -2652,6 +2652,43 @@ async def _stream_after(
         yield chunk
 
 
+def _rung_key(route: Any) -> tuple:
+    """A ladder rung's identity: ``(vendor id, forwarded model)`` — two
+    models of ONE vendor are two rungs (review C-L5)."""
+    vendor = getattr(route, "vendor", None)
+    vendor_id = vendor.vendor_id if vendor is not None else ""
+    return (vendor_id, str(getattr(route, "forward_model", "") or "").lower())
+
+
+def _first_servable_rung(
+    decision: Any,
+    first: Any,
+    switched_off: "frozenset[str] | set[str]",
+    next_rung: Callable[[Any], Any],
+    *,
+    on_skip: Optional[Callable[[Any], None]] = None,
+) -> Any:
+    """The first rung from ``first`` on whose vendor is NOT switched off, or
+    ``None``. Pure walk (review C-L5): a rung of the same vendor as the failed
+    route is a legitimate next rung — only the SKIP walk guards against a
+    cyclic table, keyed on ``(vendor, model)``, so it can never stand a real
+    rung down."""
+    seen = {_rung_key(decision)}
+    rung = first
+    while rung is not None:
+        vendor_id = rung.vendor.vendor_id if rung.vendor is not None else ""
+        if vendor_id not in switched_off:
+            return rung
+        key = _rung_key(rung)
+        if key in seen:
+            return None  # a cyclic table: stand the walk down
+        seen.add(key)
+        if on_skip is not None:
+            on_skip(rung)
+        rung = next_rung(rung)
+    return None
+
+
 def _ladder_escalation(
     *,
     request: web.Request,
@@ -2694,6 +2731,30 @@ def _ladder_escalation(
     remap is ever silent.
     """
     next_decision = fallback_route(decision, vendors=gateway.vendors)
+    if next_decision is not None and payload is not None:
+        # v0.2.106: a rung whose vendor the user switched OFF (launcher Home →
+        # Model providers) is SKIPPED — a disabled subscription's quota is
+        # never spent by a fallback either, and its key is not probed for it.
+        # The chain is walked to the first servable rung (the caller relays
+        # the ORIGINAL refusal when none is left — the ladder never
+        # fabricates a success). The seen-set stands the walk down on a
+        # cyclic table rather than looping forever. TTL-cached and fail-open
+        # like every read of the switch (model_router.provider_switch).
+        def _skipped(rung: Route) -> None:
+            rung_vendor = rung.vendor.vendor_id if rung.vendor is not None else ""
+            logger.info(
+                "model-gateway: fallback ladder skips %s %s for %s: %s",
+                rung_vendor, rung.forward_model, _log_safe(requested_model),
+                provider_switch.refusal_text(
+                    rung_vendor,
+                    vendor_display_name(rung.vendor)
+                    if rung.vendor is not None else rung_vendor),
+            )
+
+        next_decision = _first_servable_rung(
+            decision, next_decision, provider_switch.disabled_vendors(),
+            lambda rung: fallback_route(rung, vendors=gateway.vendors),
+            on_skip=_skipped)
     if next_decision is None or payload is None:
         return None
     if facts is not None and facts.count_tokens:
@@ -3103,6 +3164,25 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 extra=f"{images_field} reason={reason}",
             )
         )
+
+    # v0.2.106: a vendor the user switched OFF (launcher Home → Model
+    # providers) is refused HERE, locally — never forwarded, never a key
+    # probe, never a ladder rung. The picker already hides its rows, so the
+    # request that still arrives named one (a stale picker, a pinned
+    # definition, a hand-written id) gets the cause and the remedy in words.
+    # First-party routes carry no vendor and are never touched. The read is
+    # TTL-cached and fails OPEN (an unreadable setting disables nothing — see
+    # model_router.provider_switch).
+    if decision.vendor is not None:
+        vendor_id = decision.vendor.vendor_id
+        if vendor_id in provider_switch.disabled_vendors():
+            log_local(403, "provider_disabled")
+            return _json_error(
+                403,
+                "permission_error",
+                f"{provider_switch.refusal_text(vendor_id, vendor_display_name(decision.vendor))} "
+                f"The request for {str(requested_model)!r} was not forwarded.",
+            )
 
     # Everything the RELAY will need about this request once the RESPONSE
     # ends. Assembled here because this is the last point at which both the

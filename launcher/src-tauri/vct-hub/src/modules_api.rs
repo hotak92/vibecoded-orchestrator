@@ -371,7 +371,8 @@ struct RegisterCodegraphBuildReq {
     /// `"running"` (or absent — pre-#31 drivers keep working) is accepted;
     /// terminal statuses there are REJECTED (M4 — see the handler doc). On
     /// the `/terminal` subroute the field is REQUIRED and must be one of
-    /// `"success"` / `"partial"` / `"failed"`.
+    /// `"success"` / `"partial"` / `"failed"` / `"skipped"` (v0.2.106: a
+    /// run that a twin walk made unnecessary is a SKIP, not a failure).
     #[serde(default)]
     status: Option<String>,
     // ── Terminal-report stats (ignored on registration) ──
@@ -513,14 +514,27 @@ async fn register_codegraph_build(
             Err(resp) => return resp,
         };
 
-    match h.0.register_running_code_graph_build(&resolved_id, req.pid) {
-        Ok(()) => {
+    // v0.2.106 fix round 1: a LIVE walk's running row is never superseded
+    // (a twin driver's registration used to steal it — see the db fn).
+    match h.0.register_running_code_graph_build(
+        &resolved_id,
+        req.pid,
+        vct_launcher_core::process::pid_is_alive,
+    ) {
+        Ok(registered) => {
             let mut body = serde_json::json!({
-                "registered": true,
+                "registered": registered,
                 "project_id": resolved_id,
                 "pid": req.pid,
-                "status": "running",
             });
+            if registered {
+                body["status"] = serde_json::json!("running");
+            } else {
+                body["reason"] = serde_json::json!(
+                    "another code-graph walk is already running for this project; \
+                     its row was left as it is"
+                );
+            }
             if resolved_by == "path" {
                 body["resolved_by"] = serde_json::json!("path");
             }
@@ -564,15 +578,20 @@ async fn report_codegraph_build_terminal(
         );
     }
     // The terminal route REQUIRES an explicit terminal status — "running"
-    // (or absence) here is a caller bug, not a registration.
+    // (or absence) here is a caller bug, not a registration. `skipped`
+    // (v0.2.106) is the NON-failure state of a run a twin walk made
+    // unnecessary: the row must not read as a red "failed".
     let status = match req.status.as_deref() {
-        Some(s @ (build_status::SUCCESS | build_status::PARTIAL | build_status::FAILED)) => s,
+        Some(s @ (build_status::SUCCESS
+        | build_status::PARTIAL
+        | build_status::FAILED
+        | build_status::SKIPPED)) => s,
         other => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_status",
                 format!(
-                    "terminal status must be \"success\"/\"partial\"/\"failed\" \
+                    "terminal status must be \"success\"/\"partial\"/\"failed\"/\"skipped\" \
                      (registrations go to POST .../codegraph-builds), got {:?}",
                     other.unwrap_or("<absent>")
                 ),
@@ -860,6 +879,18 @@ async fn project_env(
         }
         Err(e) => return db_error_response("get project (env)", e),
     };
+
+    // v0.2.106 (review W5 M1): the machine-wide-install loop below runs the
+    // enable cascade, which reads the RL reranker's bundled-weights default
+    // when no row decides — a Python spawn on a cold cache. Resolve it HERE,
+    // off the async workers and before the secret session opens (that one
+    // must not be held across an `.await`), so the sync cascade finds it
+    // cached.
+    if h.0.list_global_module_installs().unwrap_or_default().iter().any(|r| {
+        r.module_id == vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID
+    }) {
+        let _ = h.0.rl_scoring_default_async().await;
+    }
 
     // v0.2.84 (D8.2): open ONE memory-only read-through secret session for the
     // WHOLE request. Every `secrets::get_with_context` call below — the module
@@ -3768,6 +3799,27 @@ mod tests {
         assert_eq!(missing.status(), 404);
     }
 
+    /// v0.2.106 fix round 1 (U1-1): a twin driver's registration while the
+    /// first walk's pid is ALIVE is refused (`registered: false`) and the row
+    /// keeps the live pid. This test process's own pid is the live walk.
+    #[tokio::test]
+    async fn register_codegraph_build_never_steals_a_live_walks_row() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-twin", "Twin", "/tmp/proj-twin");
+        let live = std::process::id();
+        assert!(h.0.register_running_code_graph_build("proj-twin", live, |_| false).unwrap());
+        let resp = reqwest::Client::new()
+            .post(format!("{}/projects/proj-twin/codegraph-builds", base))
+            .json(&serde_json::json!({"pid": 4_000_001u32, "repo_root": "/tmp/proj-twin"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.get("registered").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(h.0.get_code_graph_build("proj-twin").unwrap().unwrap().pid, Some(live as i64));
+    }
+
     // ─── v0.2.91 (#31): terminal report on the same route ───────────────
 
     /// ACT: the terminal success report finalizes the registered row with
@@ -3858,7 +3910,7 @@ mod tests {
             &serde_json::Value::Null,
         )
         .unwrap();
-        h.0.register_running_code_graph_build("proj-t2", 555).unwrap();
+        h.0.register_running_code_graph_build("proj-t2", 555, |_| false).unwrap();
         let client = reqwest::Client::new();
 
         let resp = client
@@ -3884,6 +3936,44 @@ mod tests {
         );
     }
 
+    /// v0.2.106: a walk a twin made unnecessary reports `skipped` — a
+    /// NON-failure terminal state. The row must finalize (so the
+    /// pid-aliveness sweep cannot later fail it) and the binding must NOT be
+    /// stamped (nothing was analyzed).
+    #[tokio::test]
+    async fn terminal_skipped_report_finalizes_without_stamping_the_binding() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "proj-t2s", "Terminal Two Skip", "/tmp/proj-t2s");
+        h.0.set_project_codegraph_binding(
+            "proj-t2s", "TerminalTwoSkip", None, None, None, None, true,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        h.0.register_running_code_graph_build("proj-t2s", 556, |_| false).unwrap();
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{}/projects/proj-t2s/codegraph-builds/terminal", base))
+            .json(&serde_json::json!({
+                "status": "skipped", "pid": 556,
+                "error_message": "another code-graph walk is already running for this project",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body.get("finalized").and_then(|v| v.as_bool()), Some(true));
+
+        let row = h.0.get_code_graph_build("proj-t2s").unwrap().unwrap();
+        assert_eq!(row.status, "skipped");
+        let binding = h.0.get_project_codegraph_binding("proj-t2s").unwrap().unwrap();
+        assert_eq!(
+            binding.last_analyzed_at, None,
+            "a skipped walk analyzed nothing — it must not advance the binding stamp"
+        );
+    }
+
     /// LEAVE-ALONE legs: an unknown/non-terminal status on the terminal
     /// route is a 400; a terminal report with no matching running row
     /// (never registered / pid superseded) is a 200 `finalized: false`
@@ -3895,7 +3985,7 @@ mod tests {
         seed_project(&h.0, "proj-t3", "Terminal Three", "/tmp/proj-t3");
         let client = reqwest::Client::new();
 
-        for bad_status in ["skipped", "running", "borked"] {
+        for bad_status in ["running", "borked"] {
             let bad = client
                 .post(format!("{}/projects/proj-t3/codegraph-builds/terminal", base))
                 .json(&serde_json::json!({"status": bad_status, "pid": 7}))
@@ -3926,7 +4016,7 @@ mod tests {
         assert!(h.0.get_code_graph_build("proj-t3").unwrap().is_none());
 
         // Superseded pid: a newer walk re-registered; the stale report noops.
-        h.0.register_running_code_graph_build("proj-t3", 9001).unwrap();
+        h.0.register_running_code_graph_build("proj-t3", 9001, |_| false).unwrap();
         let stale = client
             .post(format!("{}/projects/proj-t3/codegraph-builds/terminal", base))
             .json(&serde_json::json!({"status": "success", "pid": 7}))
@@ -3950,10 +4040,10 @@ mod tests {
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "proj-t4", "Terminal Four", "/tmp/proj-t4");
         // Walk B's fresh registration — the row M4's hazard would clobber.
-        h.0.register_running_code_graph_build("proj-t4", 9002).unwrap();
+        h.0.register_running_code_graph_build("proj-t4", 9002, |_| false).unwrap();
         let client = reqwest::Client::new();
 
-        for terminal in ["success", "partial", "failed"] {
+        for terminal in ["success", "partial", "failed", "skipped"] {
             let resp = client
                 .post(format!("{}/projects/proj-t4/codegraph-builds", base))
                 .json(&serde_json::json!({

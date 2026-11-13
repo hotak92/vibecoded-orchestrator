@@ -145,6 +145,11 @@ print("\n".join(lines))
 
 $env:VCO_DEFERRAL_PROJECT_DIR = $ProjectDir
 try {
-    & $RunPy -c $pyCode 2>$null
+    # v0.2.106: the body runs as a temp FILE through
+    # _lib/run-python-program.ps1 - `& $RunPy -c $pyCode` loses every
+    # embedded double quote under Windows PowerShell 5.1 (the surfaced
+    # deferral list never printed on a 5.1 host).
+    . (Join-Path $PSScriptRoot "_lib/run-python-program.ps1")
+    Invoke-VcoPythonProgram -Python $RunPy -Body $pyCode 2>$null
 } catch { }
 exit 0

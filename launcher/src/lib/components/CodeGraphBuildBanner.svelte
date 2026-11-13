@@ -19,6 +19,7 @@
   // error message, log tail, and a "Retry build" button.
 
   import { onDestroy, onMount } from 'svelte';
+  import { pollWhileActive } from '$lib/window-activity';
   import { listen, invoke, safeInvoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type {
@@ -69,7 +70,7 @@
   let now = $state(Date.now());
   // Tick the clock once per second only while we're in a terminal state
   // that needs auto-hide. Cheaper than a constant 1Hz timer.
-  let tickHandle: ReturnType<typeof setInterval> | null = null;
+  let tickHandle: (() => void) | null = null;
 
   async function rerun() {
     if (rerunning) return;
@@ -101,10 +102,10 @@
     const terminal =
       v.status === 'success' || v.status === 'skipped' || v.status === 'partial';
     if (terminal && v.finished_at_iso && tickHandle === null) {
-      tickHandle = setInterval(() => { now = Date.now(); }, 1000);
+      tickHandle = pollWhileActive(() => { now = Date.now(); }, 1000);
     }
     if (!terminal && tickHandle !== null) {
-      clearInterval(tickHandle);
+      tickHandle();
       tickHandle = null;
     }
   }
@@ -161,7 +162,7 @@
 
   onDestroy(() => {
     unlisten?.();
-    if (tickHandle !== null) clearInterval(tickHandle);
+    if (tickHandle !== null) tickHandle();
   });
 
   function statusGlyph(s: CodeGraphBuildStatus): string {
@@ -190,7 +191,11 @@
           ? 'Code graph: built with stale-row cleanup warnings'
           : `Code graph: indexed ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'} (stale-row cleanup warnings)`;
       case 'failed': return 'Code graph: build failed';
-      case 'skipped': return 'Code graph: no source files found';
+      // v0.2.106: `skipped` is not always "no source files". A walk made
+      // unnecessary by a twin walk is reported skipped with its reason, so
+      // the label names the state and the detail line carries the reason
+      // ("another code-graph walk is already running …"). Never a failure.
+      case 'skipped': return 'Code graph: skipped';
     }
   }
 

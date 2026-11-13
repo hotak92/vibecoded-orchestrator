@@ -47,7 +47,7 @@ class _FakeResp:
     text = ""
 
     def __init__(self, payload=None):
-        self._payload = payload or {"top_k": [{"title": "N1", "score": 0.9}]}
+        self._payload = payload or {"scored": True, "order": [0], "scores": [0.9]}
 
     def json(self):
         return self._payload
@@ -83,11 +83,15 @@ class _CapturingClient:
         pass
 
 
+_DIM = 4
+_Q = [1.0] * _DIM
+
+
 def _make_client(captured, payload=None):
     from claude_mcp_servers.rl_client.client import RLClient
 
     return RLClient(
-        text_dim=1024,
+        text_dim=_DIM,
         active_embedding="qwen3",
         base_url="http://127.0.0.1:0",
         client=_CapturingClient(captured, payload=payload),
@@ -95,15 +99,20 @@ def _make_client(captured, payload=None):
 
 
 def test_uuid_inside_candidate_node_serializes_and_posts():
-    """A uuid.UUID buried in a candidate node dict must not break the POST."""
+    """A uuid.UUID buried in a candidate node dict must not break the POST.
+
+    v0.2.106: candidates travel slim (title + node_type; the vectors go in the
+    feature block), so a UUID in an enrichment field is not even sent; a
+    UUID-typed title is coerced to its str form."""
     captured = {}
     rl = _make_client(captured)
 
     node_uuid = uuid.uuid4()
     candidates = [
         {
-            "title": "N1",
+            "title": node_uuid,
             "score": 0.5,
+            "emb": [0.5] * _DIM,
             # UUID embedded in an enrichment / links field — the real hazard.
             "links": [{"target": "Other", "uuid": node_uuid}],
             "enrichment_id": node_uuid,
@@ -117,17 +126,16 @@ def test_uuid_inside_candidate_node_serializes_and_posts():
             top_k=1,
             task_id="task-xyz",
             session_id="sess-1",
+            query_emb=_Q,
         )
     )
 
-    # The rerank succeeded (server's top_k returned) — no cosine fallback.
-    assert result == [{"title": "N1", "score": 0.9}]
+    # The rerank succeeded — the caller's own dict comes back, no fallback.
+    assert result == candidates and result[0] is candidates[0]
     # The body was posted and is fully JSON-safe.
     body = captured["json"]
     assert body is not None
-    # UUID coerced to its str form (not a raw UUID object).
-    assert body["nodes"][0]["enrichment_id"] == str(node_uuid)
-    assert body["nodes"][0]["links"][0]["uuid"] == str(node_uuid)
+    assert body["nodes"] == [{"title": str(node_uuid), "node_type": ""}]
     # The whole body is genuinely serializable (would have raised otherwise).
     json.dumps(body)
 
@@ -140,10 +148,11 @@ def test_already_string_wire_fields_unaffected():
     _run(
         rl.cache_nodes(
             query="q",
-            nodes=[{"title": "N1", "score": 0.5}],
+            nodes=[{"title": "N1", "score": 0.5, "emb": [0.5] * _DIM}],
             top_k=1,
             task_id="task-abc",
             session_id="claude-session-xyz",
+            query_emb=_Q,
         )
     )
     body = captured["json"]

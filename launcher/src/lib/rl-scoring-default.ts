@@ -6,8 +6,9 @@
 // What it is: the GLOBAL DEFAULT of the per-project RL reranker toggle. It is
 // the host-wide `enabled_for_project` row of module `vct-rl-reranker`
 // (`module_set_global_enabled` / `module_is_global_enabled`); a project with
-// no explicit row inherits it. The licence gate is unchanged and sits in
-// front of it.
+// no explicit row inherits it. v0.2.106: no licence gate sits in front of it
+// any more (owner 2026-11-11, "the RL reranker is no more paid") — the lock
+// below is its only gate.
 //
 // What it is NOT: a switch on data collection. Event logging is gated by its
 // own flags (RL_LOCAL_LOGGING_DISABLED*) and never consults this one.
@@ -22,6 +23,68 @@
 // stored host-wide choice named as what applies once unlocked.
 
 export const RL_RERANKER_MODULE_ID = 'vct-rl-reranker';
+
+// v0.2.106 (owner rulings 2026-11-12): the lock is lifted and RL scoring is
+// OPT-IN per project — per-project online learning, served only while the
+// project's model beats plain search on its own record of queries scored
+// before the model trained on them (judged on confidence bounds with a 10%
+// total error budget over every check, owner ruling 2026-11-12). This is the
+// ONE home of the sentence that tells the user what turning it on does; every
+// RL control (the per-project Modules control, the host-wide default switch,
+// the "enough training events" toast) renders it from here.
+export const RL_OPT_IN_EXPLAINER =
+  'Off by default until a trained model is bundled for your embedding profile ' +
+  "(then on by default); your own choice always wins. When on, the reranker learns from this project's own citations " +
+  '(the search results your answers actually use) and reorders its searches only once ' +
+  "this project's model beats plain search on its own check — every query scored before " +
+  'the model learns from it, judged over its whole history with a margin that holds at ' +
+  'high confidence however often it is re-checked, not a lucky stretch. ' +
+  'Until then, and whenever it stops passing, results keep their plain search order. ' +
+  'You can turn it off any time.';
+
+/**
+ * v0.2.106 (owner ruling 2026-11-12): what RL scoring resolves to when
+ * nothing is chosen. Wire shape of the Rust
+ * `vct_launcher_core::rl_scoring_default::RlScoringDefault`, served by the
+ * `rl_scoring_default` command and in `ModuleEnableState.rl_default`. The
+ * decision itself lives once, in `vco_lib/rl_scoring_default.py`; the GUI
+ * never decides, it only words the served answer.
+ */
+export interface RlScoringDefault {
+  /** The active embedding profile (e.g. `qwen3`). */
+  profile: string;
+  /** A trained model is bundled for `profile`. */
+  bundled_model: boolean;
+  /** The default: on exactly when a trained model is bundled. */
+  default_on: boolean;
+  /** Why the answer could not be confirmed (the default is then off). */
+  error?: string | null;
+}
+
+/**
+ * The ONE wording of RL scoring's default. `undefined`/`null` = not loaded or
+ * the read failed: the default is then treated as off, and says so.
+ */
+export function rlDefaultLine(d: RlScoringDefault | null | undefined): string {
+  if (!d) return 'Off — the bundled-model check has not answered (treated as off).';
+  if (d.default_on) return `On — trained model bundled for ${d.profile}.`;
+  if (d.error) return `Off — no trained model could be confirmed for ${d.profile || 'the active profile'}.`;
+  return `Off — no trained model bundled yet for ${d.profile}.`;
+}
+
+/** The opt-in explainer for `moduleId`'s enable control, or null for other modules. */
+export function rlOptInExplainer(moduleId: string): string | null {
+  return moduleId === RL_RERANKER_MODULE_ID ? RL_OPT_IN_EXPLAINER : null;
+}
+
+/** The toast shown once enough training events exist to make turning it on worthwhile. */
+export function rlAutoEnableToast(eventCount: number, threshold: number): string {
+  return (
+    `RL Reranker: ${eventCount}/${threshold} training events collected. It is off ` +
+    "until you turn it on for a project (Modules → RL Reranker); it then learns from that " +
+    "project's own citations and reranks only once it beats plain search."
+  );
+}
 
 export interface RlScoringSwitchView {
   /** Whether RL scoring is ON by default — never true while locked. */
@@ -44,7 +107,6 @@ export interface RlScoringSwitchView {
  */
 export function rlScoringSwitchView(
   globalEnabled: boolean | null | undefined,
-  hasRlRetrieval: boolean,
   lockReason: string | null | undefined,
 ): RlScoringSwitchView {
   if (lockReason === undefined) {
@@ -63,7 +125,7 @@ export function rlScoringSwitchView(
   }
   return {
     checked: globalEnabled === true,
-    disabled: !hasRlRetrieval,
+    disabled: false,
     notice: null,
     storedNote: null,
   };

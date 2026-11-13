@@ -6,7 +6,8 @@ Ollama's default keep_alive is ~5 min; after any idle gap the next embed pays
 a ~1.9 s model reload (hook-latency audit 2026-07-11). Sending keep_alive on
 every embed request pins the model resident. These tests pin:
 
-  - _keep_alive() default is "10m" (24h until v0.2.102 W4-E)
+  - _keep_alive() default is the shared caller value "45m" (24h until
+    v0.2.102 W4-E, 10m until v0.2.106 moved unloading to the hub)
   - VCO_OLLAMA_KEEP_ALIVE overrides the value
   - an EMPTY VCO_OLLAMA_KEEP_ALIVE is an explicit opt-out (no field sent)
   - _with_keep_alive adds the field (default) and is a no-op on opt-out
@@ -39,8 +40,8 @@ def _clean_env():
         os.environ["VCO_OLLAMA_KEEP_ALIVE"] = saved
 
 
-def test_keep_alive_default_is_10m():
-    assert ollama_mod._keep_alive() == "10m"
+def test_keep_alive_default_is_the_shared_caller_value():
+    assert ollama_mod._keep_alive() == "45m"
 
 
 def test_keep_alive_env_override():
@@ -49,8 +50,10 @@ def test_keep_alive_env_override():
 
 
 def test_keep_alive_env_never_evict():
+    # v0.2.106: a bare number goes out as a JSON NUMBER (Ollama reads a
+    # string as a Go duration, which needs a unit; -1 = never evict).
     os.environ["VCO_OLLAMA_KEEP_ALIVE"] = "-1"
-    assert ollama_mod._keep_alive() == "-1"
+    assert ollama_mod._keep_alive() == -1
 
 
 def test_empty_env_is_opt_out():
@@ -60,7 +63,7 @@ def test_empty_env_is_opt_out():
 
 def test_with_keep_alive_adds_field_by_default():
     body = ollama_mod._with_keep_alive({"model": "m", "input": "x"})
-    assert body["keep_alive"] == "10m"
+    assert body["keep_alive"] == "45m"
     # original-shape keys preserved
     assert body["model"] == "m" and body["input"] == "x"
 
@@ -100,7 +103,7 @@ def test_embed_request_body_carries_keep_alive():
         adapter = ollama_mod.OllamaAdapter("http://x:11435", session=mock.MagicMock())
         adapter.embed("qwen3-embedding:0.6b", "hello", num_ctx=8192)
 
-    assert captured["json"].get("keep_alive") == "10m", captured["json"]
+    assert captured["json"].get("keep_alive") == "45m", captured["json"]
 
 
 def test_embed_request_honors_opt_out():

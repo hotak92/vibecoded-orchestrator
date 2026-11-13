@@ -236,6 +236,9 @@ pub async fn start_hub_server() -> Result<u16, String> {
     //     unauthenticated request never even reaches the secret-
     //     serving logic. The `Extension` carries `AuthState` into
     //     the middleware closure.
+    // v0.2.106: one tracker for the unloader task and its routes.
+    let ollama_lifetime_api =
+        super::ollama_lifetime::OllamaLifetimeApi::new(launcher_state.clone());
     let routes = axum::Router::new()
         .nest("/api/v1", api::router(database))
         .nest("/api/v1", modules_api::router().with_state(launcher_state.clone()))
@@ -293,6 +296,13 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest(
             "/api/v1",
             chat_model_context_api::router().with_state(launcher_state.clone()),
+        )
+        // v0.2.106: the Ollama model list + "Unload now" for the Services
+        // card. Ordinary global-hub.token routes inside the auth layer. The
+        // same tracker feeds the unloader task spawned below.
+        .nest(
+            "/api/v1",
+            super::ollama_lifetime::router().with_state(ollama_lifetime_api.clone()),
         )
         // v0.2.31: module-owned DB rows. Uses its OWN bearer-scope
         // middleware (require_module_scope) — token is the per-(module,
@@ -430,6 +440,12 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // one, and it heals through the SAME `vco_lib.gateway_ensure` entry
     // point rather than a second copy of the start logic.
     gateway_watchdog::spawn_gateway_watchdog(launcher_state.clone());
+
+    // v0.2.106 (owner ruling 2026-11-11): the hub is the ONE owner of how
+    // long Ollama keeps a model loaded. VCO's callers send a long, bounded
+    // keep_alive (the fail-safe when the hub is down); this task unloads a
+    // model once no VCO request has used it for the Preferences idle time.
+    super::ollama_lifetime::spawn_ollama_lifetime(ollama_lifetime_api);
 
     // v0.2.97 (lane V): poll every active module's `runtime.health_check`
     // (loopback only, bounded, one task per probe) so the module tiles can

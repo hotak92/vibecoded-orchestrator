@@ -20,7 +20,9 @@ shim (before `install.py`'s 10-step flow runs). It tells you the answer to
   means pip would have fallen back to source build; the user needs a
   3.12/3.13 interpreter, not 3.14).
 - `system.podman` / `system.docker` / `system.container_runtime_chosen` —
-  which runtime install.py would have picked.
+  which runtime install.py would have picked; `system.compose` — whether a
+  compose provider exists for it (`ok: false` = the blocking
+  `compose_provider` prereq: install step 5 cannot start the services).
 - `system.gpu` — vendor (`nvidia` / `amd` / `metal` / `intel` / `none`),
   VRAM, driver, container-toolkit reachability. This is what drove the
   GPU-vs-CPU tier decision.

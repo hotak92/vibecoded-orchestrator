@@ -84,6 +84,9 @@ build/
 launcher/dist/**/*-debug
 launcher/dist/**/*-with-devtools
 launcher/src-tauri/target/
+# A cargo build run from the repository root (CARGO_TARGET_DIR=target, a
+# stray `cargo` invocation) lands here; it is never source.
+/target/
 
 # Virtual environments
 .venv/

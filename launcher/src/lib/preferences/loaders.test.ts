@@ -168,7 +168,10 @@ describe('the registry holds every loader exactly once', () => {
     // + `engineAutostart` (v0.2.103, review R19 F4): the container-engine
     // auto-start Preferences toggle, lazy.
     expect(PREF_LOADER_KEYS).toContain('engineAutostart');
-    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 8);
+    // + `servicesWatcher` (v0.2.106): the shared auto-restart toggle
+    // (launcher watcher + hub watchdog), lazy.
+    expect(PREF_LOADER_KEYS).toContain('servicesWatcher');
+    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 9);
   });
 
   it('every lazy key is attached to a section of the page', () => {
@@ -224,6 +227,7 @@ describe('every toggle still reaches its command (set_*/get_* census)', () => {
     ['set_hub_boot_autostart', 'get_hub_boot_autostart'],
     ['set_launcher_session_autostart', 'get_launcher_session_autostart'],
     ['set_container_engine_autostart', 'get_container_engine_autostart'],
+    ['set_services_watcher_enabled', 'get_services_watcher_enabled'],
     ['set_logging_level', 'get_logging_level'],
     ['set_volumes_config_dry_run', 'get_volumes_config'],
     ['migrate_volumes', 'get_volumes_config'],

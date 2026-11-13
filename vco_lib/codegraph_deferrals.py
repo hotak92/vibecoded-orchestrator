@@ -114,6 +114,7 @@ def clear_backend_deferrals(
 
 def record_successful_walk(
     install_root: Path, force_recreate: bool = False,
+    whole_repo_rewalk: bool = False,
 ) -> int:
     """Everything a COMPLETED analyzer walk owes the ledger, in one call.
 
@@ -131,6 +132,17 @@ def record_successful_walk(
       and proves nothing about stale boundaries. Stamping on a plain walk
       would retire the entry for work nobody did.
 
+      v0.2.106: ALSO after a COMPLETED whole-repo ``--force-rewalk``
+      (``whole_repo_rewalk`` — the analyzer passes the truthy result of
+      ``codegraph_extractor_generation.stamp_after_walk``, which records only
+      a clean whole-repo force walk). That walk bypasses the per-file gate and
+      re-plans every entity with the CURRENT chunker; an entity whose chunks
+      changed gets new chunk hashes and re-embeds, one whose chunks did not is
+      hash-skipped — the same re-chunk the drop-and-rebuild buys, without
+      dropping the graph first. The extractor-generation rung for a chunker
+      bump triggers exactly this walk on update, so the code-graph half
+      retires on its own instead of waiting for a destructive command.
+
     ``install_root`` is the ledger root the caller resolved
     (``--deferral-root``, else its default): emit-root == clear-root ==
     stamp-root, the MAJOR-A invariant, so a retry cannot record in one tree
@@ -142,7 +154,7 @@ def record_successful_walk(
     bookkeeping.
     """
     removed = clear_backend_deferrals(install_root)
-    if force_recreate:
+    if force_recreate or whole_repo_rewalk:
         from vco_lib.chunker_revision import record_resync_half
 
         record_resync_half(Path(install_root), "codegraph")

@@ -3,14 +3,14 @@ title: Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 type: concept
 tags: [launcher, supabase, schema, paid-modules, licensing, commercial, partially-superseded, low-level-implementation]
 created: 2026-04-23T16:20:00Z
-updated: 2026-07-20T00:00:00Z
+updated: 2026-11-12T10:00:00Z
 status: active
 implementation: "Migration 004_paid_modules.sql lives in the launcher's Supabase project under supabase/migrations/. The launcher-side mirror of per-module entitlements is tier_cache.module_licenses (read via is_module_licensed_v2)."
 ---
 
 # Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 
-⚠️ **Partially-superseded** (2026-05-26): the `profiles.paid_modules` JSONB column described below was designed in the pre-v0.2.33 architecture, intended to be read by a single `validate-module` endpoint at runtime. v0.2.33+ uses a three-endpoint design instead (`validate-tier` + `rl-artifact-url` + `module-catalog`) and the source-of-truth for per-module entitlements lives in `tier_cache.module_licenses` on the launcher side, with server-authoritative checks at `rl-artifact-url` via its server-to-server call to `validate-tier`. The `profiles.paid_modules` column shape is still RELEVANT for org-side persistence of which modules a user owns (especially when Lemon Squeezy webhooks fire post-purchase) once Path B (LS-variant licensing) ships, but the launcher-side runtime flow has evolved away from this single-endpoint design.
+⚠️ **Partially-superseded** (2026-05-26): the `profiles.paid_modules` JSONB column described below was designed in the pre-v0.2.33 architecture, intended to be read by a single `validate-module` endpoint at runtime. v0.2.33–v0.2.105 used a three-endpoint design instead (`validate-tier` + `rl-artifact-url` + `module-catalog`), with per-module entitlements in `tier_cache.module_licenses` on the launcher side and server-authoritative checks at `rl-artifact-url` via its server-to-server call to `validate-tier`. Since v0.2.106 the RL reranker is free and bundled (built locally) and only its paid catalog listing is retired: the edge functions (`validate-tier`, `module-catalog`, `rl-artifact-url`, `rl-latest-version`, `rl-latest-weights`) all stay deployed as paid-module infrastructure for future paid modules, and the bundled reranker never calls the `rl-*` ones. The `profiles.paid_modules` column shape is still RELEVANT for org-side persistence of which modules a user owns (especially when Lemon Squeezy webhooks fire post-purchase) once Path B (LS-variant licensing) ships, but the launcher-side runtime flow has evolved away from this single-endpoint design.
 
 The current install-time gate is the pre-install catalog architecture (L0 public endpoint + post-install on-disk manifest); server-side admin license validation covers the production deployment status; the superseded single-endpoint design was the validate-module Supabase Edge Function.
 
@@ -77,7 +77,7 @@ Added `PAID_MODULES_MAP` dict (parallel to `VARIANT_MAP` / `ORCHESTRATOR_TIER_MA
 
 ### `validate-module` edge function (design only — not the shipped path)
 
-This single-endpoint runtime check was designed as a sibling of `validate-tier` but was never deployed; the runtime licensing flow ships as the three-endpoint design (`validate-tier` + `rl-artifact-url` + `module-catalog`) with `tier_cache.module_licenses` as the launcher-side source of truth. The original contract:
+This single-endpoint runtime check was designed as a sibling of `validate-tier` but was never deployed; the runtime licensing flow shipped (v0.2.33–v0.2.105) as the three-endpoint design (`validate-tier` + `rl-artifact-url` + `module-catalog`; since v0.2.106 the free, bundled RL reranker no longer calls `rl-artifact-url`, which stays deployed for future paid modules) with `tier_cache.module_licenses` as the launcher-side source of truth. The original contract:
 
 1. Receives `{license_key, module_slug, machine_id}` from the launcher.
 2. Validates key via LS `/v1/licenses/validate` + `/v1/licenses/activate`.

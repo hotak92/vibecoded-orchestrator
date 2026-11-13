@@ -104,7 +104,7 @@ pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 /// Text model id → ACTIVE_EMBEDDING profile.
 ///
 /// must match install.py::_TEXT_MODEL_ACTIVE_EMBEDDING (the Python side is
-/// the canonical home; this is the Rust mirror so the GUI chooser can write
+/// the canonical home; the Rust mirror lives in core, so the GUI chooser can write
 /// the same profile key install.py would derive). Drift here re-introduces
 /// the v0.2.68 Defect D bug: the GUI writes only the model id, the canonical
 /// `embedding.active_profile` key stays empty, and `populate` falls back to
@@ -114,13 +114,9 @@ pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 /// same map (single source) when deriving the per-project
 /// `module_settings/active_embedding` seed from the hardware pick.
 pub(crate) fn active_profile_for_model(model_id: &str) -> Option<&'static str> {
-    match model_id.trim() {
-        "qwen3-embedding:0.6b" => Some("qwen3"),
-        "snowflake-arctic-embed2:latest" => Some("arctic"),
-        "openai-text-embedding-3-small" => Some("openai"),
-        "text-embedding-3-small" => Some("openai"),
-        _ => None,
-    }
+    // v0.2.106: the map lives in `vct_launcher_core::active_embedding` (the
+    // hub's former copy went there too).
+    vct_launcher_core::active_embedding::active_profile_for_model(model_id)
 }
 
 /// Write the new-project default TEXT embedding model id AND its derived
@@ -215,28 +211,18 @@ pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
 /// → `None`. Returns `None` (caller falls to `"qwen3"`) when neither is set
 /// or the hardware pick maps to no known profile. Soft-fail on any DB error.
 ///
-/// This is the GLOBAL leg of the active-embedding cascade — shared by
-/// `resolve_active_embedding_cascade` (below) and mirrored in
-/// `config_api.rs` (hub) + `config_projection.py` (projection writer).
+/// This is the GLOBAL leg of the active-embedding cascade. v0.2.106: its
+/// Rust home is `vct_launcher_core::active_embedding` (the hub calls the same
+/// function); `config_projection.py` is the Python side.
 fn global_active_embedding(db: &Db) -> Option<String> {
-    db.app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING)
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            db.app_state_get(APP_STATE_DEFAULT_TEXT_EMBED)
-                .ok()
-                .flatten()
-                .and_then(|model_id| active_profile_for_model(&model_id))
-                .map(|profile| profile.to_string())
-        })
+    vct_launcher_core::active_embedding::global_active_embedding(db)
 }
 
 /// The ONE active-embedding resolution — ONE global profile for every
 /// project (v0.2.102 W6-J; owner ruling 2026-10-11).
 ///
-/// Order (must match the hub `config_api.rs::resolve_active_embedding_for_hub`
-/// and the Python `config_projection.py::_resolve_active_embedding_cascade`):
+/// Order (the hub resolves through the same core function; must match the
+/// Python `config_projection.py::_resolve_active_embedding_cascade`):
 ///
 ///   1. Machine-global `app_state[embedding.active_profile]` (Preferences),
 ///      then the hardware-pick derive (`app_state[default_text_embedding]`).

@@ -15,6 +15,7 @@
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke, listen } from '$lib/tauri';
+  import { pollWhileActive } from '$lib/window-activity';
   // PR-37 (v0.2.12 / 2026-05-16): schema-health card surfaces the two
   // schema migrations introduced in PR-24 (Development temporal props
   // + shared KG indexNullState). Soft-fails to a "Weaviate not
@@ -88,7 +89,9 @@
   import { gatewayAccountLines } from '$lib/api/gateway_accounts';
   import { projects } from '$lib/stores/projects';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { toast } from '$lib/stores/toast';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
+  import OllamaModelsCard from '$lib/components/OllamaModelsCard.svelte';
   import {
     ACTION_LABELS,
     buildCandidateReport,
@@ -130,7 +133,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let progress = $state<LifecycleProgress | null>(null);
-  let pollerHandle: ReturnType<typeof setInterval> | null = null;
+  let pollerHandle: (() => void) | null = null;
   let unlistenProgress: (() => void) | null = null;
 
   // ─── Model gateway card ────────────────────────────────────────────────
@@ -394,6 +397,10 @@
       await refresh();
     } catch (e) {
       error = String(e);
+      // v0.2.106: the confirmation dialog stays open on a failure, and the
+      // page banner sits behind its backdrop — the toast layer renders above
+      // any open modal (`top-layer-host.ts`), so the failure is seen.
+      toast.error(`Handing the service to VCO failed: ${String(e)}`);
     } finally {
       handBusy = false;
     }
@@ -559,7 +566,8 @@
     // this page was the entry point.
     await projects.load();
     await loadGuidanceFlags();
-    pollerHandle = setInterval(() => {
+    // v0.2.106: no polling while the window is minimised or hidden.
+    pollerHandle = pollWhileActive(() => {
       refresh();
       refreshGateway();
     }, 5000);
@@ -581,7 +589,7 @@
   });
 
   onDestroy(() => {
-    if (pollerHandle) clearInterval(pollerHandle);
+    if (pollerHandle) pollerHandle();
     if (unlistenProgress) unlistenProgress();
   });
 </script>
@@ -602,6 +610,20 @@
     <p class="muted">
       Manage the shared Weaviate / Ollama / code_embed containers used by
       every project.
+    </p>
+    <!-- v0.2.106: Stop is the supported maintenance path. A stop from this
+         page drops the shared pause marker, so BOTH automatic restarters
+         (this launcher's services watcher and the hub's watchdog) leave
+         the service down until you press Start. A stop done outside VCO
+         (`docker stop` / `podman stop` in a terminal) cannot be told apart
+         from a crash and WILL be auto-restarted — use the buttons here. -->
+    <p class="muted">
+      <strong>Stop pauses automatic restarts.</strong> A service stopped here
+      stays down (for backup, maintenance, …) until you press Start — neither
+      the launcher watcher nor the hub watchdog will bring it back. A stop
+      from a terminal (<code>podman stop</code>) looks like a crash and is
+      restarted automatically; use these buttons instead. The auto-restart
+      behaviour itself has a switch in Preferences → Services.
     </p>
   </header>
 
@@ -1190,6 +1212,12 @@
       </ul>
     {/if}
   </section>
+
+  <!-- v0.2.106 (owner ruling 2026-11-11): which models Ollama has loaded,
+       their RAM / VRAM, when the hub unloads them, and "Unload now" — all
+       through the hub, which owns unloading. Outside the snapshot guard like
+       the gateway card: it reads the hub, not the container table. -->
+  <OllamaModelsCard />
 
   <ExternalServicesDialog
     bind:open={endpointDialogOpen}

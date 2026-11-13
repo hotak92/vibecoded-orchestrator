@@ -103,36 +103,39 @@ CLIENT_WINDOW_DEFAULT = 200_000
 #: Where a completed request's row lands, under :func:`_metrics_dir`.
 LEDGER_BASENAME = "gateway-usage.jsonl"
 
-#: Rotate past this. A row with every field populated measures
-#: :data:`LEDGER_ROW_BYTES`, so this is ~96k requests — months of ordinary use
-#: — and it is bounded at all because the daemon is long-lived and nothing
-#: else prunes it. ONE file, never a ``.1`` sibling: this is a context
-#: monitor, not an archive, and a scheme that keeps N generations is a
+#: Rotate past this. A row with every field at its maximum measures
+#: :data:`LEDGER_ROW_BYTES`, so this is at least ~52k requests — months of
+#: ordinary use — and it is bounded at all because the daemon is long-lived
+#: and nothing else prunes it. ONE file, never a ``.1`` sibling: this is a
+#: context monitor, not an archive, and a scheme that keeps N generations is a
 #: disk-usage decision the user never made.
 LEDGER_MAX_BYTES = 50 * 1024 * 1024
 
-#: One fully-populated row, measured — the LONGEST realistic row across every
-#: route (anthropic, zai, qwen, kimi — the qwen/deepseek model id is the
-#: longest namespaced ``[1m]`` spelling), every field set at its realistic
-#: maximum: UUID session/agent/parent-agent ids, 7-digit token counts on a
-#: 1M-window chat, ``window_actual`` 1 000 000, an 8-digit
-#: ``request_bytes``, the longest ``fallback_from`` label
-#: (``vendor:qwen:deepseek-v4.1-flash``), and the LONGEST effort spelling
-#: (``budget_tokens=8192`` on both sides of the pair; a named tier is
-#: shorter). That case serialises to 776 bytes + the newline. Used only to
-#: turn a byte cap into a LINE count for
+#: One row with EVERY field at its maximum, MEASURED from a row
+#: :func:`build_record` builds and :meth:`UsageRecord.to_json` serialises,
+#: plus the newline — pinned by
+#: ``tests/test_v0295_gateway_usage_ledger.py::test_the_row_size_constant_is_a_row_the_code_builds``,
+#: so a new field or a longer id fails there instead of drifting here. It is
+#: an UPPER BOUND, not one realistic request: the longest namespaced ``[1m]``
+#: vendor id (``claude-gw/qwen/deepseek-v4.1-flash-1017[1m]``) shares the row
+#: with the first-party account fields (a 32-character account id, the longest
+#: fallback reason) and a compaction value at its 64-character cap; UUID
+#: session/agent/parent ids, 7-digit counts in all four token fields, an
+#: 8-digit ``request_bytes``, the longest ``fallback_from`` label, the
+#: ``inherited:`` window source and the ``budget_tokens=8192`` effort pair.
+#: Used only to turn a byte cap into a LINE count for
 #: :func:`vco_lib.atomic.rotate_tail_lines`, which keeps lines rather than
-#: bytes — a TYPICAL row is smaller, so the surviving tail is at most about a
-#: quarter of the cap, never more. Re-measured at v0.2.102 when the effort
-#: pair (``effort_requested`` / ``effort_forwarded``) joined the row; the
-#: pre-pair figure of 545 was itself a derived underestimate.
-LEDGER_ROW_BYTES = 777
+#: bytes — every real row is smaller, so the surviving tail is at most a
+#: quarter of the cap, never more. History: 545 (derived), 776 (v0.2.102, the
+#: effort pair), 792 (v0.2.106, the dated DeepSeek id) — all arithmetic that
+#: missed v0.2.105's compaction and account fields; v0.2.106 Q7 measures it.
+LEDGER_ROW_BYTES = 1008
 
 #: What fraction of :data:`LEDGER_MAX_BYTES` survives a rotation. A quarter:
 #: enough recent history that a monitor restarted after a rotation still has
 #: context to show, and small enough that rotations are rare rather than one
-#: per write. At the default cap that is ``(52428800 // 4) // 777`` =
-#: **16 868 lines**, about 12.5 MiB when every row is a maximal
+#: per write. At the default cap that is ``(52428800 // 4) // 1008`` =
+#: **13 003 lines**, about 12.5 MiB when every row is a maximal
 #: :data:`LEDGER_ROW_BYTES` row — at most a quarter of the cap, as intended;
 #: typical (smaller) rows keep the same LINE count and proportionally fewer
 #: bytes.

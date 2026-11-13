@@ -42,6 +42,9 @@
     ]
   },
   "idleCompaction": false,
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_EFFORT": "medium"
+  },
   "skillOverrides": {
     "loop": "user-invocable-only"
   },
@@ -869,7 +872,7 @@
         ]
       },
       {
-        "matcher": "Write",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",

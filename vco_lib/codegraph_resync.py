@@ -135,7 +135,7 @@ def _truthy_env(name: str) -> bool:
 # (the primary source — `_resolve_embed_revision` regex-parses it from the
 # resolved analyzer file so the two can't silently drift on a normal install;
 # this constant only covers a missing/unreadable analyzer).
-_FALLBACK_EMBED_REVISION = 1
+_FALLBACK_EMBED_REVISION = 2
 
 _EMBED_REVISION_RE = re.compile(
     r"^CODEGRAPH_EMBED_REVISION\s*:\s*int\s*=\s*(\d+)", re.MULTILINE
@@ -1836,10 +1836,9 @@ def count_cleanup_owed_rows(
 # props). The right shape is a Weaviate-side `data.update` pass: PATCH
 # semantics — no vector touch, no tombstone, no embed.
 
-# Chunked bodies carry a leading `[chunk N/total]\n\n` header. MUST MATCH
-# templates/scripts/analyze_code_graph.py::_CHUNK_HEADER_RE (and
-# server._parse_chunk_header).
-_CHUNK_HEADER_RE = re.compile(r"^\[chunk \d+/\d+\]\n\n")
+# Chunked bodies carry a leading `[chunk N/total]\n\n` header — the ONE pattern
+# is `codegraph_guards.CODE_CHUNK_HEADER_RE` (the analyzer reads it there too).
+from vco_lib.codegraph_guards import CODE_CHUNK_HEADER_RE as _CHUNK_HEADER_RE  # noqa: E402
 
 
 def _resolve_metadata_helpers():
@@ -3659,9 +3658,10 @@ def _register_spawn_with_hub(
 # completing" — a false failure on a healthy code graph, with files_analyzed=0
 # and log_tail NULL as the fingerprint. Rule (KG: pid-liveness-tracking-needs-
 # a-terminal-report-2026-08-28): never ship the register half without the
-# terminal half. The driver now posts success/partial/failed + stats through
-# the SAME wire it registered on; the reconciler keeps firing, but only for
-# rows with no terminal status — which is now genuinely "died or lost".
+# terminal half. The driver now posts success/partial/failed/skipped +
+# stats through the SAME wire it registered on; the reconciler keeps firing,
+# but only for rows with no terminal status — which is now genuinely "died or
+# lost". (`skipped` is v0.2.106: the run a twin walk made unnecessary.)
 
 #: Byte cap for the log tail carried on the terminal report. Mirrors the
 #: launcher DB layer's LOG_TAIL_MAX_BYTES (db/log_tail.rs) — the hub caps
@@ -3799,7 +3799,8 @@ def _report_terminal_to_hub(
     this function's soft-skip, the exact pre-fix degrade; the base route
     would instead have executed the report as a registration there). Body
     extends the registration payload: ``{"status": "success"|"partial"|
-    "failed", "pid": <driver pid>, "source": "install_resync", "repo_root":
+    "failed"|"skipped", "pid": <driver pid>, "source": "install_resync",
+    "repo_root":
     ..., "files_analyzed": N?, "duration_ms": M?, "error_message": ...?,
     "log_tail": ...?, "analyzed_commit": ...?}``. ``pid`` is this driver
     process (== the pid the spawn registered, os.getpid()); the hub finalizes
@@ -3827,8 +3828,22 @@ def _report_terminal_to_hub(
             payload["log_tail"] = log_tail
         if analyzed_commit:
             payload["analyzed_commit"] = analyzed_commit
-        resp = _hub_post_codegraph_build(project_name, payload,
-                                         path_suffix="/terminal")
+        try:
+            resp = _hub_post_codegraph_build(project_name, payload,
+                                             path_suffix="/terminal")
+        except Exception as exc:
+            # Version skew (v0.2.106 fix round 1, U1-5): a hub older than
+            # v0.2.106 refuses "skipped" with 400 invalid_status, which left
+            # the row running for the pid sweep to call "the walk died before
+            # completing" — worse than the old explicit report. Retry ONCE as
+            # "failed" with the same reason (the pre-v0.2.106 behaviour): the
+            # row then says what happened, in words.
+            if status != "skipped" or not _is_invalid_status_refusal(exc):
+                raise
+            payload["status"] = "failed"
+            resp = _hub_post_codegraph_build(project_name, payload,
+                                             path_suffix="/terminal")
+            status = "failed (this hub predates 'skipped')"
         logger.info(
             "codegraph resync: reported terminal '%s' to hub (HTTP %s)",
             status,
@@ -3836,6 +3851,33 @@ def _report_terminal_to_hub(
         )
     except Exception as exc:  # noqa: BLE001 — observability, never a gate
         logger.debug("codegraph resync: hub terminal report skipped: %s", exc)
+
+
+def _is_invalid_status_refusal(exc: BaseException) -> bool:
+    """A 400 whose JSON body names ``invalid_status`` — an older hub refusing
+    a terminal status it does not know yet. Never raises."""
+    import urllib.error
+
+    if not isinstance(exc, urllib.error.HTTPError) or exc.code != 400:
+        return False
+    try:
+        return b"invalid_status" in (exc.read() or b"")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _report_skip_to_hub(project_name: str, repo_root: "Path | str | None",
+                        reason: str) -> None:
+    """The ONE home of a driver's "this run was skipped" terminal report
+    (the driver-claim skip and the walk-claim skip). A no-op on the hub
+    whenever this driver's pid does not own a running row. Soft-fail."""
+    try:
+        _report_terminal_to_hub(
+            project_name, "skipped", repo_root=repo_root,
+            files_analyzed=0, duration_ms=0, error_message=reason,
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never a gate
+        logger.debug("resync driver: skip report raised: %s", exc)
 
 
 def _maybe_run_exposure_heal(repo_root: Path, project_name: str) -> bool:
@@ -4268,6 +4310,18 @@ def run_resync_and_verify(
             f"is already running — skipping",
             flush=True,
         )
+        # v0.2.106 fix round 1 (U1-1): close THIS driver's row as skipped
+        # when its spawn registration took one. Against a current hub the
+        # registration was refused while the twin was alive, so this is a
+        # no-op (the hub finalizes only a running row with this pid); against
+        # an older hub, which let the registration steal the twin's row, it
+        # turns the later "died before completing" sweep into "skipped".
+        _report_skip_to_hub(
+            project_name, repo_root,
+            "another resync for this project is already running — this run "
+            "was skipped, not failed; the running resync reports the build's "
+            "real outcome",
+        )
         return 0
     try:
         slots = int(max(1, env_float(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT)))
@@ -4582,21 +4636,25 @@ def _run_resync_and_verify_slotted(
         # guard makes this report a no-op — it finalizes ONLY a still-running
         # row with this exact pid. Soft-fail as everywhere: observability
         # never gates the exit.
-        try:
-            _report_terminal_to_hub(
-                project_name,
-                "failed",
-                repo_root=repo_root,
-                files_analyzed=0,
-                duration_ms=0,
-                error_message=(
-                    "refused: another code-graph walk is already running "
-                    "(this run was skipped, not failed — the running walk's "
-                    "own completion reports the build's real outcome)"
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001 — observability, never a gate
-            logger.debug("resync driver: walk-refusal report raised: %s", exc)
+        # v0.2.106: the SKIP is not a failure, so it is reported as one of
+        # the hub's NON-failure terminal states ("skipped"). Before this the
+        # driver posted "failed" for a walk that never ran beside a healthy
+        # twin, and every "Update all" log read
+        #   "… skipping this run (no twin walks) … reported terminal 'failed'"
+        # — a red row for a project whose graph was in fact being rebuilt.
+        # Fix round 1 (U1-2): whose row this closes. A LIVE twin's running
+        # row is never taken by this driver's spawn registration (the hub
+        # refuses to supersede a launcher build with a fresh heartbeat or a
+        # detached walk whose pid is alive), so for a launcher build /
+        # Re-analyze twin this report matches nothing and that walk's own
+        # row keeps showing its progress and outcome. A twin that keeps no
+        # row (a CLI walk) leaves this driver's own registered row, which is
+        # closed here as skipped — an accurate account of THIS run.
+        _report_skip_to_hub(
+            project_name, repo_root,
+            "another code-graph walk is already running for this project — "
+            "this run was skipped, not failed",
+        )
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)

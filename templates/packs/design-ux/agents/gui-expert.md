@@ -6,6 +6,8 @@ keywords: [Gradio, "Gradio app", "gr.Blocks", "WCAG 2.1", "Python GUI", "progres
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: medium
+background: true
+autoCompactWindow: 750000
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
 ---

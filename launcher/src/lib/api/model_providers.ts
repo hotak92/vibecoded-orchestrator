@@ -48,11 +48,61 @@ export interface ModelProvidersPayload {
   app_state_key?: string;
 }
 
+/** One project's outcome inside the apply summary. */
+export interface ProviderApplyProjectRow {
+  project: string;
+  folder: string;
+  status: 'ok' | 'skipped' | 'held' | 'failed';
+  parked: string[];
+  already_parked: string[];
+  kept: string[];
+  restored: string[];
+  /** Restored definitions parked under an older release and brought to this
+   *  release's version the way a bundle update does (a copy that matched no
+   *  shipped version is backed up first). */
+  refreshed?: string[];
+  /** Restored definitions LEFT AS THEY WERE (v0.2.106 review L2/L4): the
+   *  refresh could not bring them to this release's bytes (a backup could
+   *  not be written, or the file could not be classified), so they carry no
+   *  manifest entry and the next Update bundle adopts them with a backup.
+   *  The card must say so — before this field the label reported the
+   *  restore as done while the file was still the parked copy. */
+  not_refreshed?: string[];
+  notes: string[];
+  error: string;
+}
+
+/**
+ * What the immediate apply did (v0.2.106): a stored `set` parks or restores
+ * the vendor's agent definitions in the orchestrator root and every
+ * registered project AT ONCE, and this is the per-project record of it.
+ * `held` means the vendor was switched ON but its key does not resolve, so
+ * the definitions stay parked — the same decision the delivery gate makes,
+ * and the bundle update's restore makes the same one (one rule,
+ * `module_gated_delivery.restore_gate`), so they return with the first
+ * update or switch after the key resolves.
+ */
+export interface ProviderApplySummary {
+  vendor: string;
+  enabled: boolean;
+  held: boolean;
+  held_reason: string;
+  parked_projects: number;
+  restored_projects: number;
+  failed_projects: number;
+  /** Non-empty when the launcher's project list could not be read: only the
+   *  orchestrator root was reached (counted in `failed_projects`). */
+  registry_error?: string;
+  projects: ProviderApplyProjectRow[];
+}
+
 /** The `set` payload: `stored: false` means the choice was NOT saved. */
 export interface ModelProviderSetResult {
   vendor: string;
   enabled: boolean;
   stored: boolean;
+  /** Present on a stored change: what the agents leg did, per project. */
+  agents?: ProviderApplySummary;
 }
 
 /** Every gateway provider with its switch and its key state. */
@@ -76,14 +126,74 @@ export async function setModelProviderEnabled(
 
 /**
  * The one line the card shows when a provider is off: what the choice means,
- * in the user's terms. Deliberately concrete about the three effects and about
- * the one thing that does NOT happen (nothing is deleted).
+ * in the user's terms. Deliberately concrete about the four effects and about
+ * the one thing that does NOT happen (nothing is deleted). All four apply AT
+ * ONCE (v0.2.106) — no restart, no bundle update.
  */
 export const PROVIDER_OFF_NOTICE =
-  'Off is remembered on this machine: on the next update each project moves ' +
-  'this provider\'s agent definitions to .claude/agents.disabled/ (nothing is ' +
-  'deleted — switching it back on restores them) and its rows leave the ' +
-  'model guidance in every CLAUDE.md.';
+  'Off is remembered on this machine and applies at once: this provider\'s ' +
+  'agent definitions move to .claude/agents.disabled/ in every project ' +
+  '(nothing is deleted — switching it back on restores them), its rows leave ' +
+  'the model guidance in every CLAUDE.md, and the running gateway stops ' +
+  'serving its models within seconds.';
+
+/**
+ * The one sentence reporting what the AGENTS leg of a stored toggle did —
+ * parked/restored counts, the key-held case, and any per-project failure.
+ * A stored change with no summary means the helper answered before the apply
+ * existed; say the setting landed and nothing more.
+ */
+export function applyOutcomeLabel(result: ModelProviderSetResult): string {
+  const a = result.agents;
+  if (!a) {
+    return 'The agent follow-up did not report back; the setting itself is saved.';
+  }
+  if (a.held) {
+    return (
+      `Its agent definitions stay parked (${a.held_reason || 'the key does not resolve'}) ` +
+      '— they come back with the first bundle update (or provider switch) after the key resolves.'
+    );
+  }
+  const moved = result.enabled ? a.restored_projects : a.parked_projects;
+  const verb = result.enabled ? 'restored in' : 'parked in';
+  let out =
+    moved > 0
+      ? `Its agent definitions were ${verb} ${moved} ${moved === 1 ? 'project' : 'projects'} right away`
+      : 'No delivered agent definitions needed moving';
+  const refreshed = result.enabled
+    ? a.projects.reduce((n, p) => n + (p.refreshed?.length ?? 0), 0)
+    : 0;
+  if (refreshed > 0) {
+    out +=
+      ` — ${refreshed} of them came from an older release and ` +
+      `${refreshed === 1 ? 'was' : 'were'} brought to this release's version, as a bundle ` +
+      'update would (a copy that matched no version VCO shipped is backed up under ' +
+      '.claude/backups/bundle-adoptions/ first)';
+  }
+  // Review L4: a restored copy the refresh LEFT AS IT WAS (its backup could
+  // not be written, or it could not be compared) is still the parked
+  // version — name it, or the card reports the restore as done while the
+  // retired pin is still in place.
+  const notRefreshed = result.enabled
+    ? a.projects.reduce((n, p) => n + (p.not_refreshed?.length ?? 0), 0)
+    : 0;
+  if (notRefreshed > 0) {
+    out +=
+      ` — but ${notRefreshed} restored ${notRefreshed === 1 ? 'copy is' : 'copies are'} ` +
+      'still the parked version (left as it was — its backup could not be written, or it ' +
+      'could not be compared); the next Update bundle brings it to this release, backing ' +
+      'the current bytes up first';
+  }
+  if (a.failed_projects > 0) {
+    out +=
+      `, but the follow-up failed in ${a.failed_projects} ` +
+      `${a.failed_projects === 1 ? 'project' : 'projects'} — flip the switch again or let the next update finish it`;
+  }
+  if (a.registry_error) {
+    out += ` (${a.registry_error})`;
+  }
+  return out + '.';
+}
 
 /** Short wording + tone for one key state. Words only — never a value. */
 export function keyStateLabel(
@@ -141,9 +251,10 @@ export function toggleNote(
   if (result.stored !== true) {
     return `Could not save the change for ${row.display}: the launcher database could not be written. Nothing was changed.`;
   }
+  const outcome = applyOutcomeLabel(result);
   return enabled
-    ? `${row.display} is on again: its agent definitions come back on the next update and its rows return to the model guidance.`
-    : `${row.display} is off. ${PROVIDER_OFF_NOTICE}`;
+    ? `${row.display} is on again: its rows return to the model guidance and the gateway serves its models again. ${outcome}`
+    : `${row.display} is off. ${outcome} ${PROVIDER_OFF_NOTICE}`;
 }
 
 /** Should the card render at all? (No gateway ⇒ the card is meaningless.) */

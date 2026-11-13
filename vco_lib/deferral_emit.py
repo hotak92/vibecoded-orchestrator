@@ -155,22 +155,31 @@ def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None,
         A :class:`DeferralReport` seeded from the on-disk state, ready to
         mutate. The write is performed on exit.
     """
+    from vco_lib import probe_bound
+
     folder = Path(folder)
     with exclusive_file_lock(folder / LOCK_REL, timeout_s=lock_timeout_s):
         report = DeferralReport.read(folder)
         yield report
-        if gate is None or gate.write:
+        # v0.2.106 review C-M3: a doctor probe the doctor has given up on
+        # (its per-check bound ran out) never writes the ledger afterwards.
+        if (gate is None or gate.write) and not probe_bound.cancelled():
             report.write(folder)
+            if gate is not None:
+                gate.wrote = True
 
 
 class WriteGate:
     """:func:`locked_report`'s ``gate``: clear ``write`` inside the block when
     nothing changed, and the report is not rewritten."""
 
-    __slots__ = ("write",)
+    __slots__ = ("write", "wrote")
 
     def __init__(self) -> None:
         self.write = True
+        #: set by :func:`locked_report` once the report WAS written (a
+        #: cancelled doctor probe's block writes nothing — review L10)
+        self.wrote = False
 
 
 def _first_detected(prior: Optional[DeferralEntry], entry: DeferralEntry) -> DeferralEntry:
@@ -329,15 +338,22 @@ def resolve_conditions(
     Returns:
         The number of condition IDs that were actually PRESENT (and therefore
         removed) — computed before mutation. IDs absent from the report count
-        0. Returns 0 on any I/O error (soft-fail).
+        0. Returns 0 on any I/O error (soft-fail) and when the write was
+        skipped (a cancelled doctor probe — nothing was resolved).
     """
     try:
         present: list[str] = []
-        with locked_report(folder) as report:
+        gate = WriteGate()
+        with locked_report(folder, gate=gate) as report:
             for cid in condition_ids:
                 if report.has_condition(cid):
                     present.append(cid)
                 report.mark_resolved(cid)
+        if not gate.wrote:
+            # Review L10: `locked_report` skipped the write (a cancelled
+            # doctor probe writes nothing), so nothing was resolved — a
+            # caller must not log a "resolved" trail for an unchanged ledger.
+            return 0
         _end_retry_episodes(folder, present, log=log)
         return len(present)
     except Exception as exc:  # noqa: BLE001 — deferral I/O is best-effort

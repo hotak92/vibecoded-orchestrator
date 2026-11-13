@@ -7,6 +7,11 @@
 // function re-validates the tier, then exchanges a long-lived
 // service-account PAT for a short-lived registry-scoped token.
 //
+// v0.2.106 (owner 2026-11-12): kept deployed as paid-module infrastructure
+// for future paid modules. The RL reranker is bundled and free now and the
+// launcher never calls this function for it; only the RL module's paid
+// catalog listing was retired.
+//
 // ─── Runtime env-var contract ────────────────────────────────────────────────
 //
 // Required (function returns 500 / `Service misconfigured` if missing):

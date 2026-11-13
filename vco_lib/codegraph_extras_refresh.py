@@ -413,7 +413,17 @@ class RunLog:
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line)
         except OSError:
-            pass  # logging is best-effort; never fail the refresh over it
+            # v0.2.106: a log that cannot be written must not ALSO swallow the
+            # reason silently — the field report had 4 failed catch-up runs and
+            # a 0-byte log. Mirror the line to stderr: a manual run shows it on
+            # the terminal. Under the hook stderr is redirected to that same
+            # unwritable log, so there the line is still lost — the mirror
+            # helps manual runs only (review C-L7).
+            try:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            except OSError:
+                pass  # logging is best-effort; never fail the refresh over it
 
 
 @dataclass

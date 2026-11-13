@@ -257,6 +257,20 @@ If a build still fails because of a wrapper that bypasses our detection, the rec
 - **macOS**: install [Podman Desktop](https://podman-desktop.io/) or [Docker Desktop](https://www.docker.com/products/docker-desktop), then re-run `bash first-install.sh`.
 - **Windows**: install [Docker Desktop](https://www.docker.com/products/docker-desktop) or [Podman Desktop](https://podman-desktop.io/), then double-click `first-install.bat` again.
 
+### No compose provider ("looking up compose provider failed")
+
+Install step 5 starts the services with compose. `podman compose` is only a delegator: it needs `podman-compose` or `docker-compose` installed. Since v0.2.106 the installer checks this right after detecting the runtime — a fresh install stops there (before the venv) with the command for your OS, an `--update` warns, and `install.py --bootstrap` lists the blocking `compose_provider` prereq (`vco doctor` too).
+
+- **macOS**: `brew install podman-compose` (Docker Desktop ships `docker compose`).
+- **Linux**: your distribution's `podman-compose` package (`sudo apt-get install -y podman-compose`, `sudo dnf install -y podman-compose`, …); for Docker, `docker-compose-plugin`.
+- **Windows**: `winget install --id Docker.DockerCompose` (podman compose delegates to it); Docker Desktop ships compose.
+
+Check with `podman-compose version` / `docker compose version`, then re-run the installer.
+
+### Docker Hub rate limit on an image pull ("toomanyrequests")
+
+Docker Hub (which also serves `cr.weaviate.io`) refuses anonymous pulls past a quota. Since v0.2.106 install step 5 pulls the Weaviate / Ollama image itself before `compose up` (`vco_lib/compose_image_prepull.py`, `ensure_image`), and a pull refused with `toomanyrequests` / HTTP 429 / "pull rate limit" is retried from Google's official Docker Hub mirror with the same path and tag (`cr.weaviate.io/semitechnologies/weaviate:<tag>` → `mirror.gcr.io/semitechnologies/weaviate:<tag>`; `docker.io/<ns>/<img>` → `mirror.gcr.io/<ns>/<img>`; library images → `mirror.gcr.io/library/<img>`), then tagged under the original name. When the engine can read the original registry's digests (`<engine> manifest inspect`), the mirror image must match one of them or it is removed and refused; when it cannot (the registry is refusing), the mirror is accepted and the install prints and logs that it is unverified. Any other pull failure is reported as before (`service_image_pull_failed` for a service being recreated). By hand: `podman pull mirror.gcr.io/semitechnologies/weaviate:<tag> && podman tag mirror.gcr.io/semitechnologies/weaviate:<tag> cr.weaviate.io/semitechnologies/weaviate:<tag>`, or log in (`podman login docker.io`) for a higher quota.
+
 ### GPU hardware detected but no driver installed
 
 `first-install.*` detects NVIDIA and AMD GPU hardware but does not attempt driver installation — driver installs require a reboot and carry risk. If it prints a GPU URL:
@@ -407,6 +421,62 @@ open -a Docker                           # macOS (Docker Desktop)
 ```
 
 **Insufficient memory**: Weaviate needs ~512 MB RAM minimum, 1-2 GB to run comfortably. On Docker Desktop, raise the memory limit under Settings → Resources.
+
+## Backing up the Weaviate volume
+
+VCO has TWO automatic restarters that can bring a stopped service back mid-copy: the launcher's services watcher (a ~30 s poll) and the hub's infra watchdog. Since v0.2.106 both honor the same pause marker, and **Stop on the launcher's Services page is the supported way to hold them off**:
+
+1. In the launcher, open **Services** and press **Stop** on Weaviate (or **Stop All**). That writes the shared pause marker, so BOTH restarters leave the service down until you press Start again. A stop done outside VCO (`podman stop` / `docker stop` in a terminal) cannot be told apart from a crash and WILL be auto-restarted — use the buttons, not the terminal.
+2. Copy the volume while the service is down, e.g. `podman volume export vco_weaviate_data -o weaviate-backup.tar` (or copy the volume directory under the runtime's volume root).
+3. Press **Start** on Weaviate — that clears the pause and supervision resumes.
+
+Keep the launcher running (not restarted) while the pause must hold: on launcher start the boot auto-start deliberately brings the stack back up. If you need automatic restarts off for longer, Preferences → Services has a **"Restart stopped services automatically"** switch that stands down both restarters.
+
+## Weaviate collections lose their data at every restart (Weaviate 1.37)
+
+**Symptom**: a collection is still listed in the schema, but every search or listing fails with
+`tried to browse non-existing index` / `cannot get shards status for a non-existing index`. Rebuilding it helps
+until the next restart of the Weaviate container. `vco doctor` reports `weaviate_collection_index_missing`.
+
+**Cause** (an upstream Weaviate defect, read in the 1.37.18 source): Weaviate keeps its schema in a raft log and,
+on a small install, never takes a raft snapshot (its default threshold is 8192 entries), so every start replays the
+whole log. From 1.37 a replayed collection delete is recorded as an "orphan" whose data is dropped at the end of the
+start, unless a later create used the EXACT same name. The data folder, however, is named by the lower-cased class
+name. So a delete of `ProjectX_KnowledgeGraph` followed by a create of `ProjectX_Knowledgegraph` drops the live
+collection's data at every start. VCO's v0.2.88 re-spelling of the orchestrator's own collections
+(`VibecodedOrchestrator_*` → `VibeCodedOrchestrator_*`) left exactly that history on some machines.
+
+**What VCO does since v0.2.106**:
+
+- the shipped compose has Weaviate snapshot its schema within a minute of any change (`RAFT_SNAPSHOT_THRESHOLD`,
+  `RAFT_SNAPSHOT_INTERVAL`); once a snapshot holds the history, a start replays nothing dangerous;
+- before VCO moves data from Weaviate 1.28 or older to a newer release (`python install.py --update`,
+  `python -m vco_lib.service_endpoints hand-to-vco --service weaviate`, the session restart of a stopped container,
+  a port move, the launcher's volume migration), it runs the OLD image once on the same data until a snapshot
+  holds the whole history, then starts the old container again. If it cannot, the container is left as it is and
+  `weaviate_upgrade_snapshot_refused` explains why — VCO never starts a newer Weaviate on data whose snapshot
+  state it does not know;
+- VCO does not create a collection while a delete of the same name in other letter case can still be replayed;
+- `vco doctor` reports the damage (`weaviate_collection_index_missing`) and the risk
+  (`weaviate_raft_replay_exposed`).
+
+**Check**: `python -m vco_lib.weaviate_raft_guard status` prints the Weaviate version, the raft log and snapshot
+indexes (`covered: yes` when the latest snapshot holds the whole log) and, for every collection whose name differs only in case from one VCO derived or deleted (the collections the defect can hit), whether its data index is gone.
+
+**Repair a damaged collection — in this order** (rebuilding before step 1 is wiped again at the next restart):
+
+1. Make sure the running Weaviate takes snapshots: a VCO-managed container is recreated with the settings by
+   `python install.py --update`; for one you run yourself, add the two variables above.
+2. Drop each broken collection (its data is already gone) and create it again:
+   `curl -X DELETE <weaviate-url>/v1/schema/<Collection>`, then `python install.py --update` (the orchestrator
+   root re-creates its missing collections) or, for another project,
+   `python -m vco_lib.project_init bootstrap-collections --name "<project name>" --project-folder <project folder>`.
+3. Re-fill it from its sources: `.claude/scripts/kg-sync --all` (knowledge graph from `knowledge/`, docs from
+   `docs/`).
+4. Before any restart, wait until `python -m vco_lib.weaviate_raft_guard status` prints `covered: yes`.
+
+**Moving Weaviate by hand**: before you start a newer Weaviate on data an older one wrote, take the snapshot with
+the old container's own image: `python -m vco_lib.weaviate_raft_guard snapshot --container <name>`.
 
 ## Ollama container won't start
 

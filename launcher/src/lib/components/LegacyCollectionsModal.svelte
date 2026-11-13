@@ -433,11 +433,11 @@
 
       <!-- Affected projects -->
       <section class="legacy-section">
-        <h4>Projects with mismatched code-graph prefix</h4>
+        <h4>Projects without a code graph under their own prefix</h4>
         {#if report.affected_projects.length === 0}
           <p class="legacy-empty-inline">
-            All registered projects already use the legacy prefix — they are
-            the consumers of the data, not victims of the bug.
+            Every registered project already has code-graph data under its own
+            prefix (or uses the legacy prefix itself) — nothing to re-analyze.
           </p>
         {:else}
           <ul class="legacy-list">

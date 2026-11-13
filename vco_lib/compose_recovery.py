@@ -63,7 +63,7 @@ __all__ = [
     "SOCKET_MISSING", "DAEMON_DOWN", "PORT_TAKEN",
     "NAME_CONFLICT_STORAGE_LEFTOVER", "NAME_CONFLICT_OTHER_PROVIDER",
     "NETWORK_LABEL_MISMATCH", "PROVIDER_MISMATCH", "BUILD_FAILED",
-    "BUILD_FLAG_UNSUPPORTED", "UNKNOWN",
+    "BUILD_FLAG_UNSUPPORTED", "PROVIDER_MISSING", "UNKNOWN",
     "ComposeFailure", "HealResult", "UpResult",
     "classify", "refine", "heal", "compose_up_with_recovery", "deferral_entries",
     "heal_deferral_entry", "daemon_remedy", "compose_project_from_argv",
@@ -84,6 +84,9 @@ NETWORK_LABEL_MISMATCH = "network_label_mismatch"
 PROVIDER_MISMATCH = "provider_mismatch"
 BUILD_FAILED = "build_failed"
 BUILD_FLAG_UNSUPPORTED = "build_flag_unsupported"
+#: v0.2.106: no compose implementation at all (podman's delegator found no
+#: provider; docker has no compose plugin) — remedy from vco_lib.compose_prereq
+PROVIDER_MISSING = "compose_provider_missing"
 UNKNOWN = "unknown"
 
 CID_SOCKET_HEAL_FAILED = "compose_socket_heal_failed"
@@ -109,6 +112,7 @@ CAUSE_LABELS = {
     PROVIDER_MISMATCH: "the container was created by a different compose tool",
     BUILD_FAILED: "the image build failed",
     BUILD_FLAG_UNSUPPORTED: "this compose does not accept `--build` on `up`",
+    PROVIDER_MISSING: "no compose provider is installed",
     UNKNOWN: "compose failed for a reason VCO does not recognise",
 }
 
@@ -158,6 +162,9 @@ _RE_BUILD_FAILED = re.compile(
     r"^.*(?:\bfailed to solve:|\bError: building at STEP\b|\bexecutor failed running\b"
     r"|\bService\s+'?[\w-]+'?\s+failed to build\b|\btarget\s+[\w-]+:\s+failed to solve\b).*$", _I)
 _RE_BANNER = re.compile(r"^\s*>>>>.*<<<<\s*$")
+_RE_NO_PROVIDER = re.compile(
+    r"^.*(?:\blooking up compose provider failed\b|'compose' is not a docker command\b"
+    r"|\bunknown command:? \"?compose\"?).*$", _I)
 
 
 def _last_line(stderr: str) -> str:
@@ -190,6 +197,10 @@ def classify(stderr: str, *, provider: Optional[_cp.ComposeProvider] = None,
     text = stderr or ""
     rt = runtime or (provider.runtime if provider else "podman")
 
+    m = _RE_NO_PROVIDER.search(text)
+    if m:
+        from vco_lib.compose_prereq import remediation  # noqa: PLC0415
+        return ComposeFailure(PROVIDER_MISSING, m.group(0).strip(), remediation(rt), False)
     m = _RE_DOCKER_DAEMON.search(text) or _RE_DIAL_UNIX.search(text)
     if m:
         addr = m.group("addr")

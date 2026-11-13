@@ -253,7 +253,13 @@ $NotifyMsg = "unknown: (core unavailable; see metrics ledger)"
 $CoreRan = $false
 if ($PY) {
     try {
-        $CoreOut = ($Payload | & $PY -c $StopFailureCore $LogDir $ProjectName)
+        # v0.2.106: the core runs as a temp FILE through
+        # _lib/run-python-program.ps1 - `& $PY -c $StopFailureCore` loses
+        # every embedded double quote under Windows PowerShell 5.1 (the
+        # failure ledger + notification never ran on a 5.1 host). The
+        # payload stays on the child's stdin (-Stdin), like the pipe did.
+        . (Join-Path $PSScriptRoot "_lib/run-python-program.ps1")
+        $CoreOut = Invoke-VcoPythonProgram -Python $PY -Body $StopFailureCore -Arguments @($LogDir, $ProjectName) -Stdin $Payload
         $CoreLines = @($CoreOut)
         if ($CoreLines.Count -ge 2) {
             $CoreRan = $true

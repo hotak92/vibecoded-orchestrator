@@ -449,7 +449,8 @@ function Print-Podman-Manual-Hint {
     Write-Host ""
     Write-Host "Install Podman manually, then re-run install.ps1:" -ForegroundColor Yellow
     Write-Host "  winget:           winget install RedHat.Podman --silent --accept-package-agreements --accept-source-agreements"
-    Write-Host "  podman.io:        https://podman.io/getting-started/installation"
+    Write-Host "  compose provider: winget install --id Docker.DockerCompose --silent (podman compose delegates to it)"
+    Write-Host "  podman.io:       https://podman.io/getting-started/installation"
     Write-Host "  Note: Podman on Windows requires WSL2: https://learn.microsoft.com/windows/wsl/install"
 }
 
@@ -462,6 +463,8 @@ function Attempt-Install-Podman {
     }
     Write-Host "Detected winget. Will run:"
     Write-Host "  winget install RedHat.Podman --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  winget install --id Docker.DockerCompose --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  (the second is the compose provider podman compose delegates to - install.py step 5 needs one)"
     Write-Host "  Note: Podman on Windows requires WSL2. Install WSL2 first if you haven't:"
     Write-Host "        https://learn.microsoft.com/windows/wsl/install"
     if (-not (Prompt-Yes "Proceed?")) { return $false }
@@ -471,6 +474,10 @@ function Attempt-Install-Podman {
         Write-Host "ERROR: winget install failed (exit $LASTEXITCODE)." -ForegroundColor Red
         Print-Podman-Manual-Hint
         return $false
+    }
+    & winget install --id Docker.DockerCompose --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARN: compose provider install failed (exit $LASTEXITCODE); install.py will stop with the remedy." -ForegroundColor Yellow
     }
     return $true
 }

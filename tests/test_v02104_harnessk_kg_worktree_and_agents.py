@@ -151,6 +151,16 @@ def test_every_implementer_lane_commits_on_its_own_branch():
         assert "own worktree branch" not in squashed, name
 
 
+def test_the_kimi_trailer_names_only_the_model_that_answered():
+    """Q4 (v0.2.106): Kimi lane commits carried a stray ``Co-Authored-By:
+    Claude Code …`` line beside the Kimi one — the definition says the
+    trailer names only the model that answered."""
+    squashed = _squash((GATEWAY_AGENTS / "kimi-implementer.md").read_text(encoding="utf-8"))
+    assert "The trailer names only the model that answered" in squashed
+    assert "`Co-Authored-By: Kimi K3.1 Pro`" in squashed
+    assert "no second line such as `Co-Authored-By: Claude Code …`" in squashed
+
+
 def test_read_only_gateway_lanes_never_run_a_mutating_git_command():
     """The allowance is for lanes that write source, not for report-only ones:
     those may read history (log/diff/show) but never run a git command that

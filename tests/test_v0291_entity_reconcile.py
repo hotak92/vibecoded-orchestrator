@@ -218,7 +218,9 @@ def _owed_counts(analyzer, repo: Path) -> Optional[dict]:
     """The REAL R-6 owed probe, run against the walk's own fake store."""
     return _REAL_COUNT_STALE_ROWS(
         PROJECT,
-        current_revision=1,
+        # The analyzer's own constant, parsed the way production parses it
+        # (it was a literal 1 until v0.2.106 bumped it to 2 for split rows).
+        current_revision=cr._resolve_embed_revision(_ANALYZER_PATH),
         repo_root=repo,
         index_dot_claude=False,
         client=_fake_client([

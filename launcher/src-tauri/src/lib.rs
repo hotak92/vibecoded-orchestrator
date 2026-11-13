@@ -50,6 +50,14 @@ mod convergence;
 #[path = "commands/deferral_ledger.rs"]
 mod deferral_ledger;
 
+// v0.2.106: `--remove-project` — "Remove from VCO" from a terminal, through
+// the one `projects_v2::unregister_project` implementation.
+mod remove_project_cli;
+
+fn handle_remove_project_cli(rest: &[String]) -> i32 {
+    remove_project_cli::run(rest)
+}
+
 // v0.2.26: WebKitGTK pre-flight probe — public so main.rs (which is a
 // separate compilation unit from this lib) can call it before Tauri
 // init. Linux-only at the use site; the module's own `#![cfg(...)]`
@@ -128,6 +136,13 @@ use std::sync::Mutex;
 //     install.py interactive prompt to `~/.vct/storage.toml` and regenerates
 //     `infrastructure/compose.override.yaml` if needed.
 //
+//   * `--remove-project <id|slug|name> [--keep-collections] [--leave-unremovable]
+//     [--yes] [--preview]` (v0.2.106): "Remove from VCO" from a terminal —
+//     the SAME operation as the Projects-page Remove button
+//     (`projects_v2::unregister_project`, one implementation, the GUI's
+//     Remove-flow options by default). The folder and the user's own files
+//     stay; the JSON report goes to stdout.
+//
 // Contract: when `handle_cli_args()` returns `Some(exit_code)` we exit
 // immediately. The GUI startup path is gated on `None`. This MUST stay
 // gated before `tauri::Builder::default()` so a CLI invocation in CI /
@@ -163,6 +178,7 @@ fn handle_cli_args() -> Option<i32> {
     match args[1].as_str() {
         "--set-storage-config" => Some(handle_set_storage_config_cli(&args[2..])),
         "--register-default-mcps" => Some(handle_register_default_mcps_cli(&args[2..])),
+        "--remove-project" => Some(handle_remove_project_cli(&args[2..])),
         _ => None,
     }
 }
@@ -2236,13 +2252,16 @@ pub fn run() {
             // the user to navigate to /preferences/modules. Soft-fail:
             // a missing rl_events table (pre-migration-025 DB) just
             // skips the emit. The user can always navigate manually.
+            // v0.2.106 (review W5 M1): on the blocking pool, not the setup
+            // thread — the decision may ask for the bundled-weights default,
+            // a Python spawn on a cold cache.
             {
-                use tauri::Manager;
-                let db_ref = app.state::<crate::db::Db>();
-                commands::module_enabled::probe_rl_auto_enable_at_boot(
-                    &db_ref,
-                    &app.handle(),
-                );
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    use tauri::Manager;
+                    let db_ref = handle.state::<crate::db::Db>();
+                    commands::module_enabled::probe_rl_auto_enable_at_boot(&db_ref, &handle);
+                });
             }
 
             // System tray (v1.1)
@@ -2325,6 +2344,9 @@ pub fn run() {
             // `module://weights-update-available` for Stream D's
             // WeightsUpdatePrompt component. Soft-fail throughout —
             // never blocks setup, never crashes the launcher.
+            // v0.2.106: the poll stands down while the RL reranker is a
+            // bundled module (its weights ship in its image); see
+            // `module_service::spawn_daily_weights_poll`.
             //
             // Step 24 Phase 2 (commit b) relocates the resume + poller
             // implementations into `vct-hub::module_supervisor`; the
@@ -3036,7 +3058,7 @@ pub fn run() {
             commands::orchestrator_core::validate_clone_manifest,
             // RL Reranker per-project settings (Stream 2 / 2026-05-19).
             // Backs the schema-rendered controls declared in
-            // paid-modules/vct-rl-reranker/vct-module.json's
+            // claude_mcp_servers/rl_reranker/vct-module.json's
             // gui.config_tab. The four reset/retrain stubs that
             // previously lived here (rl_reset_to_global,
             // rl_reset_and_specialize, retrain_global_online,
@@ -3081,6 +3103,10 @@ pub fn run() {
             // process, live) and projected to every project as VCO_LOG_LEVEL.
             commands::logging_prefs::get_logging_level,
             commands::logging_prefs::set_logging_level,
+            commands::ollama_lifetime_prefs::get_ollama_idle_unload,
+            commands::ollama_lifetime_prefs::set_ollama_idle_unload,
+            commands::ollama_lifetime_prefs::ollama_models_status,
+            commands::ollama_lifetime_prefs::ollama_unload_model,
             // v0.2.71: GUI-only per-project worktree-repo mode (T-WT) — the
             // subagent-git modal's create-local/adopt/opt-out choice.
             commands::worktree_repo_mode::set_worktree_repo_mode,
@@ -3273,6 +3299,7 @@ pub fn run() {
             commands::module_enabled::rl_events_count,
             // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
             commands::module_enabled::rl_scoring_lock,
+            commands::module_enabled::rl_scoring_default,
             // v0.2.102 (owner decision 2026-10-08): `is_project_module_active`
             // was REMOVED from here — after the Diagrams tab went it had zero
             // callers (the invoke census recorded it as an open finding). The
@@ -3578,6 +3605,9 @@ pub fn run() {
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
             commands::kg_summary::get_summary_model_info,
+            commands::local_summary_model::get_local_summary_model_status,
+            commands::local_summary_model::remove_local_summary_model,
+            commands::local_summary_model::download_local_summary_model,
             commands::kg_summary::retry_kg_summary,
             // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
             // (Preferences → KG Summaries) — shells to
@@ -3671,6 +3701,11 @@ pub fn run() {
             // auto-start (read by the Python home + the core Rust pre-check).
             commands::engine_autostart_pref::get_container_engine_autostart,
             commands::engine_autostart_pref::set_container_engine_autostart,
+            // v0.2.106: the GUI switch for the shared auto-restart toggle
+            // (read on every tick by the services watcher AND the hub's
+            // infra watchdog).
+            commands::services_watcher_pref::get_services_watcher_enabled,
+            commands::services_watcher_pref::set_services_watcher_enabled,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,

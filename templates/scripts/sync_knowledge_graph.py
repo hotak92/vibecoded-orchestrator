@@ -73,7 +73,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -405,6 +405,7 @@ from vco_lib.embedding_service import (  # noqa: E402 - must follow the AuthlibD
 # ONE shared stamper (vco_lib home — importable from every writer layer), so
 # kg-sync, the MCP store, and the single-slot patch writers cannot drift.
 from vco_lib.kg_truncation_tags import truncation_tag_properties  # noqa: E402 - must follow the AuthlibDeprecationWarning filter block above, which MUST run before `import weaviate`
+from vco_lib.embed_split import embed_rows as _embed_rows, stored_rows_cover_plan as _stored_rows_cover_plan  # noqa: E402 - v0.2.106 split on refusal; same import-order constraint as the group above
 # v0.2.94: the named-vector slot has ONE home. The WRITER (this script) and
 # every READER (detect_duplicates.py, search_knowledge.py, the MCP write path)
 # resolve it through the same helper, so a scan cannot target a slot the sync
@@ -440,6 +441,8 @@ from vco_lib import progress_event as _progress_event  # noqa: E402 — same imp
 # at all; `WeaviateWrapper.__init__` already reaches this same module lazily
 # for `connect_v4`.
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — same import-order constraint as the group above
+# v0.2.106: no create while a delete of a case-variant of the name is still replayable.
+from vco_lib.weaviate_case_history import guard_create as _no_case_twin  # noqa: E402 — same import-order constraint as the group above
 from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # noqa: E402 — same import-order constraint as the group above
 # v0.2.101 (item 3): the archived-node predicate has ONE home. The seed's
 # change check (vco_lib.install_weaviate) must skip exactly what this script
@@ -566,6 +569,29 @@ def _shared_kg_from_launcher_db(project_root: Path) -> str:
     nothing is printed. The update window's real DB state is "launcher
     closed, file on disk" — the normal case, not an error.
     """
+    return _kg_binding_from_launcher_db(project_root, "shared")
+
+
+def _kg_binding_from_launcher_db(project_root: Path, role: str) -> str:
+    """The ONE hub-less launcher.db tier for a KG binding name (v0.2.106).
+
+    Both roles go through this lookup: by the registered project folder
+    (``resolve_project_id_for_folder`` → ``get_kg_binding(pid, role)``). Only
+    the SHARED role then falls back to the orchestrator-root row (host-keyed):
+    the shared class is machine-wide, so the root's shared binding is every
+    project's. The root's PRIMARY class is the root's own private KG — an
+    unregistered folder (CLI-added, mid-move, symlinked path) answers ``""``
+    for primary so the env ``KG_COLLECTION`` decides, never the root's class
+    (v0.2.106 review C-H1: the fallback would have upserted a foreign
+    project's notes into the root's KG). ``""`` on any failure.
+
+    The PRIMARY role joined in v0.2.106 for the field defect where a project's
+    ``kg-sync --all`` read the env ``KG_COLLECTION`` on a hub-down run (an
+    update window) while the doctor read the launcher BINDING: the sync found
+    the notes in the shared class, reported "already current", and the doctor
+    reported the same notes disk-only. One rule (the binding is the project's
+    collection) now answers both surfaces when the hub cannot.
+    """
     try:
         from vco_lib.launcher_db_reader import (
             get_kg_binding,
@@ -575,8 +601,10 @@ def _shared_kg_from_launcher_db(project_root: Path) -> str:
 
         pid = resolve_project_id_for_folder(Path(project_root))
         if pid:
-            name = get_kg_binding(pid, "shared")
+            name = get_kg_binding(pid, role)
             return (name or "").strip()
+        if role != "shared":
+            return ""
         _db_primary, db_shared = get_orchestrator_root_bindings()
         return (db_shared or "").strip()
     except Exception:  # noqa: BLE001 — the tier must never raise
@@ -669,25 +697,33 @@ def _resolve_collections() -> tuple[str, str, str, bool]:
         # (register issue 2, the 2026-09-20 update hang). See
         # `_shared_kg_from_launcher_db` for the V44-G1 reconciliation and
         # the soft-fail contract.
+        # v0.2.106: the PRIMARY name joins the shared one in this tier. On a
+        # hub-down run the env KG_COLLECTION used to win, so a stale/foreign
+        # value made the sync read a different class than the doctor's
+        # binding-based census (the "already current" vs "disk-only"
+        # disagreement); the binding is the one rule both surfaces use.
+        _db_primary = _kg_binding_from_launcher_db(PROJECT_ROOT, "primary")
         _db_shared = _shared_kg_from_launcher_db(PROJECT_ROOT)
-        if _db_shared:
+        _env_kg = os.getenv("KG_COLLECTION", "KnowledgeGraph")
+        if _db_primary or _db_shared:
             # WP-2 review MINOR-1: one stderr line so the tier's engagement
             # is observable — a silent middle tier that fixes the 2026-09-20
             # hang is indistinguishable from one that never ran. stderr,
             # never stdout (the JSON-contract rule).
             print(
-                f"[kg-sync] hub unreachable; shared collection resolved "
-                f"from launcher.db (read-only): {_db_shared}",
+                "[kg-sync] hub unreachable; collection binding resolved "
+                f"from launcher.db (read-only): primary="
+                f"{_db_primary or '(env)'} shared={_db_shared or '(env)'}",
                 file=sys.stderr,
             )
             return (
-                os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+                _db_primary or _env_kg,
                 os.getenv("DEVELOPMENT_COLLECTION", ""),
-                _db_shared,
-                bool(os.getenv("KG_COLLECTION", "").strip()),
+                _db_shared or os.getenv("SHARED_KG_COLLECTION", ""),
+                bool((_db_primary or os.getenv("KG_COLLECTION", "")).strip()),
             )
         return (
-            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            _env_kg,
             os.getenv("DEVELOPMENT_COLLECTION", ""),
             os.getenv("SHARED_KG_COLLECTION", ""),
             bool(os.getenv("KG_COLLECTION", "").strip()),
@@ -882,17 +918,20 @@ def _stored_plan_matches_current(
     # is by construction what either writer stored.
     _plan = _plan_for(server, content, source_id="plan-check")
     plan_total = _plan.total
+    # The texts the writers EMBED: the full file for a single-chunk plan.
     plan_contents: List[str] = (
-        [] if _plan.is_single else [c.content for c in _plan.chunks]
+        [content] if _plan.is_single else [c.content for c in _plan.chunks]
     )
 
-    if stored_row_count != plan_total:
+    if stored_row_count < plan_total:
         return False
-    if plan_total == 1:
+    if stored_row_count == plan_total == 1:
         return True
 
-    # Multi-chunk plan with a matching row COUNT — the boundaries must
-    # match too. Second fetch pulls just this entry's chunk contents.
+    # v0.2.106 split on refusal: a chunk the model refused whole is stored as
+    # several CONSECUTIVE rows whose texts concatenate to that chunk, so more
+    # rows than plan chunks can still be current — the stored texts decide.
+    # Second fetch pulls just this entry's chunk contents.
     # v0.2.101 B3: through the exact-path reader — the tokenized filter alone
     # also returns token-superset siblings' chunks, which would make the count
     # below never match (a needless re-chunk of an up-to-date entry).
@@ -909,15 +948,12 @@ def _stored_plan_matches_current(
         if not isinstance(num, int) or isinstance(num, bool):
             return False  # cannot order the rows → cannot judge → re-embed
         numbered.append((num, props.get("content")))
-    if len(numbered) != plan_total:
+    if len(numbered) != stored_row_count:
         return False  # row set changed between fetches → not judgeable
     numbered.sort(key=lambda pair: pair[0])
-    if [n for n, _ in numbered] != list(range(1, plan_total + 1)):
+    if [n for n, _ in numbered] != list(range(1, stored_row_count + 1)):
         return False  # duplicate/gap in chunk_num → not judgeable
-    return all(
-        stored_content == plan_content
-        for (_, stored_content), plan_content in zip(numbered, plan_contents)
-    )
+    return _stored_rows_cover_plan([c for _, c in numbered], plan_contents)
 
 # Project root — resolved ONCE at module top (v0.2.89 BUG 3, see
 # `_resolve_project_root` above) with the layered precedence
@@ -1189,7 +1225,11 @@ def _build_vector_arg(
 #           "total_chunks": 1,
 #           "chunks": [
 #             {"chunk_num": 1, "vector": [<float>, ...]}
-#           ]
+#           ],
+#           "splits": {"2": [<chars>, ...]}    # v0.2.106, optional: plan
+#                                              #   chunk → piece lengths of a
+#                                              #   chunk the model refused
+#                                              #   whole (rows = plan + pieces)
 #         },
 #         ...
 #       }
@@ -1222,6 +1262,13 @@ def _build_vector_arg(
 _SHIPPED_EMBED_CACHE: Dict[Tuple[str, str], Optional[dict]] = {}
 
 
+def _current_chunker_revision() -> str:
+    """The live ``_CHUNKER_REVISION`` of the chunker this script plans with."""
+    from weaviate_mcp.chunking import _CHUNKER_REVISION
+
+    return _CHUNKER_REVISION
+
+
 def _shipped_embeddings_path(knowledge_root: Path, slot: str) -> Path:
     """Path to the per-slot shipped-embeddings sidecar under knowledge/."""
     return knowledge_root / f".node_embeddings.{slot}.json"
@@ -1233,7 +1280,16 @@ def _load_shipped_embeddings(knowledge_root: Path, slot: str) -> Optional[dict]:
     Returns None (cached) when the sidecar is absent, unparseable, schema-
     incompatible, or declares a DIFFERENT slot than requested (slot-mismatch
     guard at the file level — a defensive second check on top of the
-    filename, in case a file is mis-named). Soft-fail: never raises.
+    filename, in case a file is mis-named), or was built under a DIFFERENT
+    chunker revision (v0.2.106). Soft-fail: never raises.
+
+    The revision guard closes a silent wrong-vector ingest: the per-entry
+    guards check the content hash and the chunk COUNT, but a chunker change
+    can move boundaries while keeping the count (measured at the v0.2.106
+    revision: 3 of 113 curated nodes — 2 chunks before, 2 chunks after, with
+    different text in each). A sidecar that does not name the CURRENT
+    ``_CHUNKER_REVISION`` (absent included: every pre-v0.2.106 file) is
+    therefore treated as absent and the node is embedded locally.
     """
     key = (str(knowledge_root), slot)
     if key in _SHIPPED_EMBED_CACHE:
@@ -1253,6 +1309,9 @@ def _load_shipped_embeddings(knowledge_root: Path, slot: str) -> Optional[dict]:
                 # we were asked for. A mismatch means this file is for another
                 # model — treat as absent (never cross-model ingest).
                 and data.get("slot") == slot
+                # Chunker-revision guard (v0.2.106): vectors planned under
+                # other chunk boundaries are never ingested.
+                and data.get("chunker_revision") == _current_chunker_revision()
             ):
                 result = data
     except Exception:
@@ -1270,6 +1329,7 @@ def _shipped_slot_chunk_vector(
     content_hash: str,
     chunk_num: int,
     expected_chunks: int,
+    expected_layout: "Optional[Mapping[str, Any]]" = None,
 ) -> Optional[List[float]]:
     """Pure per-(slot, chunk) sidecar lookup with EVERY ingest guard applied.
 
@@ -1283,6 +1343,10 @@ def _shipped_slot_chunk_vector(
         against a now-edited node is never reused),
       * the entry's chunk count != *expected_chunks* (the node would chunk
         differently than the shipped vectors cover),
+      * the entry's split layout (``splits`` — which plan chunks the builder's
+        model refused whole and stored as several rows, v0.2.106) differs
+        from *expected_layout* when one is given: rows cut at other places
+        hold other text, so their vectors are never mixed in,
       * no chunk with this 1-indexed *chunk_num*, or its vector is
         missing / empty / non-numeric (incl. a non-int ``chunk_num`` field
         in the sidecar — malformed data falls back to compute, never raises).
@@ -1296,6 +1360,8 @@ def _shipped_slot_chunk_vector(
         return None
     chunks = entry.get("chunks")
     if not isinstance(chunks, list) or not chunks or len(chunks) != expected_chunks:
+        return None
+    if expected_layout is not None and (entry.get("splits") or {}) != dict(expected_layout):
         return None
 
     target = None
@@ -1356,6 +1422,7 @@ def _merge_secondary_shipped_slots(
     content_hash: str,
     chunk_num: int,
     expected_chunks: int,
+    expected_layout: "Optional[Mapping[str, Any]]" = None,
 ) -> None:
     """v0.2.89 §8.5 dual-slot ingest merge (mutates *slots* in place).
 
@@ -1371,91 +1438,74 @@ def _merge_secondary_shipped_slots(
     """
     for other_slot in _shipped_secondary_slots(knowledge_root, active_slot):
         vec2 = _shipped_slot_chunk_vector(
-            knowledge_root, other_slot, content_hash, chunk_num, expected_chunks
+            knowledge_root, other_slot, content_hash, chunk_num, expected_chunks,
+            expected_layout=expected_layout,
         )
         if vec2 is not None:
             slots[other_slot] = vec2
 
 
-def _shipped_vector_for(
+def _shipped_rows_for(
     server: "WeaviateMCPServer",
     knowledge_root: Path,
     content_hash: str,
-    expected_chunks: int,
-) -> Optional[Tuple[object, Mapping[str, List[float]]]]:
-    """Return a ready ``(vector_arg, slots_map)`` from the shipped sidecar, or None.
+    plan_texts: "Sequence[str]",
+) -> "Optional[List[Tuple[str, object, Mapping[str, List[float]]]]]":
+    """The node's ROWS from the shipped sidecar — ``[(row_text, vector_arg,
+    slots_map), ...]`` in ``chunk_num`` order — or None (→ compute locally).
 
-    Mirrors ``_build_vector_arg``'s return shapes so the embed path can drop
-    in the shipped vector with no other changes:
+    ``plan_texts`` is the node's chunk plan as the writer embeds it (the full
+    file text for a single-chunk plan). The sidecar entry's ``splits``
+    (v0.2.106 split on refusal: which plan chunks the builder's model refused
+    whole, and the lengths of the pieces it stored instead) rebuilds the exact
+    row texts through ``vco_lib.embed_split.apply_row_layout``; a layout that
+    does not describe this plan → None. Every row needs the ACTIVE slot's
+    vector (guard chain: ``_shipped_slot_chunk_vector``, with the row count
+    and the layout as the expected shape).
 
-      * ``DUAL_EMBEDDING_ENABLED`` (default) → ``({slot: vec, ...}, same)``.
-        The active slot's hit is REQUIRED; on that hit, every other
-        configured slot's sidecar is consulted for the same signature/chunk
-        and merged (v0.2.89 §8.5 — see ``_merge_secondary_shipped_slots``).
-        Secondaries are best-effort: a miss is NEVER computed for.
-      * legacy single-slot mode → ``(vec_list, {slot: vec})`` — the active
-        slot only, matching the legacy ``_build_vector_arg`` shape.
-
-    Returns None (→ caller computes the embedding) when any guard fails for
-    the ACTIVE slot — see ``_shipped_slot_chunk_vector`` for the guard
-    chain. The active slot is ``server.text_vector_slot``, so a vector is
-    only ever placed in the slot whose embedding space matches the model
-    that produced it (the never-cross-model invariant); the merged
-    secondaries carry their OWN slots' vectors, so the invariant holds for
-    them too. This function is the single-object path (``expected_chunks``
-    must be 1); the multi-chunk path goes through ``_shipped_chunk_vector``.
-    """
-    if expected_chunks != 1:
-        return None
-
-    slot = server.text_vector_slot
-    vec = _shipped_slot_chunk_vector(
-        knowledge_root, slot, content_hash, chunk_num=1,
-        expected_chunks=expected_chunks,
-    )
-    if vec is None:
-        return None  # no sidecar / stale / malformed → compute (pre-.89 path)
-
-    if DUAL_EMBEDDING_ENABLED:
-        slots: Dict[str, List[float]] = {slot: vec}
-        _merge_secondary_shipped_slots(
-            knowledge_root, slot, slots, content_hash,
-            chunk_num=1, expected_chunks=expected_chunks,
-        )
-        return slots, slots
-    return vec, {slot: vec}
-
-
-def _shipped_chunk_vector(
-    server: "WeaviateMCPServer",
-    knowledge_root: Path,
-    content_hash: str,
-    chunk_num: int,
-    expected_chunks: int,
-) -> Optional[Tuple[object, Mapping[str, List[float]]]]:
-    """Per-chunk variant of ``_shipped_vector_for`` for the multi-chunk path.
-
-    ``chunk_num`` is 1-indexed (matches the stored ``chunk_num`` and the
-    multi-chunk insert loop). Same guards (via ``_shipped_slot_chunk_vector``)
-    and the same v0.2.89 §8.5 dual-slot merge semantics as the single-object
-    path: active-slot hit required; secondary slots merged per-chunk when
-    ``DUAL_EMBEDDING_ENABLED``; never computed for.
+    Shapes mirror ``_build_vector_arg``: with ``DUAL_EMBEDDING_ENABLED`` the
+    vector arg is ``{slot: vec, ...}`` and every OTHER configured slot's
+    sidecar is merged for the same row when its entry has the same row count
+    AND the same split layout (v0.2.89 §8.5; never computed for); the legacy
+    single-slot mode returns ``(vec_list, {slot: vec})`` per row. The active
+    slot is ``server.text_vector_slot``, so a vector only ever lands in the
+    slot whose embedding space produced it (the never-cross-model invariant).
     """
     slot = server.text_vector_slot
-    vec = _shipped_slot_chunk_vector(
-        knowledge_root, slot, content_hash, chunk_num, expected_chunks
-    )
-    if vec is None:
+    data = _load_shipped_embeddings(knowledge_root, slot)
+    if data is None:
         return None
+    entry = data["nodes"].get(content_hash)
+    if not isinstance(entry, dict):
+        return None
+    layout = entry.get("splits") or {}
+    if not isinstance(layout, dict):
+        return None
+    from vco_lib.embed_split import apply_row_layout
 
-    if DUAL_EMBEDDING_ENABLED:
-        slots: Dict[str, List[float]] = {slot: vec}
-        _merge_secondary_shipped_slots(
-            knowledge_root, slot, slots, content_hash,
-            chunk_num=chunk_num, expected_chunks=expected_chunks,
+    row_texts = apply_row_layout(list(plan_texts), layout)
+    if row_texts is None:
+        return None
+    total = len(row_texts)
+    rows: "List[Tuple[str, object, Mapping[str, List[float]]]]" = []
+    for index, (_source, row_text) in enumerate(row_texts):
+        vec = _shipped_slot_chunk_vector(
+            knowledge_root, slot, content_hash, chunk_num=index + 1,
+            expected_chunks=total, expected_layout=layout,
         )
-        return slots, slots
-    return vec, {slot: vec}
+        if vec is None:
+            return None  # one missing row → the whole node computes locally
+        if DUAL_EMBEDDING_ENABLED:
+            slots: Dict[str, List[float]] = {slot: vec}
+            _merge_secondary_shipped_slots(
+                knowledge_root, slot, slots, content_hash,
+                chunk_num=index + 1, expected_chunks=total,
+                expected_layout=layout,
+            )
+            rows.append((row_text, slots, slots))
+        else:
+            rows.append((row_text, vec, {slot: vec}))
+    return rows
 
 
 def _coerce_vector(raw: object) -> Optional[List[float]]:
@@ -2448,6 +2498,7 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
             for name, dt in _scalar_props.items()
         ]
 
+        _no_case_twin(COLLECTION_NAME, WEAVIATE_URL)
         server.client.collections.create(
             name=COLLECTION_NAME,
             description="Claude knowledge graph nodes with semantic search (chunked for large files)",
@@ -2561,6 +2612,7 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
             ]
 
         print(f"Creating dev collection '{DEV_COLLECTION_NAME}'...")
+        _no_case_twin(DEV_COLLECTION_NAME, WEAVIATE_URL)
         server.client.collections.create(
             name=DEV_COLLECTION_NAME,
             description="Project development documentation (docs/) — chunked, "
@@ -3225,6 +3277,145 @@ def _print_metadata_repair_report() -> None:
         )
 
 
+def _truncation_record_ask(declared_props: "Optional[set]") -> List[str]:
+    """``["truncated_slots"]`` when the class POSITIVELY declares the property.
+
+    v0.2.106: the embed-skip gates read the stored truncation record so a row
+    whose vector of a slot this sync writes was a leading window (written by
+    the retired shrink ladder, before split on refusal) is re-embedded once
+    (``_split_rows_heal_reason``). Asked only when the
+    schema probe saw the property: naming an undeclared property errors the
+    whole read, and an unknown schema keeps the pre-existing ask.
+    """
+    from vco_lib.kg_truncation_tags import TRUNCATED_SLOTS_PROP
+
+    if declared_props is not None and TRUNCATED_SLOTS_PROP in declared_props:
+        return [TRUNCATED_SLOTS_PROP]
+    return []
+
+
+def _kg_write_models(
+    server: "WeaviateMCPServer", collection_name: str, active_slot: str,
+) -> Dict[str, str]:
+    """``{slot: model}`` for every slot a sync of ``collection_name`` rewrites.
+
+    The service's document fan-out set (``EmbeddingService.
+    configured_text_write_models`` — the ONE decision the fan-out itself gates
+    on) plus the carry model of a pending model fill (``kg_embed_model``), so
+    the re-embed-once gate below re-lays a row only for a slot the rewrite
+    actually produces. A slot outside it (an RL slot regen's store-back, a
+    secondary switched off since) is never a reason to re-embed: the rewrite
+    would not write it, and the gate would fire again on every sync.
+    Soft-fails to the active slot alone.
+    """
+    svc = getattr(server, "embedding_service", None)
+    models: Dict[str, str] = {}
+    try:
+        models = dict(svc.configured_text_write_models())  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 — degenerate wrapper / double
+        models = {}
+    target = str(getattr(svc, "text_model_id", "") or "")
+    if active_slot and active_slot not in models:
+        models[active_slot] = target
+    try:
+        res = _kg_embed_model.resolve_kg_model(
+            collection_name, role="write", target=target or None,
+        )
+        if res.carry:
+            models.setdefault(_kg_embed_model.text_model_slot(res.carry)[0], res.carry)
+    except Exception:  # noqa: BLE001 — no record resolvable → no carry
+        pass
+    return models
+
+
+def _split_rows_heal_reason(
+    server: "WeaviateMCPServer",
+    collection_name: str,
+    rows: Any,
+    content: str,
+    active_slot: str,
+) -> Optional[str]:
+    """Why a content-current node must still be re-embedded once, or None.
+
+    v0.2.106 (owner rulings 2026-11-11, "split on refusal" and "extra rows in
+    both places"): every slot a sync writes is now embedded whole or the
+    chunk is split into rows, so two kinds of stored row are stale although
+    their text is current. The ONE gate for both, shared by ``sync_node`` and
+    ``sync_doc``:
+
+    1. a row whose truncation record names a slot this sync writes — its
+       vector covers only a leading window (the shrink ladder, v0.2.105 and
+       before, recorded it). Re-embedded rows record no cut, so it fires once.
+    2. while a chunker-revision crossing is pending (the update's one-time
+       re-chunk window; ``_chunker_resync_pending``): a row holding the
+       vector of a NON-active slot this sync writes (an enabled secondary, the
+       fill's carry) whose model may have refused a chunk of this node
+       (``embedding_service.text_may_exceed_window`` on the plan's chunks).
+       Such a vector may be the length-weighted mean the first split-on-
+       refusal build wrote — that build recorded nothing on the row, so the
+       crossing (bumped for exactly this, ``_CHUNKER_REVISION`` v0.2.106.1)
+       is the only "once". A chunk that provably fits every such model was
+       never refused, and its node keeps its vectors.
+
+    3. (v0.2.106, owner ruling 2026-11-12 "backfill once") a row the
+       one-time secondary backfill of THIS run found refused whole by a newly
+       enabled secondary model (``kg_secondary_backfill.relay_reason``): the
+       fill cannot add rows, so the node is re-laid here — the finest split
+       any model of its vector set needs, embedded first, replaced after.
+
+    Unknown (no record, an unreadable value, no vector payload) never forces
+    work beyond these: the gate keeps its pre-existing skip.
+    """
+    from vco_lib.kg_secondary_backfill import relay_reason
+    from vco_lib.kg_truncation_tags import TRUNCATED_SLOTS_PROP
+
+    rows = list(rows or ())
+    relay = relay_reason(collection_name, rows)
+    if relay:
+        return relay
+    named: set = set()
+    for obj in rows:
+        record = (getattr(obj, "properties", None) or {}).get(TRUNCATED_SLOTS_PROP)
+        if isinstance(record, (list, tuple)):
+            named.update(str(s) for s in record if isinstance(s, str))
+    write_models: Optional[Dict[str, str]] = None
+    if named:
+        write_models = _kg_write_models(server, collection_name, active_slot)
+        cut = sorted(named & set(write_models))
+        if cut:
+            return (
+                f"a stored row's {', '.join(cut)} vector covers only part of its "
+                "text (written before split on refusal)"
+            )
+    if not _chunker_resync_pending():
+        return None
+    if write_models is None:
+        write_models = _kg_write_models(server, collection_name, active_slot)
+    present: set = set()
+    for obj in rows:
+        vec_field = getattr(obj, "vector", None)
+        if isinstance(vec_field, dict):
+            present.update(s for s, v in vec_field.items() if v)
+    others = {
+        s: m for s, m in write_models.items()
+        if s != active_slot and s in present and m
+    }
+    if not others:
+        return None
+    from vco_lib.embedding_service import text_may_exceed_window
+
+    plan = _plan_for(server, content, source_id="split-rows-heal")
+    texts = [content] if plan.is_single else [c.content for c in plan.chunks]
+    for slot in sorted(others):
+        if any(text_may_exceed_window(t, others[slot]) for t in texts):
+            return (
+                f"a stored row's {slot} vector may be an average of split pieces "
+                "(written before split rows; re-laid once on this chunker-revision "
+                "crossing)"
+            )
+    return None
+
+
 def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """Sync a single docs/ file to the development collection.
 
@@ -3345,6 +3536,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             _warn_old_schema_trimmed_once(
                 DEV_COLLECTION_NAME, _CHUNK_PROPS - _declared_props
             )
+        _base_return_props += _truncation_record_ask(_declared_props)
 
         # Pull existing objects WITH vectors so we can verify the active
         # slot is populated. `include_vector=True` returns `obj.vector` as
@@ -3482,6 +3674,18 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 _self_consistent = (
                     chunk_count_ok and hashes_ok and slots_ok and shapes_ok
                 )
+                # v0.2.106: a row whose vector of a slot this sync writes is a
+                # recorded leading window, or (on the chunker-revision crossing)
+                # may be an averaged one, is not current — re-embed once.
+                _heal = (
+                    _split_rows_heal_reason(
+                        server, DEV_COLLECTION_NAME, existing, content, active_slot,
+                    )
+                    if _self_consistent else None
+                )
+                if _heal:
+                    _self_consistent = False
+                    print(f"   ♻️  Re-embedding: {_heal}")
                 _plan_ok = True
                 # v0.2.96 F-L5: the plan check hard-asks chunk props, so on an
                 # old-schema class it can only ever answer False — a needless
@@ -3523,11 +3727,15 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 # Soft-fail: fall through to the delete-and-re-embed path.
                 print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
-        # Fast path didn't apply (or no existing objects). Delete old
-        # versions and re-embed. The `content_hash` written below means
-        # the NEXT re-sync will hit the fast path.
-        if existing is not None:
-            for obj in existing:
+        # Fast path didn't apply (or no existing objects). Re-embed, then
+        # replace the old versions. The `content_hash` written below means
+        # the NEXT re-sync will hit the fast path. v0.2.106: the delete runs
+        # only once every new vector exists (see `sync_node`'s note) — a
+        # failed embed leaves the doc's old rows in place.
+        _old_doc_rows = list(existing or [])
+
+        def _delete_old_doc_rows() -> None:
+            for obj in _old_doc_rows:
                 coll.data.delete_by_id(obj.uuid)
 
         source_id = str(uuid.uuid4())
@@ -3545,65 +3753,40 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             },
         )
 
+        # v0.2.106 split on refusal: rows are the plan's chunks, a chunk any
+        # model of the row refuses whole becoming several rows (the ONE row embed
+        # `sync_node` uses, `_embed_node_rows`). Every row is embedded before
+        # the old rows are deleted.
         if _plan.is_single:
-            vec_arg, slots_written, truncated_slots = _build_vector_arg(
-                server, content, DEV_COLLECTION_NAME)
-            data_obj = {
-                "title": doc_data["title"],
-                "content": doc_data["content"],
-                "file_path": doc_data["file_path"],
-                "created_at": doc_data["created_at"],
-                "updated_at": doc_data["updated_at"],
-                "chunk_num": 1,
-                "total_chunks": 1,
-                "source_node_id": source_id,
-                # v0.2.18 (2026-05-19): persist content_hash so the next
-                # re-sync can take the embed-skip fast-path above. Same
-                # value for all chunks of the same file (computed once
-                # over the whole file content above).
-                "content_hash": current_content_hash,
-            }
-            # W3: persist the per-call truncation record (the shared stamper
-            # derives BOTH properties from the ONE atomic capture).
-            data_obj.update(
-                truncation_tag_properties(
-                    truncated_slots, server.text_vector_slot,
-                    measured_slots=slots_written,
-                )
-            )
-            coll.data.insert(properties=data_obj, vector=vec_arg)
-            print(f"   ✓ Stored doc as single chunk (vectors={sorted(slots_written)})")
-            return SyncOutcome(OUTCOME_SYNCED, doc_data["file_path"])
-
-        # Chunked path — mirrors `sync_node` chunked branch. W8: the
-        # boundaries are the SAME plan the gate above decided on.
-        chunks = _plan.chunks
-        print(f"   Split into {len(chunks)} chunks", flush=True)
+            _plan_texts = [content]
+        else:
+            # W8: the boundaries are the SAME plan the gate above decided on.
+            print(f"   Split into {len(_plan.chunks)} chunks", flush=True)
+            _plan_texts = [chunk.content for chunk in _plan.chunks]
+        _rows = _embed_node_rows(server, _plan_texts, DEV_COLLECTION_NAME)
+        _total_rows = len(_rows)
+        _keep_body = _plan.is_single and _total_rows == 1
+        _delete_old_doc_rows()
         last_slots: Mapping[str, List[float]] = {}
-        for i, chunk in enumerate(chunks):
-            vec_arg, last_slots, truncated_slots = _build_vector_arg(
-                server, chunk.content, DEV_COLLECTION_NAME
-            )
+        for i, (_row_text, vec_arg, last_slots, truncated_slots) in enumerate(_rows):
             data_obj = {
                 "title": doc_data["title"],
-                "content": chunk.content,
+                "content": doc_data["content"] if _keep_body else _row_text,
                 "file_path": doc_data["file_path"],
                 "created_at": doc_data["created_at"],
                 "updated_at": doc_data["updated_at"],
                 "chunk_num": i + 1,
-                "total_chunks": len(chunks),
+                "total_chunks": _total_rows,
                 "source_node_id": source_id,
-                # v0.2.18 (2026-05-19): every chunk of the same file
-                # shares the same content_hash (computed over the whole
-                # file). The embed-skip fast-path above requires ALL
-                # chunks for a file_path to carry an identical, non-empty
-                # hash before it skips — writing the same value here
-                # keeps that invariant.
+                # v0.2.18 (2026-05-19): every row of the same file shares the
+                # same content_hash (computed over the whole file). The
+                # embed-skip fast-path above requires ALL rows for a
+                # file_path to carry an identical, non-empty hash before it
+                # skips — writing the same value here keeps that invariant.
                 "content_hash": current_content_hash,
             }
-            # W3: per-chunk truncation record — a chunk whose SECONDARY (or,
-            # on a runner refusal, ACTIVE) vector came from a bounded leading
-            # sub-window is distinguishable from STORED DATA alone.
+            # W3: per-row truncation record (the shared stamper derives BOTH
+            # properties from the ONE atomic capture).
             data_obj.update(
                 truncation_tag_properties(
                     truncated_slots, server.text_vector_slot,
@@ -3611,23 +3794,18 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 )
             )
             coll.data.insert(properties=data_obj, vector=vec_arg)
-            # v0.2.69 FIX 3 (review SHOULD-FIX): per-chunk heartbeat. The
-            # launcher's kg-sync stall watchdog re-arms on every output
-            # line; without a per-chunk print here, a large multi-chunk
-            # doc would embed+insert silently (N × ~30 s on a slow CPU)
-            # and could exceed the watchdog window with no output —
-            # false-tripping it. The KG path (`sync_node`) already prints
-            # per chunk; this mirrors that on the docs path so the
-            # window's "no-output ⇒ wedge" assumption holds on both.
-            # `flush=True` guarantees the line is emitted even if stdout
-            # isn't running unbuffered (the launcher exports
-            # PYTHONUNBUFFERED, but a direct-CLI run might not).
-            print(
-                f"   ✓ Stored chunk {i + 1}/{len(chunks)}",
-                flush=True,
-            )
-            _heartbeat_note_chunk()
-        print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})", flush=True)
+            if _total_rows > 1:
+                # v0.2.69 FIX 3 (review SHOULD-FIX): per-chunk heartbeat for
+                # the launcher's kg-sync stall watchdog, which re-arms on
+                # every output line (a large multi-chunk doc would otherwise
+                # embed+insert silently past the watchdog window).
+                # `flush=True` guarantees prompt emission on a direct-CLI run.
+                print(f"   ✓ Stored chunk {i + 1}/{_total_rows}", flush=True)
+                _heartbeat_note_chunk()
+        if _total_rows == 1:
+            print(f"   ✓ Stored doc as single chunk (vectors={sorted(last_slots)})")
+        else:
+            print(f"   ✓ Stored {_total_rows} chunks (vectors={sorted(last_slots)})", flush=True)
         return SyncOutcome(OUTCOME_SYNCED, doc_data["file_path"])
     except Exception as e:
         import traceback
@@ -4390,6 +4568,52 @@ def _normalize_typed_links(typed_links: object, context: str = "") -> list:
     return normalized
 
 
+def _embed_node_rows(
+    server: "WeaviateMCPServer",
+    plan_texts: "Sequence[str]",
+    collection_name: str,
+) -> "List[Tuple[str, Any, Mapping[str, List[float]], Any]]":
+    """Embed a node's (or doc's) plan chunks into ROWS — the ONE row embed both
+    writers here use (`sync_node`, `sync_doc`).
+
+    Returns ``[(row_text, vector_arg, slots_map, truncated_slots), ...]``.
+    v0.2.106 split on refusal: through ``vco_lib.embed_split.embed_rows``, so a
+    chunk ANY model of the row refuses whole (the active one, an enabled
+    secondary, the carry of a model fill) comes back as several rows, each
+    embedded whole by every model (the same driver the MCP `store_knowledge_node` and the
+    shipped-sidecar builder use). Every row is embedded before this returns,
+    which is what lets the callers delete the old rows only afterwards. A
+    piece still refused at the split floor raises
+    ``UnsplittableTextError`` — the node fails, its old rows stay.
+    """
+    plan_total = len(plan_texts)
+    embedded = [0]
+
+    def _one(text: str):
+        out = _build_vector_arg(server, text, collection_name)
+        embedded[0] += 1
+        # Heartbeat per EMBEDDED row: the embeds are the slow part, and the
+        # launcher's stall watchdog re-arms on every line.
+        if plan_total > 1 or embedded[0] > 1:
+            print(
+                f"   ✓ Embedded chunk {embedded[0]} ({len(text)} chars)",
+                flush=True,
+            )
+            _heartbeat_note_chunk()
+        return out
+
+    rows = _embed_rows(list(plan_texts), _one)
+    if len(rows) > plan_total:
+        refused = len({r.source_index for r in rows if r.piece_count > 1})
+        print(
+            f"   ✂️  The embedding model refused {refused} chunk(s) whole; "
+            f"stored as {len(rows)} rows instead of {plan_total} "
+            "(nothing cut off)",
+            flush=True,
+        )
+    return [(r.text, *r.payload) for r in rows]
+
+
 def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
     """
     Sync a single knowledge node to Weaviate (with chunking support)
@@ -4716,6 +4940,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             _warn_old_schema_trimmed_once(
                 target_collection_name, _CHUNK_PROPS - _declared_props
             )
+        _base_return_props += _truncation_record_ask(_declared_props)
         _vectors_requested = True
         _metadata_props_available = True
         try:
@@ -4847,6 +5072,21 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                         f"residue)"
                     )
             _self_consistent = _hashes_and_shape_ok and _slots_ok
+            # v0.2.106: a row whose vector of a slot this sync writes is a
+            # recorded leading window (the retired shrink ladder), or — on the
+            # chunker-revision crossing — may be an averaged one (the first
+            # split-on-refusal build), is not current: re-embed once; a refused
+            # chunk is now split into rows for every model instead.
+            _heal = (
+                _split_rows_heal_reason(
+                    server, target_collection_name, existing_rows, content,
+                    _active_slot_for_gate,
+                )
+                if _self_consistent else None
+            )
+            if _heal:
+                _self_consistent = False
+                print(f"   ♻️  Re-embedding: {_heal}")
             _plan_ok = True
             # WP-2 review MINOR-2: the plan check hard-asks chunk props, so
             # on an old-schema class (chunk props undeclared) it can only
@@ -4919,13 +5159,22 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
             # debugging knows the fast path tried but didn't apply.
             print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
-        deleted_count = 0
-        for obj in existing_rows:  # exact-path rows only (v0.2.101 B3)
-            collection.data.delete_by_id(obj.uuid)
-            deleted_count += 1
+        # v0.2.106: the old rows are deleted only once EVERY new vector for
+        # this node exists (`_delete_old_rows` runs right before the first
+        # insert). Deleting first meant a failed embed — backend down, a
+        # refusal the shrink ladder could not resolve — left the node with NO
+        # rows until a later sync; a chunker-revision re-chunk runs this path
+        # for every re-planned node, so that window would have been opened
+        # across the whole KG at once.
+        _old_rows = list(existing_rows)  # exact-path rows only (v0.2.101 B3)
 
-        if deleted_count > 0:
-            print(f"   ✓ Deleted {deleted_count} old version(s)")
+        def _delete_old_rows() -> None:
+            deleted_count = 0
+            for obj in _old_rows:
+                collection.data.delete_by_id(obj.uuid)
+                deleted_count += 1
+            if deleted_count > 0:
+                print(f"   ✓ Deleted {deleted_count} old version(s)")
 
         # Check if content needs chunking.
         # W8 (v0.2.92 wiring audit): the gate AND the boundaries come from
@@ -4947,41 +5196,56 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         print(f"   Content size: {token_count} tokens")
         _max_tokens = _plan.threshold
 
+        # v0.2.106 (owner ruling 2026-11-11, split on refusal): the ROWS are
+        # the plan's chunks, except that a chunk any model of the row refuses
+        # whole is split at its best boundary nearest the middle and stored
+        # as several rows of this node, each embedded whole — nothing is cut
+        # off. A single-chunk plan embeds the FULL file text (as before); its
+        # stored `content` stays the body unless it had to be split.
+        # Every row's vectors exist before the old rows are deleted.
         if _plan.is_single:
-            # Single chunk - store as-is
             print("   Storing as single object")
+            _plan_texts = [content]
+        else:
+            # W8: the boundaries come from the SAME plan the gate above
+            # decided on (one `_plan_for` call), and `source_node_id` is the
+            # per-write id that plan was built with.
+            print(f"   ⚠️  Content exceeds {_max_tokens} tokens - chunking required")
+            print(f"   Split into {len(_plan.chunks)} chunks")
+            _plan_texts = [chunk.content for chunk in _plan.chunks]
 
-            # v0.2.70 Part 2 + v0.2.89 §8.5: try a pre-shipped embedding
-            # FIRST. Both guards (content_hash staleness + active-slot
-            # match) live inside _shipped_vector_for; with dual embedding
-            # enabled, a hit also merges every OTHER configured slot's
-            # sidecar vector for this node (never computing for a missing
-            # secondary). expected_chunks=1 for the single-object path.
-            _shipped = _shipped_vector_for(
-                server, KNOWLEDGE_ROOT, current_content_hash, expected_chunks=1
+        # v0.2.70 Part 2 + v0.2.89 §8.5: try the pre-shipped embeddings
+        # FIRST (`_shipped_rows_for` — content_hash staleness, active-slot
+        # match, row count AND split layout must all hold, or every row is
+        # computed: shipped and computed vectors are never mixed in a node).
+        _shipped_rows = _shipped_rows_for(
+            server, KNOWLEDGE_ROOT, current_content_hash, _plan_texts
+        )
+        # (row_text, vector_arg, slots_map, truncated_slots_or_None)
+        _rows: List[Tuple[str, Any, Mapping[str, List[float]], Any]]
+        if _shipped_rows is not None:
+            # Shipped sidecar vectors carry NO truncation record (computed
+            # elsewhere, at release time) — those rows deliberately get NO
+            # truncated_slots property, so their state resolves UNKNOWN for
+            # every slot (never a guessed False).
+            _rows = [(t, v, sl, None) for t, v, sl in _shipped_rows]
+            print(
+                f"   📦 Ingested shipped vector(s) for {len(_rows)} row(s) "
+                f"(slots={sorted(_rows[0][2])}, no embed call)"
             )
-            if _shipped is not None:
-                vec_arg, slots_written = _shipped
-                # Shipped sidecar vectors carry NO truncation record (computed
-                # elsewhere, at release time) — the row deliberately gets NO
-                # truncated_slots property, so its state resolves UNKNOWN for
-                # every slot (never a guessed False). Do not stamp here.
-                print(
-                    f"   📦 Ingested shipped vector(s) "
-                    f"(slots={sorted(slots_written)}, no embed call)"
-                )
-            else:
-                # v0.2.18: build vector arg via EmbeddingService. With
-                # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
-                # reachable text backend so multiple slots get populated.
-                vec_arg, slots_written, truncated_slots = _build_vector_arg(
-                    server, content, target_collection_name
-                )
+        else:
+            # v0.2.18: embed via EmbeddingService (multi-slot when
+            # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
+            _rows = _embed_node_rows(server, _plan_texts, target_collection_name)
+        _total_rows = len(_rows)
+        _keep_body = _plan.is_single and _total_rows == 1
 
-            # Prepare data object
+        _delete_old_rows()  # v0.2.106: only now — every row's vectors exist
+        last_slots: Mapping[str, List[float]] = {}
+        for _row_index, (_row_text, vec_arg, last_slots, truncated_slots) in enumerate(_rows):
             data_obj = {
                 "title": node_data["title"],
-                "content": node_data["content"],
+                "content": node_data["content"] if _keep_body else _row_text,
                 "file_path": node_data["file_path"],
                 "node_type": node_data["node_type"],
                 "tags": node_data["tags"],
@@ -4995,21 +5259,23 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 "external_links": node_data["external_links"],  # External links (RDF)
                 "created_at": node_data["created_at"],
                 "updated_at": node_data["updated_at"],
-                "chunk_num": 1,
-                "total_chunks": 1,
+                "chunk_num": _row_index + 1,  # 1-indexed
+                "total_chunks": _total_rows,
                 "source_node_id": source_node_id,
-                # v0.2.17 (plan 0.2): persist content_hash so the next
-                # re-sync can skip the embed pipeline when unchanged.
+                # v0.2.17 (plan 0.2): every row of the same file shares the
+                # same content_hash (computed over the whole file). The
+                # embed-skip check requires ALL rows for a file_path to carry
+                # an identical, non-empty hash before it skips.
                 "content_hash": current_content_hash,
             }
             # W3: persist the per-call truncation record on the COMPUTED
             # embed path only — a shipped-sidecar ingest leaves the row
             # without the property (UNKNOWN, never a guessed False).
-            if _shipped is None:
+            if _shipped_rows is None:
                 data_obj.update(
                     truncation_tag_properties(
                         truncated_slots, server.text_vector_slot,
-                        measured_slots=slots_written,
+                        measured_slots=last_slots,
                     )
                 )
 
@@ -5018,39 +5284,23 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                 if field in node_data:
                     data_obj[field] = node_data[field]
 
-            # Insert into the configured named-vector slots. With multi-
-            # slot writes (DUAL_EMBEDDING_ENABLED=true, the default since
-            # v0.2.18) every reachable backend's vector lands in its own
-            # slot — so a project switched from qwen3 → openai still has
-            # qwen3_embed populated and search-with-qwen3 keeps working
-            # during the transition.
-            #
-            # NEVER cross-write a vector under a name that implies a
-            # different model: each backend's vectors go ONLY into the
-            # slot whose embedding-space matches. The EmbeddingService
-            # multi-slot fan-out enforces this — same model → same slot.
-            #
-            # Note for Weaviate 1.31+: `Reconfigure.NamedVectors.add()`
-            # lets us add new named vectors after creation. The Wave A
-            # `vco_lib.weaviate_schema.add_named_vector_slot` helper uses
-            # this when available; the schema-creation block in
-            # `ensure_collection_exists` declares every slot up-front for
-            # older Weaviate versions where post-create adds aren't
-            # supported.
+            # Insert into the configured named-vector slots. With multi-slot
+            # writes (DUAL_EMBEDDING_ENABLED=true, the default since v0.2.18)
+            # every reachable backend's vector lands in its own slot. NEVER
+            # cross-write a vector under a name that implies a different
+            # model: the EmbeddingService fan-out enforces same model → same
+            # slot (see `vco_lib.weaviate_schema.add_named_vector_slot` for
+            # slots added after creation).
             obj_uuid = collection.data.insert(
                 properties=data_obj,
                 vector=vec_arg
             )
+            chunks_created += 1
 
-            chunks_created = 1
-            print(f"   ✓ Stored node with UUID: {str(obj_uuid)[:8]}... (vectors={sorted(slots_written)})")
-
-            # Create cross-references for WikiLinks.
-            # v0.2.89 BUG 6: resolve within the TARGET collection — Weaviate
-            # cross-references must point at objects in the collection the
-            # `linksTo` property targets, so a shared-routed node resolves
-            # its links against the shared store.
-            if node_data["links"]:
+            # Cross-references for WikiLinks — from the FIRST row only (it
+            # represents the main node). v0.2.89 BUG 6: resolved within the
+            # TARGET collection, the one the `linksTo` property targets.
+            if _row_index == 0 and node_data["links"]:
                 target_uuids = resolve_wikilinks_to_uuids(
                     server, node_data["links"],
                     collection_name=target_collection_name,
@@ -5064,135 +5314,25 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
                                 to=target_uuid
                             )
                         except Exception:
-                            # Silently skip if reference already exists or target not found
+                            # Skip if the reference already exists or the target is gone
                             pass
                     print(f"   ✓ Created {len(target_uuids)} cross-references")
 
-        else:
-            # Multiple chunks needed
-            print(f"   ⚠️  Content exceeds {_max_tokens} tokens - chunking required")
-
-            # W8: the boundaries come from the SAME plan the gate above
-            # decided on (one `_plan_for` call), and `source_node_id` is the
-            # per-write id that plan was built with — so the gate, the chunk
-            # sizes and the stored ids cannot disagree.
-            chunks = _plan.chunks
-
-            print(f"   Split into {len(chunks)} chunks")
-
-            # Store each chunk
-            last_slots: Mapping[str, List[float]] = {}
-            _total_chunks = len(chunks)
-            for i, chunk in enumerate(chunks):
-                # v0.2.70 Part 2: per-chunk shipped-vector ingest (NO-OP this
-                # release). Same guards as the single-object path. The shipped
-                # entry must cover EXACTLY this node's chunk count; if the node
-                # would chunk differently than the shipped vectors expect, every
-                # chunk falls back to compute (the count guard is enforced
-                # inside _shipped_chunk_vector, so we never mix shipped + freshly
-                # computed chunk vectors for the same node).
-                _shipped = _shipped_chunk_vector(
-                    server,
-                    KNOWLEDGE_ROOT,
-                    current_content_hash,
-                    chunk_num=chunk.chunk_number + 1,
-                    expected_chunks=_total_chunks,
-                )
-                if _shipped is not None:
-                    vec_arg, last_slots = _shipped
-                    # Shipped sidecar vector — no truncation record: the row
-                    # keeps NO truncated_slots property (UNKNOWN for every
-                    # slot, never a guessed False). See the single-chunk
-                    # path's shipped note.
-                else:
-                    # v0.2.18: embed via EmbeddingService (multi-slot when
-                    # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
-                    vec_arg, last_slots, truncated_slots = _build_vector_arg(
-                        server, chunk.content, target_collection_name
-                    )
-
-                # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
-                data_obj = {
-                    "title": node_data["title"],
-                    "content": chunk.content,
-                    "file_path": node_data["file_path"],
-                    "node_type": node_data["node_type"],
-                    "tags": node_data["tags"],
-                    "links": node_data["links"],
-                    # NEW-11 (2026-05-28): same guard as single-chunk path above.
-                    "typed_links": _normalize_typed_links(
-                        node_data["typed_links"], context=node_data.get("title", "")
-                    ),
-                    "external_links": node_data["external_links"],  # External links (RDF)
-                    "created_at": node_data["created_at"],
-                    "updated_at": node_data["updated_at"],
-                    "chunk_num": chunk.chunk_number + 1,  # 1-indexed
-                    "total_chunks": chunk.total_chunks,
-                    "source_node_id": source_node_id,
-                    # v0.2.17 (plan 0.2): every chunk of the same file
-                    # shares the same content_hash (computed over the
-                    # whole file). The embed-skip check in sync_node
-                    # requires ALL chunks for a file_path to carry an
-                    # identical, non-empty hash before it skips —
-                    # writing the same value here keeps that invariant.
-                    "content_hash": current_content_hash,
-                }
-                # W3: per-chunk truncation record on the COMPUTED embed path
-                # only (shipped-ingest chunks stay record-less → UNKNOWN).
-                if _shipped is None:
-                    data_obj.update(
-                        truncation_tag_properties(
-                            truncated_slots, server.text_vector_slot,
-                            measured_slots=last_slots,
-                        )
-                    )
-
-                # Add temporal metadata if present
-                for field in ['created', 'updated', 'valid_from', 'valid_until', 'status']:
-                    if field in node_data:
-                        data_obj[field] = node_data[field]
-
-                # Insert with the v0.2.18 multi-slot vector arg from
-                # _build_vector_arg. See single-chunk path comment for
-                # the rationale.
-                obj_uuid = collection.data.insert(
-                    properties=data_obj,
-                    vector=vec_arg
-                )
-
-                # Create cross-references only from first chunk (represents the main node)
-                # v0.2.89 BUG 6: resolve within the TARGET collection (see
-                # the single-chunk path comment).
-                if chunk.chunk_number == 0 and node_data["links"]:
-                    target_uuids = resolve_wikilinks_to_uuids(
-                        server, node_data["links"],
-                        collection_name=target_collection_name,
-                    )
-                    if target_uuids:
-                        for target_uuid in target_uuids:
-                            try:
-                                collection.data.reference_add(
-                                    from_uuid=obj_uuid,
-                                    from_property="linksTo",
-                                    to=target_uuid
-                                )
-                            except Exception:
-                                pass
-                        print(f"   ✓ Created {len(target_uuids)} cross-references")
-
-                chunks_created += 1
-                # v0.2.69 FIX 3 (review SHOULD-FIX): per-chunk heartbeat
-                # feeds the launcher's re-armed-per-line stall watchdog.
-                # `flush=True` guarantees prompt emission even on a
-                # direct-CLI run that doesn't inherit PYTHONUNBUFFERED.
+            if _total_rows == 1:
+                print(f"   ✓ Stored node with UUID: {str(obj_uuid)[:8]}... (vectors={sorted(last_slots)})")
+            else:
+                # v0.2.69 FIX 3: per-row heartbeat for the launcher's
+                # re-armed-per-line stall watchdog (`flush=True` for a
+                # direct-CLI run that doesn't inherit PYTHONUNBUFFERED).
                 print(
-                    f"   ✓ Stored chunk {chunk.chunk_number + 1}/{chunk.total_chunks} ({chunk.token_count} tokens)",
+                    f"   ✓ Stored chunk {_row_index + 1}/{_total_rows} "
+                    f"({len(_row_text)} chars)",
                     flush=True,
                 )
                 _heartbeat_note_chunk()
 
-            if last_slots:
-                print(f"   ✓ All chunks written to vectors={sorted(last_slots)}")
+        if _total_rows > 1 and last_slots:
+            print(f"   ✓ All chunks written to vectors={sorted(last_slots)}")
 
         # v0.2.89 BUG 6 scope transitions (see the contract block above
         # `_node_scope`): shared-routed → migrate same-file_path rows OUT of
@@ -5677,15 +5817,57 @@ def _regen_node_formats_after_full_sync() -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
-        while True:
+        # v0.2.106 field report: this step sat silent for 28 minutes. The
+        # generator DOES print `[i/total] OK …` per node, but `communicate()`
+        # buffered it and the parent never forwarded it — so a working refresh
+        # was indistinguishable from a hang. Forward the child's lines as they
+        # arrive (high-water tails kept for the failure messages below) and
+        # keep a 120 s per-CHUNK heartbeat; there is deliberately NO whole-run
+        # cap (every LLM call inside the generator has its own per-call bound
+        # and the sidecar is persisted after each node).
+        import threading  # noqa: PLC0415
+
+        out_tail: "list[str]" = []
+        err_tail: "list[str]" = []
+
+        def _pump(stream, sink, tail: "list[str]") -> None:
             try:
-                out, err = proc.communicate(timeout=120)
-                break
+                for line in stream:
+                    sink.write(line)
+                    sink.flush()
+                    tail.append(line.rstrip("\n"))
+                    if len(tail) > 200:
+                        del tail[:100]
+            except (OSError, ValueError):
+                return
+
+        _t_out = threading.Thread(
+            target=_pump, args=(proc.stdout, sys.stdout, out_tail), daemon=True,
+        )
+        _t_err = threading.Thread(
+            target=_pump, args=(proc.stderr, sys.stderr, err_tail), daemon=True,
+        )
+        _t_out.start()
+        _t_err.start()
+        _refresh_started = time.monotonic()
+        while proc.poll() is None:
+            try:
+                proc.wait(timeout=120)
             except subprocess.TimeoutExpired:
+                _elapsed = int(time.monotonic() - _refresh_started)
+                print(
+                    f"   … KG-summary refresh still running ({_elapsed}s; each "
+                    "generator call has its own bound — no whole-run cap)",
+                    flush=True,
+                )
                 _emit_sync_event(
                     "start",
                     "refreshing KG summaries (still working — no whole-run cap)",
                 )
+        _t_out.join(5)
+        _t_err.join(5)
+        out = "\n".join(out_tail)
+        err = "\n".join(err_tail)
         if proc.returncode == _NODE_FORMATS_EXIT_NO_BACKEND:
             # "Owed, retry later" WITHOUT arming the auto-retry that re-runs
             # a full `--all` sync (review M-2): no backend was selectable at
@@ -5988,7 +6170,7 @@ def _emit_node_formats_no_backend_deferral(project_root: Path) -> None:
 DRIFT_SENTINEL_PREFIX = "KG_DRIFT_JSON "
 
 
-def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
+def _print_drift_sentinel(binding, report, repair_owed=None, rechunk_owed=None) -> None:
     """Emit the machine-readable drift verdict. Best-effort; never raises.
 
     Always printed — including on the ``unbound`` early exit, where ``report``
@@ -6005,6 +6187,13 @@ def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
     wire as true: ``None`` means the stamp could not be read, and "could not
     look" must leave the launcher on its prior behaviour rather than spawn a
     pass on every update forever.
+
+    ``rechunk_owed`` (v0.2.106) is the THIRD question, on the same footing:
+    a chunker-revision crossing left this project's stored chunk boundaries
+    stale (the ledger carries ``chunker_preset_overhaul_pending`` and the KG
+    half has not run under the current revision —
+    ``vco_lib.chunker_revision.kg_rechunk_owed``). The texts did not change,
+    so ``status`` cannot see it either; only a positive True reaches the wire.
     """
     import json  # local import — this script imports json per-function
 
@@ -6025,6 +6214,7 @@ def _print_drift_sentinel(binding, report, repair_owed=None) -> None:
                 else (getattr(binding, "detail", "") or "no KG binding")
             ),
             "repair_owed": repair_owed is True,
+            "rechunk_owed": rechunk_owed is True,
         }
         print(DRIFT_SENTINEL_PREFIX + json.dumps(payload), flush=True)
     except Exception as exc:  # noqa: BLE001 — a report line never breaks a scan
@@ -6153,8 +6343,24 @@ def _run_check_drift() -> None:
             "whole-tree `--all` patches them (property writes only; a node "
             "whose content hash matches is never re-embedded to do it)."
         )
+    # v0.2.106: the chunker re-chunk, same gating and the same "only a
+    # positive True" rule (`kg_rechunk_owed` returns None on anything it
+    # could not read). The whole-tree `--all` the launcher then spawns is
+    # armed by the same ledger entry, re-embeds only nodes whose stored plan
+    # differs, and stamps the KG half — so the next probe answers False.
+    rechunk_owed = False
+    if binding.status == "bound":
+        from vco_lib.chunker_revision import kg_rechunk_owed
+
+        rechunk_owed = kg_rechunk_owed(PROJECT_ROOT) is True
+    if rechunk_owed:
+        print(
+            "♻️  KG re-chunk: owed — the chunker revision changed and this "
+            "project's KG has not been re-chunked under it yet. A whole-tree "
+            "`--all` re-embeds only the nodes whose chunks changed."
+        )
     surface_drift(PROJECT_ROOT, report)
-    _print_drift_sentinel(binding, report, repair_owed)
+    _print_drift_sentinel(binding, report, repair_owed, rechunk_owed)
     sys.exit(0)
 
 
@@ -6388,7 +6594,10 @@ def main():
             # v0.2.102 W6-I: a selected model that differs from a collection's
             # recorded one is filled additively BEFORE the walk (only missing
             # vectors embed), so unchanged nodes then skip with zero re-embeds.
-            _kg_embed_model.fill_before_walk(_fill_collections(), embedding_service)
+            # v0.2.106 ("backfill once"): the same pre-walk leg backfills a
+            # newly enabled SECONDARY slot once (`vco_lib.kg_secondary_backfill`).
+            _kg_embed_model.fill_before_walk(_fill_collections(), embedding_service,
+                                             folder=PROJECT_ROOT)
             kg_tally = sync_all_nodes(server)
             doc_tally = sync_all_docs(server)
             total_fail = kg_tally.failed + doc_tally.failed

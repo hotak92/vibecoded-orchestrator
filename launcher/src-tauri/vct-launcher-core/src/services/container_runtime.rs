@@ -457,6 +457,10 @@ pub fn gpu_passthrough_args(
     }
 }
 
+// v0.2.106: the host-user mapping both start-argument builders append (the
+// podman-version-aware `--userns` / `--user` choice) lives in its own module.
+pub use super::host_user_mapping::{host_user_mapping_args, host_user_mapping_args_for};
+
 // ─── Pure helpers ──────────────────────────────────────────────────────
 
 /// Resolve `{project_slug}` (and any other launcher-wide tokens) into a
@@ -990,6 +994,8 @@ pub fn build_podman_run_args_with_env(
         gpu_mode,
         runtime.gpu_image_variants.is_some(),
     ));
+    // v0.2.106: the host user owns what the container writes to its mounts.
+    args.extend(host_user_mapping_args(engine, runtime.image_user));
 
     // Ports: one `-p [bind:]host:container` per entry.
     for port in &runtime.ports {
@@ -1219,6 +1225,8 @@ pub fn build_podman_run_args_global_inheriting(
         gpu_mode,
         runtime.gpu_image_variants.is_some(),
     ));
+    // v0.2.106: the host user owns what the container writes to its mounts.
+    args.extend(host_user_mapping_args(engine, runtime.image_user));
 
     for port in &runtime.ports {
         args.push("-p".into());
@@ -2809,6 +2817,15 @@ pub async fn ensure_volume_host_dirs(
 /// resolved endpoint (L0 override → L1 manifest → env override) is
 /// empty or matches a known placeholder pattern. Mirrors the launcher's
 /// `installer_engine::RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+///
+/// v0.2.106: the function it names (`rl-artifact-url`, the paid RL
+/// reranker's gateway) is retired and no longer ships from
+/// `launcher/supabase/functions/`. The RL reranker is a `container_build`
+/// module now and never pulls; this fallback is reached only by a
+/// `container_pull` manifest — an old paid RL install not yet updated to
+/// the bundled module (its pull then fails with the gateway's 404, and the
+/// start path continues from the cached image) or a future paid module
+/// that ships no endpoint of its own.
 pub const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
 
@@ -3475,6 +3492,8 @@ mod tests {
                     pull_token_method: "POST".into(),
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
+                    build_context: None,
+                    dockerfile: None,
                 }),
                 scope: crate::manifest::InstallScope::PerProject,
             },
@@ -3500,6 +3519,7 @@ mod tests {
                 min_gpu_vram_gb: None,
                 gpu_optional: true,
                 gpu_image_variants: None,
+                image_user: None,
                 log_path_template: None,
                 container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
                 image_ref: Some("{install.container.image}:{install.container.tag}".into()),
@@ -5543,6 +5563,8 @@ mod tests {
                     pull_token_method: "POST".into(),
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
+                    build_context: None,
+                    dockerfile: None,
                 }),
                 scope: InstallScope::Global,
             },
@@ -5565,6 +5587,7 @@ mod tests {
                 image_ref: None,
                 auto_restart: false,
                 gpu_image_variants: None,
+                image_user: None,
                 log_file: None,
                 log_path_template: None,
                 min_gpu_vram_gb: None,
@@ -6888,6 +6911,73 @@ mod tests {
         }
         let at = args.iter().position(|a| a == "--label").expect("--label present");
         assert_eq!(args[at..at + 2].to_vec(), want);
+    }
+
+    /// v0.2.106 (B2): the SHIPPED bundled RL manifest runs with its host
+    /// mounts (state, logs, global model) and the host-user mapping, so a
+    /// recreate (every module update, every hub restart of the container)
+    /// finds the per-project models it saved. Before the fix the manifest
+    /// mounted nothing and the models lived in the container's writable
+    /// layer.
+    #[test]
+    fn the_shipped_rl_manifest_runs_with_its_mounts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../claude_mcp_servers/rl_reranker/vct-module.json");
+        let raw = std::fs::read_to_string(&path).expect("shipped RL manifest");
+        let manifest = crate::manifest::ModuleManifest::from_json(&raw).expect("parses");
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let data = ctx.vct_data.display().to_string();
+        let want_mounts: Vec<String> = ["state", "logs", "global"]
+            .iter()
+            .map(|d| format!("{}/vct-rl-reranker/_bundled/{}:/data/{}:Z", data, d, d))
+            .collect();
+        let mounts = |args: &[String]| -> Vec<String> {
+            args.windows(2).filter(|w| w[0] == "-v").map(|w| w[1].clone()).collect()
+        };
+
+        // podman >= 4.3 (the version injected — the live probe would make
+        // the answer depend on this machine's podman): keep-id ONTO the
+        // image user, in BOTH builders.
+        let project = make_project();
+        {
+            let _v = crate::services::host_user_mapping::with_podman_version_for_thread(Some((4, 9)));
+            let podman = build_podman_run_args_global(
+                &manifest, &ctx, 11450, "vct-rl-reranker", "localhost/vco-rl-reranker:0.3.1-cpu",
+                "podman", None, &[],
+            )
+            .unwrap();
+            assert_eq!(mounts(&podman), want_mounts);
+            assert!(podman.iter().any(|a| a == "--userns=keep-id:uid=1000,gid=1000"), "{podman:?}");
+
+            // The per-project builder (same manifest fields) carries them too.
+            let per =
+                build_podman_run_args(&manifest, &ctx, &project, 11533, "c", "img:1", "podman", None)
+                    .unwrap();
+            assert_eq!(mounts(&per), want_mounts);
+            assert!(per.iter().any(|a| a == "--userns=keep-id:uid=1000,gid=1000"), "{per:?}");
+        }
+
+        // Review W5 M2: podman < 4.3 (Ubuntu 22.04's 3.4) and an unreadable
+        // version never get `keep-id:uid=` (podman 3.4 refuses the whole
+        // run): plain keep-id + `--user <host uid>:<gid>`, in BOTH builders.
+        for version in [Some((3, 4)), None] {
+            let _v = crate::services::host_user_mapping::with_podman_version_for_thread(version);
+            let global = build_podman_run_args_global(
+                &manifest, &ctx, 11450, "vct-rl-reranker", "localhost/vco-rl-reranker:0.3.1-cpu",
+                "podman", None, &[],
+            )
+            .unwrap();
+            let per =
+                build_podman_run_args(&manifest, &ctx, &project, 11533, "c", "img:1", "podman", None)
+                    .unwrap();
+            for args in [&global, &per] {
+                assert_eq!(mounts(args), want_mounts);
+                assert!(!args.iter().any(|a| a.starts_with("--userns=keep-id:")), "{version:?} {args:?}");
+                assert!(args.iter().any(|a| a == "--userns=keep-id"), "{version:?} {args:?}");
+                #[cfg(unix)]
+                assert!(args.windows(2).any(|w| w[0] == "--user"), "{version:?} {args:?}");
+            }
+        }
     }
 }
 

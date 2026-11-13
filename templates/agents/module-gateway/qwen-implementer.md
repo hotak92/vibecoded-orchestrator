@@ -3,6 +3,8 @@ name: qwen-implementer
 description: Qwen3.8-Max lane via the claude-gw gateway for bounded multi-file/multi-step fixes — top qwen-vendor rung above deepseek-implementer; not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer/kimi-reviewer.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: medium
+background: true
+autoCompactWindow: 750000
 tools: Read, Write, Edit, Grep, Glob, Bash
 isolation: worktree
 disallowedTools: mcp__vct-coordination__*
@@ -36,7 +38,8 @@ Rules that are absolute:
 Where this lane fits:
 - It is the top rung because the vendor ranks it so: Alibaba's model-selection
   guide lists qwen3.8-max under "Highest capability" and both
-  deepseek-v4.1-flash and qwen3.8-flash under "Lightweight & low-cost". That
+  deepseek-v4.1-flash (the deepseek lanes pin its 1017 build) and qwen3.8-flash
+  under "Lightweight & low-cost". That
   is the vendor's tiering, not a VCO measurement.
 - Reach for it when one lane must hold several files in view at once, or when
   the cheap flash lane has already produced a lead that needs a second,

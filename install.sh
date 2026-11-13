@@ -463,14 +463,14 @@ print_podman_manual_hint() {
     echo "Install Podman manually, then re-run ./install.sh:" >&2
     case "${OSTYPE:-}" in
         linux*)
-            echo "  Ubuntu/Debian:    sudo apt install podman" >&2
-            echo "  Fedora:           sudo dnf install podman" >&2
-            echo "  Arch:             sudo pacman -S podman" >&2
-            echo "  openSUSE/SLES:    sudo zypper install podman" >&2
-            echo "  Alpine:           sudo apk add podman" >&2
+            echo "  Ubuntu/Debian:    sudo apt install podman podman-compose" >&2
+            echo "  Fedora:           sudo dnf install podman podman-compose" >&2
+            echo "  Arch:             sudo pacman -S podman podman-compose" >&2
+            echo "  openSUSE/SLES:    sudo zypper install podman podman-compose" >&2
+            echo "  Alpine:           sudo apk add podman podman-compose" >&2
             ;;
         darwin*)
-            echo "  macOS (brew):  brew install podman" >&2
+            echo "  macOS (brew):  brew install podman podman-compose" >&2
             echo "  Then:          podman machine init && podman machine start" >&2
             ;;
         *)
@@ -484,40 +484,40 @@ attempt_install_podman_linux() {
     # install.py:_prompt_install_container_runtime's Linux ladder.
     if command -v apt-get &>/dev/null; then
         echo "Detected apt (Debian/Ubuntu). Will run:"
-        echo "  sudo apt-get install podman"
+        echo "  sudo apt-get install podman podman-compose"
         if prompt_yes "Proceed? You'll be asked for your sudo password."; then
-            sudo apt-get install -y podman
+            sudo apt-get install -y podman podman-compose
             return 0
         fi
     elif command -v dnf &>/dev/null; then
         echo "Detected dnf (Fedora/RHEL). Will run:"
-        echo "  sudo dnf install podman"
+        echo "  sudo dnf install podman podman-compose"
         if prompt_yes "Proceed? You'll be asked for your sudo password."; then
-            sudo dnf install -y podman
+            sudo dnf install -y podman podman-compose
             return 0
         fi
     elif command -v pacman &>/dev/null; then
         echo "Detected pacman (Arch). Will run:"
-        echo "  sudo pacman -S podman"
+        echo "  sudo pacman -S podman podman-compose"
         if prompt_yes "Proceed? You'll be asked for your sudo password."; then
-            sudo pacman -S --noconfirm podman
+            sudo pacman -S --noconfirm podman podman-compose
             return 0
         fi
     elif command -v zypper &>/dev/null; then
         echo "Detected zypper (openSUSE/SLES). Will run:"
-        echo "  sudo zypper install podman"
+        echo "  sudo zypper install podman podman-compose"
         if prompt_yes "Proceed? You'll be asked for your sudo password."; then
-            sudo zypper install -y podman
+            sudo zypper install -y podman podman-compose
             return 0
         fi
     elif command -v apk &>/dev/null; then
         echo "Detected apk (Alpine). Will run:"
-        echo "  sudo apk add podman"
+        echo "  sudo apk add podman podman-compose"
         if prompt_yes "Proceed? You'll be asked for your sudo password."; then
             # Alpine ships podman in the community repo. If community
             # isn't enabled, apk surfaces "unable to select packages:
             # podman" — acceptable failure mode.
-            sudo apk add --no-cache podman
+            sudo apk add --no-cache podman podman-compose
             return 0
         fi
     else
@@ -539,13 +539,13 @@ attempt_install_podman_macos() {
     if ! command -v brew &>/dev/null; then
         echo "ERROR: Homebrew not found." >&2
         echo "       Install Homebrew first: https://brew.sh" >&2
-        echo "       Then: brew install podman" >&2
+        echo "       Then: brew install podman podman-compose" >&2
         return 1
     fi
     echo "Detected Homebrew. Will run:"
-    echo "  brew install podman"
+    echo "  brew install podman podman-compose"
     if prompt_yes "Proceed?"; then
-        brew install podman
+        brew install podman podman-compose
         if [ $? -eq 0 ]; then
             # podman machine init + start are interactive and can take
             # 1-2 minutes (downloads a VM image). Defer to install.py

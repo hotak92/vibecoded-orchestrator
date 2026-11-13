@@ -204,7 +204,11 @@ def test_instruction_free_text_query_equals_document():
     )
     # jina needs no query prefix → query and document embeds are identical.
     assert svc.embed_text_query("hello") == svc.embed_text("hello")
-    assert sent == ["hello"]
+    # The model receives exactly the same text for both. Since v0.2.106 the two
+    # are separate calls (separate memo namespaces): a query that overflows the
+    # window is cut to a leading window, a document is split instead, so a
+    # memo entry must not serve one for the other.
+    assert sent == ["hello", "hello"]
 
 
 def test_code_query_sends_is_query_true_to_the_service():

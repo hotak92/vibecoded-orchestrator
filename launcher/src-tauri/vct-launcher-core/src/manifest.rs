@@ -1455,11 +1455,17 @@ impl InstallScope {
     }
 }
 
-/// Container-pull install metadata. Carries the registry image reference
-/// + the signed-URL token gateway endpoint. The launcher's installer
-/// engine POSTs the user's validated-tier JWT to `pull_token_endpoint`
-/// before invoking `podman/docker pull` — no anonymous registry access
-/// is ever attempted.
+/// Container install metadata, shared by both container install methods.
+///
+/// * `container_pull`: the registry image reference + the signed-URL token
+///   gateway endpoint. The launcher's installer engine POSTs the user's
+///   validated-tier JWT to `pull_token_endpoint` before invoking
+///   `podman/docker pull` — no anonymous registry access is ever attempted.
+/// * `container_build` (v0.2.106): `image` is the LOCAL tag the launcher
+///   builds (e.g. `localhost/vco-rl-reranker`), `build_context` is the build
+///   context inside the orchestrator checkout and `dockerfile` the
+///   Dockerfile (default `<build_context>/Dockerfile`).
+///   `pull_token_endpoint` is unused and may be omitted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerInstallBlock {
     /// Fully-qualified image reference WITHOUT a tag (e.g.
@@ -1477,6 +1483,9 @@ pub struct ContainerInstallBlock {
     /// HTTPS endpoint that issues short-lived pull tokens against the
     /// user's validated-tier JWT. POST-only. Returns
     /// `{ image, tag, pull_token, expires_at }`. TTL ~15 minutes.
+    /// Required by `container_pull`; empty (the default) for
+    /// `container_build`, which never contacts a registry for its image.
+    #[serde(default)]
     pub pull_token_endpoint: String,
     /// HTTP method to use (default POST).
     #[serde(default = "default_pull_token_method")]
@@ -1490,6 +1499,20 @@ pub struct ContainerInstallBlock {
     /// once per day per the project's locked decision (2026-05-16).
     #[serde(default)]
     pub rotate_weights_endpoint: Option<String>,
+    /// `container_build` only: the image's build context, RELATIVE to the
+    /// orchestrator checkout root (`.` for the checkout itself). It must
+    /// stay inside the checkout; `bundled_modules::build_inputs` enforces
+    /// that. `None` for `container_pull`.
+    #[serde(default)]
+    pub build_context: Option<String>,
+    /// `container_build` only: the Dockerfile, RELATIVE to the orchestrator
+    /// checkout root (e.g. `claude_mcp_servers/rl_reranker/Dockerfile`).
+    /// `None` = `<build_context>/Dockerfile`. A module whose image needs
+    /// files from elsewhere in the checkout uses the root as its context and
+    /// names its Dockerfile here (the root `.dockerignore` limits what enters
+    /// the context).
+    #[serde(default)]
+    pub dockerfile: Option<String>,
 }
 
 fn default_pull_token_method() -> String {
@@ -1528,11 +1551,32 @@ pub enum InstallMethod {
     /// (~weekly) — a leaked snapshot degrades vs free-tier within 2 weeks
     /// of stopping refreshes.
     ContainerPull,
+    /// v0.2.106: BUILD the container image locally from a directory of the
+    /// orchestrator checkout (`install.container.build_context`) instead of
+    /// pulling it. Used by modules whose source ships inside the
+    /// orchestrator (the RL reranker): no registry, no pull token, no
+    /// licence gate. The image is tagged `install.container.image` +
+    /// the same variant tag `container_pull` would use, so every start /
+    /// resume / health path that runs a container image treats the two
+    /// methods alike (see [`InstallMethod::runs_container_image`]); only the
+    /// registry-specific steps (authed pre-pull, pullability pre-flight,
+    /// pull-failure reconcile) stay `container_pull`-only.
+    ContainerBuild,
     // Reserved methods previously stubbed (tarball / pypi / npm) were
     // removed in v0.1.0 — they returned hard errors and confused users
     // browsing the modules catalog. They will land in v0.2 with real
     // implementations + signature verification. Manifests that specify
     // them will fail to deserialize with a clean serde error.
+}
+
+impl InstallMethod {
+    /// True for the install methods whose runtime is a container IMAGE the
+    /// launcher runs (`container_pull`, `container_build`). The one answer
+    /// to "is this a container-distributed module" for the start, resume,
+    /// auto-migrate and post-install-start gates.
+    pub fn runs_container_image(&self) -> bool {
+        matches!(self, InstallMethod::ContainerPull | InstallMethod::ContainerBuild)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1746,6 +1790,30 @@ pub struct RuntimeBlock {
     /// (from `install.container.tag_from_version`) is used unchanged.
     #[serde(default)]
     pub gpu_image_variants: Option<GpuImageVariants>,
+
+    /// v0.2.106: the numeric user the image's process runs as (its
+    /// `USER`). When set, the start paths map the HOST user onto it, so the
+    /// container can write its bind-mounted `volumes` and every file it
+    /// writes there stays owned by the host user (who can back it up or
+    /// delete it without a root shell): podman >= 4.3 gets
+    /// `--userns=keep-id:uid=<uid>,gid=<gid>` (rootless on Linux, and the
+    /// podman machine on macOS / Windows), an older or unreadable podman
+    /// `--userns=keep-id` + `--user <host uid>:<host gid>`, docker on Linux runs the
+    /// container as the host user (`--user <host uid>:<host gid>`), and
+    /// Docker Desktop (macOS / Windows) needs nothing — its file sharing
+    /// already maps ownership. Without it a non-root image cannot write a
+    /// host directory under rootless podman (its uid maps to a subordinate
+    /// id that does not own the directory). See
+    /// `container_runtime::host_user_mapping_args`.
+    #[serde(default)]
+    pub image_user: Option<ImageUser>,
+}
+
+/// [`RuntimeBlock::image_user`]: the image's runtime uid / gid.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct ImageUser {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// NEW-3.B (2026-05-28): Defaulting helpers for container-runtime fields.
@@ -2217,9 +2285,10 @@ impl ModuleManifest {
     /// module has the fields needed for the launcher's container start path.
     /// Returns a Vec of [`ManifestWarning`]s (empty = fully valid).
     ///
-    /// Only applies to manifests with `install.method == ContainerPull` AND
-    /// `runtime.type ∈ {"container", "service"}`. All other modules return
-    /// an empty Vec immediately.
+    /// Only applies to manifests whose install method runs a container image
+    /// (`container_pull` / `container_build`) AND `runtime.type ∈
+    /// {"container", "service"}`. All other modules return an empty Vec
+    /// immediately.
     ///
     /// Warnings divide into two severity levels:
     /// - `Error` — field is required with no sensible default (e.g. missing
@@ -2230,8 +2299,8 @@ impl ModuleManifest {
     pub fn validate_for_container_start(&self) -> Vec<ManifestWarning> {
         let mut warnings = Vec::new();
 
-        // Only meaningful for container-pull + container/service runtime.
-        if self.install.method != InstallMethod::ContainerPull {
+        // Only meaningful for container-image + container/service runtime.
+        if !self.install.method.runs_container_image() {
             return warnings;
         }
         if !matches!(self.runtime.r#type.as_str(), "container" | "service") {
@@ -2245,8 +2314,21 @@ impl ModuleManifest {
         if !image_ok {
             warnings.push(ManifestWarning::error(
                 "install.container.image",
-                "required for container_pull modules — no image to pull",
+                "required for container modules — no image to run",
             ));
+        }
+        // Hard error: a container_build module must name its build context.
+        if self.install.method == InstallMethod::ContainerBuild {
+            let ctx_ok = self.install.container.as_ref()
+                .and_then(|c| c.build_context.as_deref())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !ctx_ok {
+                warnings.push(ManifestWarning::error(
+                    "install.container.build_context",
+                    "required for container_build modules — nothing to build from",
+                ));
+            }
         }
 
         // Deprecation: container_name_template missing but synthesizable.
@@ -2712,7 +2794,7 @@ mod tests {
     /// (e.g. ContainerInstallBlock gains a required field without a
     /// default), this test fails fast at CI time before any user hits it.
     ///
-    /// The manifest lives at <repo>/paid-modules/vct-rl-reranker/vct-module.json
+    /// The manifest lives at <repo>/claude_mcp_servers/rl_reranker/vct-module.json
     /// — a staging dir, NOT shipped via launcher/bundled_manifests/ (paid
     /// modules ship via the signed-URL gateway, not the AGPL release).
     #[test]
@@ -2729,17 +2811,11 @@ mod tests {
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
-        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
-        if !path.exists() {
-            // Test is informational on dev clones that don't have the
-            // paid-modules staging dir checked out. Skip rather than fail.
-            eprintln!(
-                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
-                 (path: {}) — skipping deserialize check",
-                path.display()
-            );
-            return;
-        }
+        // v0.2.106: the RL reranker ships IN this repository (bundled
+        // module, `claude_mcp_servers/rl_reranker`), so its manifest is
+        // always present — read it unconditionally (pre-v0.2.106 this test
+        // skipped whenever the private module checkout was absent).
+        let path = repo_root.join("claude_mcp_servers/rl_reranker/vct-module.json");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
         let manifest: ModuleManifest = serde_json::from_str(&body)
@@ -2772,19 +2848,37 @@ mod tests {
              update active_series list when the module advances past 0.4.x",
             manifest.version
         );
-        assert_eq!(manifest.install.method, InstallMethod::ContainerPull);
-        assert!(manifest.license.required);
-        assert_eq!(manifest.license.min_orchestrator_tier, "pro");
+        // v0.2.106 (owner ruling 2026-11-11, "the RL reranker is no more
+        // paid"): built locally from the checkout, no licence, no registry.
+        assert_eq!(manifest.install.method, InstallMethod::ContainerBuild);
+        assert!(manifest.install.method.runs_container_image());
+        assert!(!manifest.license.required);
+        assert_eq!(manifest.license.min_orchestrator_tier, "free");
 
         let container = manifest
             .install
             .container
             .as_ref()
-            .expect("install.container present for container_pull method");
-        assert_eq!(container.image, "ghcr.io/hotak92/vct-rl-reranker");
+            .expect("install.container present for container_build method");
+        assert_eq!(container.image, "localhost/vco-rl-reranker");
         assert!(container.tag_from_version);
-        assert!(container.pull_token_endpoint.starts_with("https://"));
-        assert!(container.rotate_weights);
+        assert!(container.pull_token_endpoint.is_empty(), "no pull token for a local build");
+        // Built from the checkout ROOT (it imports rl_client/rl_logger.py and
+        // vco_lib/rl_training_targets.py — one copy each), with its own
+        // Dockerfile; the root `.dockerignore` keeps the context small.
+        assert_eq!(container.build_context.as_deref(), Some("."));
+        assert_eq!(
+            container.dockerfile.as_deref(),
+            Some("claude_mcp_servers/rl_reranker/Dockerfile")
+        );
+        assert!(
+            manifest.validate_for_container_start().iter().all(|w| w.severity != WarningSeverity::Error),
+            "shipped manifest must pass the container-start validation"
+        );
+        // The Supabase weight-rotation channel is retired for this module:
+        // its weights are bundled in the image.
+        assert!(!container.rotate_weights);
+        assert!(container.rotate_weights_endpoint.is_none());
     }
 
     // ─── Stream 2 (2026-05-19): GuiBlock / ConfigTab / ConfigControl ────
@@ -3115,8 +3209,8 @@ mod tests {
     }
 
     /// Confirms the vct-rl-reranker manifest carries a fully-populated
-    /// `gui.config_tab` after Stream 2 (Part D). Skipped when the file
-    /// is absent (paid-modules dir not present on this dev clone).
+    /// `gui.config_tab` after Stream 2 (Part D). The manifest ships in this
+    /// repository (v0.2.106), so this always runs.
     /// Pins the section count, title, and presence of at least one
     /// control of each kind so manifest drift breaks loudly.
     #[test]
@@ -3132,15 +3226,11 @@ mod tests {
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
-        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
-        if !path.exists() {
-            eprintln!(
-                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
-                 (path: {}) — skipping gui_tab check",
-                path.display()
-            );
-            return;
-        }
+        // v0.2.106: the RL reranker ships IN this repository (bundled
+        // module, `claude_mcp_servers/rl_reranker`), so its manifest is
+        // always present — read it unconditionally (pre-v0.2.106 this test
+        // skipped whenever the private module checkout was absent).
+        let path = repo_root.join("claude_mcp_servers/rl_reranker/vct-module.json");
         let body = std::fs::read_to_string(&path).expect("read manifest");
         let manifest: ModuleManifest =
             serde_json::from_str(&body).expect("deserialize manifest");
@@ -3296,8 +3386,8 @@ mod tests {
     }
 
     /// Confirms the on-disk vct-rl-reranker manifest carries the v0.2.20
-    /// GPU hints. Skipped when the paid-modules staging dir is absent
-    /// (some dev clones don't have it). Pins the three values so a
+    /// GPU hints. The manifest ships in this repository (v0.2.106), so this
+    /// always runs. Pins the three values so a
     /// later manifest edit can't silently drop them.
     #[test]
     fn vct_rl_reranker_manifest_carries_v0_2_20_gpu_hints() {
@@ -3312,15 +3402,11 @@ mod tests {
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
-        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
-        if !path.exists() {
-            eprintln!(
-                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
-                 (path: {}) — skipping v0.2.20 GPU-hints check",
-                path.display()
-            );
-            return;
-        }
+        // v0.2.106: the RL reranker ships IN this repository (bundled
+        // module, `claude_mcp_servers/rl_reranker`), so its manifest is
+        // always present — read it unconditionally (pre-v0.2.106 this test
+        // skipped whenever the private module checkout was absent).
+        let path = repo_root.join("claude_mcp_servers/rl_reranker/vct-module.json");
         let body = std::fs::read_to_string(&path).expect("read manifest");
         let m: ModuleManifest = ModuleManifest::from_json(&body).expect("parse manifest");
 
@@ -4726,7 +4812,7 @@ mod tests {
     }
 
     /// Full smoke test: load the actual v0.2.7 RL manifest from
-    /// `paid-modules/vct-rl-reranker/vct-module.json` and assert it
+    /// `claude_mcp_servers/rl_reranker/vct-module.json` and assert it
     /// parses cleanly via `ModuleManifest::from_json`. This is THE
     /// regression test for the v0.2.32 manifest-validation bug — pre-D, the
     /// manifest rejected at line 242 (`tauri_command` step kind)
@@ -4734,9 +4820,9 @@ mod tests {
     /// variant. Post-D, it parses cleanly and the catalog tile can
     /// render with the correct version.
     ///
-    /// Like `vct_rl_reranker_manifest_deserializes` above, this test
-    /// is informational on dev clones without the paid-modules
-    /// staging dir.
+    /// Like `vct_rl_reranker_manifest_deserializes` above, this test reads
+    /// the manifest shipped in this repository (v0.2.106) and always
+    /// runs.
     #[test]
     fn rl_reranker_v0_2_7_manifest_with_chained_action_tauri_command_parses() {
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4745,15 +4831,11 @@ mod tests {
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
-        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
-        if !path.exists() {
-            eprintln!(
-                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
-                 (path: {}) — skipping v0.2.7 regression smoke",
-                path.display()
-            );
-            return;
-        }
+        // v0.2.106: the RL reranker ships IN this repository (bundled
+        // module, `claude_mcp_servers/rl_reranker`), so its manifest is
+        // always present — read it unconditionally (pre-v0.2.106 this test
+        // skipped whenever the private module checkout was absent).
+        let path = repo_root.join("claude_mcp_servers/rl_reranker/vct-module.json");
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
         let manifest = ModuleManifest::from_json(&body)

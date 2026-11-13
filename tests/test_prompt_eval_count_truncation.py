@@ -307,16 +307,25 @@ def test_service_does_not_tag_from_a_pinned_count_alone(monkeypatch):
     )
 
 
+def _query_record(svc) -> "list[str]":
+    return sorted(k for k, v in svc._last_truncated_slots.items() if v)
+
+
 def test_service_keeps_ratio_verdict_when_count_absent(monkeypatch):
-    """Fallback leg: no count on the response → the ratio estimate stands
-    (an over-budget text is still tagged)."""
+    """Fallback leg: no count on the response → the ratio estimate stands.
+
+    v0.2.106: an over-budget DOCUMENT is split into pieces within the budget
+    (nothing cut, nothing tagged); the ratio verdict is the QUERY arm's,
+    which still bounds an over-budget query to a leading window."""
     handler = _counts_handler({}, include_count=False)
     adapter, _ = _adapter(handler)
     svc = _service(monkeypatch, adapter)
     text = "r" * (ARCTIC_BUDGET + 2_000)
     slots, truncated = svc.embed_text_all_configured_tagged(text)
     assert "arctic2_embed" in slots
-    assert truncated == ["arctic2_embed"]
+    assert truncated == []
+    svc.embed_text_query_all_configured(text)
+    assert _query_record(svc) == ["arctic2_embed"]
 
 
 def test_service_subwindowed_text_stays_truncated_when_exact_fits(monkeypatch):
@@ -330,8 +339,12 @@ def test_service_subwindowed_text_stays_truncated_when_exact_fits(monkeypatch):
     adapter, _ = _adapter(handler)
     svc = _service(monkeypatch, adapter)
     text = "s" * (ARCTIC_BUDGET + 2_000)
-    slots, truncated = svc.embed_text_all_configured_tagged(text)
-    assert truncated == ["arctic2_embed"]
+    # The QUERY arm is the one that still sub-windows (v0.2.106).
+    svc.embed_text_query_all_configured(text)
+    assert _query_record(svc) == ["arctic2_embed"]
+    # The DOCUMENT arm splits: every piece fits, nothing is tagged.
+    _slots, truncated = svc.embed_text_all_configured_tagged(text)
+    assert truncated == []
 
 
 def test_service_with_plain_adapter_keeps_estimate_only(monkeypatch):
@@ -343,11 +356,14 @@ def test_service_with_plain_adapter_keeps_estimate_only(monkeypatch):
     # Fits the budget → NOT truncated (estimate; no exact path exists).
     _, truncated_fit = svc.embed_text_all_configured_tagged("t" * 6_000)
     assert truncated_fit == []
-    # Over the budget → truncated by the estimate alone.
+    # Over the budget: a DOCUMENT is split (v0.2.106) — not tagged; a QUERY
+    # is still bounded by the estimate alone.
     _, truncated_over = svc.embed_text_all_configured_tagged(
         "u" * (ARCTIC_BUDGET + 2_000)
     )
-    assert truncated_over == ["arctic2_embed"]
+    assert truncated_over == []
+    svc.embed_text_query_all_configured("u" * (ARCTIC_BUDGET + 2_000))
+    assert _query_record(svc) == ["arctic2_embed"]
 
 
 if __name__ == "__main__":

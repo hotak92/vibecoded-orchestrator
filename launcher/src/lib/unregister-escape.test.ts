@@ -10,10 +10,11 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import {
   DEFAULT_UNREGISTER_OPTIONS,
+  REMOVE_UNREGISTER_OPTIONS,
   UNREGISTER_ANYWAY_LABEL,
   UNREGISTER_STOPPED_PREFIX,
   isUnregisterStopped,
-  quickUnregister,
+  removeUnregister,
   runUnregister,
 } from './unregister-escape';
 import type { UnregisterOptions, UnregisterReport } from '$lib/types/launcher';
@@ -28,6 +29,9 @@ function report(extra: Partial<UnregisterReport> = {}): UnregisterReport {
     projectId: 'p1',
     projectName: 'Gamma',
     filesPurged: [],
+    filesKeptModified: [],
+    keptAsYours: [],
+    settingsEntriesRemoved: [],
     keysPurgedFromEnv: [],
     collectionsDropped: [],
     warnings: [],
@@ -100,14 +104,15 @@ describe('the unregister stop and its escape', () => {
   });
 });
 
-describe("the project list's quick unregister (review R6 F46)", () => {
-  it('is the settings page default unregister: launcher files purged, collections kept', async () => {
+describe('the shared Remove flow (v0.2.106): removal includes the collections', () => {
+  it('is the owner definition of removal: launcher files purged AND collections dropped', async () => {
     expect(DEFAULT_UNREGISTER_OPTIONS).toEqual({ purgeLauncherFiles: true, purgeCollections: false });
+    expect(REMOVE_UNREGISTER_OPTIONS).toEqual({ purgeLauncherFiles: true, purgeCollections: true });
     const del = vi.fn(async (_o: UnregisterOptions) => report());
-    await quickUnregister(del, async () => true);
+    await removeUnregister(del, async () => true);
     expect(del.mock.calls[0][0]).toEqual({
       purgeLauncherFiles: true,
-      purgeCollections: false,
+      purgeCollections: true,
       leaveUnremovable: false,
     });
   });
@@ -119,7 +124,7 @@ describe("the project list's quick unregister (review R6 F46)", () => {
         throw STOP;
       });
     const ask = vi.fn(async () => true);
-    const out = await quickUnregister(del, ask);
+    const out = await removeUnregister(del, ask);
     expect(ask).toHaveBeenCalledWith(STOP);
     expect(out.kind).toBe('done');
     expect(del).toHaveBeenCalledTimes(2);
@@ -132,7 +137,7 @@ describe("the project list's quick unregister (review R6 F46)", () => {
     const del = vi.fn(async (_o: UnregisterOptions) => {
       throw STOP;
     });
-    const out = await quickUnregister(del, async () => false);
+    const out = await removeUnregister(del, async () => false);
     expect(out).toEqual({ kind: 'kept', message: STOP });
     expect(del).toHaveBeenCalledTimes(1);
   });

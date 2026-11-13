@@ -77,6 +77,10 @@ __all__ = [
     "CLAIM_MARK",
     "CTX_PENDING_PATH_KEY",
     "AGENT_WINDOW_FINAL_KEY",
+    "TRANSCRIPT_PATH_KEY",
+    "TRANSCRIPT_ENV",
+    "staging_transcript_for",
+    "staged_transcript",
 ]
 
 # v0.2.102 W6-RL2 (owner ruling, R7-4): the ONLY time bound left on a pending
@@ -146,6 +150,24 @@ AGENT_WINDOW_FINAL_KEY = "agent_window_final"
 # attribution rule, ``rl_drain_citations._query_in_transcript``).
 NO_SESSION_PREFIX = "nosession"
 
+# v0.2.106 (owner ruling R7-3, 2026-10-13: "store the transcript path at
+# staging; score only against it"): the payload field holding the EXACT
+# transcript of the chat that made the retrieval — the main chat's
+# ``<session>.jsonl``, or a subagent's own ``agent-<id>.jsonl`` — recorded
+# when the retrieval is staged. A drain scores the file against exactly
+# that file (``rl_drain_citations``): never a sibling looked up in its own
+# transcripts folder, which is a DIFFERENT folder whenever the staging chat's
+# transcript lives elsewhere. ``""`` = not knowable at staging (the MCP
+# server and the ``kg-search`` CLI are not told which chat or subagent calls
+# them): those files keep the query-in-transcript attribution.
+TRANSCRIPT_PATH_KEY = "transcript_path"
+
+# The env channel through which a hook process hands :func:`stage_pending`
+# the staging chat's exact transcript (set per run by
+# ``hook_context_router`` from its payload, exactly like ``VCT_AGENT_ID``;
+# never set by the MCP server or the CLI).
+TRANSCRIPT_ENV = "VCT_TRANSCRIPT_PATH"
+
 # Filesystem-safe key sanitiser. session_id / task_id come from Claude Code +
 # our own uuid hex, but a defensive scrub keeps a stray path separator from
 # escaping the pending dir.
@@ -165,6 +187,50 @@ def _resolve_project_root() -> Optional[Path]:
     from vco_lib.project_root import resolve_project_root  # noqa: PLC0415
 
     return resolve_project_root()
+
+
+def _chat_project_root() -> Optional[Path]:
+    """Where a retrieval is STAGED when no root is given: ``CLAUDE_PROJECT_DIR``,
+    else the chat's project (``KG_BASE_DIR``), else :func:`_resolve_project_root`.
+
+    v0.2.106 (worktree lanes): a pending file belongs to the CHAT that made
+    the retrieval, and only that chat's drains (run with the chat's
+    ``CLAUDE_PROJECT_DIR``) ever read its pending dir. A lane's Bash
+    command (``kg-search``) gets no ``CLAUDE_PROJECT_DIR`` and runs in a git
+    worktree: the cwd walk resolved NOTHING for a worktree outside the
+    project (``<repo>.vco-lanes/<branch>-<id>/``: the retrieval was never
+    staged) and the WORKTREE itself for a harness worktree inside a project
+    (``.claude/worktrees/agent-*/``, which carries the tracked
+    ``.claude/settings.json``: staged where no drain runs, deleted with the
+    worktree). ``KG_BASE_DIR`` — the chat's project folder, which the
+    project's own settings ``env`` puts into every process the chat spawns
+    — names the dir the chat's drains read. Taken only when it is a VCO
+    project and not a home; a plain shell without it walks from the cwd as
+    before. (The kg-sync wrapper deliberately pins the FOLDER over a leaked
+    ``KG_BASE_DIR`` — its files belong to the folder; a citation belongs to
+    the chat.)
+
+    STAGING ONLY: the readers that list, claim, collect or delete pending
+    files keep :func:`_resolve_project_root`. Adding a file is the one thing
+    an ambient ``KG_BASE_DIR`` may cause; it can never point a collector at
+    another project's queue."""
+    if not (os.environ.get("CLAUDE_PROJECT_DIR") or "").strip():
+        chat_project = (os.environ.get("KG_BASE_DIR") or "").strip()
+        if chat_project and os.path.isabs(chat_project):
+            from vco_lib.project_root import (  # noqa: PLC0415
+                home_boundaries,
+                looks_like_vco_project,
+            )
+
+            try:
+                cand: Optional[Path] = Path(chat_project).resolve()
+            except (OSError, RuntimeError):
+                cand = None
+            # A home is never a project (every user has ~/.claude/settings.json).
+            if (cand is not None and cand not in home_boundaries()
+                    and looks_like_vco_project(cand)):
+                return cand
+    return _resolve_project_root()
 
 
 def pending_dir(project_root: "str | Path | None" = None) -> Optional[Path]:
@@ -204,6 +270,17 @@ def _safe(key: str) -> str:
 def _pending_path(
     session_id: str, task_id: str, root: "str | Path | None"
 ) -> Optional[Path]:
+    # v0.2.106: a stage with no explicit root lands where the CHAT's
+    # drains look (:func:`_chat_project_root`).
+    if root is None:
+        root = _chat_project_root()
+        if root is None:
+            logger.info(
+                "citation_pending: no VCO project encloses %s and CLAUDE_PROJECT_DIR "
+                "is unset; skipping the pending-queue write",
+                _cwd_for_log(),
+            )
+            return None
     d = pending_dir(root)
     if d is None:
         return None
@@ -221,6 +298,7 @@ def stage_pending(
     source: str = "hook",
     project_root: "str | Path | None" = None,
     agent_id: Optional[str] = None,
+    transcript_path: Optional[str] = None,
 ) -> Optional[Path]:
     """Persist the staged citation ctx as a pending file. Returns the path
     (or None on soft-fail). Idempotent per (session_id, task_id): a re-stage
@@ -240,6 +318,13 @@ def stage_pending(
     for a subagent's call (the hook-path KG leg runs in the router's
     process); the drain routes agent-tagged files to the agent's own
     transcript (``rl_drain_citations.drain_session``).
+
+    ``transcript_path`` (v0.2.106, owner ruling R7-3): the EXACT transcript
+    of the chat that made this retrieval (:data:`TRANSCRIPT_PATH_KEY`).
+    ``None`` reads :data:`TRANSCRIPT_ENV`, which the context router sets per
+    run from its hook payload (:func:`staging_transcript_for`). Recorded only
+    when it names an existing ``.jsonl`` file; otherwise the field is ``""``
+    and the drain keeps the pre-v0.2.106 attribution for the file.
     """
     # v0.2.105: a session that keeps no transcript (a headless
     # ``--no-session-persistence`` run, marked by the process that started
@@ -254,6 +339,8 @@ def stage_pending(
         return None
     if agent_id is None:
         agent_id = os.environ.get("VCT_AGENT_ID", "")
+    if transcript_path is None:
+        transcript_path = os.environ.get(TRANSCRIPT_ENV, "")
     try:
         # One agent-id rule (vco_lib is a hard dependency here, exactly like
         # the atomic writer below — a failed import fails the stage).
@@ -268,6 +355,7 @@ def stage_pending(
             "ts_ms": int(time.time() * 1000),
             "source": source,
             "agent_id": agent_id,
+            TRANSCRIPT_PATH_KEY: _existing_transcript(transcript_path),
             "ctx": ctx,
         }
         # W6-C2 fix round (review R4c-8): a retrieval staged for a subagent's
@@ -748,6 +836,10 @@ def record_unscored(
         "agent_id": str(info.get("agent_id") or ""),
         "source": str(info.get("source") or ""),
         "ts_ms": info.get("ts_ms"),
+        # v0.2.106: the exact transcript recorded at staging ("" = not
+        # knowable there: an MCP / CLI retrieval, or a pre-v0.2.106 file),
+        # so a no_transcript row says WHICH case it is.
+        "transcript_path": str(info.get(TRANSCRIPT_PATH_KEY) or ""),
     }
     logger.warning(
         "citation_pending: unscored citation %s (%s, %s) -- the citation for task "
@@ -956,19 +1048,78 @@ def _safe_tool_use_id(raw: str) -> str:
 def agent_transcript_for(parent_transcript: str, agent_id: str) -> str:
     """Where Claude Code writes a subagent's transcript, beside the parent's:
     ``<parent without .jsonl>/subagents/agent-<id>.jsonl`` (the layout
-    SubagentStop's ``agent_transcript_path`` shows — probe 2026-10-13).
-    ``""`` when either input is missing or the file does not exist, so a
-    caller never points a drain at a guessed path."""
+    SubagentStop's ``agent_transcript_path`` shows — probe 2026-10-13), or,
+    for an agent a workflow launched,
+    ``<parent without .jsonl>/subagents/workflows/<wf>/agent-<id>.jsonl``
+    (v0.2.106: the layout of 360 agent transcripts on the maintainer's
+    machine, 2026-11-11). Only the parent SESSION's own folder is looked
+    at, for the one file name the agent id fixes — never another chat's.
+    ``""`` when either input is missing or no such file exists (or more than
+    one does), so a caller never points a drain at a guessed path."""
     from vco_lib.hook_agent_key import sanitize_agent_id  # noqa: PLC0415
 
     agent = sanitize_agent_id(agent_id or "")
     if not parent_transcript or not agent or not parent_transcript.endswith(".jsonl"):
         return ""
-    cand = Path(parent_transcript[: -len(".jsonl")]) / "subagents" / f"agent-{agent}.jsonl"
+    subagents = Path(parent_transcript[: -len(".jsonl")]) / "subagents"
+    name = f"agent-{agent}.jsonl"
+    cand = subagents / name
     try:
-        return str(cand) if cand.is_file() else ""
+        if cand.is_file():
+            return str(cand)
+        nested = [p for p in (subagents / "workflows").glob(f"*/{glob.escape(name)}")
+                  if p.is_file()]
     except OSError:
         return ""
+    return str(nested[0]) if len(nested) == 1 else ""
+
+
+def _existing_transcript(path: "str | None") -> str:
+    """``path`` when it names an existing absolute ``.jsonl`` file, else
+    ``""`` — what may be recorded as :data:`TRANSCRIPT_PATH_KEY`."""
+    p = (path or "").strip()
+    if not p or not p.endswith(".jsonl") or not os.path.isabs(p):
+        return ""
+    try:
+        return p if Path(p).is_file() else ""
+    except OSError:
+        return ""
+
+
+def staging_transcript_for(transcript_path: str, agent_id: str) -> str:
+    """The EXACT transcript of the chat whose hook event carries
+    ``transcript_path`` / ``agent_id`` — what the context router records at
+    staging (:data:`TRANSCRIPT_ENV`).
+
+    A main-chat event's ``transcript_path`` is its own transcript. A
+    subagent's tool events carry the PARENT's ``transcript_path`` (probe
+    2026-10-13; the agent's own path appears only on SubagentStop), so for
+    them it is the agent's own file beside the parent's
+    (:func:`agent_transcript_for` — the agent is running, so its transcript
+    exists). ``""`` when that file does not exist: the retrieval is then
+    staged without a path and keeps the pre-v0.2.106 routing (SubagentStop
+    supplies the path), never the parent's transcript."""
+    if agent_id:
+        return agent_transcript_for(transcript_path, agent_id)
+    return _existing_transcript(transcript_path)
+
+
+def staged_transcript(payload: object) -> "str | None":
+    """The transcript a pending payload recorded at staging
+    (:data:`TRANSCRIPT_PATH_KEY`), for a drain to score against.
+
+    ``None`` when nothing was recorded (a file staged before v0.2.106, or by
+    the MCP server / the CLI): the caller keeps its pre-v0.2.106 rule. A
+    recorded path is AUTHORITATIVE (owner ruling R7-3): it is returned when
+    the file still exists, and ``""`` when it does not — the chat's
+    transcript is gone, so the citation cannot be scored, and no other
+    transcript may stand in for it."""
+    if not isinstance(payload, dict):
+        return None
+    recorded = str(payload.get(TRANSCRIPT_PATH_KEY) or "")
+    if not recorded:
+        return None
+    return _existing_transcript(recorded)
 
 
 def session_transcript_for(known_transcript: str, session_id: str) -> str:
@@ -1156,6 +1307,12 @@ def adopt_brief_citations(
             payload = read_pending(claimed)
             if isinstance(payload, dict) and not payload.get("agent_id"):
                 payload["agent_id"] = agent
+                # v0.2.106: the transcript recorded at staging is the
+                # CALLER's (the brief is retrieved before the agent exists);
+                # the adopted file's chat is the agent, so the record becomes
+                # the agent's transcript — or goes, when that is not known
+                # yet (the agent's own SubagentStop drain supplies it).
+                payload[TRANSCRIPT_PATH_KEY] = agent_transcript_path
                 if agent_transcript_path:
                     payload["agent_transcript_path"] = agent_transcript_path
                     if not window_final:

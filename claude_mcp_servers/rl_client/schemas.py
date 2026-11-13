@@ -3,19 +3,20 @@
 """Pydantic wire-contract schemas for the RL reranker HTTP API.
 
 These models pin the request/response shape that
-``paid-modules/vct-rl-reranker/rl_server.py`` (the paid container)
+``claude_mcp_servers/rl_reranker/rl_server.py`` (the reranker container)
 must accept. If a field name changes here, the same change MUST land
-in the server's handlers — otherwise the launcher's free-tier
-plumbing will silently fail to talk to the paid module.
+in the server's handlers — otherwise the MCP plumbing will silently
+fail to talk to the reranker.
 
 The wire contract is derived directly from the server source as of
 2026-05-19:
 
   * ``POST /cache_nodes`` — body: ``{task_id, query, nodes[], limit,
-    embedding_source?}``. Response: ``{ok, task_id, top_k[]}``.
-    ``nodes`` items have ``{title, content?, node_type?, emb?,
-    score?, weaviate_id?, ...}`` — free-form dicts on the server
-    side (it forwards them to ``RetrievalRL.rerank_query_aware``).
+    features, active_embedding?, session_id?}``. Response: ``{ok, task_id,
+    scored, order[], scores[], top_k[]}``. ``nodes`` items are slim
+    (``{title, node_type}``); the vectors travel in ``features``
+    (``rl_client.rerank_wire``, protocol v2 since v0.2.106). A body without
+    ``features`` is refused with 422.
   * ``POST /rl_update`` — body: ``{task_ids[], agent_output}``.
     Response: ``{ok, scheduled}`` or ``{ok, skipped}``.
   * ``GET /health`` — response: ``{ok, model}``.
@@ -72,8 +73,10 @@ class CacheNodesRequest(BaseModel):
     # Optional metadata for cross-process drift detection. The server
     # logs these but does not switch networks per-request.
     embedding_source: Optional[str] = None
-    query_emb: Optional[List[float]] = None
     active_embedding: Optional[str] = None
+    # Protocol v2 (v0.2.106): the serve-time feature block
+    # (``rl_client.rerank_wire.encode_rerank_features``).
+    features: Optional[dict] = None
 
 
 class RankedNode(BaseModel):
@@ -102,6 +105,16 @@ class CacheNodesResponse(BaseModel):
     # forward them through the existing weaviate_mcp result pipeline
     # unchanged. Tests + the client adapter shape-check selectively.
     top_k: List[Any] = Field(default_factory=list)
+    # Protocol v2: request-node indices best first, and the model score per
+    # request node (None = the node had no vector and was not scored).
+    # ``scored: false`` with ``serving: "search_order"`` (v0.2.106) = the
+    # project's model is not served (it has not passed its own check on
+    # its prequential record); ``order`` is then the identity and ``reason`` says why.
+    scored: bool = False
+    serving: Optional[str] = None
+    reason: Optional[str] = None
+    order: List[int] = Field(default_factory=list)
+    scores: List[Optional[float]] = Field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -175,3 +188,13 @@ class HealthResponse(BaseModel):
     # arctic / ...). Both optional; None ⇒ container did not advertise.
     embedding_dim: Optional[int] = None
     embedding_space: Optional[str] = None
+    # v0.2.106: whether the loaded base model is a released, trained
+    # checkpoint (None = the container did not say), and whether its profile
+    # masks the linked slots (``rl_model.LINKED_SLOTS_MASKED_PROFILES``).
+    trained: Optional[bool] = None
+    linked_slots_masked: Optional[bool] = None
+    # v0.2.106: the container gates every project's model on that project's
+    # own prequential record and answers a project whose model does not pass
+    # with its search order (``serving: "search_order"``). True = the client
+    # may call it even while ``trained`` is false.
+    per_project_gate: Optional[bool] = None

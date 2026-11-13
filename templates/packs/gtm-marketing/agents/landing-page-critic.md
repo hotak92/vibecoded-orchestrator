@@ -6,6 +6,8 @@ keywords: ["landing page", "hero section", "above the fold", "CTA hierarchy", "c
 tools: WebFetch, WebSearch, Read, Write, Edit, Grep, Bash
 model: opus
 effort: medium
+background: true
+autoCompactWindow: 750000
 disallowedTools: mcp__vct-coordination__*
 ---
 

@@ -163,7 +163,7 @@ from vco_lib import uninstall_artifacts as _uninstall_artifacts  # noqa: E402
 from vco_lib import uninstall_containers as _uninstall_containers, uninstall_quiesce as _uninstall_quiesce, uninstall_state as _uninstall_state  # noqa: E402,E501
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
-from vco_lib import compose_provider as _compose_provider  # noqa: E402
+from vco_lib import compose_provider as _compose_provider, compose_prereq as _compose_prereq  # noqa: E402
 from vco_lib import install_services_up as _isu  # noqa: E402
 from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
@@ -293,32 +293,17 @@ def validate_source_repo(install_path: Path) -> None:
         )
 
 
-def _windows_powershell_version() -> tuple[int, int] | None:
-    """Return the (major, minor) version of the available PowerShell, or
-    None if neither `pwsh` (PowerShell 7+) nor `powershell` (Windows
-    PowerShell 5.1) resolves on PATH.
+def _windows_powershell_probe():
+    """PowerShell's state (ok/missing/too_old/no_answer) — logic in
+    ``vco_lib.windows_powershell``; this shim is the tests' patch point."""
+    from vco_lib.windows_powershell import probe
 
-    Used by the Windows install gate (audit F1, P0). PowerShell 5.1 ships
-    preinstalled on Windows 10/11 — that's the floor. `pwsh` (Core 7+) is
-    preferred when available but not required.
-    """
-    for exe in ("pwsh", "powershell"):
-        if not shutil.which(exe):
-            continue
-        try:
-            r = subprocess.run(
-                [exe, "-NoProfile", "-Command",
-                 "$PSVersionTable.PSVersion.Major; $PSVersionTable.PSVersion.Minor"],
-                capture_output=True, text=True, timeout=8,
-            )
-        except (subprocess.SubprocessError, OSError):
-            continue
-        if r.returncode != 0:
-            continue
-        nums = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
-        if len(nums) >= 2:
-            return (nums[0], nums[1])
-    return None
+    return probe()
+
+
+def _windows_powershell_version() -> tuple[int, int] | None:
+    """The (major, minor) version, or None when it could not be read."""
+    return _windows_powershell_probe().version
 
 
 def _windows_has_git_bash() -> bool:
@@ -348,20 +333,21 @@ def _check_windows_shell_prereqs() -> None:
         actionable install message.
       - Windows + Git Bash only (no PowerShell): same SystemExit — the
         `.ps1` hooks need PowerShell.
+      - Windows + PowerShell below 5.1: SystemExit naming the version found.
+      - Windows + PowerShell present but the probe did not answer: a WARNING,
+        never a refusal — "could not confirm" is not "not installed".
 
     See VCO portability audit 2026-04-30, finding F1.
     """
     if platform.system() != "Windows":
         return
 
-    pwsh_ver = _windows_powershell_version()
+    from vco_lib.windows_powershell import STATE_MISSING, STATE_NO_ANSWER, STATE_TOO_OLD
+
+    ps = _windows_powershell_probe()
     has_git_bash = _windows_has_git_bash()
 
-    pwsh_ok = pwsh_ver is not None and (
-        pwsh_ver[0] > 5 or (pwsh_ver[0] == 5 and pwsh_ver[1] >= 1)
-    )
-
-    if not pwsh_ok:
+    if ps.state == STATE_MISSING:
         msg = (
             "Refusing to install on Windows: PowerShell 5.1+ is required "
             "(Windows 10/11 ships with it; older systems need "
@@ -371,6 +357,25 @@ def _check_windows_shell_prereqs() -> None:
             "Re-run install once one of these is on PATH."
         )
         raise SystemExit(msg)
+
+    if ps.state == STATE_TOO_OLD:
+        raise SystemExit(
+            f"Refusing to install on Windows: PowerShell {ps.version_text()} is too old — "
+            "5.1+ is required for VCO's `.ps1` hooks. Install a current PowerShell "
+            "(https://aka.ms/PSWindows) and re-run install."
+        )
+
+    if ps.state == STATE_NO_ANSWER:
+        # v0.2.106: a probe timeout under load was read as "not installed"
+        # and refused a healthy install. "Could not confirm" is not absence,
+        # so install continues with a warning saying what is unverified.
+        sys.stderr.write(
+            "WARNING: PowerShell is on PATH but could not be asked for its "
+            f"version ({ps.detail}) — NOT proof it is missing or too old, so "
+            "the install continues. VCO's `.ps1` hooks need 5.1+; if they do "
+            "not fire, check `powershell -Command $PSVersionTable.PSVersion` "
+            "and re-run install.\n"
+        )
 
     if not has_git_bash:
         # PowerShell-only install: every .ps1 hook works, but the bash-only
@@ -1320,6 +1325,8 @@ def _bootstrap_package_manager_advice(
         "install_node": install_node,
         "install_podman": install_podman,
         "install_lean_ctx": install_lean_ctx,
+        "install_compose": _compose_prereq.install_commands(
+            "docker" if system_block.get("container_runtime_chosen") == "docker" else "podman", primary),
         "tauri_deps": tauri_deps,
         "selinux_volume_flag_needed": selinux_z,
         "nvidia_container_toolkit_install": nvidia_toolkit,
@@ -1367,6 +1374,10 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
                     "See docs/GETTING_STARTED.md."
                 ),
             })
+    # v0.2.106: a runtime without compose dies at install step 5 (vco_lib.compose_prereq).
+    compose_row = _compose_prereq.missing_prereq(system_block.get("compose"), os_name=system_block.get("os"))
+    if compose_row is not None:
+        out.append(compose_row)
 
     # Node/npm — required for the Claude Code MCP layer (npx-spawned
     # playwright MCP).
@@ -1502,6 +1513,8 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "podman": podman_block,
         "docker": docker_block,
         "container_runtime_chosen": container_runtime_chosen,
+        "compose": _compose_prereq.probe(container_runtime_chosen or (
+            "podman" if podman_block["cmd"] else "docker" if docker_block["cmd"] else None)),
         "git": git_block,
         "brew": brew_block,
         "lean_ctx": lean_ctx_block,
@@ -1636,8 +1649,12 @@ def _bootstrap_install_missing(envelope: dict, *, no_prompt: bool) -> int:
         name = m["name"]
         # Map prereq name to advice key.
         cmds: list[str] = []
-        if name in ("container_runtime", "podman_machine"):
+        if name == "container_runtime":  # podman, and a compose provider for it
+            cmds = advice.get("install_podman", []) + advice.get("install_compose", [])
+        elif name == "podman_machine":
             cmds = advice.get("install_podman", [])
+        elif name == _compose_prereq.PREREQ_NAME:
+            cmds = advice.get("install_compose", [])
         elif name == "node":
             cmds = advice.get("install_node", [])
         elif name == "python_wheel_coverage":
@@ -5991,6 +6008,8 @@ def main() -> int:
 
     # Step 2: Detect system
     sysinfo = _detect_system(args, _deferral_report)
+    if not _compose_prereq.install_preflight(sysinfo.container_cmd, update=bool(args.update), no_containers=bool(args.no_containers), log_event=_log_install_event):
+        return 1  # v0.2.106: no compose provider — stop before anything changes the machine
     _print_system_info(sysinfo)
 
     # Step 2b: Optional companion tools (lean-ctx for context compression)
@@ -6082,6 +6101,8 @@ def main() -> int:
                 # later _write_install_manifest call — boot services
                 # materialized later in the same run may read it before then).
                 _persist_runtime_txt(sysinfo.container_cmd)
+                if not _compose_prereq.install_preflight(sysinfo.container_cmd, update=bool(args.update), log_event=_log_install_event):
+                    return 1
             if not sysinfo.container_cmd:
                 # Either the user declined, the package manager failed,
                 # or we're on macOS/Windows (URL-only path). Fall through
@@ -6185,18 +6206,11 @@ def main() -> int:
                 f"unexpected error writing preset defaults: {_preset_err}",
             )
 
-        # v0.2.52 V52-AD — seed the host-wide RL reranker disable row
-        # when no training data has accumulated yet. Soft-fails on every
-        # known sqlite error (missing DB, missing table, pre-034 schema,
-        # existing user choice). Idempotent across re-runs.
-        try:
-            _seed_rl_reranker_default_disabled()
-        except Exception as _rl_default_err:  # noqa: BLE001
-            _log_install_event(
-                "rl_reranker_default", "warn",
-                f"unexpected error seeding RL reranker default: "
-                f"{_rl_default_err}",
-            )
+        # v0.2.52 V52-AD seeded a host-wide `false` RL reranker row here.
+        # SUPERSEDED in v0.2.106 (owner ruling 2026-11-12): RL scoring's
+        # default follows the bundled weights (`vco_lib/rl_scoring_default.py`)
+        # and only a USER's choice may override it; a seeded row would pin
+        # every fresh install OFF after a trained model ships.
 
         # PR 6 + MEDIUM-9 + HIGH-4 (vco_lib.install_weaviate.collections_and_seed):
         # a Weaviate-down run gets one soft restart, then a deferral — never a
@@ -7287,6 +7301,8 @@ def _apply_deferred_entries(
                     # Confirmed empty + still exists. Safe to drop.
                     del_req = urllib.request.Request(schema_url, method="DELETE")
                     urllib.request.urlopen(del_req, timeout=10)
+                    from vco_lib.weaviate_case_history import record_deleted  # v0.2.106
+                    record_deleted("VibeCodedOrchestrator_Development", weaviate_url)
                     print(f"  [ok]   {cid}: collection dropped. Marking resolved.")
                     # Resolved: clear seeded copy + tombstone (P1, v0.2.75).
                     current_run_report.mark_resolved(cid)
@@ -8820,21 +8836,21 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
         # manually even though post-install-launcher.sh:288 already
         # advertised zypper+apk as detected — surface-level parity gap.
         if shutil.which("apt-get"):
-            cmd = ["sudo", "apt-get", "install", "-y", "podman"]
+            cmd = ["sudo", "apt-get", "install", "-y", "podman", "podman-compose"]
             update_cmd = ["sudo", "apt-get", "update"]
             label = "apt (Debian/Ubuntu)"
         elif shutil.which("dnf"):
-            cmd = ["sudo", "dnf", "install", "-y", "podman"]
+            cmd = ["sudo", "dnf", "install", "-y", "podman", "podman-compose"]
             update_cmd = None
             label = "dnf (Fedora/RHEL)"
         elif shutil.which("pacman"):
-            cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman"]
+            cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman", "podman-compose"]
             update_cmd = None
             label = "pacman (Arch)"
         elif shutil.which("zypper"):
             # `zypper install -y` is the non-interactive flag. SLES/Leap
             # ship podman in the standard repos.
-            cmd = ["sudo", "zypper", "install", "-y", "podman"]
+            cmd = ["sudo", "zypper", "install", "-y", "podman", "podman-compose"]
             update_cmd = None
             label = "zypper (openSUSE/SLES)"
         elif shutil.which("apk"):
@@ -8842,7 +8858,7 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
             # lives in the community repo; if it's not enabled, this
             # surfaces as `ERROR: unable to select packages: podman` —
             # acceptable failure mode.
-            cmd = ["sudo", "apk", "add", "--no-cache", "podman"]
+            cmd = ["sudo", "apk", "add", "--no-cache", "podman", "podman-compose"]
             update_cmd = ["sudo", "apk", "update"]
             label = "apk (Alpine)"
         else:
@@ -9790,185 +9806,6 @@ def _write_preset_defaults_to_app_state(
             "preset_defaults", "warn",
             f"sqlite error writing preset defaults to {db_path}: {e}",
             data={"db_path": str(db_path), "error": str(e)},
-        )
-    finally:
-        try:
-            conn.close()
-        except sqlite3.Error:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# v0.2.52 V52-AD — seed host-wide RL reranker disable on fresh installs
-# ---------------------------------------------------------------------------
-#
-# User-stated 2026-06-09: "we don't have enough RL data, want to disable
-# RL rerank by default until 500+ retrieval events accumulate". This is
-# the install-time hook that lands that default: when launcher.db exists
-# (= --update flow OR fresh install after the launcher has booted at
-# least once) AND `rl_events` has fewer than 500 rows AND no global
-# enable row already exists for vct-rl-reranker, write `enabled=false`
-# at `(project_id IS NULL, vct-rl-reranker, enabled_for_project)`.
-#
-# Soft-fails identically to `_write_preset_defaults_to_app_state`:
-#   - launcher.db absent → skip (launcher will create the table on first
-#     boot; the user can then flip the toggle in Preferences → Modules).
-#   - module_settings table absent → skip.
-#   - Existing global row present → preserve user's prior choice (do
-#     not overwrite).
-#   - Existing rl_events count >= 500 → skip (training data already
-#     accumulated; let the user decide via the GUI prompt).
-#
-# Idempotency: the helper exits early if a global row already exists,
-# regardless of its value. Re-running install.py never resurrects a
-# default the user has since flipped.
-
-_RL_RERANKER_MODULE_ID = "vct-rl-reranker"
-_MODULE_ENABLED_FOR_PROJECT_KEY = "enabled_for_project"
-_RL_EVENTS_AUTO_ENABLE_THRESHOLD = 500
-
-
-def _seed_rl_reranker_default_disabled() -> None:
-    """Seed the launcher's `module_settings` table with a host-wide
-    disable row for vct-rl-reranker when the install is fresh enough
-    that the user hasn't accumulated training data yet.
-
-    Mirror of `_write_preset_defaults_to_app_state` for an adjacent
-    table. Soft-fail on every known error condition (see module-level
-    comment).
-    """
-    db_path = _discover_app_state_db_path()
-    if not db_path.is_file():
-        _log_install_event(
-            "rl_reranker_default", "skip",
-            f"launcher.db not found at {db_path}; the launcher will "
-            f"create the table on first boot. The user can flip the "
-            f"default via Preferences → Modules in the GUI.",
-            data={"db_path": str(db_path)},
-        )
-        return
-
-    import sqlite3
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as e:
-        _log_install_event(
-            "rl_reranker_default", "warn",
-            f"sqlite3.connect failed for {db_path}: {e}",
-            data={"db_path": str(db_path), "error": str(e)},
-        )
-        return
-
-    try:
-        cur = conn.cursor()
-
-        # Step 1: probe the rl_events count. Soft-fail when the table
-        # doesn't exist yet (pre-migration-025 launcher.db).
-        try:
-            row = cur.execute("SELECT COUNT(*) FROM rl_events").fetchone()
-            rl_count = int(row[0]) if row else 0
-        except sqlite3.OperationalError as e:
-            _log_install_event(
-                "rl_reranker_default", "skip",
-                f"rl_events table not present yet ({e}); will write the "
-                f"default disable row on next install run after the "
-                f"launcher has booted at least once.",
-                data={"db_path": str(db_path), "error": str(e)},
-            )
-            return
-
-        # Step 2: if the user has already accumulated 500+ events, the
-        # auto-enable path applies. Do NOT seed a disable here — let the
-        # GUI prompt them to enable via Preferences → Modules.
-        if rl_count >= _RL_EVENTS_AUTO_ENABLE_THRESHOLD:
-            _log_install_event(
-                "rl_reranker_default", "skip",
-                f"rl_events already has {rl_count} rows "
-                f"(>= {_RL_EVENTS_AUTO_ENABLE_THRESHOLD}); not seeding a "
-                f"default disable row. The user can opt in / out via the "
-                f"GUI.",
-                data={
-                    "rl_events_count": rl_count,
-                    "threshold": _RL_EVENTS_AUTO_ENABLE_THRESHOLD,
-                },
-            )
-            return
-
-        # Step 3: probe for an existing global row. If present, the
-        # user has already configured the default (either via the GUI
-        # or a prior install.py run) — preserve their choice.
-        try:
-            existing = cur.execute(
-                "SELECT setting_value FROM module_settings "
-                " WHERE project_id IS NULL "
-                "   AND module_id = ? "
-                "   AND setting_key = ?",
-                (_RL_RERANKER_MODULE_ID, _MODULE_ENABLED_FOR_PROJECT_KEY),
-            ).fetchone()
-        except sqlite3.OperationalError as e:
-            # module_settings table missing OR project_id NOT NULL
-            # (pre-034 schema). Either way we cannot land the global
-            # default — soft-fail with a hint.
-            _log_install_event(
-                "rl_reranker_default", "skip",
-                f"module_settings probe failed ({e}); the launcher's "
-                f"migration 034 (v0.2.52) lands the nullable project_id "
-                f"column. Re-run install.py after the launcher boots.",
-                data={"db_path": str(db_path), "error": str(e)},
-            )
-            return
-
-        if existing is not None:
-            _log_install_event(
-                "rl_reranker_default", "skip",
-                f"global rl-reranker enable row already present "
-                f"(value={existing[0]!r}); preserving user choice.",
-                data={"existing_value": existing[0]},
-            )
-            return
-
-        # Step 4: write the default disable row.
-        try:
-            cur.execute(
-                "INSERT INTO module_settings "
-                "  (project_id, module_id, setting_key, setting_value) "
-                "VALUES (NULL, ?, ?, ?)",
-                (
-                    _RL_RERANKER_MODULE_ID,
-                    _MODULE_ENABLED_FOR_PROJECT_KEY,
-                    "false",  # JSON-encoded bool — matches the Rust
-                              # setter's encoding so the cascade reader
-                              # decodes it correctly.
-                ),
-            )
-            conn.commit()
-        except sqlite3.Error as e:
-            _log_install_event(
-                "rl_reranker_default", "warn",
-                f"failed to seed default disable row: {e}",
-                data={"error": str(e)},
-            )
-            return
-
-        _log_install_event(
-            "rl_reranker_default", "ok",
-            f"seeded host-wide default: vct-rl-reranker disabled until "
-            f"{_RL_EVENTS_AUTO_ENABLE_THRESHOLD}+ retrieval events "
-            f"accumulate (currently {rl_count}). Override in "
-            f"Preferences → Modules.",
-            data={
-                "module_id": _RL_RERANKER_MODULE_ID,
-                "setting_key": _MODULE_ENABLED_FOR_PROJECT_KEY,
-                "value": False,
-                "rl_events_count": rl_count,
-                "threshold": _RL_EVENTS_AUTO_ENABLE_THRESHOLD,
-            },
-        )
-    except sqlite3.Error as e:
-        _log_install_event(
-            "rl_reranker_default", "warn",
-            f"unexpected sqlite error: {e}",
-            data={"error": str(e)},
         )
     finally:
         try:
@@ -12788,11 +12625,13 @@ def _ensure_collections(embed_config: dict,
     failed: list[tuple[str, str]] = []
     schema_url = f"{weaviate_url}/v1/schema"
     from vco_lib.fixture_class_guard import FixtureClassWriteRefused, guard_fixture_class_write
+    from vco_lib.weaviate_case_history import CaseVariantCreateRefused, guard_create as _no_case_twin
     for name, builder in missing:
         try:
             # v0.2.94: refuse at ADD time — created here then refused at every sync
             guard_fixture_class_write(name, operation="create", weaviate_url=weaviate_url)
-        except FixtureClassWriteRefused as refusal:
+            _no_case_twin(name, weaviate_url)  # v0.2.106: no case-variant of a replayable delete
+        except (FixtureClassWriteRefused, CaseVariantCreateRefused) as refusal:
             failed.append((name, str(refusal)))
             continue
         try:
@@ -13815,6 +13654,10 @@ def _seed_weaviate_impl(
             # leg's own reporting: `vco_lib.install_weaviate`.
             _install_weaviate.announce_kg_metadata_repair_leg(_log_install_event)
             _sync_all = True
+        elif _install_weaviate.kg_rechunk_due_now(PROJECT_ROOT):
+            # v0.2.106 — leg (e), the one-time chunker re-chunk (see the helper).
+            _install_weaviate.announce_kg_rechunk_leg(_log_install_event)
+            _sync_all = True
         else:
             # Context unchanged — attempt per-file content-hash diff.
             knowledge_root = PROJECT_ROOT / "knowledge"
@@ -14544,14 +14387,15 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
     confusing duplicate search results.
 
     Strategy:
-      * For each canonical CodeXxx suffix, detect any Weaviate class whose
-        name ends in that suffix AND whose FULL name (prefix included) is a
-        pure-lowercase form of an existing canonical-cased class.
+      * Detect any Weaviate class that ends in a CodeXxx suffix (any case)
+        AND is the lower-cased form of a live class VCO minted (the minted
+        spelling with one or more letters lower-cased —
+        ``vco_lib.weaviate_case_history.lowercase_residuals``).
       * If the lowercase variant has fewer than 100 objects it is
-        "clearly residual" — safe to drop.
-      * We NEVER auto-drop. Instead, one deferral entry per qualifying
-        collection is emitted to UPDATE_DEFERRED.md with an explicit
-        single-class `DELETE /v1/schema/<class>` command (no VCO verb drops one).
+        "clearly residual" and gets one deferral entry (UPDATE_DEFERRED.md).
+      * v0.2.106: it is NEVER dropped and no DELETE is printed — Weaviate
+        keys both spellings to ONE lower-cased index, so deleting either
+        removes the other's data (vco_lib.weaviate_case_history).
 
     Idempotent — runs every update; already-absent collections produce no
     entries (the check re-reads the live schema each run).
@@ -14569,34 +14413,16 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
     except Exception:
         return  # Weaviate down — skip silently, upstream already deferred this.
 
-    all_classes: list[str] = sorted(
-        _wh.schema_class_names(schema)
-    )
-    # Build a lookup: lower(name) -> set of canonical names sharing that key.
-    from_lower: dict[str, list[str]] = {}
-    for cls in all_classes:
-        key = cls.lower()
-        from_lower.setdefault(key, []).append(cls)
-
-    # Code collection suffixes from the canonical catalog.
+    # Code collection suffixes from the canonical catalog. A residual is the
+    # LOWER-CASED form of a minted class that is also live (review A-M1: the
+    # old test — all-lower AND ending in a mixed-case suffix — could never
+    # hold, so the notice never appeared).
     from vco_lib.weaviate_schema import _CODE_COLLECTION_SUFFIXES
+    from vco_lib.weaviate_case_history import lowercase_residuals
 
-    residual: list[str] = []
-    for cls in all_classes:
-        # Skip already-canonical: class is its own lone lower-representative.
-        key = cls.lower()
-        siblings = from_lower.get(key, [])
-        # Must have a case-different sibling to qualify as residual.
-        canonical_siblings = [s for s in siblings if s != cls]
-        if not canonical_siblings:
-            continue
-        # Must end in a code-graph suffix.
-        if not any(cls.endswith(sfx) for sfx in _CODE_COLLECTION_SUFFIXES):
-            continue
-        # Must be the LOWERCASE variant (i.e. cls == key → all lower).
-        if cls != cls.lower():
-            continue
-        residual.append(cls)
+    shadows = lowercase_residuals(
+        _wh.schema_class_names(schema), _CODE_COLLECTION_SUFFIXES)
+    residual: list[str] = sorted(shadows)
 
     if not residual:
         _log_install_event(
@@ -14627,8 +14453,8 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
             )
             continue
 
-        # Qualify as residual: lowercase + case-sibling + < 100 rows.
-        canonical_siblings = [s for s in from_lower.get(cls.lower(), []) if s != cls]
+        # Qualify as residual: lower-cased form of a live minted class + < 100 rows.
+        canonical_siblings = shadows[cls]
         canonical_str = ", ".join(f"`{s}`" for s in sorted(canonical_siblings))
         deferral_report.add_entry(
             DeferralEntry(
@@ -14638,18 +14464,18 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
                     f"Collection `{cls}` ({count} objects) appears to be a "
                     f"residual lowercase variant of the canonical "
                     f"{canonical_str}. It was likely created by an older "
-                    f"version of the orchestrator and can be safely dropped."
+                    f"version of the orchestrator."
                 ),
                 why_deferred=(
-                    "The orchestrator never auto-drops populated collections "
-                    "(even with < 100 rows) to avoid accidental data loss. "
-                    "Inspect `{cls}` with the Weaviate console or the CLI, "
-                    "then drop it manually when confident the data is "
-                    "captured in the canonical collection."
+                    "Do NOT drop it: Weaviate stores a class's index under its "
+                    "LOWER-CASED name, so a DELETE of either spelling removes the "
+                    "data both share, and from Weaviate 1.37 a restart that "
+                    "replays such a delete wipes the canonical class again. "
+                    "Leave both in place."
                 ),
                 command_to_apply=(
-                    f"curl -X DELETE {weaviate_url.rstrip('/')}/v1/schema/{cls}"
-                    f"   # drops ONLY this class; confirm its rows first"
+                    "python -m vco_lib.weaviate_raft_guard status"
+                    "   # read-only: version, raft snapshot coverage, broken classes"
                 ),
                 severity="info",
                 kg_node_refs=[],

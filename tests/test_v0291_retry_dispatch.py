@@ -620,7 +620,7 @@ class ExitZeroIsNotProofTests(unittest.TestCase):
                     / "analyze_code_graph.py").read_text(encoding="utf-8")
         self.assertIn(
             '_deferral_op("record_successful_walk", deferral_root, '
-            'args.force_recreate)', analyzer,
+            'args.force_recreate, bool(_stamped))', analyzer,
             "the analyzer must CALL its clear on the success path "
             "(v0.2.95 F1: composed with the chunker-resync half-stamp under "
             "`record_successful_walk`, which performs the same clear)",

@@ -527,11 +527,14 @@ class DeliveryAuditTests(unittest.TestCase):
         ``module_gated_delivery.provider_restore_pass``, and the Weaviate class
         builders (``named_vector_config``, ``kg/development/diagrams/code``
         class definitions) moved to ``vco_lib.collection_schemas`` (re-exported).
+
+        v0.2.106 — LOWERED 14_380 -> 14_320: the ``drop-collections`` decision
+        and drop loop live in ``vco_lib.unregister_collections``.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 14_380,
+            n, 14_320,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

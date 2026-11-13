@@ -305,6 +305,11 @@ export const PREF_LOADERS = {
     section: 'Startup (container engine autostart)',
     load: () => invoke<boolean>('get_container_engine_autostart'),
   },
+  servicesWatcher: {
+    eager: false,
+    section: 'Services (automatic restarts)',
+    load: () => invoke<boolean>('get_services_watcher_enabled'),
+  },
   services: {
     eager: false,
     slow: true,

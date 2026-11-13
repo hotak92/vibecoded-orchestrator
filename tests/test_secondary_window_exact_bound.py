@@ -72,11 +72,14 @@ def _own_chunker_max(model: str) -> int:
     from claude_mcp_servers.weaviate_mcp.chunking import CHARS_PER_TOKEN_TEXT, Chunker
     return Chunker.for_model(model).max_tokens * CHARS_PER_TOKEN_TEXT
 
+# v0.2.106: the chunkers are clamped to the dense budget (arctic 7 064 / qwen3
+# 19 560 chars), so the own-chunker floor no longer binds for a registered
+# model and the attempt budget is the median-ratio bound itself.
 ARCTIC_BUDGET = max(int(ARCTIC_NUM_CTX * ARCTIC_ATTEMPT_RATIO * 0.75),
-                    _own_chunker_max(ARCTIC_MODEL))                   # 12800
+                    _own_chunker_max(ARCTIC_MODEL))                   # 9815
 ARCTIC_FALLBACK = int(ARCTIC_NUM_CTX * ARCTIC_MIN_RATIO * 0.75)       # 7065 fallback
 QWEN3_BUDGET = max(int(QWEN3_NUM_CTX * QWEN3_ATTEMPT_RATIO * 0.75),
-                   _own_chunker_max(QWEN3_MODEL))                     # 32768
+                   _own_chunker_max(QWEN3_MODEL))                     # 30543
 QWEN3_FALLBACK = int(QWEN3_NUM_CTX * QWEN3_MIN_RATIO * 0.75)  # 19560
 
 
@@ -94,13 +97,13 @@ def test_arctic_budget_is_measured_min_ratio_with_margin():
     in full; the fallback uses the measured MINIMUM so it is provably under the
     window even at worst density, and therefore cannot be refused again.
     """
-    assert _char_budget_for_model(ARCTIC_MODEL) == ARCTIC_BUDGET == 12800
+    assert _char_budget_for_model(ARCTIC_MODEL) == ARCTIC_BUDGET == 9815
     assert _char_budget_for_model(ARCTIC_MODEL, conservative=True) == ARCTIC_FALLBACK == 7065
 
 
 def test_qwen3_budget_is_measured_min_ratio_with_margin():
     """qwen3 ATTEMPT: 10240 × 3.977 × 0.75 = 30543; FALLBACK: × 2.547 = 19560."""
-    assert _char_budget_for_model(QWEN3_MODEL) == QWEN3_BUDGET == 32768
+    assert _char_budget_for_model(QWEN3_MODEL) == QWEN3_BUDGET == 30543
     assert _char_budget_for_model(QWEN3_MODEL, conservative=True) == QWEN3_FALLBACK == 19560
 
 
@@ -184,7 +187,7 @@ def test_sixteen_thousand_char_text_truncates_for_arctic():
 
 
 def test_median_density_text_inside_the_window_is_not_truncated():
-    """12 000 chars at the MEDIAN ratio is ~3 756 tokens — inside the 4 096
+    """9 000 chars at the MEDIAN ratio is ~2 817 tokens — inside the 4 096
     window — so it must pass UNTOUCHED.
 
     Rewritten 2026-09-04. The previous version asserted the opposite, because
@@ -199,8 +202,12 @@ def test_median_density_text_inside_the_window_is_not_truncated():
     arctic always refused). The caller retries once at the provable fallback
     budget. Estimation decides what we attempt; the runner decides what fits.
     """
-    text = "y" * 12_000
+    # v0.2.106: 9 000 chars, inside the 9 815-char median attempt. (The
+    # former 12 000 passed only through the own-chunker-max floor, 12 800 —
+    # gone now that arctic's chunker max is its 7 064-char dense budget.)
+    text = "y" * 9_000
     assert len(text) / ARCTIC_MEDIAN_RATIO < ARCTIC_NUM_CTX
+    assert len(text) <= ARCTIC_BUDGET
     sub, trunc = _bounded_for_model(text, ARCTIC_MODEL)
     assert trunc is False, "text that fits at median density must not be cut"
     assert sub == text, "byte-for-byte fidelity below the attempt budget"
@@ -406,46 +413,68 @@ class _RefuseThenAccept:
         return [self.embed(model, t) for t in texts]
 
 
-def test_secondary_retries_and_still_produces_a_vector_on_refusal():
-    """A refused secondary must end with a VECTOR, not a warning.
+def _accepted(calls, limit):
+    """The lengths the fake accepted (every call at or under its limit)."""
+    return [n for n in calls if n <= limit]
+
+
+#: What `combine_vectors` makes of identical piece vectors: their direction.
+_UNIT = [x / sum(y * y for y in (0.1, 0.2, 0.3)) ** 0.5 for x in (0.1, 0.2, 0.3)]
+
+
+def _close(a, b):
+    return len(a) == len(b) and all(abs(x - y) < 1e-12 for x, y in zip(a, b))
+
+
+def test_secondary_refusal_raises_and_a_row_writer_splits_it():
+    """A refused secondary must end with VECTORS of the whole text, not a
+    warning — and since v0.2.106 ("extra rows in both places") as more ROWS,
+    never as one averaged vector.
 
     Before the retry was wired, `truncate: false` turned an over-window chunk
-    into a hard refusal that was logged and dropped — strictly worse than the
-    truncated-and-tagged vector it replaced.
+    into a hard refusal that was logged and dropped; the shrink ladder that
+    followed kept only a leading window; the first split-on-refusal build
+    averaged the piece vectors. Now the helper raises ChunkOverflowError and
+    the row driver splits the chunk: every row's secondary vector is whole.
+    Red-proof: restore the combine (pre-split at the budget + combine_vectors)
+    and the raise below never happens.
     """
+    from vco_lib.embed_split import ChunkOverflowError, embed_rows
     from vco_lib.embedding_service import _embed_secondary_with_refusal_retry
     adapter = _RefuseThenAccept(limit=3_000)
     text = "z" * 40_000
-    vec, truncated = _embed_secondary_with_refusal_retry(
-        adapter, ARCTIC_MODEL, text
+    with pytest.raises(ChunkOverflowError):
+        _embed_secondary_with_refusal_retry(adapter, ARCTIC_MODEL, text)
+    assert adapter.calls == [40_000], "one whole attempt, nothing averaged"
+
+    rows = embed_rows(
+        [text], lambda t: _embed_secondary_with_refusal_retry(adapter, ARCTIC_MODEL, t)
     )
-    assert vec == [0.1, 0.2, 0.3], "a refusal must not lose the vector"
-    assert truncated is True, "we sent less than we were given — say so"
-    assert len(adapter.calls) >= 2, "the first refusal must trigger a retry"
-    assert adapter.calls == sorted(adapter.calls, reverse=True), (
-        "each attempt must be strictly smaller, or the retry cannot terminate"
-    )
+    assert "".join(r.text for r in rows) == text
+    assert all(r.payload == ([0.1, 0.2, 0.3], False) for r in rows)
+    assert all(len(r.text) <= adapter.limit for r in rows)
 
 
-def test_secondary_retry_terminates_on_pathologically_dense_content():
+def test_secondary_split_terminates_on_pathologically_dense_content():
     """Dense content (tables 1.41 chars/token, CJK 1.35) overflowed the OLD
     single fallback too, and the second refusal propagated — no vector.
 
-    The loop must keep shrinking to the floor rather than giving up after one
-    step. This adapter accepts nothing above the floor, so a two-tier scheme
-    raises here and the halving loop succeeds.
+    The row driver keeps splitting down to the floor rather than giving up
+    after one step: this adapter accepts nothing above the floor.
     """
+    from vco_lib.embed_split import embed_rows
     from vco_lib.embedding_service import (
         _EMBED_RETRY_FLOOR_CHARS,
         _embed_secondary_with_refusal_retry,
     )
     adapter = _RefuseThenAccept(limit=_EMBED_RETRY_FLOOR_CHARS)
-    vec, truncated = _embed_secondary_with_refusal_retry(
-        adapter, ARCTIC_MODEL, "y" * 40_000
+    rows = embed_rows(
+        ["y" * 40_000],
+        lambda t: _embed_secondary_with_refusal_retry(adapter, ARCTIC_MODEL, t),
     )
-    assert vec == [0.1, 0.2, 0.3]
-    assert truncated is True
-    assert min(adapter.calls) <= _EMBED_RETRY_FLOOR_CHARS
+    assert sum(len(r.text) for r in rows) == 40_000
+    assert all(len(r.text) <= _EMBED_RETRY_FLOOR_CHARS for r in rows)
+    assert all(r.payload[1] is False for r in rows)
 
 
 def test_secondary_retry_does_not_swallow_a_non_overflow_error():
@@ -534,15 +563,37 @@ def _dual_service(monkeypatch, adapter):
     return svc
 
 
-def test_fanout_secondary_refusal_still_yields_a_tagged_vector(monkeypatch):
-    """ACT arm: through `embed_text_all_configured`, an arctic refusal must
-    end with an `arctic2_embed` vector tagged truncated — not an absent slot.
+def test_fanout_secondary_refusal_splits_the_row_for_every_model(monkeypatch):
+    """ACT arm: through the production row writer entry point
+    (`embed_rows` over `embed_text_all_configured_tagged`), an arctic refusal
+    must end with ROWS that each carry BOTH the active and the arctic vector —
+    not an absent slot (the field symptom of an unwired retry) and not one
+    averaged vector (v0.2.106, "extra rows in both places").
 
-    Red-proof: replace either fan-out site's
-    `_embed_secondary_with_refusal_retry(...)` with a direct
-    `_bounded_for_model` + `_embed_with_exact_truncation` pair (the round-5
-    MUT-B2 shape) and this test fails — the slot is gone.
+    Red-proof: let the fan-out's arctic leg swallow the refusal (or average
+    it) and either a row lacks `arctic2_embed` or there is only one row.
     """
+    from vco_lib.embed_split import embed_rows
+    from vco_lib.embedding_service import ARCTIC_SECONDARY_MODEL
+
+    adapter = _RefuseForModel(ARCTIC_SECONDARY_MODEL, limit=3_000)
+    svc = _dual_service(monkeypatch, adapter)
+
+    rows = embed_rows(["z" * 20_000], svc.embed_text_all_configured_tagged)
+
+    assert len(rows) > 1 and sum(len(r.text) for r in rows) == 20_000
+    for r in rows:
+        slots, truncated = r.payload
+        assert "qwen3_embed" in slots, "the ACTIVE slot must always be written"
+        assert "arctic2_embed" in slots, "every row carries every model's vector"
+        assert truncated == [], "nothing is cut"
+    arctic_ok = _accepted(adapter.calls_for(ARCTIC_SECONDARY_MODEL), adapter.limit)
+    assert sum(arctic_ok) == 20_000, "arctic embedded every row whole"
+
+
+def test_fanout_secondary_refusal_outside_a_row_writer_leaves_the_slot_empty(monkeypatch):
+    """LEAVE-ALONE arm: a one-call fan-out (no row writer) cannot add rows, so
+    a refusing secondary is left EMPTY for that call — never averaged."""
     from vco_lib.embedding_service import ARCTIC_SECONDARY_MODEL
 
     adapter = _RefuseForModel(ARCTIC_SECONDARY_MODEL, limit=3_000)
@@ -550,17 +601,9 @@ def test_fanout_secondary_refusal_still_yields_a_tagged_vector(monkeypatch):
 
     slots, truncated = svc.embed_text_all_configured_tagged("z" * 20_000)
 
-    assert "qwen3_embed" in slots, "the ACTIVE slot must always be written"
-    assert "arctic2_embed" in slots, (
-        "a refused secondary must still produce a vector; an absent slot is "
-        "the field symptom of an unwired retry"
-    )
-    assert truncated == ["arctic2_embed"]
-    arctic_calls = adapter.calls_for(ARCTIC_SECONDARY_MODEL)
-    assert len(arctic_calls) >= 2, "the first refusal must trigger a retry"
-    assert arctic_calls == sorted(arctic_calls, reverse=True), (
-        "each attempt must be strictly smaller, or the retry cannot terminate"
-    )
+    assert "qwen3_embed" in slots and "arctic2_embed" not in slots
+    assert truncated == []
+    assert adapter.calls_for(ARCTIC_SECONDARY_MODEL) == [20_000]
 
 
 def test_fanout_secondary_auth_error_is_not_retried(monkeypatch):
@@ -611,17 +654,20 @@ def test_primary_refusal_yields_a_leading_window_vector_not_nothing(monkeypatch)
     slots = svc.embed_text_all_configured("z" * 20_000)
 
     assert "qwen3_embed" in slots, (
-        "a refused ACTIVE embed must fall back to a leading window; dropping "
-        "the P1 slot inverts the user's priority ordering (retrieval first)"
+        "a refused ACTIVE embed must still produce a vector; dropping the P1 "
+        "slot inverts the user's priority ordering (retrieval first)"
     )
-    assert svc.last_active_truncated is True, "a primary shrink must be reported"
+    assert svc.last_active_truncated is False, (
+        "split on refusal (v0.2.106): the refused text is split and every "
+        "character embedded — no leading window"
+    )
     qwen_calls = adapter.calls_for(DEFAULT_TEXT_MODEL)
     assert len(qwen_calls) >= 2
-    assert qwen_calls == sorted(qwen_calls, reverse=True)
     assert qwen_calls[0] == 20_000, (
         "the primary is never pre-bounded — it attempts the WHOLE text and "
-        "shrinks only if the runner refuses (R45 primary full coverage)"
+        "splits only if the runner refuses (R45 primary full coverage)"
     )
+    assert sum(_accepted(qwen_calls, adapter.limit)) == 20_000
 
 
 def test_primary_embed_text_returns_a_vector_on_refusal(monkeypatch):
@@ -632,8 +678,8 @@ def test_primary_embed_text_returns_a_vector_on_refusal(monkeypatch):
     adapter = _RefuseForModel(DEFAULT_TEXT_MODEL, limit=13_000)
     svc = _dual_service(monkeypatch, adapter)
 
-    assert svc.embed_text("z" * 20_000) == [0.1, 0.2, 0.3]
-    assert svc.last_active_truncated is True
+    assert _close(svc.embed_text("z" * 20_000), _UNIT)
+    assert svc.last_active_truncated is False
 
 
 def test_primary_full_text_is_not_shrunk_when_accepted(monkeypatch):
@@ -700,9 +746,21 @@ def test_openai_secondary_uses_the_secondary_tier_not_the_primary_floor(monkeypa
     """
     from vco_lib.embedding_service import _bounded_for_model, _bounded_for_secondary
 
+    import claude_mcp_servers.weaviate_mcp.chunking as _chunking
+
     openai_model = "text-embedding-3-small"
+    # v0.2.106: every registered chunker is clamped to its dense budget, so
+    # the primary's own-chunker-max floor no longer exceeds the ratio bound
+    # for any shipped model and the two tiers coincide. To keep this guard
+    # DISCRIMINATING (the alias must deliver the SECONDARY tier, not the
+    # primary default), give the model a chunker maximum above its ratio
+    # bound — the pre-v0.2.106 large tier, 6 400 units = 25 600 chars.
+    monkeypatch.setattr(
+        _chunking, "chunking_preset_for_model", lambda _m: (2200, 6400, 4600)
+    )
     primary = _char_budget_for_model(openai_model)
     secondary = _char_budget_for_model(openai_model, full_coverage=False)
+    assert primary == 25_600
     assert secondary < primary, (
         "the secondary tier must be tighter than the primary's chunker-max floor"
     )
@@ -733,7 +791,8 @@ def test_active_truncation_flag_does_not_latch_across_calls(monkeypatch):
     adapter = _RefuseForModel(DEFAULT_TEXT_MODEL, limit=13_000)
     svc = _dual_service(monkeypatch, adapter)
 
-    svc.embed_text("z" * 20_000)
+    # v0.2.106: only a QUERY vector is still a leading window on refusal.
+    svc.embed_text_query("z" * 20_000)
     assert svc.last_active_truncated is True
 
     svc.embed_text("short text that fits")
@@ -784,11 +843,12 @@ def test_code_embed_refusal_yields_a_leading_window_vector_not_nothing(monkeypat
     adapter = _RefuseForModel(DEFAULT_TEXT_MODEL, limit=5_000)
     svc = _code_service(monkeypatch, adapter)
 
-    assert svc.embed_code("c" * 7_000) == [0.1, 0.2, 0.3]
-    assert svc.last_active_truncated is True
+    assert _close(svc.embed_code("c" * 7_000), _UNIT)
+    assert svc.last_active_truncated is False  # split, not cut (v0.2.106)
     calls = adapter.calls_for(DEFAULT_TEXT_MODEL)
-    assert len(calls) >= 2 and calls == sorted(calls, reverse=True)
-    assert calls[0] == 7_000, "the entity is attempted WHOLE before any shrink"
+    assert len(calls) >= 2
+    assert calls[0] == 7_000, "the entity is attempted WHOLE before any split"
+    assert sum(_accepted(calls, adapter.limit)) == 7_000
 
 
 def test_code_all_configured_keeps_the_active_slot_on_refusal(monkeypatch):
@@ -801,7 +861,7 @@ def test_code_all_configured_keeps_the_active_slot_on_refusal(monkeypatch):
     slots = svc.embed_code_all_configured("c" * 7_000)
 
     assert "qwen3_embed" in slots, (
-        "a refused ACTIVE code embed must fall back to a leading window; an "
+        "a refused ACTIVE code embed must still produce a vector; an "
         "empty dict is the field symptom (the entity stores no vector)"
     )
 
@@ -926,17 +986,16 @@ def test_codeembed_service_refusal_yields_leading_window_vector_not_nothing(monk
     adapter = _RefusingCodeEmbedService(limit=2_000)
     svc = _codeembed_service(monkeypatch, adapter)
 
-    assert svc.embed_code("c" * 7_000) == [0.1, 0.2, 0.3]
+    assert _close(svc.embed_code("c" * 7_000), _UNIT)
     # The code slot's verdict lives in the shared per-call record
     # (``last_active_truncated`` is deliberately the TEXT-slot view — see
     # its docstring — and the code slot here is codesage_embed, not the
-    # text slot).
-    assert svc._last_truncated_slots.get("codesage_embed") is True
+    # text slot). Split on refusal (v0.2.106): nothing is cut.
+    assert svc._last_truncated_slots.get("codesage_embed") is False
     calls = adapter.calls
-    assert len(calls) >= 2 and calls == sorted(calls, reverse=True), (
-        "each attempt must be strictly smaller, or the retry cannot terminate"
-    )
-    assert calls[0] == 7_000, "the entity is attempted WHOLE before any shrink"
+    assert len(calls) >= 2
+    assert calls[0] == 7_000, "the entity is attempted WHOLE before any split"
+    assert sum(_accepted(calls, adapter.limit)) == 7_000
 
 
 def test_codeembed_service_all_configured_keeps_the_active_slot_on_refusal(monkeypatch):
@@ -949,9 +1008,27 @@ def test_codeembed_service_all_configured_keeps_the_active_slot_on_refusal(monke
     slots = svc.embed_code_all_configured("c" * 7_000)
 
     assert "codesage_embed" in slots, (
-        "a refused ACTIVE code embed must fall back to a leading window; an "
+        "a refused ACTIVE code embed must still produce a vector; an "
         "empty dict is the field symptom (the entity stores no vector)"
     )
+
+
+def test_codeembed_active_refusal_inside_the_analyzer_scope_splits_rows(monkeypatch):
+    """v0.2.106 ("extra rows in both places"): inside the code-graph
+    analyzer's row writer an ACTIVE code refusal raises, so the entity is
+    stored as ROWS each holding a whole vector — never one averaged vector
+    (what the one-vector arm above still does for a caller outside a row
+    writer)."""
+    from vco_lib.embed_split import embed_rows
+
+    adapter = _RefusingCodeEmbedService(limit=2_000)
+    svc = _codeembed_service(monkeypatch, adapter)
+
+    rows = embed_rows(["c" * 7_000], svc.embed_code_all_configured)
+
+    assert len(rows) > 1 and sum(len(r.text) for r in rows) == 7_000
+    assert all(r.payload == {"codesage_embed": [0.1, 0.2, 0.3]} for r in rows)
+    assert all(len(r.text) <= adapter.limit for r in rows)
 
 
 def test_codeembed_service_full_entity_is_not_shrunk_when_accepted(monkeypatch):
@@ -977,8 +1054,10 @@ def test_codeembed_service_non_overflow_error_is_not_retried(monkeypatch):
 
 def test_codeembed_service_batch_isolates_a_refusal_per_item(monkeypatch):
     """`embed_code_batch` (the enrichment path): one over-window entity must
-    neither 400 the whole batch nor lose its own vector — it shrinks; the
-    survivors embed whole.
+    not 400 the whole batch — it is kept out of the batch call and embedded
+    alone, WHOLE; refused, it gets the empty-vector sentinel (its row is
+    re-laid as split rows by the next code-graph walk), never a leading
+    window and never an averaged vector (v0.2.106).
 
     Red-proof: revert the CodeEmbed leg of `embed_code_batch` to the bare
     `self._retry_once_on_503(self.codeembed.embed_batch, codes)` and this
@@ -989,16 +1068,25 @@ def test_codeembed_service_batch_isolates_a_refusal_per_item(monkeypatch):
 
     out = svc.embed_code_batch(["s" * 100, "c" * 7_000, "s" * 200])
 
-    assert adapter.batch_calls == 1, "the batch is attempted once, whole"
+    assert adapter.batch_calls == 1, "the batch is attempted once"
     assert len(out) == 3, "order and count preserved"
     assert out[0] == [0.1, 0.2, 0.3] and out[2] == [0.1, 0.2, 0.3]
-    assert out[1] == [0.1, 0.2, 0.3], (
-        "the over-window item shrinks to a leading window, not [] — the "
-        "refusal is an overflow, so the shared shrink loop handles it"
-    )
-    # The over-window item was retried strictly smaller.
-    shrunk_attempts = [n for n in adapter.calls if n <= 7_000]
-    assert len(shrunk_attempts) >= 1 and shrunk_attempts[0] < 7_000
+    assert out[1] == [], "refused whole → the sentinel, never pieces"
+    assert adapter.calls == [7_000], "the over-budget item was tried alone, whole"
+
+
+def test_codeembed_service_batch_refusal_isolates_per_item_and_keeps_survivors(monkeypatch):
+    """A refused item never fails the batch's survivors; it is attempted
+    whole exactly once and marked with the sentinel."""
+    adapter = _RefusingCodeEmbedService(limit=900)
+    svc = _codeembed_service(monkeypatch, adapter)
+
+    out = svc.embed_code_batch(["s" * 100, "c" * 7_000])
+
+    assert adapter.batch_calls == 1
+    assert out[0] == [0.1, 0.2, 0.3]
+    assert out[1] == []
+    assert adapter.calls == [7_000]
 
 
 def test_codeembed_service_batch_hard_failure_yields_the_sentinel(monkeypatch):
@@ -1031,14 +1119,19 @@ def test_codeembed_service_batch_hard_failure_yields_the_sentinel(monkeypatch):
     )
 
 
-def test_codeembed_secondary_slot_refusal_shrinks_and_tags(monkeypatch):
+def test_codeembed_secondary_slot_refusal_splits_and_is_not_tagged(monkeypatch):
     """The SECONDARY codesage slot (dual-write ON, active code slot served by
-    Ollama): a refused entity shrinks and the slot is TAGGED truncated.
+    Ollama): inside the analyzer's row writer a refused entity is split into
+    ROWS (v0.2.106, "extra rows in both places") — every row carries both the
+    active and the codesage vector, none tagged truncated, none averaged.
+    Outside a row writer the slot is left empty for that call.
 
     Without the wrapper the service's NEW 400 refusal would DROP the slot
     with a warning — strictly worse than the silent half-embedding it
-    replaced, which is why the secondary leg needed the same shrink.
+    replaced, which is why the secondary leg needed the same handling.
     """
+    from vco_lib.embed_split import embed_rows
+
     adapter = _RefusingCodeEmbedService(limit=2_000)
     # Active code slot served by Ollama (qwen3) so the SECONDARY codesage
     # leg is the one under test.
@@ -1048,15 +1141,19 @@ def test_codeembed_secondary_slot_refusal_shrinks_and_tags(monkeypatch):
     # AFTER the helper (it delenv's the flag for the default-off case).
     monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "true")
 
-    slots = svc.embed_code_all_configured("c" * 7_000)
+    rows = embed_rows(["c" * 7_000], svc.embed_code_all_configured)
+    assert len(rows) > 1 and sum(len(r.text) for r in rows) == 7_000
+    for r in rows:
+        assert "qwen3_embed" in r.payload, "the active Ollama code slot is kept"
+        assert r.payload.get("codesage_embed") == [0.1, 0.2, 0.3], (
+            "every row carries a WHOLE codesage vector"
+        )
+    assert not svc._last_truncated_slots.get("codesage_embed"), (
+        "nothing is cut, so nothing is tagged"
+    )
 
-    assert "qwen3_embed" in slots, "the active Ollama code slot is unaffected"
-    assert slots.get("codesage_embed") == [0.1, 0.2, 0.3], (
-        "the secondary slot survives the refusal via the shared shrink loop"
-    )
-    assert svc._last_truncated_slots.get("codesage_embed") is True, (
-        "a shrunk secondary slot is TAGGED, like every other secondary leg"
-    )
+    slots = svc.embed_code_all_configured("c" * 7_000)
+    assert "qwen3_embed" in slots and "codesage_embed" not in slots
 
 
 # ── The ANALYZER's per-entity path (generate_embedding) on the service leg ──

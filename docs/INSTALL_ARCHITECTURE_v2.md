@@ -119,7 +119,9 @@ crashed; `2` bad invocation (e.g. combined with `--update`); `3` an
 
 - `system.*` — OS/arch/RAM, per-tool `{cmd, version, ok}` blocks for
   Python/Node/npm/pnpm/Podman/Docker/git/brew/lean-ctx/Claude CLI,
-  `gpu` (vendor/VRAM/driver/container-toolkit), `linux_distro` /
+  `compose` (the compose provider for the runtime, from
+  `vco_lib.compose_prereq.probe`; `ok: false` raises the blocking
+  `compose_provider` prereq), `gpu` (vendor/VRAM/driver/container-toolkit), `linux_distro` /
   `windows_features` / `macos_features`. `system.python.wheel_support_ok`
   reports whether pip can satisfy the dependency set with wheels only
   (a dry-run `pip install --only-binary=:all:` probe).
@@ -395,19 +397,27 @@ the revision is bumped. On the
 next update the launcher (and the Python emitter) compares the live revision
 against the persisted `chunker.last_seen_revision` marker and, on a change,
 writes a resync deferral to `UPDATE_DEFERRED.md` naming both revisions plus the
-commands the user runs to re-chunk and re-embed:
+commands that re-chunk and re-embed:
 
 ```
 <folder>/.claude/scripts/kg-sync --all
-<folder>/.claude/scripts/code-graph-analyze <folder> --from-resolver --force-recreate
+<folder>/.claude/scripts/code-graph-analyze <folder> --from-resolver --force-rewalk
 ```
 
-`--from-resolver` is not optional decoration: `--force-recreate` DROPS the five
-`<prefix>_Code*` classes, and without an identity flag the analyzer's last
-resolution rung is the folder BASENAME (`.claude/env` is sourced for hooks, not
-for the terminal a user pastes this into). `vco_lib.codegraph_drop_guard`
-refuses the drop at run time if the resolved family is not this project's bound
-one.
+Since v0.2.106 the update runs both halves itself: the KG half is the update's
+own KG pass (the launcher's bundle update spawns `kg-sync --all` when
+`kg-sync --check-drift` reports `rechunk_owed`; `install.py` takes seed leg (e)
+for the root — both ask `vco_lib.chunker_revision.kg_rechunk_owed`), and the
+code-graph half is the extractor-generation rung's background `--force-rewalk`.
+Each re-embeds only what re-planned (content-hash gated), writes the new vectors
+before it deletes a node's old rows, and stamps its half in
+`.claude/state/chunker-resync.json`; the entry clears once both halves name the
+current revision. The printed commands are the same two passes, for a half that
+did not complete. `--force-rewalk` replaced `--force-recreate` there: the
+latter dropped the five `<prefix>_Code*` classes before rebuilding them.
+`--from-resolver` keeps the walk on this project's bound collections instead of
+a family derived from the folder BASENAME (`.claude/env` is sourced for hooks,
+not for the terminal a user pastes this into).
 
 It fires **once per revision** (the marker advances after the write; first boot
 seeds the marker without a deferral) and is independent of the file-hash bundle
@@ -469,7 +479,7 @@ daily 06:00 UTC schedule was removed on 2026-07-23 and must not be re-added
 for it).
 
 - **Matrix**: `ubuntu-22.04`, `ubuntu-24.04` (libwebkit2gtk 4.0/4.1
-  fallback), `macos-14` (Apple Silicon, bash 3.2, Homebrew cascade),
+  fallback), `macos-15` (Apple Silicon, bash 3.2, Homebrew cascade),
   `windows-latest` (`first-install.bat` under real `cmd.exe`), `fedora-40`
   (SELinux `:Z`, dnf).
 - **Fresh `git clone`**, not `actions/checkout` — the smoke exercises the
