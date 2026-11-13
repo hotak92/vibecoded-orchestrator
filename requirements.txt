@@ -17,7 +17,7 @@ weaviate-client>=4.21.0
 # ─── HTTP / async ───
 aiohttp>=3.13.5
 httpx>=0.28.1
-requests>=2.31
+requests>=2.34.2
 
 # ─── Data validation ───
 # Pydantic (MIT)
