@@ -13,9 +13,9 @@
 # numpy BSD-3-Clause, aiohttp Apache-2.0.
 
 # PyTorch. The variant-specific wheel index (cpu / cu121 / rocm6.1) is chosen
-# in the Dockerfile; the ROCm channel pins torch==2.5.1 there, so the CPU and
+# in the Dockerfile; the ROCm channel pins torch==2.13.0 there, so the CPU and
 # CUDA variants are kept on the same release for identical numerics.
-torch==2.5.1
+torch==2.13.0
 
 # Numerical core.
 numpy>=1.26,<3.0
