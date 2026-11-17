@@ -442,6 +442,12 @@ class SseIdRewriter:
         #: visible text note is emitted at content_block_stop, when the URL or
         #: query is complete.
         self._converting: dict[int, dict] = {}
+        #: Original indexes of blocks converted to a text note WHOLE at
+        #: ``content_block_start`` (start + one ``text_delta``). Their own
+        #: later deltas belong to the original type, not to a text block, so
+        #: they are suppressed; the ``content_block_stop`` still closes the
+        #: text block.
+        self._converted_at_start: set[int] = set()
         self._next_index = 0
         self._passthrough = False
         #: Block indexes whose ``signature_delta`` has already been marked
@@ -642,7 +648,10 @@ class SseIdRewriter:
                 if isinstance(partial, str):
                     self._converting[original_index]["json"].append(partial)
             return None
-        if isinstance(original_index, int) and original_index in self._dropped_indexes:
+        if isinstance(original_index, int) and (
+            original_index in self._dropped_indexes
+            or original_index in self._converted_at_start
+        ):
             return None
         patched: Optional[dict] = None
         if isinstance(original_index, int):
@@ -787,6 +796,8 @@ class SseIdRewriter:
                     "json": [],
                 }
                 return patched
+            if isinstance(original_index, int):
+                self._converted_at_start.add(original_index)
             return [
                 ("content_block_start", patched),
                 ("content_block_delta", {
