@@ -33,8 +33,9 @@ function Invoke-AgentAlertsPendingDelivery {
     try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
     if (-not $HookStdin) { return }
 
-    # The stderr cap compiles a C# writer (Add-Type, ~165 ms measured): taken
-    # only once there is something to say, never on the no-pending path.
+    # The stderr cap is loaded only once there is something to say, never on
+    # the no-pending path (it no longer compiles C# -- v0.2.107 -- but the
+    # no-pending path stays as lean as it can be).
     $StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
     if (Test-Path $StderrCap) { . $StderrCap }
 

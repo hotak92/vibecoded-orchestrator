@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows hooks no longer compile C# on every fire.** The stderr cap that most PowerShell hooks load (among them
+  the one that runs on every tool call) built its writer with `Add-Type`, so each fire started `csc.exe` and
+  `cvtres.exe` and wrote a temporary DLL for Defender to scan (about 150 ms per fire under Windows PowerShell 5.1,
+  310 ms under PowerShell 7). The writer is now a PowerShell class, defined in-process with no compiler; the cap,
+  its 1 MB default and `STDERR_CAP_DISABLE` behave as before.
 - **A count that cannot be read never authorises a delete.** Four copies of the Weaviate object count read an
   error-shaped reply (HTTP 200 with an `errors` array and a null class field: a shard not ready, memory pressure, a
   timeout inside the server) as "0 objects", and 0 was the licence to drop. There is now one count
