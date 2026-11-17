@@ -135,19 +135,23 @@ def _default_http(method: str, url: str, body: Optional[dict], timeout: float) -
 def class_count(url: str, cls: str, *, http: Optional[HttpFn] = None) -> Optional[int]:
     """The number of objects in class *cls*, or ``None`` when it cannot be
     read: a transport error, a non-200 answer, an ``errors`` body, a missing
-    or null field, or a value that is not a non-negative integer. ``None`` is
-    never "zero" and never "equal".
+    or null field, a value that is not a non-negative integer, or a class
+    name that is not ``[A-Za-z0-9_]+``. ``None`` is never "zero" and never
+    "equal".
 
-    The reply is read by ``weaviate_helpers.parse_aggregate_count`` - the one
-    reading of an Aggregate reply every VCO count shares (lane SAFETY)."""
-    from vco_lib.weaviate_helpers import parse_aggregate_count  # noqa: PLC0415
+    THE count helper, ``weaviate_helpers.http_count_objects`` (one query, one
+    reading of the reply, one class-name check for every VCO count); this
+    module only lends it its own transport (*http*, the tests' fake engine
+    seam) through the helper's ``request`` parameter."""
+    from vco_lib.weaviate_helpers import http_count_objects  # noqa: PLC0415
 
-    query = {"query": "{ Aggregate { %s { meta { count } } } }" % cls}
-    try:
-        status, raw = (http or _default_http)("POST", f"{url.rstrip('/')}/v1/graphql", query, 120.0)
-    except Exception:  # noqa: BLE001 — could not be read
-        return None
-    return parse_aggregate_count(status, raw, cls)
+    send = http or _default_http
+
+    def request(method: str, target: str, *, body: Optional[dict] = None,
+                timeout: float = 120.0) -> tuple[int, bytes]:
+        return send(method, target, body, timeout)
+
+    return http_count_objects(cls, url, timeout=120.0, request=request)
 
 
 def schema_classes(url: str, *, http: Optional[HttpFn] = None) -> Optional[list[str]]:

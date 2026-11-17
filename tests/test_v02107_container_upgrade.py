@@ -1260,3 +1260,26 @@ def test_a_container_whose_image_cannot_be_read_is_not_handed_over(tmp_path, mon
     w = _HandWorld(tmp_path, monkeypatch)
     monkeypatch.setattr(det, "list_containers_or_none", lambda *_a, **_kw: None)
     assert w.hand() == 1 and w.adopt_calls == []
+
+
+def test_the_count_is_the_one_count_helper_with_this_modules_transport(monkeypatch):
+    # C-6: no second query / transport for the one count.
+    from vco_lib import weaviate_helpers
+
+    seen = {}
+
+    def helper(cls, url, **kw):
+        seen.update(cls=cls, url=url, **kw)
+        return 7
+
+    monkeypatch.setattr(weaviate_helpers, "http_count_objects", helper)
+    sent = []
+    assert cu.class_count("http://wv:1", "Cls", http=lambda *a: sent.append(a) or (200, b"")) == 7
+    assert (seen["cls"], seen["url"], seen["timeout"]) == ("Cls", "http://wv:1", 120.0)
+    seen["request"]("POST", "http://wv:1/v1/graphql", body={"q": 1}, timeout=5.0)
+    assert sent == [("POST", "http://wv:1/v1/graphql", {"q": 1}, 5.0)]
+
+
+def test_a_class_name_the_helper_rejects_is_unreadable_not_counted():
+    ok = _http({"data": {"Aggregate": {"Bad-Name": [{"meta": {"count": 3}}]}}})
+    assert cu.class_count("http://localhost:1", "Bad-Name", http=ok) is None
