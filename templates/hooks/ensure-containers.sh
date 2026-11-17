@@ -616,8 +616,8 @@ fi
 # podman 4.9. It does nothing for VCO's own container (its compose carries the
 # limit), for a container that already has a limit, or when the user switched
 # it off (VCO_WEAVIATE_FOREIGN_LIMIT=off). It prints one line only when it
-# changed something or could not.
-"$RUN_PY" -m vco_lib.weaviate_memory ensure-foreign-limit 2>/dev/null || true
+# changed something or could not (`--quiet`: applied, failed, or unreadable).
+"$RUN_PY" -m vco_lib.weaviate_memory ensure-foreign-limit --quiet 2>/dev/null || true
 
 if [ "$started" -gt 0 ]; then
     echo "Started $started container(s) via $RUNTIME"

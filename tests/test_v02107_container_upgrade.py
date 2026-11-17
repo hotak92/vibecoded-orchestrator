@@ -1283,3 +1283,26 @@ def test_the_count_is_the_one_count_helper_with_this_modules_transport(monkeypat
 def test_a_class_name_the_helper_rejects_is_unreadable_not_counted():
     ok = _http({"data": {"Aggregate": {"Bad-Name": [{"meta": {"count": 3}}]}}})
     assert cu.class_count("http://localhost:1", "Bad-Name", http=ok) is None
+
+
+@pytest.mark.parametrize("status, shown", [
+    (wm.APPLIED, True), (wm.FAILED, True), (wm.UNKNOWN, True),
+    (wm.OWN_LIMIT, False), (wm.OPTED_OUT, False), (wm.ALREADY, False)])
+def test_the_hooks_quiet_verb_prints_only_a_change_or_a_failure(tmp_path, monkeypatch, capsys,
+                                                                 status, shown):
+    # C-5: the hook comment promises one line "only when it changed something
+    # or could not"; OWN_LIMIT / OPTED_OUT printed at every ensure.
+    monkeypatch.setattr(wm, "ensure_foreign_limit_for_install",
+                        lambda root, dry_run=False: wm.ForeignLimit(status, "c", 0, "1g", "  line"))
+    wm.main(["ensure-foreign-limit", "--root", str(tmp_path), "--quiet"])
+    assert (capsys.readouterr().out.strip() == "line") is shown
+    wm.main(["ensure-foreign-limit", "--root", str(tmp_path)])   # by hand: always the line
+    assert capsys.readouterr().out.strip() == "line"
+
+
+@pytest.mark.parametrize("hook", ["ensure-containers.sh", "ensure-containers.ps1"])
+def test_both_hooks_call_the_quiet_verb(hook):
+    text = (REPO_ROOT / "templates" / "hooks" / hook).read_text(encoding="utf-8-sig")
+    calls = [line for line in text.splitlines()
+             if "weaviate_memory ensure-foreign-limit" in line and not line.lstrip().startswith("#")]
+    assert len(calls) == 1 and "--quiet" in calls[0]

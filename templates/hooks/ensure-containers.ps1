@@ -746,8 +746,8 @@ $recovered = $script:recovered
 # podman 4.9. It does nothing for VCO's own container (its compose carries the
 # limit), for a container that already has a limit, or when the user switched
 # it off (VCO_WEAVIATE_FOREIGN_LIMIT=off). It prints one line only when it
-# changed something or could not.
-& $RunPy -m vco_lib.weaviate_memory ensure-foreign-limit 2>$null | ForEach-Object { Write-Output $_ }
+# changed something or could not (`--quiet`: applied, failed, or unreadable).
+& $RunPy -m vco_lib.weaviate_memory ensure-foreign-limit --quiet 2>$null | ForEach-Object { Write-Output $_ }
 
 if ($started -gt 0) { Write-Output "Started $started container(s) via $Runtime" }
 if ($recovered -gt 0) { Write-Output "Recovered $recovered zombie container(s) via $Runtime" }
