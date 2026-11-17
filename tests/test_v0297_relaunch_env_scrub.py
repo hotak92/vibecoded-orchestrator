@@ -110,6 +110,9 @@ def _recording_popen(seen: list, *, stop: bool = False):
             pid = 4321
             returncode = 0
 
+            def wait(self, timeout=None):
+                return 0
+
         return _Proc()
 
     return _popen
