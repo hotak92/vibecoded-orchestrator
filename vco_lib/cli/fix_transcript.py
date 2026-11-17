@@ -4,10 +4,11 @@
 
 The condition it repairs, and how a user recognises it: every request in a
 session fails with ``400 … messages.<N>.content.<M>.server_tool_use.id:
-String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'``, switching models
-does not help, and ``/compact`` fails too. That is a vendor tool block sitting
-in the HISTORY — the session cannot heal itself, because every later request
-re-sends it.
+String should match pattern '^srvtoolu_[a-zA-Z0-9_]+$'``, an ``Input tag
+'mcp_tool_use'`` rejection, or ``Invalid signature in thinking block``;
+switching models does not help, and ``/compact`` fails too. Those are vendor
+blocks sitting in the HISTORY — the session cannot heal itself, because every
+later request re-sends them.
 
 This command rewrites the ``.jsonl`` with the same deterministic mapping the
 gateway applies in flight (:mod:`vco_lib.transcript_repair`), so a session
@@ -47,6 +48,8 @@ def _as_json(result: FileRepairResult) -> str:
             "ids_rewritten": result.stats.ids_rewritten,
             "blocks_stripped": result.stats.blocks_stripped,
             "results_stripped": result.stats.results_stripped,
+            "blocks_converted": result.stats.blocks_converted,
+            "results_converted": result.stats.results_converted,
             "thinking_stripped": result.stats.thinking_blocks_stripped,
             "stripped_names": sorted(result.stats.stripped_names),
             "unparseable_lines": result.unparseable_lines,
@@ -96,8 +99,8 @@ def add_subparsers(sub: Any) -> None:
         "fix-transcript",
         help=(
             "Repair a Claude Code session .jsonl whose history carries "
-            "vendor-shaped tool ids (400 'server_tool_use.id: String should "
-            "match pattern ^srvtoolu_'). Backs up to <file>.bak-<timestamp>."
+            "vendor-shaped tool ids, mcp_tool_use blocks, or vendor thinking "
+            "signatures. Backs up to <file>.bak-<timestamp>."
         ),
     )
     parser.add_argument(

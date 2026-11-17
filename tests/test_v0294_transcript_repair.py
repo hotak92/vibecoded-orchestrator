@@ -143,6 +143,7 @@ class IdShapeTests(unittest.TestCase):
                     "text_editor_code_execution",
                     "tool_search_tool_regex",
                     "tool_search_tool_bm25",
+                    "advisor",
                 }
             ),
         )
