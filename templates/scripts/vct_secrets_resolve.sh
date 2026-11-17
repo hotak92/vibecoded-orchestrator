@@ -152,8 +152,11 @@
 #   - This script writes ONLY to stdout on success. All diagnostics go
 #     to stderr so the caller can `value=$(./vct_secrets_resolve.sh ...)`
 #     without inheriting log lines.
-#   - No caching. The hub itself is the source-of-truth; if the user
-#     pauses or rotates a secret, the next call sees the new state.
+#   - No caching in this script. The hub is the source-of-truth: a pause
+#     applies to the next call (the active flag is re-read on every
+#     request). A value rotated or removed in the launcher can still be
+#     served for up to 30 s, the hub's in-process value cache
+#     (VCT_HUB_SECRET_CACHE_SECS, see docs/CONFIGURATION.md).
 
 set -euo pipefail
 
