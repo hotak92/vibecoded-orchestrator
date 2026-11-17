@@ -1532,7 +1532,7 @@ re-runs `sync_knowledge_graph.py --all` with the project root pinned, \
 content-hash gated so the retry re-embeds only what never landed). The \
 paired clear is NARROW by design (decision #12 shape): only the end of a \
 FULLY successful `--all` tree sync resolves it — a clean file-list or \
-docs-only run proves nothing about the nodes an earlier run failed on."""
+docs-only run proves nothing about the nodes an earlier run failed on. v0.2.107 (A-003): the failing run records the failed paths beside the entry (`vco_lib.owed_work.record_sync_failures`), the retry re-syncs only those, and a clean file-list run covering every one of them is a second paired clear; an entry with no record for itself (the install-enqueued whole-tree seed) still gets `--all`."""
 
 [conditions.kg_sync_shared_pending]
 class = "auto_retryable"
@@ -1594,7 +1594,7 @@ EXISTING `retry:py:kg_seed` handler: `kg-sync --all` backfills before its walk \
 one probe embed, then the UPDATE-only slot enrichment with the secondary's own \
 model; rows it refuses whole are re-laid by the walk for every model) and its \
 paired clear (`kg_secondary_backfill.after_walk`) resolves the row once every \
-configured secondary is stamped on every collection — or none is configured."""
+configured secondary is stamped on every collection — or none is configured. v0.2.107 (A-003): the owed-work worker runs the backfill alone (`python -m vco_lib.owed_work backfill`, rows missing the vector only); `--all` only when rows the secondary refuses whole remain."""
 
 [conditions.embed_self_heal_failed]
 class = "action_required"
@@ -1774,7 +1774,7 @@ saved incrementally after each node. `retry_action` reuses the EXISTING \
 `retry:py:kg_seed` handler rather than declaring a new one: that handler \
 re-runs `sync_knowledge_graph.py --all`, which re-runs this refresh — the \
 retry is real and already wired, so no HANDLERS edit is claimed. Cleared by \
-the paired `_clear_node_formats_deferral` on a refresh that exits 0."""
+the paired `_clear_node_formats_deferral` on a refresh that exits 0. v0.2.107 (A-003): the owed-work worker narrows this retry to `sync_knowledge_graph.py --refresh-node-formats` (the refresh alone, no tree walk); a whole-tree job owed in the same project absorbs it."""
 
 [conditions.kg_node_formats_backend_unavailable]
 class = "environmental"

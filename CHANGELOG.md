@@ -33,6 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose module row was written and whose entity writes then failed (embedding backend down) keeps its old entity
   rows instead of losing them at the end of the walk.
 
+- **Owed background work no longer starts all at once, and no longer as full re-syncs.** A KG seed, secondary-vector
+  backfill or code-graph walk skipped while a backend was down used to be retried by one detached driver per project
+  per session start, with no check that Weaviate was ready and one whole-tree `kg-sync --all` per owed condition, so
+  after a crash every open project fired its driver together against a Weaviate still loading - which crashed it
+  again. Session starts now put the project in one machine-wide queue (`vco_lib.owed_work`) served by ONE worker.
+  The worker runs a job only once Weaviate has answered ready for 30 s, one job per free slot of the same pool the
+  code-graph resync drivers use (sized from the RAM), and exits when nothing can run, leaving the queue on disk for
+  the next session start or prompt; while Weaviate is not ready no retry attempt is consumed. Conditions that need
+  the same work run it once; a secondary backfill embeds only the rows missing the vector, a sync failure re-syncs
+  only the files that failed, the node-format refresh runs alone, and `--all` runs only when a whole tree is owed.
+  A retry attempt is excused only when Weaviate provably failed during it (it answered "not ready" afterwards or its
+  container restarted), at most three times per episode; a worker that died still counts. Job logs are named
+  `owed-work-<project>-<pid>-<time>.log`. Preferences → Services shows the queue.
+
 ## [0.2.106] - 2026-11-12
 
 ### Added

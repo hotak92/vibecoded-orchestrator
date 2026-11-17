@@ -100,6 +100,8 @@ pub mod kg_summary;
 pub mod lifecycle;
 // v0.2.106: Preferences, KG Summaries, "Local summary model" (opt-out).
 pub mod local_summary_model;
+// v0.2.107 (A-003): Preferences, Services, the owed-work queue line.
+pub mod owed_work;
 pub mod licensing;
 // v0.2.91 WP-L (decision #21): the machine-global diagnostic log level
 // preference. Writes app_state `logging.level` — the key

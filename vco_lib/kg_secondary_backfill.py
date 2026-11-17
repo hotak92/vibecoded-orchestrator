@@ -538,11 +538,12 @@ def _emit_deferral(folder: Path, owed: "list[tuple[str, str, str]]") -> None:
             title=f"Secondary embedding backfill owed on {len(owed)} collection slot(s)",
             detected=("A secondary text-embedding slot is enabled, and these stored KG "
                       "rows do not all hold its vector yet:\n" + "\n".join(lines)),
-            why_deferred=("The backfill runs once, in the background, inside the "
-                          "whole-tree sync (`kg-sync --all`), which VCO's retry driver "
-                          "starts by itself; a secondary that did not answer is retried "
-                          "then. Searches keep working meanwhile; only rows without the "
-                          "vector are embedded and no existing vector is dropped."),
+            why_deferred=("The backfill runs once, in the background: VCO's owed-work "
+                          "worker embeds the rows that lack the vector without walking "
+                          "the tree (the whole-tree sync `kg-sync --all` does it too); a "
+                          "secondary that did not answer is retried then. Searches keep "
+                          "working meanwhile; only rows without the vector are embedded "
+                          "and no existing vector is dropped."),
             command_to_apply="# Run the whole-tree sync now (only missing vectors are embedded):\n"
                              ".claude/scripts/kg-sync --all",
             severity="info",
