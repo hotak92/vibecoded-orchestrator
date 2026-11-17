@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout inside the server) as "0 objects", and 0 was the licence to drop. There is now one count
   (`vco_lib.weaviate_helpers.http_count_objects`) that returns "unknown" for anything but an integer count from the
   server, and every caller that deletes, drops, verifies a copy, recovers a staging class or stamps a collection as
-  new leaves the data alone on "unknown": the automatic drop of empty legacy code-graph classes, the rename verification and `drop-retired`, the staging
-  recovery (it counted by listing the class, and a listing that ended early read a populated class as empty), and the
+  new leaves the data alone on "unknown": the automatic drop of empty legacy code-graph classes, the rename
+  verification and `drop-retired`, the staging recovery (it counted by listing the class, and a listing that ended
+  early read a populated class as empty), and the
   migration runner's "born at the current version" stamp.
 - **Adding a named-vector slot no longer drops and re-copies the collection.** Selecting an embedding model, install
   step 7d and every bundle update added a missing vector slot by creating a staging class, copying every object into
