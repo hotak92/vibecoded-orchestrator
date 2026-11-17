@@ -2470,12 +2470,10 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                         )
                     )
 
-                # Add external_links property if missing (RDF-inspired)
-                if 'external_links' not in existing_props:
-                    print("  Adding property: external_links (JSON text)")
-                    collection.config.add_property(
-                        Property(name="external_links", data_type=DataType.TEXT)
-                    )
+                # ``external_links`` is one of the scalar props added by the
+                # loop above; a second add here ran in the same pass against
+                # the stale ``existing_props`` and made the server answer
+                # "already exists" on every collection that lacked it.
 
                 # Add cross-reference property if missing
                 from weaviate.classes.config import ReferenceProperty
