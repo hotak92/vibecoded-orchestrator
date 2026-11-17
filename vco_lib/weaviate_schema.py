@@ -516,9 +516,17 @@ def _existing_slot_dim(
     except Exception:
         return None
     try:
+        from vco_lib.codegraph_cursor import iter_class
+
         col = client.collections.get(collection)
         seen = 0
-        for obj in col.iterator(include_vector=True):
+        # v0.2.107 (CG-2): the shared cursor (from the nil uuid), no
+        # properties, one page of at most ``sample_limit`` rows. All vectors
+        # (not ``[slot_name]``): the slot may not be declared yet.
+        for obj in iter_class(
+            col, "weaviate_schema._existing_slot_dim", return_properties=[],
+            include_vector=True, page_size=sample_limit, weaviate_url=url,
+        ):
             seen += 1
             vec = obj.vector
             if isinstance(vec, dict):

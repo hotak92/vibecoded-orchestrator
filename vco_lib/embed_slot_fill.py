@@ -29,8 +29,10 @@ guess. Callers decide what an absent verdict means.
 """
 from __future__ import annotations
 
-import json
 from typing import Any, Callable, Iterable, Mapping, Optional
+
+from vco_lib.codegraph_cursor import iter_class
+from vco_lib.kg_vector_slot import collection_vector_slots
 
 
 def declared_slots(name: str, weaviate_url: Optional[str]) -> Optional[set]:
@@ -58,16 +60,17 @@ def sample_slot_population(
     (:func:`vco_lib.kg_embed_model.record_from_live`) follows a MAJORITY slot,
     so a handful of objects rewritten target-only cannot empty the answer
     (W6-J, review F1)."""
-    from vco_lib import weaviate_helpers as _wh
+    from vco_lib.codegraph_cursor import CursorUndeterminable, rest_first_page
 
-    base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
-    status, body = _wh.http_request(
-        "GET", f"{base}/v1/objects?class={name}&limit={int(limit)}&include=vector",
-        timeout=10.0,
-    )
-    if status != 200:
+    try:
+        # v0.2.107 (CG-2): from the nil-uuid cursor - a cursorless sample read
+        # returned nothing on a populated class.
+        objs = rest_first_page(
+            name, "embed_slot_fill.sample_slot_population", limit=limit,
+            include_vector=True, weaviate_url=weaviate_url,
+        )
+    except CursorUndeterminable:
         return {}, 0
-    objs = json.loads(body.decode("utf-8")).get("objects") or []
     population: "dict[str, tuple[int, int]]" = {}
     for obj in objs:
         vectors = obj.get("vectors") or {}
@@ -115,9 +118,11 @@ def scan_slot_counts(
     """``({slot: filled}, total)`` across ``collections`` (missing classes are
     skipped): per slot, the objects holding a vector there, vs all objects.
 
-    Weaviate cannot filter on "vector missing", so this is a cursor scan with
-    vectors (the client's iterator takes no per-slot selection). ``None`` when
-    Weaviate cannot be asked — never a guess."""
+    Weaviate cannot filter on "vector missing", so this is a cursor scan
+    (:func:`vco_lib.codegraph_cursor.iter_class`) that reads no property and
+    only the wanted slots' vectors (v0.2.107: it used to read every vector of
+    every row). ``None`` when Weaviate cannot be asked or a class could not be
+    listed — never a guess."""
     wanted = list(dict.fromkeys(slots))
     client = None
     try:
@@ -128,7 +133,15 @@ def scan_slot_counts(
             if not client.collections.exists(name):
                 continue
             coll = client.collections.get(name)
-            for obj in coll.iterator(include_vector=True, return_properties=[]):
+            # Only slots the class declares can be asked for by name; an
+            # unreadable config (or a class with one unnamed vector) keeps the
+            # all-vectors read.
+            have = collection_vector_slots(coll)
+            ask: Any = [s for s in wanted if s in have] if have else True
+            for obj in iter_class(
+                coll, "embed_slot_fill.scan_slot_counts",
+                return_properties=[], include_vector=ask,
+            ):
                 total += 1
                 vec = obj.vector
                 if not isinstance(vec, dict):

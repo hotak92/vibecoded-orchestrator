@@ -274,8 +274,13 @@ class WeaviateBackend:
     def fetch_rows(self, collection: str) -> list[dict[str, Any]]:
         coll = self._client.collections.get(collection)
         rows: list[dict[str, Any]] = []
-        for obj in coll.iterator(
-            return_properties=["file_path", "updated_at", "chunk_num"]
+        from vco_lib.codegraph_cursor import iter_class
+
+        # v0.2.107 (CG-2): the shared cursor. A class that lists nothing while
+        # it is not confirmed empty raises -> the caller's READ_FAILED refusal.
+        for obj in iter_class(
+            coll, "kg_dedup.fetch_rows",
+            return_properties=["file_path", "updated_at", "chunk_num"],
         ):
             props = obj.properties or {}
             rows.append({

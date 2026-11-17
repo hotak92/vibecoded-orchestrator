@@ -1230,17 +1230,16 @@ def _snapshot_collection_for_rebuild(
     # Sample UUIDs via REST (simpler than GraphQL, no class-vs-quoted-name
     # escaping headaches).
     try:
-        status, body = _http_request(
-            "GET",
-            f"{base}/v1/objects?class={name}&limit={sample_limit}",
-            timeout=10,
-        )
-        if status == 200:
-            payload = json.loads(body.decode("utf-8"))
-            snapshot["sample_uuids"] = [
-                obj.get("id", "") for obj in payload.get("objects", [])
-                if obj.get("id")
-            ]
+        # v0.2.107 (CG-2): from the nil-uuid cursor, through the one home.
+        from vco_lib.codegraph_cursor import rest_first_page
+
+        snapshot["sample_uuids"] = [
+            obj.get("id", "") for obj in rest_first_page(
+                name, "project_init._snapshot_collection_for_rebuild",
+                limit=sample_limit, weaviate_url=base, request=_http_request,
+                timeout=10,
+            ) if obj.get("id")
+        ]
     except Exception:
         pass
 
@@ -1281,7 +1280,7 @@ def _copy_collection_with_vectors(
     writes with named vectors easily. Returns object count copied.
 
     Round-trip semantics (verified by research report):
-      iterator(include_vector=True) yields obj.vector as dict[str, list[float]]
+      the cursor (include_vector=True) yields obj.vector as dict[str, list[float]]
       batch.add_object(vector=<dict>, uuid=<orig>) re-imports byte-for-byte.
 
     BUG-2 (v0.2.73) pre-flight shape guard: before the copy loop, probe the
@@ -1319,7 +1318,16 @@ def _copy_collection_with_vectors(
         dst_col = client.collections.get(dst)
         copied = 0
         with dst_col.batch.dynamic() as bw:
-            for obj in src_col.iterator(include_vector=True):
+            # v0.2.107 (CG-2): the shared cursor. A source that lists 0 rows
+            # while its count is positive or unreadable raises
+            # CursorUndeterminable - a failed copy, never "nothing to copy".
+            from vco_lib.codegraph_cursor import iter_class
+
+            for obj in iter_class(
+                src_col, "project_init._copy_collection_with_vectors",
+                return_properties=None, include_vector=True,
+                weaviate_url=weaviate_url,
+            ):
                 # `obj.vector` is dict[str, list[float]] for named-vector
                 # collections, list[float] for legacy single-vector. We
                 # only copy if it's a dict (named-vector); single-vector

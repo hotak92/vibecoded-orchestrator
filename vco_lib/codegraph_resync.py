@@ -183,6 +183,9 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
 # directly with a hardcoded INFO level, ignoring the global VCO_LOG_LEVEL
 # pref. Route them through the ONE shared helper instead.
 from vco_lib.log_setup import configure_logging  # noqa: E402 — grouped with the notes above
+# v0.2.107 (CG-2): the ONE whole-class listing (cursor from the nil uuid; a
+# 0-row pass is checked against the class count, never read as "empty").
+from vco_lib.codegraph_cursor import iter_class as _iter_class  # noqa: E402
 
 # v0.2.82 (WP-2 task 3): the resync's "owed work" staleness + the convergence
 # report's embed-vs-stamp split delegate to the ONE pure guards module, so the
@@ -642,6 +645,24 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
     return None
 
 
+def narrowed_or_all_rows(coll, read_props, narrow_filter, call_site: str):
+    """The candidate rows of one decision: the narrowed read when
+    ``narrow_filter`` is given and completes, else the whole class through the
+    ONE cursor (:func:`vco_lib.codegraph_cursor.iter_class`).
+
+    Narrowing only changes WHICH rows are read back (see
+    :func:`_fetch_narrowed_rows`); the caller still decides per row in Python.
+    The whole-class arm raises ``CursorUndeterminable`` when the class could
+    not be read - the caller must then decide nothing.
+    """
+    rows = None
+    if narrow_filter is not None:
+        rows = _fetch_narrowed_rows(coll, read_props, narrow_filter)
+    if rows is not None:
+        return rows
+    return _iter_class(coll, call_site, return_properties=read_props)
+
+
 def delete_file_rows_exact(
     coll,
     path_prop: str,
@@ -721,14 +742,11 @@ def delete_file_rows_exact(
     except Exception:  # noqa: BLE001 — config probe is best-effort; fall through
         pass
 
-    rows = None
-    if narrow_filter is not None:
-        rows = _fetch_narrowed_rows(coll, read_props, narrow_filter)
-    if rows is None:
-        rows = coll.iterator(return_properties=read_props)
-
     to_delete = []
-    for obj in rows:
+    for obj in narrowed_or_all_rows(
+        coll, read_props, narrow_filter,
+        f"codegraph_resync.delete_file_rows_exact[{log_prefix or 'delete'}]",
+    ):
         props = (getattr(obj, "properties", None) or {})
         raw = props.get(path_prop) or ""
         if project and (props.get("project") or "") != project:
@@ -1200,7 +1218,9 @@ def _count_stale_in_collection(
             want_source = False
     try:
         stale = 0
-        for obj in coll.iterator(return_properties=read_props):
+        for obj in _iter_class(
+            coll, "codegraph_resync._count_stale_in_collection", return_properties=read_props,
+        ):
             props = getattr(obj, "properties", None) or {}
             if reachable_fn is None:
                 # Pre-R3 tier: no root/predicate → revision-only counting
@@ -1492,7 +1512,9 @@ def demote_current_revision_rows(
                     continue  # undeclared slot: nothing a re-embed could fill
                 iter_kwargs["include_vector"] = [vector_slot]
             try:
-                for obj in coll.iterator(**iter_kwargs):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.demote_current_revision_rows", **iter_kwargs,
+                ):
                     props = getattr(obj, "properties", None) or {}
                     # Already-stale rows (NULL / 0 / older) re-embed on any
                     # walk — demoting them would be a pointless write.
@@ -1579,7 +1601,10 @@ def list_owed_row_identities(
                 continue
             read_props = ["embed_revision", path_prop, "project_source", "full_name"]
             try:
-                for obj in coll.iterator(return_properties=read_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.list_owed_row_identities",
+                    return_properties=read_props,
+                ):
                     if len(out) >= limit:
                         break
                     props = getattr(obj, "properties", None) or {}
@@ -1678,7 +1703,10 @@ def classify_stale_kinds(
                 read_props.append(path_prop)
                 read_props.append("project_source")
             try:
-                for obj in coll.iterator(return_properties=read_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.classify_stale_kinds",
+                    return_properties=read_props,
+                ):
                     props = getattr(obj, "properties", None) or {}
                     if reachable_fn is not None and classify_row(
                         props,
@@ -1789,7 +1817,10 @@ def count_cleanup_owed_rows(
                 except Exception:  # noqa: BLE001 — probe best-effort
                     want_source = False
             try:
-                for obj in coll.iterator(return_properties=read_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.count_cleanup_owed_rows",
+                    return_properties=read_props,
+                ):
                     props = getattr(obj, "properties", None) or {}
                     if is_deleted_primary_row(
                         props,
@@ -1961,7 +1992,8 @@ def _backfill_anchor_file_paths(
                     heal_is_test = False
             updated = 0
             left = 0
-            for obj in coll.iterator(
+            for obj in _iter_class(
+                coll, "codegraph_resync._backfill_anchor_file_paths",
                 return_properties=["file_path"],
                 return_references=query_refs,
             ):
@@ -2212,7 +2244,10 @@ def count_orphan_interaction_rows(
             pass
         try:
             orphans = 0
-            for obj in coll.iterator(return_properties=read_props):
+            for obj in _iter_class(
+                coll, "codegraph_resync.count_orphan_interaction_rows",
+                return_properties=read_props,
+            ):
                 props = getattr(obj, "properties", None) or {}
                 if is_provable_codegraph_orphan(
                     coll, str(obj.uuid), props,
@@ -2350,7 +2385,10 @@ def backfill_codegraph_metadata(
                     return_props += [body_prop, "doc", "language", "chunk_num"]
 
                 updated = 0
-                for obj in coll.iterator(return_properties=return_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.backfill_metadata",
+                    return_properties=return_props,
+                ):
                     p = getattr(obj, "properties", None) or {}
                     new_props: dict = {}
 

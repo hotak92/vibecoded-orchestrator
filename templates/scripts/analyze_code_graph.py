@@ -441,7 +441,7 @@ try:
         # reconcile that closes the entity-orphan convergence gap.
         delete_file_rows_exact as _delete_file_rows_exact_impl,
         primary_sources_for as _primary_sources_for,
-        _narrow_filter_for_paths,
+        _narrow_filter_for_paths, narrowed_or_all_rows as _narrowed_rows,  # v0.2.107 CG-2 / A-095
         reconcile_walked_file_rows as _reconcile_walked_file_rows,
         open_walked_file_scope as _open_scope,
         commit_walked_file_scope as _commit_scope,
@@ -460,7 +460,9 @@ try:
     from vco_lib.codegraph_prune import (  # v0.2.103: + failure ledger + remedy lines
         prune_collection as _prune_collection_impl, expand_preserve_entries as _expand_preserve,
         record_prune_failures as _record_prune_failures, prune_walk_guard as _prune_walk_guard,
-        format_prune_remedy_lines as _format_prune_remedy_lines)
+        format_prune_remedy_lines as _format_prune_remedy_lines,
+        reset_prune_ledgers as _reset_prune_ledgers, prune_failure_stats as _prune_failure_stats)
+    from vco_lib.codegraph_cursor import iter_class as _iter_class  # v0.2.107 CG-2: the ONE class listing
     from vco_lib import codegraph_source_scope as _src_scope  # W6-CGD: stamp + ownership + preserve keys
     from vco_lib.codegraph_extra_overlap import classify as _extra_overlap  # W6-CGD D-4
     from vco_lib.codegraph_schema import (  # v0.2.102: one ensure loop + backfill
@@ -2459,7 +2461,7 @@ class CodeGraphAnalyzer:
                 project=self.project_name or "",
                 project_source=current_source or "",
                 extra_props=_extra,
-                log_prefix="stale-chunk cleanup",
+                log_prefix="stale-chunk cleanup", narrow_filter=_narrow_filter_for_paths("full_name", [_target]),
             )
             # C-13 (v0.2.75 P3a): the SURVIVING chunk rows (0..min-1) keep their
             # OLD `total_chunks` — it's deliberately excluded from the content
@@ -2506,7 +2508,7 @@ class CodeGraphAnalyzer:
                 _read = [p for p in _read if p in _present] or _read
             except Exception:  # noqa: BLE001 — probe best-effort
                 pass
-            for obj in collection.iterator(return_properties=_read):
+            for obj in _narrowed_rows(collection, _read, _narrow_filter_for_paths("full_name", [full_name]), "analyzer.total_chunks_patch"):
                 props = getattr(obj, "properties", None) or {}
                 if not _guards.survivor_needs_total_patch(
                     props, full_name=full_name,
@@ -3444,8 +3446,7 @@ class CodeGraphAnalyzer:
         # so a stale value from a prior analyze_repository call in the same
         # process must never leak into this run's stats. v0.2.103 (plan 24):
         # the per-collection ledger resets with it (remedy names REAL classes).
-        self._prune_failures = 0
-        self._prune_failure_collections = {}
+        _reset_prune_ledgers(self)  # + the unlisted-class record (v0.2.107 CG-2)
         self._policy_skipped = {}  # S16-3: per-run policy-skip record (flushed per walk)
         # v0.2.100 (--as-extra-path): repo_path IS an extra path → only rows PROVABLY
         # stamped with it are ever judged/deleted (source_is_owned strict).
@@ -3914,9 +3915,8 @@ class CodeGraphAnalyzer:
         # it, and NOTHING converges it — the build must surface as partial,
         # never as a clean success. Read via getattr because the attribute
         # may be absent if a future path skips the per-run reset.
-        stats['prune_failures'] = int(getattr(self, "_prune_failures", 0))
-        # v0.2.103 (plan item 24): per-collection map for the remedy block.
-        stats['prune_failure_collections'] = dict(getattr(self, "_prune_failure_collections", None) or {})
+        # v0.2.103 (plan 24): + per-collection map; v0.2.107 (CG-2): + classes that could not be listed.
+        stats.update(_prune_failure_stats(self))
         _gd = self._git_deleted_report
         stats.update(deleted_files=_gd.files, deleted_file_entities=_gd.deleted,
                      deleted_file_prune_failures=_gd.failures)
@@ -4679,7 +4679,7 @@ class CodeGraphAnalyzer:
             except Exception:  # noqa: BLE001 — probe best-effort
                 pass
             try:
-                for obj in coll.iterator(return_properties=_read_props):
+                for obj in _iter_class(coll, "analyzer._build_stale_file_set", return_properties=_read_props):
                     p = getattr(obj, "properties", None) or {}
                     # Only OWED rows enter the re-walk set: a re-walk can
                     # actually converge them. Purgeable rows are handled by
@@ -5328,7 +5328,7 @@ class CodeGraphAnalyzer:
         # same bounded scan so reference_add remains idempotent.
         self._xref_stored_import_refs: Dict[str, List[str]] = {}
         try:
-            for obj in self.modules_collection.iterator(
+            for obj in _iter_class(self.modules_collection, "analyzer.cache_modules",
                     return_properties=["path", "project_source", "import_names"],
                     return_references=QueryReference(
                         link_on="imports", return_properties=["path"])):
@@ -5347,7 +5347,7 @@ class CodeGraphAnalyzer:
         # Classes: cache the canonical chunk and its file for scoped xref reads.
         self._xref_class_file_path: Dict[str, str] = {}
         try:
-            for obj in self.classes_collection.iterator(
+            for obj in _iter_class(self.classes_collection, "analyzer.cache_classes",
                     return_properties=["full_name", "chunk_num", "file_path"]):
                 full_name = obj.properties.get("full_name", "")
                 self._xref_class_file_path[str(obj.uuid)] = str(
@@ -5370,7 +5370,7 @@ class CodeGraphAnalyzer:
         # text property); same single-scan sourcing as the modules loop above.
         self._xref_stored_call_refs: Dict[str, List[str]] = {}
         try:
-            for obj in self.functions_collection.iterator(
+            for obj in _iter_class(self.functions_collection, "analyzer.cache_functions",
                     return_properties=[
                         "full_name", "chunk_num", "file_path", "call_names",
                         "n_callers", "project_source",
@@ -5969,9 +5969,8 @@ def _migrate_from_shared(project_name: str, named_vectors: bool = False) -> int:
 
             # Fetch all objects filtered by project
             count = 0
-            for obj in shared_coll.iterator(
-                return_properties=True,
-            ):
+            # return_properties=None: every property (a whole-row copy)
+            for obj in _iter_class(shared_coll, "analyzer._migrate_from_shared", return_properties=None):
                 props = obj.properties
                 if props.get("project") != project_name and props.get("source_project") != project_name:
                     continue

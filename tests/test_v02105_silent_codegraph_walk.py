@@ -128,9 +128,16 @@ def test_a_walk_that_dispatched_files_reports_nothing(capsys):
 
 
 class _Coll:
+    # v0.2.107 (CG-2): the gate's unfiltered read goes through the shared
+    # cursor, so this fake speaks its protocol: pages by ``after`` and reports
+    # its object count (``count``) for the cursor's zero-row cross-check.
+    cursor_native = True
+    name = "Acme_CodeModule"
+
     def __init__(self, objects, raises=False):
         self._objects, self._raises, self.calls = objects, raises, []
         self.query = self
+        self.count = len(objects)
 
     def fetch_objects(self, **kw):
         self.calls.append(kw)

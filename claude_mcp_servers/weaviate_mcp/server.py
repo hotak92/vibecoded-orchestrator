@@ -258,6 +258,7 @@ except ImportError as _exc:
 # discipline" note further below), so a failed import here already fails
 # loudly (ImportError) with no fallback, matching that same discipline.
 from vco_lib.log_setup import configure_logging  # noqa: E402 — after package-identity bootstrap
+from vco_lib.codegraph_cursor import iter_class as _iter_class  # noqa: E402 — the ONE class listing (CG-2)
 from vco_lib.embed_outage import EmbeddingBackendUnavailable  # noqa: E402 — after package-identity bootstrap
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -8007,7 +8008,9 @@ async def migrate_embeddings(
     # Read all objects with their vectors
     logger.info("migrate_embeddings: reading all objects from '%s' (scheme=%s)...", collection_name, scheme)
     all_objects = []
-    for obj in coll.iterator(include_vector=True):
+    # v0.2.107 (CG-2): the shared cursor. A class that lists nothing while it
+    # is not confirmed empty raises here - BEFORE the drop + recreate below.
+    for obj in _iter_class(coll, "server.migrate_embeddings", return_properties=None, include_vector=True):
         all_objects.append({
             "properties": dict(obj.properties),
             "vector": obj.vector.get("default") if isinstance(obj.vector, dict) else obj.vector,
@@ -8167,7 +8170,7 @@ async def backfill_embeddings(
     skipped = 0
     errors = 0
 
-    for obj in coll.iterator(include_vector=True):
+    for obj in _iter_class(coll, "server.backfill_embeddings", return_properties=None, include_vector=True):  # CG-2
         total += 1
 
         # Check if this object already has the target named vector
