@@ -27,10 +27,12 @@ BINDING POLICY for DERIVED Weaviate collections is:
      a ``schema_migration_needs_choice`` deferral. Re-embed/drop is the LAST
      resort, gated on explicit user choice.
 
-NO-OP TODAY: ``migrations/`` ships empty → every artifact is either
+EDGES SHIPPED TODAY: ``migrations/codegraph_collection/`` 4_to_5 … 8_to_9
+(``apply_edge`` runs them for a project whose recorded code-graph version is
+behind). Every OTHER artifact type has no edge file and is a no-op: either
 NEVER_MATERIALIZED (registered at canonical, one idempotent DB write) or
-UP_TO_DATE + not-stale (DO NOTHING). ``apply_edge`` is never called. Proven by
-``tests/test_schema_migration_runner.py`` T7 + T8.
+UP_TO_DATE + not-stale (DO NOTHING) — ``tests/test_schema_migration_runner.py``
+T7 + T8 pin that no-op.
 
 Piece 3 (the richer ``live_fingerprint_stale`` Weaviate fingerprint) and
 Piece 4 (the launcher regenerate-or-defer modal + Tauri pair) are built later;
