@@ -1529,10 +1529,12 @@ retrieval forever). Emitted at the end of ANY sync run shape (`--all`, \
 naming the failure count. `auto_retryable` with a REAL retry_action — \
 the SAME handler `kg_sync_no_embedding_backend` uses (`retry:py:kg_seed` \
 re-runs `sync_knowledge_graph.py --all` with the project root pinned, \
-content-hash gated so the retry re-embeds only what never landed). The \
+content-hash gated so the retry re-embeds only what never landed) — but \
+since v0.2.107 it first tries the NARROW re-sync of the recorded failed \
+paths and falls back to `--all` (see the v0.2.107 note below). The \
 paired clear is NARROW by design (decision #12 shape): only the end of a \
 FULLY successful `--all` tree sync resolves it — a clean file-list or \
-docs-only run proves nothing about the nodes an earlier run failed on. v0.2.107 (A-003): the failing run records the failed paths beside the entry (`vco_lib.owed_work.record_sync_failures`), the retry re-syncs only those, and a clean file-list run covering every one of them is a second paired clear; an entry with no record for itself (the install-enqueued whole-tree seed) still gets `--all`."""
+docs-only run proves nothing about the nodes an earlier run failed on. v0.2.107 (A-003): the failing run records the failed paths beside the entry (`vco_lib.owed_work.record_sync_failures`), the retry re-syncs only those, and a clean file-list run covering every one of them is a second paired clear; an entry with no record for itself (the install-enqueued whole-tree seed) still gets `--all`, and so does a record longer than 200 paths or 24 000 characters of arguments (a Windows command line is capped at 32 767)."""
 
 [conditions.kg_sync_shared_pending]
 class = "auto_retryable"

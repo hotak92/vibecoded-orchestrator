@@ -474,6 +474,65 @@ def test_a_sync_failure_resyncs_only_the_failed_paths(tmp_path):
     assert call[-2:] == [str(folder / "knowledge" / "a.md"), str(folder / "knowledge" / "c.md")]
 
 
+def _owe_failed_paths(folder: Path, count: int, stem: str = "n", subdir: str = "") -> None:
+    from vco_lib import owed_work
+
+    rels = []
+    for i in range(count):
+        rel = f"knowledge/{subdir}{stem}{i}.md"
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_text("# n\n", encoding="utf-8")
+        rels.append(rel)
+    prior = owed_work.failed_paths_state(folder)
+    _owe(folder, FAIL_CID)
+    owed_work.record_sync_failures(folder, rels, whole_tree=True, prior=prior)
+
+
+def test_just_below_the_threshold_the_retry_stays_narrow(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, dr.MAX_NARROW_SYNC_PATHS)
+    runner = _Runner()
+    with mock.patch.object(dr, "_record_resolution"):
+        dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                    runner=runner, single_instance=False)
+    assert "--all" not in runner.calls[0]
+    assert len(runner.calls[0]) == 2 + dr.MAX_NARROW_SYNC_PATHS
+
+
+def test_above_the_path_count_the_retry_falls_back_to_the_whole_tree(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, dr.MAX_NARROW_SYNC_PATHS + 1)
+    runner = _Runner()
+    with mock.patch.object(dr, "_record_resolution"):
+        dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                    runner=runner, single_instance=False)
+    assert runner.calls[0][-1] == "--all"
+    assert len(runner.calls[0]) == 3
+
+
+def test_above_the_argument_length_the_retry_falls_back_to_the_whole_tree(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, 30, subdir="".join(c * 240 + "/" for c in "dfgh"), stem="x")
+    runner = _Runner()
+    with mock.patch.object(dr, "_record_resolution"):
+        dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                    runner=runner, single_instance=False)
+    assert runner.calls[0][-1] == "--all"
+
+
+def test_a_spawn_that_cannot_start_is_a_failed_attempt_not_a_crash(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, 3)
+
+    def boom(argv, cwd):
+        raise OSError("command line too long")
+
+    results = dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                          runner=boom, single_instance=False)
+    assert [r.status for r in results] == [dr.FAILED]
+    assert dr.attempt_count(folder, FAIL_CID) == 1
+
+
 def test_a_failure_entry_without_a_record_still_owes_the_whole_tree(tmp_path):
     """LEAVE-ALONE: install.py's enqueued seed re-emits the same condition for
     a WHOLE-TREE seed — a record left by an earlier entry must not narrow it."""
@@ -837,3 +896,119 @@ def test_job_log_names_carry_the_project_key_and_the_pid(state, tmp_path, monkey
     assert log.name.startswith(f"owed-work-{entry.key}-{os.getpid()}-")
     assert entry.key.startswith("my_proj-")
     assert "child output" in log.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Fix round (acceptance check Q-2 .. Q-4, S-2)
+# ---------------------------------------------------------------------------
+
+
+def _worker_deps(state, **kw):
+    from vco_lib.owed_work import WorkerDeps
+
+    clock = iter(range(0, 100_000, 1))
+    base = dict(state=lambda: _ready(), sleep=lambda s: None,
+                clock=lambda: float(next(clock)), wall=lambda: 10_000.0, idle_s=1000,
+                settle_s=0, slot_dir=state / "slots", slots=1, log=lambda line: None)
+    base.update(kw)
+    return WorkerDeps(**base)
+
+
+def test_a_job_kept_for_a_reason_other_than_weaviate_is_not_re_dispatched_at_once(state, tmp_path):
+    """Q-2: before, a QUEUED verdict with Weaviate ready looped with no pause."""
+    from vco_lib import owed_work
+
+    folder = _project(tmp_path, "p")
+    _owe(folder, KG_CID)
+    owed_work.enqueue(folder)
+    sleeps: list[float] = []
+    calls = []
+
+    def dispatch(f, **kw):
+        calls.append(f)
+        if len(calls) >= 3:
+            _clear(f, KG_CID)
+            return [dr.RetryResult(KG_CID, dr.RETRIED, "")]
+        return [dr.RetryResult(KG_CID, dr.QUEUED, "another driver is running")]
+
+    owed_work.run_worker(_worker_deps(state, dispatch=dispatch, sleep=sleeps.append, poll_s=7.0))
+    assert len(calls) == 3
+    assert sleeps.count(7.0) >= 2
+
+
+def test_one_projects_handler_exception_does_not_end_the_worker(state, tmp_path):
+    """Q-3: the other project's job still runs; the failing entry stays queued."""
+    from vco_lib import owed_work
+
+    a = _project(tmp_path, "a")
+    b = _project(tmp_path, "b")
+    for f in (a, b):
+        _owe(f, KG_CID)
+        owed_work.enqueue(f)
+    ran = []
+
+    def dispatch(f, **kw):
+        ran.append(f.name)
+        if f.name == "a":
+            if ran.count("a") == 1:
+                raise RuntimeError("handler blew up")
+            _clear(f, KG_CID)
+            return [dr.RetryResult(KG_CID, dr.RETRIED, "")]
+        _clear(f, KG_CID)
+        return [dr.RetryResult(KG_CID, dr.RETRIED, "")]
+
+    logs: list[str] = []
+    report = owed_work.run_worker(_worker_deps(
+        state, dispatch=dispatch, idle_s=5, log=logs.append))
+    # b ran right after a's crash, and a was retried by the SAME worker.
+    assert ran == ["a", "b", "a"]
+    assert any("handler blew up" in line for line in logs)
+    assert owed_work.read_queue() == []
+    assert report.exit_reason == "queue empty"
+
+
+def test_the_worker_waits_for_the_lock_instead_of_giving_up_instantly(state, tmp_path, monkeypatch):
+    """Q-4: a status peek holds the lock for an instant; a starting worker must wait."""
+    from vco_lib import atomic, owed_work
+
+    seen = {}
+    real = atomic.exclusive_file_lock
+
+    def spy(path, *, timeout_s=None, **kw):
+        seen.setdefault("timeout", timeout_s)
+        return real(path, timeout_s=timeout_s, **kw)
+
+    monkeypatch.setattr(atomic, "exclusive_file_lock", spy)
+    owed_work.run_worker(_worker_deps(state))
+    assert seen["timeout"] >= 1
+
+
+def test_the_worker_stands_down_while_an_update_runs(state, tmp_path):
+    """S-2: no job while an orchestrator update is in progress; none consumed."""
+    from vco_lib import owed_work
+
+    folder = _project(tmp_path, "p")
+    _owe(folder, KG_CID)
+    owed_work.enqueue(folder)
+    dispatch = mock.Mock()
+    report = owed_work.run_worker(_worker_deps(
+        state, dispatch=dispatch, idle_s=5, update_in_progress=lambda: True))
+    dispatch.assert_not_called()
+    assert "update" in report.exit_reason
+    assert len(owed_work.read_queue()) == 1
+    assert dr.attempt_count(folder, KG_CID) == 0
+
+
+def test_an_update_gate_blocks_the_worker_spawn_and_lifts_after(state, tmp_path, monkeypatch):
+    from vco_lib import owed_work, update_gate
+
+    folder = _project(tmp_path, "p")
+    _owe(folder, KG_CID)
+    owed_work.enqueue(folder)
+    popen = mock.Mock()
+    monkeypatch.setattr(update_gate, "is_update_in_progress", lambda **kw: True)
+    assert owed_work.ensure_worker(popen=popen) is False
+    popen.assert_not_called()
+    monkeypatch.setattr(update_gate, "is_update_in_progress", lambda **kw: False)
+    assert owed_work.ensure_worker(popen=popen) is True
+    popen.assert_called_once()

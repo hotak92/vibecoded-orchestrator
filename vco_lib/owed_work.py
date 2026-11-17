@@ -400,6 +400,8 @@ def ensure_worker(*, python: str = "", popen: Optional[Callable[..., Any]] = Non
     try:
         if not read_queue():
             return False
+        if _update_in_progress():
+            return False  # S-2: the next prompt after the update starts it
         from vco_lib.atomic import LockTimeout, exclusive_file_lock
 
         try:
@@ -530,8 +532,20 @@ class WorkerDeps:
     idle_s: Optional[float] = None
     settle_s: Optional[float] = None
     poll_s: float = POLL_S
+    update_in_progress: Callable[[], bool] = lambda: _update_in_progress()
     job_log: Callable[[QueueEntry], "contextlib.AbstractContextManager[Any]"] = _job_log
     log: Callable[[str], None] = lambda line: print(f"[owed-work] {line}", flush=True)
+
+
+def _update_in_progress() -> bool:
+    """S-2: an orchestrator update is running (``vco_lib.update_gate``). A
+    reader that cannot tell reads as "no update" — the gate's own soft-fail."""
+    try:
+        from vco_lib.update_gate import is_update_in_progress
+
+        return bool(is_update_in_progress())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def run_worker(deps: Optional[WorkerDeps] = None) -> WorkerReport:
@@ -546,7 +560,7 @@ def run_worker(deps: Optional[WorkerDeps] = None) -> WorkerReport:
     d = deps or WorkerDeps()
     report = WorkerReport()
     try:
-        lock = exclusive_file_lock(worker_lock_path(), timeout_s=0)
+        lock = exclusive_file_lock(worker_lock_path(), timeout_s=2)  # Q-4: ride out a status peek
         lock.__enter__()
     except LockTimeout:
         report.already_running = True
@@ -581,8 +595,9 @@ def _loop(d: WorkerDeps, report: WorkerReport, *, slot_dir: Path, slots: int,
         if not entries:
             report.exit_reason = "queue empty"
             return
+        updating = d.update_in_progress()
         st = d.state()
-        if st.ready is True:
+        if st.ready is True and not updating:
             if ready_since is None:
                 ready_since = d.clock()
         else:
@@ -591,7 +606,8 @@ def _loop(d: WorkerDeps, report: WorkerReport, *, slot_dir: Path, slots: int,
         settled = ready_since is not None and d.clock() - ready_since >= settle_s and not young
         free = try_machine_slot_free(slot_dir, slots=slots) if settled else None
         if not settled or free is None:
-            why = ("Weaviate is not ready" if st.ready is not True else
+            why = ("an orchestrator update is running" if updating else
+                   "Weaviate is not ready" if st.ready is not True else
                    "Weaviate is settling after a start" if not settled else
                    f"all {slots} bulk-writer slot(s) are busy")
             if why != waiting_for:
@@ -607,6 +623,10 @@ def _loop(d: WorkerDeps, report: WorkerReport, *, slot_dir: Path, slots: int,
         kept = _process_entry(entry, d, report, slot_dir=slot_dir, slots=slots)
         if kept:
             _note_try(entry, d.wall)
+            # Q-2: kept for a reason other than Weaviate (e.g. another retry
+            # driver holds the project) — without a pause this loop would
+            # re-dispatch at once, with a container probe each round.
+            d.sleep(d.poll_s)
         idle_deadline = d.clock() + idle_s
 
 
@@ -627,8 +647,15 @@ def _process_entry(entry: QueueEntry, d: WorkerDeps, report: WorkerReport, *,
     dispatch = d.dispatch or dr.dispatch
     report.runs.append(str(folder))
     with d.job_log(entry), _env_overlay(entry.env):
-        results = dispatch(folder, machine_watch=d.state,
-                           slot_guard=_slot_guard_factory(slot_dir, slots))
+        try:
+            results = dispatch(folder, machine_watch=d.state,
+                               slot_guard=_slot_guard_factory(slot_dir, slots))
+        except Exception as exc:  # noqa: BLE001 — Q-3: one project's crash must not end the worker
+            import traceback
+
+            traceback.print_exc()
+            d.log(f"{entry.key}: handler raised {type(exc).__name__}: {exc} — kept queued")
+            return True  # the attempt row is already written by the dispatcher
     kept = any(r.status in (dr.QUEUED, dr.INTERRUPTED) for r in results)
     summary = ", ".join(f"{r.condition_id}={r.status}" for r in results) or "nothing ran"
     d.log(f"{entry.key}: {summary}" + (" — kept queued" if kept else ""))
