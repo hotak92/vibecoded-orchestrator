@@ -3903,8 +3903,8 @@ async def _semantic_graph_search_body(
     # Determine all collections to search. Mirrors hybrid_search: project KG +
     # shared KG (when configured) + peer-project KGs from the launcher's
     # access matrix (VCT_KG_ACCESS_LIST, P1-D 2026-05-08). The shared KG
-    # read is unconditional — there is NO per-project read opt-out
-    # (asymmetric semantic, see module docstring). We do NOT include
+    # is read unless this project set SHARED_KG_READ_DISABLED=true (v0.2.46;
+    # the gate lives in `_kg_collections_to_search`). We do NOT include
     # DEVELOPMENT_COLLECTION here — graph traversal relies on WikiLinks
     # which are a knowledge-graph convention, not present in dev docs.
     collections_to_search: list[str] = _kg_collections_to_search(include_dev=False)
