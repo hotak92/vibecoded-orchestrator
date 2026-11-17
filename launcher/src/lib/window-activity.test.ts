@@ -202,4 +202,73 @@ describe('watchUserIdle: decorative motion rests when nobody is using the window
     vi.advanceTimersByTime(5000);
     expect(root.attrs.has(USER_IDLE_ATTR)).toBe(false);
   });
+
+  // A browser brand-checks the receiver of `setTimeout` / `clearTimeout`:
+  // called as a METHOD of any other object they throw — WebKit (Linux, macOS)
+  // "Can only call Window.setTimeout on instances of Window", Chromium
+  // (WebView2 on Windows) "Illegal invocation". Node's timers do not check,
+  // so the stubs below reproduce the browser rule.
+  //
+  // RED-PROOF: on the pre-fix tree the default `timers` was
+  // `{ set: setTimeout, clear: clearTimeout }` and `arm()` called
+  // `timers.set(...)`: both tests below throw "Illegal invocation" — in the
+  // app that was `startWindowActivity()` rejecting at its first statement, so
+  // neither `visibilitychange` nor the minimise listener was ever wired and
+  // no poll or animation paused.
+  function stubBrandCheckedTimers() {
+    const realSet = globalThis.setTimeout;
+    const realClear = globalThis.clearTimeout;
+    const check = (self: unknown) => {
+      if (self !== undefined && self !== globalThis) throw new TypeError('Illegal invocation');
+    };
+    vi.stubGlobal('setTimeout', function (this: unknown, fn: () => void, ms?: number) {
+      check(this);
+      return realSet(fn, ms);
+    });
+    vi.stubGlobal('clearTimeout', function (this: unknown, h: ReturnType<typeof setTimeout>) {
+      check(this);
+      realClear(h);
+    });
+  }
+
+  it('default timers call the globals with a receiver a browser accepts', async () => {
+    stubBrandCheckedTimers();
+    try {
+      const { watchUserIdle } = await import('./window-activity');
+      const target = new EventTarget();
+      let stop: (() => void) | undefined;
+      expect(() => {
+        stop = watchUserIdle(fakeRoot(), target);
+      }).not.toThrow();
+      // The re-arm path clears the pending timer, then sets a new one.
+      expect(() => target.dispatchEvent(new Event('keydown'))).not.toThrow();
+      expect(() => stop?.()).not.toThrow();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('startWindowActivity wires visibilitychange under browser timer rules', async () => {
+    stubBrandCheckedTimers();
+    const listened: string[] = [];
+    const root = fakeRoot();
+    vi.stubGlobal('document', {
+      documentElement: root,
+      visibilityState: 'hidden',
+      addEventListener: (name: string) => void listened.push(name),
+    });
+    vi.stubGlobal('window', new EventTarget());
+    try {
+      vi.resetModules();
+      const { startWindowActivity, isWindowActive, INACTIVE_ATTR } = await import('./window-activity');
+      await expect(startWindowActivity()).resolves.toBeUndefined();
+      expect(listened).toContain('visibilitychange');
+      // The hidden document was read: the window counts as inactive.
+      expect(isWindowActive()).toBe(false);
+      expect(root.attrs.has(INACTIVE_ATTR)).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.resetModules();
+    }
+  });
 });
