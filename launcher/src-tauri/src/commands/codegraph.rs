@@ -2145,6 +2145,10 @@ pub(crate) struct GitFacts {
     pub head: Option<String>,
     /// Is the recorded commit an ancestor of HEAD? Asked only when the two differ.
     pub recorded_is_ancestor: Option<bool>,
+    /// v0.2.107 (U-4): `git` itself could not be run (not on the launcher's
+    /// PATH, spawn error) — distinct from a `rev-parse` that ran and found no
+    /// HEAD (`head: None` with this `false`).
+    pub git_unavailable: bool,
 }
 
 /// The decision's answer: at most one pass, always with a reason the user sees.
@@ -2166,7 +2170,11 @@ fn short_sha(sha: &str) -> &str {
 ///    forced walk stays owed: no stamp is written, the next update asks again);
 /// 4. an owed forced walk handed to us → ONE full `--force-rewalk` pass;
 /// 5. no completed build, or a failed one → one full pass;
-/// 6. no git HEAD → nothing (the graph follows commits; Re-analyze is the
+/// 6. git could not be run at all → one full pass, as before v0.2.107 (the
+///    launcher cannot tell whether HEAD moved; a short GUI PATH must not
+///    silently stop every re-index);
+/// 6b. no git HEAD (a `rev-parse` that ran and failed: not a repository, no
+///    commit yet) → nothing (the graph follows commits; Re-analyze is the
 ///    user's full pass);
 /// 7. no recorded commit → one full pass (the baseline is re-proven);
 /// 8. HEAD equals the recorded commit → nothing. A dirty tree does not change
@@ -2223,6 +2231,13 @@ pub(crate) fn decide_post_bundle_codegraph_pass(
         }
         LastBuild::Completed | LastBuild::InFlight { .. } => {}
     }
+    if git.git_unavailable {
+        return full(
+            true,
+            false,
+            "git could not be run by the launcher, so whether HEAD moved is unknown".to_string(),
+        );
+    }
     let Some(head) = git.head.as_deref() else {
         return CodegraphPass::Nothing {
             reason: "no git HEAD in the project folder — the code graph follows \
@@ -2274,7 +2289,9 @@ pub(crate) fn codegraph_pass_notice(pass: &CodegraphPass) -> String {
 }
 
 /// The I/O half: HEAD of `folder` and, when it differs from `recorded`,
-/// whether `recorded` is its ancestor. Soft-fail to `None` everywhere.
+/// whether `recorded` is its ancestor. Soft-fail to `None` everywhere; a
+/// `git` that could not be spawned at all is reported as `git_unavailable`
+/// (U-4), never as "no HEAD".
 pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&str>) -> GitFacts {
     async fn git(folder: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
         tokio::process::Command::new("git")
@@ -2287,8 +2304,10 @@ pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&
             .await
             .ok()
     }
-    let head = git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"])
-        .await
+    let Some(rev_parse) = git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"]).await else {
+        return GitFacts { git_unavailable: true, ..GitFacts::default() };
+    };
+    let head = Some(rev_parse)
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
@@ -2304,7 +2323,7 @@ pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&
         }
         _ => None,
     };
-    GitFacts { head, recorded_is_ancestor }
+    GitFacts { head, recorded_is_ancestor, git_unavailable: false }
 }
 
 /// Persist code-graph provenance into the project's binding after a successful
@@ -3784,7 +3803,7 @@ mod v02107_post_bundle_pass_tests {
     const OLD: &str = "0000000000000000000000000000000000000000";
 
     fn git(head: Option<&str>, ancestor: Option<bool>) -> GitFacts {
-        GitFacts { head: head.map(str::to_string), recorded_is_ancestor: ancestor }
+        GitFacts { head: head.map(str::to_string), recorded_is_ancestor: ancestor, git_unavailable: false }
     }
 
     fn decide(walk: BundleCodegraphWalk, last: LastBuild, recorded: Option<&str>, g: GitFacts) -> CodegraphPass {
@@ -3869,6 +3888,42 @@ mod v02107_post_bundle_pass_tests {
     fn no_git_head_runs_nothing_once_a_build_completed() {
         let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(None, None));
         assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
+    }
+
+    /// U-4: git that could not be RUN is not "no HEAD" — one full pass with
+    /// prune (the pre-v0.2.107 pass), with a reason that names git, not the
+    /// folder. Leave-alone: a rev-parse that ran and found no HEAD still
+    /// queues nothing.
+    #[test]
+    fn git_that_cannot_run_queues_a_full_pass_not_nothing() {
+        let unavailable = GitFacts { git_unavailable: true, ..GitFacts::default() };
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), unavailable);
+        assert!(
+            matches!(
+                &p,
+                CodegraphPass::Run { mode: BuildMode::Full { prune_stale: true, force_rewalk: false }, reason }
+                    if reason.contains("git could not be run")
+            ),
+            "{p:?}"
+        );
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(None, None));
+        assert!(
+            matches!(&p, CodegraphPass::Nothing { reason } if reason.contains("no git HEAD")),
+            "{p:?}"
+        );
+    }
+
+    /// U-4, the I/O half: a folder where git runs but there is no repository
+    /// reads as "ran, no HEAD", not as "git unavailable".
+    #[tokio::test]
+    async fn probe_tells_no_repository_from_no_git() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return; // no git on this machine: nothing to tell apart
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        // (head is not asserted: a TMPDIR inside some repository has one)
+        let facts = probe_git_facts(td.path(), Some(OLD)).await;
+        assert!(!facts.git_unavailable, "{facts:?}");
     }
 
     #[test]
