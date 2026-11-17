@@ -277,6 +277,24 @@ pub async fn rebuild_code_graph(
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
+    // Audit N-1 (v0.2.107): read the stored pass shape BEFORE the PENDING
+    // write below clears it. A row the boot sweep failed after
+    // MAX_BOOT_REQUEUES still carries the owed shape, so this Retry runs an
+    // owed forced walk as a forced walk ([`retry_build_mode`]). A read error
+    // degrades to the plain re-analyse this command always ran.
+    let stored = match db.code_graph_build_pending_mode(&project.id) {
+        Ok(raw) => decode_pending_mode(raw.as_deref()),
+        Err(e) => {
+            tracing::warn!(
+                "[vct] warning: could not read the stored pass shape for {}: {}; \
+                 re-analysing without --force-rewalk",
+                project.id, e
+            );
+            None
+        }
+    };
+    let mode = retry_build_mode(prune_stale, stored.as_ref());
+
     db.upsert_code_graph_build(
         &project.id,
         build_status::PENDING,
@@ -293,7 +311,11 @@ pub async fn rebuild_code_graph(
         "code_graph_rebuild",
         Some(&project.id),
         None,
-        &serde_json::json!({ "name": project.name, "prune_stale": prune_stale }),
+        &serde_json::json!({
+            "name": project.name,
+            "prune_stale": prune_stale,
+            "force_rewalk": matches!(mode, BuildMode::Full { force_rewalk: true, .. }),
+        }),
     )?;
 
     // W3 / v0.2.16 (plan 0.9): re-analyzing a project is the most common
@@ -314,7 +336,7 @@ pub async fn rebuild_code_graph(
         );
     }
 
-    spawn_initial_build(app, project.id, project.name, project.folder_path, prune_stale);
+    spawn_build(app, project.id, project.name, project.folder_path, mode);
     Ok(())
 }
 
@@ -391,6 +413,10 @@ pub(crate) fn spawn_resumed_build(
 ///    (`pending_mode`) goes back to 'pending' and is resumed in phase 2
 ///    with that shape — the exception to phase 1's "no silent re-spawn":
 ///    the pass is owed by the update, not a user action to re-confirm.
+///    Bounded (audit N-1): at most `MAX_BOOT_REQUEUES` (3) boots per owed
+///    pass, counted in the row (`pending_requeues`); after that the row
+///    falls to phase 1 like any other and waits for the user's Retry, which
+///    still runs an owed forced walk as one ([`retry_build_mode`]).
 ///
 /// 1. **Mark stale-running rows as failed.** A 'running' row left over
 ///    from a previous launcher process is a stale ghost — its subprocess
@@ -431,7 +457,10 @@ pub fn resume_pending_builds(
     // where the row reads `running`). Put it back to `pending` so phase 2
     // resumes it with that shape; failing it would turn an owed forced walk
     // into a Retry without `--force-rewalk`. Shapeless rows are untouched and
-    // swept below exactly as before.
+    // swept below exactly as before. Audit N-1: a row already requeued
+    // MAX_BOOT_REQUEUES times (or whose count is unreadable) is NOT requeued
+    // — a walk that takes the launcher down must not re-run at every start;
+    // the sweep below fails it and Retry is the user's call.
     match db.requeue_interrupted_decided_code_graph_builds() {
         Ok(ids) if !ids.is_empty() => tracing::info!(
             "[vct] code-graph boot-resume: requeued {} interrupted decided pass(es) \
@@ -2086,6 +2115,18 @@ pub(crate) fn resumed_build_mode(stored: Option<BuildMode>, git: &GitFacts) -> B
             }
         }
     }
+}
+
+/// PURE (v0.2.107 audit N-1): the shape a user Retry / Re-analyse
+/// (`rebuild_code_graph`) runs. Always a full pass with the caller's
+/// `prune_stale`; `--force-rewalk` is added when the row still stores an owed
+/// forced walk — a decided pass the boot sweep failed after
+/// `MAX_BOOT_REQUEUES`, or one still queued — so the Retry the failure
+/// message asks for writes the generation stamp that walk owed. A stored
+/// incremental pass is covered by the full pass and adds nothing.
+pub(crate) fn retry_build_mode(prune_stale: bool, stored: Option<&BuildMode>) -> BuildMode {
+    let force_rewalk = matches!(stored, Some(BuildMode::Full { force_rewalk: true, .. }));
+    BuildMode::Full { prune_stale, force_rewalk }
 }
 
 /// How the project's `code_graph_builds` row reads for this decision.
@@ -4007,6 +4048,33 @@ mod v02107_post_bundle_pass_tests {
         );
         assert_eq!(decode_pending_mode(None), None);
         assert_eq!(decode_pending_mode(Some("{\"kind\":\"from-the-future\"}")), None);
+    }
+
+    /// N-1: the Retry after the boot cap runs an owed forced walk as a forced
+    /// walk; every other stored shape (or none) gives the plain re-analyse,
+    /// with the caller's prune either way.
+    #[test]
+    fn retry_after_the_boot_cap_keeps_an_owed_forced_walk() {
+        let forced = BuildMode::Full { prune_stale: true, force_rewalk: true };
+        assert_eq!(
+            retry_build_mode(true, Some(&forced)),
+            BuildMode::Full { prune_stale: true, force_rewalk: true }
+        );
+        assert_eq!(
+            retry_build_mode(false, Some(&forced)),
+            BuildMode::Full { prune_stale: false, force_rewalk: true }
+        );
+        for other in [
+            None,
+            Some(BuildMode::Full { prune_stale: true, force_rewalk: false }),
+            Some(BuildMode::Incremental { since_commit: OLD.into() }),
+        ] {
+            assert_eq!(
+                retry_build_mode(true, other.as_ref()),
+                BuildMode::Full { prune_stale: true, force_rewalk: false },
+                "{other:?}"
+            );
+        }
     }
 
     /// U-1 act: a pending FORCED walk, launcher restarted → the resumed run's

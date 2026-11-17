@@ -819,7 +819,8 @@ impl Db {
                          started_at = excluded.started_at,
                          finished_at = NULL,
                          error_message = NULL,
-                         pending_mode = NULL",
+                         pending_mode = NULL,
+                         pending_requeues = 0",
                     params![project_id, now],
                 ) {
                     Ok(_) => report.codegraph_enqueued = true,
