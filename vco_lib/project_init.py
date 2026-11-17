@@ -606,8 +606,8 @@ def live_fingerprint_stale(
         this is the case ``detect_kg_schema_drift`` does NOT catch — it only
         checks slot *presence*, not *dim*).
       - A merely-additive difference (catalog has an OPTIONAL slot the live
-        collection lacks) is NOT stale — the existing copy-with-vectors /
-        patch_props path adds it without re-embedding. The catalog
+        collection lacks) is NOT stale — the in-place ``add_slots`` /
+        ``patch_props`` path adds it without re-embedding. The catalog
         fingerprint (:func:`vco_lib.weaviate_schema.embedding_schema_fingerprint`)
         documents the embed-relevant identity; this probe is its live
         counterpart.

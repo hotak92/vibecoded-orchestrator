@@ -311,8 +311,8 @@ def embedding_schema_fingerprint(name: str) -> str:
     pairs (sorted for order-independence — Weaviate treats vectorConfig as an
     unordered map). It deliberately EXCLUDES property additions, descriptions,
     inverted-index flags, and the schema VERSION integer — none of those
-    require re-embedding (a new property or an additive slot is a
-    copy-with-vectors / patch_props operation, never a re-embed).
+    require re-embedding (a new property or an additive slot is an in-place
+    ``add_slots`` / ``patch_props`` operation, never a re-embed).
 
     Two collections with the same fingerprint hold vectors that are still
     valid under the current catalog → NO re-embed needed. A changed
