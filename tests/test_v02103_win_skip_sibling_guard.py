@@ -101,7 +101,12 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: ::test_a_symlinked_checkpoint_is_managed creates a symlink, which needs a
 #: privilege Windows runners lack — a POSIX-only primitive, no .ps1 sibling; the
 #: marker/plain ownership classes were split out and run on Windows too.
-NON_CONVENTION_BASELINE = 193
+#: 193 -> 194 (v0.2.107 audit): tests/test_v02105_hub_supervision.py
+#: ::test_detached_hub_starter_is_reaped reads /proc for a zombie and uses a
+#: `#!/bin/sh` starter — POSIX-only primitives, no .ps1 sibling; the reap itself
+#: (`wait()` called on the starter) is asserted on every OS in
+#: tests/test_v0292_hub_ensure.py::test_real_spawn_invokes_start_if_not_running.
+NON_CONVENTION_BASELINE = 194
 
 
 # -- which conditions skip on Windows --------------------------------------
