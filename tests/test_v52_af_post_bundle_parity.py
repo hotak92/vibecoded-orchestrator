@@ -232,7 +232,7 @@ def test_create_project_v2_calls_apply_post_bundle_steps() -> None:
         "`is_initial_create: true` to `apply_post_bundle_steps`. On "
         "first create no per-project code-graph rows can be stale, so "
         "prune_stale must be false (audit AF-6). Passing `false` here "
-        "would let codegraph::spawn_initial_build do a no-op prune "
+        "would let codegraph::spawn_build do a no-op prune "
         "pass — wasteful but not catastrophic. Passing the wrong value "
         "is still a real regression."
     )

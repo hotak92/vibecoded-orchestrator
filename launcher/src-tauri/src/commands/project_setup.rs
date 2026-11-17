@@ -19,7 +19,7 @@
 //!   - is the re-entrancy LOCK: the row IS the lock — a 2nd setup for a
 //!     project whose row is `pending`/`running` is refused (F7).
 //!
-//! Mirrors the shape of `codegraph::spawn_initial_build` (detach + row +
+//! Mirrors the shape of `codegraph::spawn_build` (detach + row +
 //! event), but the per-mode WORK is supplied as an async CLOSURE
 //! ([`SetupPhaseFn`]) so create and update — which DIVERGE — can each
 //! provide their own phase sequence without a single mega-spawn fork.
@@ -230,7 +230,7 @@ fn project_still_exists(app: &AppHandle, project_id: &str) -> bool {
 /// Public entry point used by `create_project_v2` (and, later, the update
 /// flow). Owns the detach + row lifecycle + event plumbing + re-entrancy
 /// guard; the per-mode WORK is the `phase_fn` closure. Returns `()` — never
-/// blocks, mirroring `codegraph::spawn_initial_build`.
+/// blocks, mirroring `codegraph::spawn_build`.
 ///
 /// Contract: the caller has ALREADY inserted a `pending` `project_setups`
 /// row (so the GUI can render an immediate "queued" banner and so the

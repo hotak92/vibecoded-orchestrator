@@ -138,7 +138,7 @@ pub async fn codegraph_grant_access(
 // emitted on the `code-graph-build-progress` Tauri event.
 //
 // Behaviour:
-//   1. `create_project_v2` calls `spawn_initial_build` AFTER the project
+//   1. `create_project_v2` calls `spawn_build` AFTER the project
 //      row is inserted. The spawn is fire-and-forget — project create
 //      returns immediately to the user.
 //   2. Pre-check: if the project folder has no supported source files
@@ -340,30 +340,10 @@ pub async fn rebuild_code_graph(
     Ok(())
 }
 
-/// Public entry point used by `create_project_v2` (and the rebuild
-/// command). Spawns a background task; never blocks. The caller has
-/// already inserted a `pending` row into `code_graph_builds`.
-pub fn spawn_initial_build(
-    app: AppHandle,
-    project_id: String,
-    project_name: String,
-    folder_path: String,
-    // W1+W3 wire-up / v0.2.16 (plan 1.4): see `rebuild_code_graph`
-    // doc. `false` is the right default for genuinely-first builds
-    // (no pre-existing rows to prune). Re-builds set this to `true`
-    // by default; the wizard's checkbox is the user-controlled path.
-    prune_stale: bool,
-) {
-    spawn_build(
-        app,
-        project_id,
-        project_name,
-        folder_path,
-        BuildMode::Full { prune_stale, force_rewalk: false },
-    );
-}
-
-/// v0.2.107 (UPDATE-ALL): spawn a build of an explicit [`BuildMode`] — the
+/// The one entry point that starts a code-graph build (project create, the
+/// rebuild command, the post-bundle path, boot resume). Spawns a background
+/// task and never blocks; the caller has already written the build row.
+/// v0.2.107 (UPDATE-ALL): it takes an explicit [`BuildMode`] — the
 /// post-bundle path runs whatever [`decide_post_bundle_codegraph_pass`]
 /// decided (incremental since the recorded commit, or a forced full walk).
 pub(crate) fn spawn_build(
@@ -427,7 +407,7 @@ pub(crate) fn spawn_resumed_build(
 ///
 /// 2. **Re-spawn pending rows.** A 'pending' row means the previous
 ///    `create_project_v2` / `rebuild_code_graph` inserted the row but
-///    crashed before `spawn_initial_build` actually ran (or phase 0 put it
+///    crashed before `spawn_build` actually ran (or phase 0 put it
 ///    back). Re-spawn here so the build picks up on next boot, with its
 ///    stored shape when it has one ([`resumed_build_mode`]).
 ///
@@ -842,7 +822,7 @@ async fn run_build_task(
     };
 
     // 4. Build args. First runs and user re-builds (rebuild_code_graph →
-    //    spawn_initial_build) are full passes. v0.2.107 (UPDATE-ALL): the
+    //    spawn_build) are full passes. v0.2.107 (UPDATE-ALL): the
     //    post-bundle path passes the mode `decide_post_bundle_codegraph_pass`
     //    chose from the recorded commit and HEAD — an `--incremental
     //    --since-commit <recorded>` pass when HEAD moved, a forced full walk
@@ -3317,7 +3297,7 @@ mod build_tests {
     }
 
     /// Race-fix regression test (2026-05-06): codifies the invariant that
-    /// `create_project_v2` must establish before `spawn_initial_build`
+    /// `create_project_v2` must establish before `spawn_build`
     /// runs. Pre-fix the spawn was issued BEFORE `run_install_bundle`
     /// dropped `.claude/scripts/code-graph-analyze`; the background
     /// build task therefore raced ahead, found nothing, and failed with

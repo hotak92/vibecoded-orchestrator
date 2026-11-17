@@ -10,7 +10,7 @@
 //! service's fixed semaphore shed 503s under the burst and 89 CodeFunction
 //! rows were written VECTORLESS (`embed_revision=0`). The outer update loop
 //! (`projects_v2::update_all_projects`) is serial, but each
-//! `update_project_v2` fires-and-forgets `codegraph::spawn_initial_build` +
+//! `update_project_v2` fires-and-forgets `codegraph::spawn_build` +
 //! `kg_sync::spawn_initial_sync` (each `tokio::spawn`), so N projects → up to
 //! ~2N concurrent GPU workloads with nothing bounding cross-project concurrency.
 //!
