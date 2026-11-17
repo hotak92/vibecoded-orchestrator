@@ -173,7 +173,11 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
             "chunk_number": 0,
         },
     )
-    patch(srv, "_enrich_with_adjacent_chunks", lambda coll, formatted, name: formatted)
+    def _adjacent(coll, formatted, name, **kwargs):
+        state.setdefault("neighbour_floors", []).append(kwargs.get("min_score"))
+        return formatted
+
+    patch(srv, "_enrich_with_adjacent_chunks", _adjacent)
     patch(srv, "_extract_obj_vector", lambda obj, slot: obj.vector.get(slot))
     patch(srv, "_get_result_verbosity_by_score", lambda score: "discard")
     patch(srv, "_rl_enrich_nodes_with_linked_embs", _fake_enrich(state))
@@ -269,9 +273,12 @@ def import_rl_kg_search():
 
 
 def run_main(mod, query: str = "dual log query", limit: int = 1,
-             task_type: str = "pre_edit_kg_search") -> None:
+             task_type: str = "pre_edit_kg_search",
+             injection_profile: str | None = None) -> None:
     saved = sys.argv
     sys.argv = ["rl_kg_search.py", query, "--limit", str(limit), "--hook-format"]
+    if injection_profile:
+        sys.argv += ["--injection-profile", injection_profile]
     if task_type:
         sys.argv += ["--task-type", task_type]
     try:

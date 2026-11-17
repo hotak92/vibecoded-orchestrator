@@ -1,25 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.101 §9 — the query cache must NEVER cache an empty or timed-out result.
+"""v0.2.107 — cache only a FINISHED empty result, for exactly 300 s.
 
-Lineage: the kickoff probe (reviews/V02101-INJECTION-KICKOFF-PROBES-2026-10-05.md,
-Cause 1b) found the SHELL cache (`_lib/query-cache.sh` + `codegraph_query_block`)
-storing 0-byte blobs for killed legs, poisoning each key for the whole 900 s
-TTL — a re-Read of the same file was a fast EMPTY hit. Wave 1 fixed and
-red-proved that on the shell side. Wave 3 (review SF-2/nit-6) then RETIRED the
-shell cache entirely with its last callers (`codegraph_query_block`,
-`vco_dual_search_cached`, `vco_kg_search_cached` via pre-tool-use §5): the
-surviving home of the contract is the ROUTER's Python cache
-(`hook_context_router.cache_get/cache_put`, same state dir, same
-sha1-of-0x1f-joined key algorithm, disjoint `kgi`/`cgi` namespaces).
-
-These pins hold the contract at that home:
-  * ACT   — an empty put writes NOTHING; a leg that produced nothing is
-            indistinguishable from a killed leg, so neither may poison the key;
-  * ACT   — a pre-existing EMPTY entry (any older writer) reads as a MISS and
-            is removed (self-heal);
-  * LEAVE-ALONE — non-empty round-trip, TTL staleness, key determinism and
-            namespace disjointness behave as designed.
+The v0.2.101 poisoning fix established that a zero-byte capture from a killed
+or timed-out leg must never poison a key. The v0.2.107 owner ruling narrows
+that rule: a leg that finishes with nothing above the score floor is a real
+answer and may be negatively cached for 300 s; a timeout or error remains
+uncached. Zero-byte legacy entries still read as misses and self-heal.
+Non-empty round-trip, ordinary TTL staleness, key determinism and namespace
+disjointness are unchanged.
 """
 from __future__ import annotations
 
@@ -47,8 +36,8 @@ def _cache_file(proj: Path, key: str) -> Path:
     return proj / ".claude" / "state" / "query_cache" / key
 
 
-class TestNeverCacheEmpty:
-    def test_put_empty_writes_nothing(self, proj: Path) -> None:
+class TestEmptyByCompletion:
+    def test_unclassified_empty_put_writes_nothing(self, proj: Path) -> None:
         key = router.cache_key("cgi", "emptysym", "edit", "f.py", "p1")
         router.cache_put(str(proj), key, "")
         assert not _cache_file(proj, key).exists()
@@ -70,6 +59,16 @@ class TestNeverCacheEmpty:
         leg_result = ""  # what run_legs returns for an abandoned leg
         router.cache_put(str(proj), key, leg_result)
         assert not _cache_file(proj, key).exists()
+        assert router.cache_get(str(proj), key) is None
+
+    def test_finished_empty_round_trips_for_300_seconds(self, proj: Path) -> None:
+        key = router.cache_key("kgi", "prompt", "finished empty", "3")
+        router.cache_finished_empty(str(proj), key)
+        f = _cache_file(proj, key)
+        assert f.exists() and f.stat().st_size > 0
+        assert router.cache_get(str(proj), key) == ""
+        old = time.time() - 301
+        os.utime(f, (old, old))
         assert router.cache_get(str(proj), key) is None
 
 

@@ -861,7 +861,14 @@ class TestHookCallSitesForwardTranscript:
             "defect class WP-E targeted."
         )
 
-    def test_router_scopes_its_cache_keys_by_prompt_id(self) -> None:
+    def test_router_cache_keys_are_not_prompt_scoped(self) -> None:
+        """v0.2.107 (audit A-008, owner-approved fix): the router's ``kgi``
+        and ``cgi`` cache keys no longer carry ``prompt_id`` — the R31
+        per-turn scoping made every turn re-run identical retrievals (an
+        identical re-Read cost 57-59 Weaviate requests and emitted nothing).
+        The code-graph key is per symbol; a KG entry is reused across turns
+        for its TTL, so a short trigger's transcript enrichment is the one
+        from the turn that filled the entry (accepted trade-off)."""
         body = (_repo_root() / _ROUTER_REL).read_text(encoding="utf-8")
 
         def _call_text(start: int) -> str:
@@ -880,12 +887,11 @@ class TestHookCallSitesForwardTranscript:
         for namespace in ("kgi", "cgi"):
             idx = body.find(f'cache_key("{namespace}"')
             assert idx > 0, f"the router's {namespace} cache namespace went missing"
-            assert "prompt_id" in _call_text(idx), (
-                f"the {namespace} cache key must be prompt_id-scoped "
-                "(R31/coordinator condition 4): two turns issuing the same "
-                "short trigger embed differently and must not collide on one "
-                "cache entry"
-            )
+            while idx > 0:
+                assert "prompt_id" not in _call_text(idx), (
+                    f"the {namespace} cache key must not be prompt_id-scoped "
+                    "(v0.2.107 A-008)")
+                idx = body.find(f'cache_key("{namespace}"', idx + 1)
 
     @pytest.mark.parametrize("rel_path", _SH_WRAPPER_SITES)
     def test_sh_wrappers_pipe_the_full_payload_to_the_router(self, rel_path: str) -> None:

@@ -98,6 +98,7 @@ DIFFERENT calls.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -222,8 +223,9 @@ def _resolve_project_root(payload: Dict) -> str:
 # retirement of _lib/query-cache.{sh,ps1} this algorithm has ONE owner: this
 # file. The namespaces ("kgi"/"cgi") are the guard that must hold:
 # profile-gated blocks must never
-# be served under the legacy surfaces' keys. §9: an EMPTY result is NEVER
-# written, and an empty stored file reads as a miss (self-heal).
+# be served under the legacy surfaces' keys. v0.2.107: a leg that FINISHED
+# with nothing above its floor is cached as empty for 300 s; a timeout or
+# error is never cached as empty. A zero-byte legacy entry still self-heals.
 
 
 def _cache_dir(project_root: str) -> Optional[Path]:
@@ -242,6 +244,10 @@ def cache_key(*parts: str) -> str:
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()
 
 
+_FINISHED_EMPTY = "\x1e"
+FINISHED_EMPTY_TTL_S = 300.0
+
+
 def cache_get(project_root: str, key: str) -> Optional[str]:
     d = _cache_dir(project_root)
     if d is None or not key:
@@ -250,15 +256,16 @@ def cache_get(project_root: str, key: str) -> Optional[str]:
     try:
         if not f.is_file():
             return None
-        ttl = env_int("VCO_QUERY_CACHE_TTL", 900, minimum=1)
+        blob = f.read_text(encoding="utf-8", errors="replace")
+        ttl = (FINISHED_EMPTY_TTL_S if blob == _FINISHED_EMPTY else
+               float(env_int("VCO_QUERY_CACHE_TTL", 900, minimum=1)))
         age = time.time() - f.stat().st_mtime
         if age >= ttl:
             return None
-        blob = f.read_text(encoding="utf-8", errors="replace")
         if not blob:
-            f.unlink(missing_ok=True)  # §9 self-heal of legacy poison
+            f.unlink(missing_ok=True)  # self-heal a legacy zero-byte poison entry
             return None
-        return blob
+        return "" if blob == _FINISHED_EMPTY else blob
     except OSError:
         return None
 
@@ -274,7 +281,7 @@ def cache_leg_output(project_root: str, key: str, blob: str) -> None:
 
 
 def cache_put(project_root: str, key: str, blob: str) -> None:
-    if not key or not blob:  # §9: empty is NEVER cached
+    if not key or not blob:  # a timeout/error's empty capture is never cached
         return
     d = _cache_dir(project_root)
     if d is None:
@@ -290,6 +297,11 @@ def cache_put(project_root: str, key: str, blob: str) -> None:
         atomic_write_text(d / key, blob, fsync=False)
     except OSError:
         pass
+
+
+def cache_finished_empty(project_root: str, key: str) -> None:
+    """Remember an answered-empty leg for 300 s, never a timeout or error."""
+    cache_put(project_root, key, _FINISHED_EMPTY)
 
 
 # --- seen-store (Python parity with _lib/seen-store.sh) ------------------------
@@ -438,10 +450,14 @@ def filter_seen_blocks(text: str, inject_file: str, reads_file: str,
 
 def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
                                  project_root: str = "",
-                                 suppressed_out: Optional[List[str]] = None) -> str:
-    """The filter body — callers go through :func:`filter_seen_blocks`."""
+                                 suppressed_out: Optional[List[str]] = None,
+                                 record: bool = True) -> str:
+    """The filter body — callers go through :func:`filter_seen_blocks`.
+
+    ``record=False`` is the router's read-only cached-replay check.
+    """
     dedup_on = bool(inject_file)
-    if dedup_on:
+    if dedup_on and record:
         try:
             with open(inject_file, "a", encoding="utf-8"):
                 pass  # touch (the shell's `touch "$inject_file"` gate)
@@ -475,7 +491,7 @@ def _filter_seen_blocks_unlocked(text: str, inject_file: str, reads_file: str,
                 suppress = True
         if not suppress:
             out.extend(cur_block)
-            if dedup_on:
+            if dedup_on and record:
                 try:
                     with open(inject_file, "a", encoding="utf-8") as fh:
                         fh.write(key + "\n")
@@ -601,31 +617,52 @@ WARM_LEG_GC_AGE_S = 7 * 24 * 3600.0
 
 
 def _budget_gc(project_root: str) -> None:
-    """Opportunistic GC of the router's small state files (bounded scan):
-    per-turn budget files after 1 day, and the L4 leg-warmer's
-    ``warm_leg_*`` claim files after a week — :func:`vco_lib.atomic.claim_once`
-    leaves a claim on disk by design, so without this sweep one file per
-    distinct missed cache key accumulated forever (review R1 C2). Also the
-    warmer's HELD citation ctxs (``rl_warm_held/``) once the query cache
-    they belong to has expired: nobody can be shown that entry any more, so
-    the retrieval was never seen (v0.2.105)."""
+    """Hourly full-scan GC for the router's small state files.
+
+    The scan is never truncated at 200 entries: a young first page must not
+    hide older garbage behind it. One stamp read per hook is the normal cost;
+    directory scans and the single stamp write happen at most once an hour.
+    """
     if not project_root:
         return
     now = time.time()
+    state = Path(project_root) / ".claude" / "state"
+    stamp = state / "router_gc.stamp"
     try:
-        state = Path(project_root) / ".claude" / "state"
-        for pattern, max_age in (("inject_budget_*", BUDGET_GC_AGE_S),
-                                 ("warm_leg_*", WARM_LEG_GC_AGE_S),
-                                 (f"{_WARM_HELD_DIRNAME}/*",
-                                  float(env_int("VCO_QUERY_CACHE_TTL", 900,
-                                                minimum=1)))):
-            cutoff = now - max_age
-            for f in list(state.glob(pattern))[:200]:
-                try:
-                    if f.is_file() and f.stat().st_mtime < cutoff:
-                        f.unlink()
-                except OSError:
+        if now - stamp.stat().st_mtime < 3600:
+            return
+    except OSError:
+        pass
+
+    def sweep(directory: Path, max_age: float, predicate) -> None:
+        cutoff = now - max_age
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        for entry in entries:
+            try:
+                if not predicate(entry.name) or not entry.is_file(follow_symlinks=False):
                     continue
+                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    Path(entry.path).unlink()
+            except OSError:
+                continue
+
+    cache_ttl = float(env_int("VCO_QUERY_CACHE_TTL", 900, minimum=1))
+    sweep(state, BUDGET_GC_AGE_S, lambda n: n.startswith("inject_budget_"))
+    sweep(state, WARM_LEG_GC_AGE_S, lambda n: n.startswith("warm_leg_"))
+    # Per-session files of chats idle for two weeks: the keyword matcher's
+    # dedup file (templates/scripts/agent-skill-keyword-match.py writes it in
+    # this same state dir; this sweep is its one GC home) and the seen-store.
+    sweep(state, 14 * 24 * 3600.0, lambda n: n.startswith((
+        "keyword_suggest_", "seen_inject_", "seen_reads_", "seen_cginject_count_")))
+    sweep(state / "query_cache", cache_ttl, lambda _n: True)
+    sweep(state / _WARM_HELD_DIRNAME, cache_ttl, lambda _n: True)
+    try:
+        from vco_lib.atomic import atomic_write_text
+
+        atomic_write_text(stamp, str(int(now)) + "\n", fsync=False)
     except OSError:
         pass
 
@@ -913,6 +950,67 @@ _PLAN_BUILDERS = {
 # --- legs ---------------------------------------------------------------------
 
 
+HOOK_QUERY_SLOTS = 2
+HOOK_QUERY_SLOT_WAIT_S = 5.0
+
+
+@contextlib.contextmanager
+def _query_slot(wait_s: Optional[float] = None):
+    """Hold one of ``HOOK_QUERY_SLOTS`` machine-wide query slots (A-008).
+
+    Owner ruling (v0.2.107): at most two routers query Weaviate at once across
+    every session and project on the machine; a router with no free slot
+    WAITS up to five seconds, then skips its legs for that fire (yields
+    False) with one stderr line. The slots are :func:`vco_lib.atomic.
+    machine_slot`'s — one mechanism, not a second semaphore. ``machine_slot``
+    queues forever (a background-driver contract), so the take runs in a
+    daemon holder thread: on the interactive timeout the holder is told to
+    let go of any slot it takes later without running anything, so a skipped
+    fire neither runs unbounded nor leaks a slot.
+
+    If the slot directory itself cannot be used (``machine_slot`` raises),
+    the run proceeds unbounded with a stderr line — the same degradation
+    ``machine_slot`` applies where file locks are unsupported; the bound is a
+    resource cap, never a reason to silence injection for good.
+    """
+    from vco_lib.atomic import machine_slot
+    from vco_lib.paths import vct_root_dir
+
+    if wait_s is None:
+        wait_s = HOOK_QUERY_SLOT_WAIT_S
+    acquired = threading.Event()
+    release = threading.Event()
+    failed = threading.Event()
+
+    def hold() -> None:
+        try:
+            with machine_slot(vct_root_dir() / "hook_router_slots",
+                              slots=HOOK_QUERY_SLOTS,
+                              wait_s=wait_s, poll_s=0.05):
+                acquired.set()
+                release.wait()
+        except Exception as exc:  # noqa: BLE001
+            failed.set()
+            acquired.set()
+            print(f"[hook_context_router] query slot unusable, running unbounded: {exc!r}",
+                  file=sys.stderr)
+
+    holder = threading.Thread(target=hold, name="vco-hook-query-slot", daemon=True)
+    holder.start()
+    if not acquired.wait(wait_s):
+        release.set()
+        print(f"[hook_context_router] no query slot within {wait_s:g} s; "
+              "skipping injection for this fire", file=sys.stderr)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        release.set()
+        if not failed.is_set():
+            holder.join(timeout=0.2)
+
+
 def _resolve_kg_script() -> Path:
     env = (os.environ.get("VCO_ROUTER_KG_SCRIPT") or "").strip()
     if env:
@@ -952,41 +1050,38 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
     cg_text = ""
     kg_key = ""
     kg_served_key = ""
-    cg_keys: Dict[str, str] = {}
+    cg_keys: Dict[int, Tuple[str, str, str]] = {}
 
     if plan.kg_profile and plan.kg_query:
         kg_key = cache_key("kgi", plan.kg_profile, plan.kg_query,
-                           str(plan.kg_limit), prompt_id)
+                           str(plan.kg_limit))
         cached = cache_get(project_root, kg_key)
         if cached is not None:
             kg_text = cached
             kg_served_key = kg_key  # v0.2.105: may carry a warmer-held ctx
             kg_key = ""  # served; nothing to put back
     policy = cg_policy(plan.cg_profile) if plan.cg_profile else None
-    cg_symbol_texts: List[str] = []
+    cg_symbol_texts: Dict[int, str] = {}
     if policy is not None and policy.enabled and plan.cg_symbols:
         count_file = _cg_count_path(sid, project_root)
         if _cg_capped(count_file):
             plan.cg_symbols = []  # session cap reached — skip the leg entirely
             plan.intent_out["cg_capped"] = True
         else:
-            for symbol, source_file in plan.cg_symbols:
-                key = cache_key("cgi", plan.cg_profile, symbol, source_file, prompt_id)
+            for index, (symbol, source_file) in enumerate(plan.cg_symbols):
+                key = cache_key("cgi", plan.cg_profile, symbol, source_file)
                 cached = cache_get(project_root, key)
                 if cached is not None:
-                    cg_symbol_texts.append(cached)
+                    cg_symbol_texts[index] = cached
                 else:
-                    cg_keys[symbol] = key
+                    cg_keys[index] = (key, symbol, source_file)
     else:
         plan.cg_symbols = []
 
     legs: Dict[str, Callable[[], None]] = {}
-    cg_fresh = ""  # L4: the fresh (uncached) CG run's output, "" when missed
-    # L4 (v0.2.102 W6-C1): what a detached cache-warmrer needs to RE-RUN a
-    # registered leg out-of-band (script path + pinned argv). Populated only
-    # where the leg is actually built; consumed after the join.
+    # L4: what a detached cache-warmer needs to re-run a timed-out/error leg.
     warm_kg: Dict[str, object] = {}
-    warm_cg: Dict[str, object] = {}
+    warm_cg: Dict[int, Dict[str, object]] = {}
 
     # v0.2.104 E-2: the producer modules are LOADED inside their leg (the
     # worker thread), never here in the main thread. A cold producer import
@@ -1037,74 +1132,115 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
         cg_script = _resolve_cg_script(project_root)
         if cg_script is not None:
             try:
-                if len(cg_keys) == 1:
-                    # L4: only the sole-symbol run is cached (mirroring the
-                    # cache write below), so only it is warmable.
-                    only_sym = next(iter(cg_keys))
-                    only_src = next(
-                        (sf for sym, sf in plan.cg_symbols if sym == only_sym), "")
-                    warm_cg = {"script": str(cg_script),
-                               "argv": [str(a) for a in _cg_argv(
-                                   only_sym, only_src, policy, plan.cg_profile)]}
+                cg_module = None
+                cg_module_lock = threading.Lock()
+                for index, (key, symbol, source_file) in cg_keys.items():
+                    argv = _cg_argv(symbol, source_file, policy, plan.cg_profile)
+                    warm_cg[index] = {"script": str(cg_script),
+                                      "argv": [str(a) for a in argv]}
 
-                def _cg_leg(script=cg_script, items=tuple(cg_keys.items()), pol=policy) -> None:
-                    mod = _hds._load_cg_module(script)
-                    for symbol, _key in items:
-                        source_file = next(
-                            (sf for sym, sf in plan.cg_symbols if sym == symbol), "")
-                        _hds._pin_argv(mod, _cg_argv(symbol, source_file, pol, plan.cg_profile))
-                        mod.main()
+                    def _cg_leg(script=cg_script, cg_argv=tuple(argv)) -> None:
+                        nonlocal cg_module
+                        # One producer import and one argv shim, serialized as
+                        # before; only the per-symbol captures are independent.
+                        with cg_module_lock:
+                            if cg_module is None:
+                                cg_module = _hds._load_cg_module(script)
+                            _hds._pin_argv(cg_module, [str(a) for a in cg_argv])
+                            cg_module.main()
 
-                legs["cg"] = _cg_leg
+                    legs[f"cg_{index}"] = _cg_leg
             except BaseException as exc:  # noqa: BLE001
                 print(f"[hook_context_router] CG leg setup failed: {exc!r}",
                       file=sys.stderr)
 
-    if legs:
-        remaining = deadline - time.monotonic()
-        leg_timeout = min(env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0, above=0),
-                          max(remaining, 0.1))
-        results = _hds.run_legs(legs, leg_timeout_s=leg_timeout)
+    # v0.2.107 (A-008): only a run that has a leg to RUN takes a machine-wide
+    # query slot; cache hits never wait. No slot within 5 s → the uncached
+    # legs are skipped for this fire (nothing cached, nothing warmed) and
+    # only what the cache already held is returned.
+    slot = _query_slot() if legs else contextlib.nullcontext(False)
+    with slot as acquired:
+        if legs and not acquired:
+            legs = {}
+            kg_key = ""
+            cg_keys = {}
+        results = None
+        if legs:
+            remaining = deadline - time.monotonic()
+            leg_timeout = min(env_float("VCO_INJECT_LEG_TIMEOUT_S", 4.0, above=0),
+                              max(remaining, 0.1))
+            results = _hds.run_legs(legs, leg_timeout_s=leg_timeout)
+    if results is not None:
+        statuses = getattr(results, "status", {})
+        warm_spec: Dict[str, Dict] = {}
         if kg_key:
             kg_text = (results.get("kg") or "").strip()
-            if kg_text:
-                cache_leg_output(project_root, kg_key, kg_text + "\n")
-                kg_text = kg_text + "\n"
-        if cg_keys:
-            raw = (results.get("cg") or "").strip()
-            cg_fresh = raw
-            if raw:
-                # One combined blob for the run (the per-symbol cache entries
-                # are keyed on the symbol; a combined blob is cached under
-                # each requested symbol's key ONLY when it was the sole
-                # query — multi-symbol runs skip the cache to avoid
-                # cross-symbol poisoning).
-                cg_symbol_texts.append(raw + "\n")
-                if len(cg_keys) == 1:
-                    only_key = next(iter(cg_keys.values()))
-                    cache_leg_output(project_root, only_key, raw + "\n")
-        # L4 (v0.2.102 W6-C1, owner ruling 2026-10-07): the interactive
-        # deadline still governs what is injected NOW, but a leg that missed
-        # it no longer dies uncached — on slow hardware the cache never
-        # warmed and injection stayed silent forever. Hand the miss to a
-        # DETACHED warmer (below) that completes the producer run and writes
-        # the cache, so the NEXT identical call is a cache hit. A leg that
-        # genuinely produced nothing also lands here once; the warmer
-        # re-runs it, gets the same nothing and caches nothing (§9 — an
-        # empty result is NEVER cached), so the next call still re-probes.
-        warm_spec: Dict[str, Dict] = {}
-        if kg_key and not kg_text and warm_kg:
-            warm_spec["kg"] = dict(warm_kg, cache_key=kg_key)
-        if cg_keys and len(cg_keys) == 1 and not cg_fresh and warm_cg:
-            warm_spec["cg"] = dict(warm_cg, cache_key=next(iter(cg_keys.values())))
+            status = statuses.get("kg", "finished" if kg_text else "timed_out")
+            if status == "finished":
+                if kg_text:
+                    cache_leg_output(project_root, kg_key, kg_text + "\n")
+                    kg_text = kg_text + "\n"
+                else:
+                    cache_finished_empty(project_root, kg_key)
+            elif warm_kg:
+                warm_spec["kg"] = dict(warm_kg, cache_key=kg_key)
+            if kg_text and not kg_text.endswith("\n"):
+                kg_text += "\n"
+        for index, (key, _symbol, _source) in cg_keys.items():
+            name = f"cg_{index}"
+            raw = (results.get(name) or "").strip()
+            status = statuses.get(name, "finished" if raw else "timed_out")
+            if status == "finished":
+                if raw:
+                    cg_symbol_texts[index] = raw + "\n"
+                    cache_leg_output(project_root, key, raw + "\n")
+                else:
+                    cache_finished_empty(project_root, key)
+            elif index in warm_cg:
+                warm_spec[name] = dict(warm_cg[index], cache_key=key)
+        # Finished-empty is an answer and is cached for 300 s. Only a timeout
+        # or error may be warmed; neither is ever written as an empty verdict.
         if warm_spec:
             _spawn_leg_warmer(project_root, warm_spec)
     if kg_served_key:
         # The KG producer is the only leg that stages a citation ctx; a
         # cache entry the L4 warmer filled is a retrieval first SHOWN now.
         _promote_warm_held(project_root, kg_served_key)
-    cg_text = "".join(cg_symbol_texts)
+    cg_text = "".join(cg_symbol_texts.get(i, "") for i in range(len(plan.cg_symbols)))
     return kg_text, cg_text
+
+
+def _read_replay_is_fully_seen(plan: _Plan, state_sid: str, project_root: str) -> bool:
+    """True when every cached block for this Read is already suppressed.
+
+    Any cache miss (including a legacy absent/timeout result) returns False so
+    the producer runs normally. The seen filter is read-only here; emission
+    still owns the atomic check-and-record on a run that has something new.
+    """
+    texts: List[str] = []
+    if plan.kg_profile and plan.kg_query:
+        key = cache_key("kgi", plan.kg_profile, plan.kg_query, str(plan.kg_limit))
+        cached = cache_get(project_root, key)
+        if cached is None:
+            return False
+        texts.append(cached)
+    if plan.cg_profile:
+        for symbol, source_file in plan.cg_symbols:
+            key = cache_key("cgi", plan.cg_profile, symbol, source_file)
+            cached = cache_get(project_root, key)
+            if cached is None:
+                return False
+            texts.append(cached)
+    combined = "\n".join(text for text in texts if text)
+    if not combined.strip():
+        return bool(texts)
+    inject = seen_store_path("inject", state_sid, project_root)
+    reads = seen_store_path("reads", state_sid, project_root)
+    if not inject:
+        return False
+    unseen = _filter_seen_blocks_unlocked(
+        combined, inject, reads, project_root, record=False)
+    return not unseen.strip()
 
 
 #: L4: a warmer claim younger than this belongs to a sibling warmer for the
@@ -1284,9 +1420,8 @@ def _warm_legs_main() -> int:
     cache. A citation ctx the producer would have staged is HELD beside the
     cache entry instead (:func:`_install_warm_hold_interceptor`): until an
     interactive run shows that entry, nobody has seen the retrieval, so it
-    is not a training label (v0.2.105). Empty output is never cached (§9,
-    via :func:`cache_leg_output`), so a permanently-empty query keeps
-    re-probing exactly as before — and its held ctx is dropped."""
+    is not a training label (v0.2.105). A finished empty output is cached for
+    300 s and holds no ctx; a timeout/error remains uncached (v0.2.107)."""
     held: List[Dict] = []
     _install_warm_hold_interceptor(held)
     try:
@@ -1321,12 +1456,21 @@ def _warm_legs_main() -> int:
                 asyncio.run(result)
 
         held.clear()
-        out = (_hds.run_legs({str(name): _run}) or {}).get(str(name)) or ""
+        with _query_slot() as acquired:
+            if not acquired:
+                continue
+            leg_results = _hds.run_legs({str(name): _run})
+        out = (leg_results or {}).get(str(name)) or ""
+        status = getattr(leg_results, "status", {}).get(str(name), "error")
         out = out.strip()
         if out:
             cache_leg_output(project_root, key, out + "\n")
             if cache_get(project_root, key) is not None:
                 _write_warm_held(project_root, key, list(held))
+        elif status == "finished" and cache_get(project_root, key) is None:
+            # A warmer runs to completion without an interactive join deadline;
+            # an ordinary empty return is therefore a finished-empty answer.
+            cache_finished_empty(project_root, key)
     return 0
 
 
@@ -1547,7 +1691,8 @@ def _install_staged_ctx_run_id_wrapper() -> None:
 def _amend_pending_citations(project_root: str, sid: str,
                              suppressed_titles: List[str],
                              run_id: str,
-                             staged: Optional[List[Path]] = None) -> None:
+                             staged: Optional[List[Path]] = None,
+                             shown_titles: Optional[List[str]] = None) -> None:
     """Drop never-shown nodes from the pending citation ctx this run staged.
 
     W3R-10 (v0.2.102): the RL retrieval event + the citation pending file
@@ -1574,11 +1719,12 @@ def _amend_pending_citations(project_root: str, sid: str,
     the size of every chat's unscored backlog. The stamp + session checks
     above still apply to every candidate.
     """
-    if not suppressed_titles or not sid or sid == "default" or not project_root:
+    if (not suppressed_titles and shown_titles is None) or not sid or sid == "default" or not project_root:
         return
     if not run_id:
         return
     supp = set(suppressed_titles)
+    shown = set(shown_titles) if shown_titles is not None else None
     files = [Path(p) for p in (list(_STAGED_BY_RUN.get(run_id, ()))
                                if staged is None else staged)]
     if not files:
@@ -1595,6 +1741,14 @@ def _amend_pending_citations(project_root: str, sid: str,
         ctx = payload.get("ctx")
         if not isinstance(ctx, dict) or ctx.get("router_run_id") != run_id:
             continue
+        file_supp = set(supp)
+        if shown is not None:
+            for key in ("nodes", "other_nodes"):
+                for node in ctx.get(key) or []:
+                    if isinstance(node, dict):
+                        title = cap_key_field(str(node.get("title", "")))
+                        if title not in shown:
+                            file_supp.add(title)
         removed: List[str] = []
         for key in ("nodes", "other_nodes"):
             nodes = ctx.get(key)
@@ -1603,7 +1757,7 @@ def _amend_pending_citations(project_root: str, sid: str,
             keep = []
             for n in nodes:
                 if isinstance(n, dict) and \
-                        cap_key_field(str(n.get("title", ""))) in supp:
+                        cap_key_field(str(n.get("title", ""))) in file_supp:
                     removed.append(str(n.get("title", "")))
                 else:
                     keep.append(n)
@@ -2053,7 +2207,25 @@ def _main(argv: List[str]) -> int:
             return _emit_agent_suggestions_only(payload, suggest_text)
         return 0  # MECHANICAL / no recoverable query → no spawn, no event
 
+    # The hourly GC runs before the early returns below, so a long outage
+    # (every fire returning on the down marker) does not stop it.
     _budget_gc(project_root)
+
+    # v0.2.107 (A-063): a fresh "endpoint down" verdict from any hook on this
+    # machine ends the fire before any leg — no connect wait per tool call.
+    from vco_lib.endpoint_down import endpoint_is_down  # noqa: PLC0415
+
+    if endpoint_is_down():
+        _write_intent_out()
+        if suggest_text:
+            return _emit_agent_suggestions_only(payload, suggest_text)
+        return 0
+    # v0.2.107 (A-008): an identical re-Read whose cached blocks are all
+    # already shown has nothing new to emit — return before any leg.
+    if surface == "read" and _read_replay_is_fully_seen(plan, state_sid, project_root):
+        _write_intent_out()
+        return 0
+
     # F2 (v0.2.102 W6-C1, owner decision 2026-10-07): the budget file and its
     # cap are PER AGENT — a subagent run is its own "turn" with a 20 000-char
     # bucket; the main chat keeps its unchanged 6 000 (one home for the pair:
@@ -2114,7 +2286,10 @@ def _main(argv: List[str]) -> int:
         cg_text = _strip_stamp_lines(cg_text)
 
     combined = kg_text + ("\n" if kg_text and cg_text else "") + cg_text
+    suppressed: List[str] = []
     if not combined.strip():
+        _amend_pending_citations(project_root, sid, suppressed,
+                                 router_run_id, shown_titles=[])
         if suggest_text:
             return _emit_agent_suggestions_only(payload, suggest_text)
         return 0
@@ -2133,7 +2308,6 @@ def _main(argv: List[str]) -> int:
     else:
         inject_file = seen_store_path("inject", state_sid, project_root)
         reads_file = seen_store_path("reads", state_sid, project_root)
-        suppressed: List[str] = []  # W3R-10: titles the filter dropped
         filtered = filter_seen_blocks(combined, inject_file, reads_file,
                                       project_root, suppressed_out=suppressed)
         if not filtered.strip():
@@ -2142,7 +2316,7 @@ def _main(argv: List[str]) -> int:
             # leaves `suppressed` empty — nothing was decided, so nothing is
             # amended.
             _amend_pending_citations(project_root, sid, suppressed,
-                                     router_run_id)
+                                     router_run_id, shown_titles=[])
             return 0
 
     # Per-injection soft cap + per-turn budget (degrade, never drop: past
@@ -2198,7 +2372,8 @@ def _main(argv: List[str]) -> int:
     # W3R-10 normal path: the filter's suppressed titles never reached the
     # transcript (budget degradation keeps every block's header, so the
     # remaining blocks' titles WERE shown).
-    _amend_pending_citations(project_root, sid, suppressed, router_run_id)
+    _amend_pending_citations(project_root, sid, suppressed, router_run_id,
+                             shown_titles=_block_titles(final))
     _emit(final)
     return 0
 

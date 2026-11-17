@@ -97,7 +97,7 @@ def test_a_warm_run_leaves_rl_pending_untouched_and_holds_the_ctx(tmp_path: Path
 
     proj = _project(tmp_path, junk=3)
     before = {p.name: p.stat().st_mtime_ns for p in _pending(proj)}
-    key = hcr.cache_key("kgi", "prompt", "q", "3", "p1")
+    key = hcr.cache_key("kgi", "prompt", "q", "3")
     r = _warm(tmp_path, proj, key)
     assert r.returncode == 0, r.stderr
     assert (proj / ".claude" / "state" / "query_cache" / key).is_file(), "cache warmed"
@@ -111,7 +111,7 @@ def test_an_empty_warm_result_holds_nothing(tmp_path: Path) -> None:
     import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
 
     proj = _project(tmp_path)
-    key = hcr.cache_key("kgi", "prompt", "q-empty", "3", "p1")
+    key = hcr.cache_key("kgi", "prompt", "q-empty", "3")
     r = _warm(tmp_path, proj, key, VCO_TEST_EMPTY="1")
     assert r.returncode == 0, r.stderr
     assert _pending(proj) == []
@@ -139,7 +139,7 @@ def test_the_cache_hit_that_shows_the_entry_stages_the_held_ctx(
     import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
 
     proj = _project(tmp_path)
-    key = hcr.cache_key("kgi", "prompt", "q", "3", "p1")
+    key = hcr.cache_key("kgi", "prompt", "q", "3")
     assert _warm(tmp_path, proj, key).returncode == 0
     try:
         kg_text, _cg = _hit(hcr, proj, monkeypatch, "router_hit")
@@ -173,7 +173,7 @@ def test_a_run_with_no_session_of_its_own_promotes_nothing(
     import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
 
     proj = _project(tmp_path)
-    key = hcr.cache_key("kgi", "prompt", "q", "3", "p1")
+    key = hcr.cache_key("kgi", "prompt", "q", "3")
     assert _warm(tmp_path, proj, key).returncode == 0
     plan = hcr._Plan()
     plan.kg_query = "q"
@@ -197,7 +197,7 @@ def test_a_cache_hit_with_nothing_held_stages_nothing(tmp_path: Path, monkeypatc
     import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
 
     proj = _project(tmp_path)
-    key = hcr.cache_key("kgi", "prompt", "q", "3", "p1")
+    key = hcr.cache_key("kgi", "prompt", "q", "3")
     hcr.cache_put(str(proj), key, "KG: Cached | concept | score=0.90 | TITLES | src=x.md\n")
     try:
         kg_text, _cg = _hit(hcr, proj, monkeypatch, "router_plain")
