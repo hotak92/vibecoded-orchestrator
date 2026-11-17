@@ -141,6 +141,64 @@ def test_revive_is_rate_limited_machine_wide(vct_root, monkeypatch):
     assert ensure.calls == 2
 
 
+def test_concurrent_revives_spawn_once(vct_root, monkeypatch):
+    """Three gateway requests that find the hub down in the same millisecond
+    must start ONE hub (field logs: three `state=started` lines per outage and
+    three starter processes). The claim is taken under a lock: a caller that
+    arrives while another one is claiming is rate-limited."""
+    import threading
+
+    monkeypatch.setattr(he, "is_running", lambda: False)
+    ensure = _Ensure(he.EnsureState.STARTED)
+    barrier = threading.Barrier(6)
+    states = []
+
+    def run():
+        barrier.wait()
+        states.append(he.revive_if_down(
+            source="gateway", update_in_progress=lambda: False, ensure=ensure,
+        ).state)
+
+    threads = [threading.Thread(target=run) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert states.count(he.ReviveState.STARTED) == 1, states
+    assert states.count(he.ReviveState.RATE_LIMITED) == 5, states
+
+
+def test_a_claim_in_progress_rate_limits_the_next_caller(vct_root):
+    from vco_lib.atomic import exclusive_file_lock
+
+    stamp = he._revive_stamp()
+    with exclusive_file_lock(stamp.with_name(stamp.name + ".lock")):
+        assert he._claim_revive_slot(60, 1000.0) is False
+    assert he._claim_revive_slot(60, 1000.0) is True
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_detached_hub_starter_is_reaped(tmp_path):
+    """`vct-hub --start-if-not-running` exits within ~100 ms. A long-lived
+    caller (the model gateway) that never waits for it keeps one zombie per
+    revive for its whole lifetime (field: three `[vct-hub] <defunct>` under
+    the gateway). The starter is reaped in the background."""
+    import time
+
+    starter = tmp_path / "vct-hub"
+    starter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    starter.chmod(0o755)
+    res = he._spawn(starter, wait=False)
+    assert res.state == he.EnsureState.STARTED
+    pid = he._LAST_DETACHED_STARTER_PID
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{pid}").exists():
+            return  # gone from the process table: reaped
+        time.sleep(0.05)
+    pytest.fail(f"starter pid {pid} was never reaped")
+
+
 def test_revive_reports_a_failed_start(vct_root, monkeypatch):
     monkeypatch.setattr(he, "is_running", lambda: False)
     ensure = _Ensure(state=he.EnsureState.BINARY_NOT_FOUND, reason="vct-hub binary not found")

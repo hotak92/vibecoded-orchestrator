@@ -753,6 +753,10 @@ def _default_repo_root() -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 
+#: pid of the last detached starter `_spawn` launched (tests read it).
+_LAST_DETACHED_STARTER_PID: Optional[int] = None
+
+
 def _spawn(binary: Path, wait: bool) -> EnsureResult:
     """Invoke ``<binary> --start-if-not-running``.
 
@@ -786,7 +790,7 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
                     ),
                 )
         else:
-            subprocess.Popen(  # noqa: S603 — argv is a resolved absolute path
+            proc = subprocess.Popen(  # noqa: S603 — argv is a resolved absolute path
                 argv,
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -794,6 +798,18 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
                 stderr=subprocess.DEVNULL,
                 **detached_popen_kwargs(),
             )
+            # The starter exits within ~100 ms (the hub it launches is a
+            # separate, detached process). Reap it in the background: a
+            # long-lived caller — the model gateway — otherwise keeps one
+            # zombie per revive for its whole lifetime. A short-lived caller
+            # (a hook) exits first and init reaps the starter, as before.
+            global _LAST_DETACHED_STARTER_PID
+            _LAST_DETACHED_STARTER_PID = proc.pid
+            import threading
+
+            threading.Thread(
+                target=proc.wait, name="vct-hub-starter-reaper", daemon=True,
+            ).start()
     except OSError as exc:
         return EnsureResult(
             state=EnsureState.SPAWN_FAILED,
@@ -916,19 +932,40 @@ def _claim_revive_slot(min_interval_s: float, now: float) -> bool:
     broken stamp must not silence the revive forever (the spawn itself is
     idempotent, so the worst case is an extra ``--start-if-not-running``)."""
     stamp = _revive_stamp()
+
+    def _check_and_touch() -> bool:
+        try:
+            last = stamp.stat().st_mtime
+        except OSError:
+            last = None
+        # Both signs: a caller whose clock reading was taken a moment BEFORE
+        # the winner's stamp sees a slightly negative age, and it lost the
+        # race all the same. A stamp further in the future than the interval
+        # (a clock set back) still claims, so it cannot silence the revive.
+        if last is not None and -min_interval_s < now - last < min_interval_s:
+            return False
+        try:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.touch()
+            os.utime(stamp, (now, now))
+        except OSError:
+            pass
+        return True
+
+    # The read and the touch happen under one lock: several callers that find
+    # the hub down in the same instant (parallel gateway requests, every open
+    # chat's prompt hook) otherwise all read the old stamp and all spawn. A
+    # caller that arrives while another one is claiming is rate-limited — that
+    # other caller is starting the hub right now.
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
     try:
-        last = stamp.stat().st_mtime
-    except OSError:
-        last = None
-    if last is not None and 0 <= now - last < min_interval_s:
+        with exclusive_file_lock(stamp.with_name(stamp.name + ".lock"), timeout_s=0):
+            return _check_and_touch()
+    except LockTimeout:
         return False
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-        os.utime(stamp, (now, now))
     except OSError:
-        pass
-    return True
+        return _check_and_touch()
 
 
 def revive_if_down(
