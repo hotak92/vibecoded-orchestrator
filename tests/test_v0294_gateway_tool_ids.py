@@ -10,19 +10,19 @@ cannot leave a second, stale harness behind).
 
 What is pinned, and the field consequence of each:
 
-* a vendor response carrying a ``call_…`` SERVER-tool id reaches the CLIENT
-  with a ``srvtoolu_…`` one — without this the transcript is poisoned at the
-  moment it is written and every later Anthropic request 400s. Plain
-  ``tool_use`` ids are deliberately NOT rewritten: Anthropic accepts them as
-  they are, so rewriting would only enlarge the map that has to be kept;
-* a vendor ``server_tool_use`` Anthropic cannot represent is stripped WITH its
-  result — normalising its id is not enough, the name itself is rejected;
-* the vendor gets its OWN ids back on the next request;
+* a vendor response carrying server-side tool blocks reaches the CLIENT as
+  readable text notes — without this the transcript stores a route-only type
+  that every later model may reject. Plain ``tool_use`` ids are deliberately
+  NOT rewritten: Anthropic accepts them as they are, so rewriting would only
+  enlarge the map that has to be kept;
+* inherited vendor ``server_tool_use`` history is stripped on the Anthropic
+  route and converted to notes on a vendor route;
+* legacy rewritten ids are restored only inside message content, never inside
+  ordinary tool inputs;
 * an inherited transcript is repaired on the way to Anthropic, so an ALREADY
   poisoned session recovers instead of returning an opaque 400;
-* SSE: ids fixed inside ``content_block_start``, dropped blocks suppressed,
-  indexes renumbered contiguously, and an untouched stream relayed byte for
-  byte.
+* SSE: server-side blocks become text with their full streamed input, indexes
+  stay contiguous, and an untouched stream is relayed byte for byte.
 """
 from __future__ import annotations
 
@@ -60,21 +60,23 @@ class BoundedIdMapTests(unittest.TestCase):
 
 
 class PayloadAdapterTests(unittest.TestCase):
-    def test_a_vendor_response_is_normalised_and_remembered(self) -> None:
+    def test_a_vendor_server_tool_response_becomes_a_text_note(self) -> None:
         id_map = ti.BoundedIdMap()
         payload, stats = ti.normalise_vendor_response(
             {
                 "type": "message",
                 "content": [
                     {"type": "server_tool_use", "id": "call_a.b",
-                     "name": "web_search", "input": {}},
+                     "name": "web_search", "input": {"query": "fixture"}},
                 ],
             },
             id_map,
         )
-        self.assertEqual(payload["content"][0]["id"], "srvtoolu_vct_call_a_b")
-        self.assertEqual(stats.ids_rewritten, 1)
-        self.assertEqual(id_map["srvtoolu_vct_call_a_b"], "call_a.b")
+        self.assertEqual(payload["content"][0]["type"], "text")
+        self.assertIn("web_search", payload["content"][0]["text"])
+        self.assertIn("fixture", payload["content"][0]["text"])
+        self.assertEqual(stats.blocks_converted, 1)
+        self.assertEqual(dict(id_map), {})
 
     def test_a_plain_tool_use_id_is_left_alone(self) -> None:
         """Anthropic does not pattern-check ``tool_use.id`` — a ``call_…`` one
@@ -209,14 +211,8 @@ class FirstPartyRequestSurvivalTests(unittest.TestCase):
         self.assertTrue(stats.changed)
         self.assertEqual(repaired["messages"], [])
 
-    def test_the_vendor_response_path_KEEPS_the_same_pair(self) -> None:
-        """The destination decides, and this one is not Anthropic.
-
-        The client's next turn on a vendor route goes back to the same
-        vendor, which understands its own blocks. Stripping here would take
-        the tool context out of a conversation that was working; the strip
-        belongs on the Anthropic-bound path, where the 400 is.
-        """
+    def test_the_vendor_response_path_converts_the_same_pair(self) -> None:
+        """A response is stored as portable text, not a vendor-only pair."""
         id_map = ti.BoundedIdMap()
         payload, stats = ti.normalise_vendor_response(
             {
@@ -231,14 +227,11 @@ class FirstPartyRequestSurvivalTests(unittest.TestCase):
             id_map,
         )
         self.assertEqual(
-            [b["type"] for b in payload["content"]],
-            ["server_tool_use", "web_search_tool_result"],
+            [b["type"] for b in payload["content"]], ["text", "text"],
         )
-        self.assertEqual(payload["content"][0]["id"], "srvtoolu_vct_call_probe1")
-        self.assertEqual(
-            payload["content"][1]["tool_use_id"], "srvtoolu_vct_call_probe1",
-        )
-        self.assertEqual(stats.blocks_stripped, 0)
+        self.assertIn("web_search", payload["content"][0]["text"])
+        self.assertEqual(stats.blocks_converted, 1)
+        self.assertEqual(stats.results_converted, 1)
 
     def test_a_vendor_result_is_still_stripped_on_this_path(self) -> None:
         """ACT half: the survival above is not "strip nothing"."""
@@ -272,7 +265,7 @@ class SseRewriterTests(unittest.TestCase):
         self.assertEqual(out, stream)
         self.assertFalse(rewriter.stats.changed)
 
-    def test_ids_in_content_block_start_are_normalised(self) -> None:
+    def test_vendor_tool_content_block_start_becomes_text(self) -> None:
         id_map = ti.BoundedIdMap()
         rewriter = ti.SseIdRewriter(id_map=id_map)
         out = rewriter.feed(
@@ -281,10 +274,10 @@ class SseRewriterTests(unittest.TestCase):
                 "content_block": {"type": "server_tool_use", "id": "call_abc",
                                   "name": "web_search", "input": {}}})
         ) + rewriter.flush()
-        # Compact separators (``_COMPACT_JSON``): a rewritten event must
-        # never be longer than the one upstream sent.
-        self.assertIn(b'"id":"srvtoolu_vct_call_abc"', out)
-        self.assertEqual(id_map["srvtoolu_vct_call_abc"], "call_abc")
+        self.assertIn(b'"type":"text"', out)
+        self.assertNotIn(b"server_tool_use", out)
+        self.assertEqual(rewriter.stats.blocks_converted, 1)
+        self.assertEqual(dict(id_map), {})
 
     def test_a_split_chunk_boundary_is_handled(self) -> None:
         event = _sse("content_block_start", {
@@ -295,7 +288,8 @@ class SseRewriterTests(unittest.TestCase):
         first = rewriter.feed(event[:20])
         self.assertEqual(first, b"")
         rest = rewriter.feed(event[20:]) + rewriter.flush()
-        self.assertIn(b"srvtoolu_vct_call_abc", rest)
+        self.assertIn(b'"type":"text"', rest)
+        self.assertNotIn(b"server_tool_use", rest)
 
     def test_crlf_frames_are_split_and_re_emitted_as_crlf(self) -> None:
         """SSE allows CRLF. Matching only LF+LF buffered such a stream to the
@@ -308,7 +302,8 @@ class SseRewriterTests(unittest.TestCase):
         )
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         out = rewriter.feed(stream) + rewriter.flush()
-        self.assertIn(b"srvtoolu_vct_call_abc", out)
+        self.assertIn(b'"type":"text"', out)
+        self.assertNotIn(b"server_tool_use", out)
         self.assertTrue(out.endswith(b"\r\n\r\n"))
         self.assertNotIn(b"\n\n", out.replace(b"\r\n\r\n", b""))
 
@@ -328,7 +323,8 @@ class SseRewriterTests(unittest.TestCase):
         trailing = b'event: ping\rdata: {"type":"ping"}\r\r'
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         out = rewriter.feed(poisoned + trailing)
-        self.assertIn(b"srvtoolu_vct_call_abc", out)
+        self.assertIn(b'"type":"text"', out)
+        self.assertNotIn(b"server_tool_use", out)
         self.assertTrue(out.endswith(b"\r\r"))
         self.assertNotIn(b"\n", out, "a CR stream must not acquire LFs")
         self.assertEqual(
@@ -356,9 +352,10 @@ class SseRewriterTests(unittest.TestCase):
         held = rewriter.feed(last)
         self.assertEqual(held, b"", "ambiguous while more bytes may arrive")
         tail = rewriter.flush()
-        self.assertIn(b"srvtoolu_vct_call_zzz", tail)
+        self.assertIn(b'"type":"text"', tail)
+        self.assertNotIn(b"server_tool_use", tail)
         self.assertTrue(tail.endswith(b"\r\r"))
-        self.assertEqual(id_map["srvtoolu_vct_call_zzz"], "call_zzz")
+        self.assertEqual(dict(id_map), {})
 
     def test_an_incomplete_final_event_is_still_flushed_verbatim(self) -> None:
         """LEAVE-ALONE half: no boundary at all is not a boundary at EOF."""
@@ -410,7 +407,8 @@ class SseRewriterTests(unittest.TestCase):
         )
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         out = rewriter.feed(stream) + rewriter.flush()
-        self.assertIn(b"srvtoolu_vct_call_abc", out)
+        self.assertIn(b'"type":"text"', out)
+        self.assertNotIn(b"server_tool_use", out)
         self.assertIn(b"event: content_block_start\r\n", out)
         self.assertIn(b"id: 7\n", out)
         self.assertTrue(out.rstrip().endswith(b"}}"), out)
@@ -425,10 +423,8 @@ class SseRewriterTests(unittest.TestCase):
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         self.assertEqual(rewriter.feed(stream) + rewriter.flush(), stream)
 
-    def test_an_assistant_tool_result_follows_its_dropped_producer(self) -> None:
-        """THE field shape: the vendor writes its built-in's result as a plain
-        ``tool_result`` in the ASSISTANT message. Leaving it behind is a live
-        400 — ``tool_result blocks can only be in user messages``."""
+    def test_assistant_tool_results_become_text_without_index_gaps(self) -> None:
+        """The field placement becomes portable text instead of a live 400."""
         stream = (
             _sse("content_block_start", {
                 "type": "content_block_start", "index": 0,
@@ -450,22 +446,21 @@ class SseRewriterTests(unittest.TestCase):
         )
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         out = (rewriter.feed(stream) + rewriter.flush()).decode()
-        self.assertNotIn("tool_result", out)
-        self.assertNotIn("call_5f46", out)
-        # The second one's producer is not in this stream at all: it goes
-        # because an assistant message may not carry a tool_result AT ALL,
-        # which is a separate live 400 from the dropped-producer rule.
-        self.assertNotIn("call_never_seen", out)
+        self.assertNotIn('"type":"tool_result"', out)
+        self.assertNotIn('"type":"server_tool_use"', out)
+        self.assertIn("a cat", out)
+        self.assertIn("orphan", out)
         self.assertIn('"type":"text"', out)
         indexes = [
             json.loads(line[len("data: "):])["index"]
             for line in out.splitlines()
             if line.startswith("data: ")
         ]
-        self.assertEqual(indexes, [0], "the survivor is renumbered to 0")
+        self.assertEqual(indexes, [0, 1, 1, 2, 2, 3])
+        self.assertEqual(rewriter.stats.results_converted, 2)
 
-    def test_a_dropped_block_takes_its_events_and_renumbers_the_rest(self) -> None:
-        """The whole point: a vendor built-in never reaches the transcript."""
+    def test_converted_tool_keeps_its_index_and_later_blocks_follow(self) -> None:
+        """Conversion replaces the type; it does not leave an SSE index hole."""
         stream = (
             _sse("content_block_start", {
                 "type": "content_block_start", "index": 0,
@@ -486,20 +481,21 @@ class SseRewriterTests(unittest.TestCase):
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         out = (rewriter.feed(stream) + rewriter.flush()).decode()
 
-        self.assertNotIn("analyze_image", out)
-        self.assertNotIn("call_5f46", out)
+        self.assertNotIn('"type":"server_tool_use"', out)
+        self.assertNotIn("input_json_delta", out)
+        self.assertIn("analyze_image", out)
         self.assertIn("a cat", out)
         indexes = [
             json.loads(line[len("data: "):])["index"]
             for line in out.splitlines()
             if line.startswith("data: ")
         ]
-        self.assertEqual(indexes, [0, 0, 0], "the surviving block is renumbered to 0")
-        self.assertEqual(rewriter.stats.blocks_stripped, 1)
-        self.assertEqual(rewriter.blocks_suppressed, 1)
-        self.assertNotIn("\n\n\n", out, "a suppressed event leaves no blank event")
+        self.assertEqual(indexes, [0, 0, 0, 1, 1, 1])
+        self.assertEqual(rewriter.stats.blocks_converted, 1)
+        self.assertEqual(rewriter.blocks_suppressed, 0)
+        self.assertNotIn("\n\n\n", out, "a suppressed delta leaves no blank event")
 
-    def test_a_server_tool_result_block_follows_its_dropped_producer(self) -> None:
+    def test_a_server_tool_result_becomes_text_with_its_producer(self) -> None:
         stream = (
             _sse("content_block_start", {
                 "type": "content_block_start", "index": 0,
@@ -512,8 +508,10 @@ class SseRewriterTests(unittest.TestCase):
         )
         rewriter = ti.SseIdRewriter(id_map=ti.BoundedIdMap())
         out = (rewriter.feed(stream) + rewriter.flush()).decode()
-        self.assertEqual(out, "")
-        self.assertEqual(rewriter.stats.results_stripped, 1)
+        self.assertNotIn("server_tool_use", out)
+        self.assertNotIn("analyze_image_tool_result", out)
+        self.assertEqual(out.count('"type":"text"'), 2)
+        self.assertEqual(rewriter.stats.results_converted, 1)
 
     def test_a_non_json_event_is_passed_through(self) -> None:
         raw = b": keep-alive comment\n\n"
@@ -529,7 +527,7 @@ class SseRewriterTests(unittest.TestCase):
 class VendorToolIdIntegrationTests(GatewayTestBase):
     """The whole app, against the stub upstreams."""
 
-    async def test_a_vendor_json_response_reaches_the_client_normalised(self) -> None:
+    async def test_a_vendor_json_response_reaches_the_client_as_notes(self) -> None:
         self.vendor_up.messages_body = {
             "id": "msg_1",
             "type": "message",
@@ -549,12 +547,12 @@ class VendorToolIdIntegrationTests(GatewayTestBase):
         )
         self.assertEqual(resp.status, 200)
         body = await resp.json()
-        self.assertEqual(body["content"][1]["id"], "srvtoolu_vct_call_5f460651ce")
-        self.assertEqual(
-            body["content"][2]["tool_use_id"], "srvtoolu_vct_call_5f460651ce",
-        )
+        self.assertEqual(body["content"][1]["type"], "text")
+        self.assertEqual(body["content"][2]["type"], "text")
+        self.assertIn("web_search", body["content"][1]["text"])
+        self.assertIn('"q":"x"', body["content"][1]["text"])
 
-    async def test_a_vendor_builtin_is_stripped_before_it_reaches_the_client(self) -> None:
+    async def test_a_vendor_builtin_is_converted_before_it_reaches_the_client(self) -> None:
         self.vendor_up.messages_body = {
             "id": "msg_1",
             "type": "message",
@@ -572,25 +570,11 @@ class VendorToolIdIntegrationTests(GatewayTestBase):
             json={"model": "claude-gw/glm-5.3", "messages": []},
         )
         body = await resp.json()
-        self.assertEqual([b["type"] for b in body["content"]], ["text"])
+        self.assertEqual([b["type"] for b in body["content"]], ["text", "text", "text"])
+        self.assertIn("analyze_image", body["content"][1]["text"])
 
-    async def test_the_vendor_gets_its_own_ids_back(self) -> None:
-        self.vendor_up.messages_body = {
-            "id": "msg_1",
-            "type": "message",
-            "content": [
-                {"type": "server_tool_use", "id": "call_a.b",
-                 "name": "web_search", "input": {}},
-            ],
-        }
-        first = await self.client.post(
-            "/v1/messages",
-            headers=self.auth(),
-            json={"model": "claude-gw/glm-5.3", "messages": []},
-        )
-        rewritten = (await first.json())["content"][0]["id"]
-        self.assertEqual(rewritten, "srvtoolu_vct_call_a_b")
-
+    async def test_legacy_normalised_server_ids_are_converted_for_a_vendor(self) -> None:
+        rewritten = "srvtoolu_vct_call_a_b"
         await self.client.post(
             "/v1/messages",
             headers=self.auth(),
@@ -608,10 +592,10 @@ class VendorToolIdIntegrationTests(GatewayTestBase):
             },
         )
         forwarded = json.loads(self.vendor_up.message_requests[-1]["body"])
-        self.assertEqual(forwarded["messages"][0]["content"][0]["id"], "call_a.b")
         self.assertEqual(
-            forwarded["messages"][1]["content"][0]["tool_use_id"], "call_a.b",
+            forwarded["messages"][0]["content"][0]["type"], "text",
         )
+        self.assertNotIn(rewritten, json.dumps(forwarded))
 
     async def test_an_inherited_poisoned_transcript_is_repaired_in_flight(self) -> None:
         """The dead-chat case: the client re-sends the poison every turn."""
@@ -699,16 +683,26 @@ class VendorToolIdIntegrationTests(GatewayTestBase):
         forwarded = json.loads(self.anthropic_up.message_requests[-1]["body"])
         self.assertEqual(forwarded, payload)
 
-    async def test_a_vendor_sse_stream_is_normalised_on_the_wire(self) -> None:
+    async def test_a_vendor_sse_stream_is_converted_on_the_wire(self) -> None:
         self.vendor_up.stream_chunks = [
             _sse("content_block_start", {
                 "type": "content_block_start", "index": 0,
                 "content_block": {"type": "server_tool_use", "id": "call_5f46",
                                   "name": "analyze_image", "input": {}}}),
+            _sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            _sse("content_block_stop", {
+                "type": "content_block_stop", "index": 0}),
             _sse("content_block_start", {
                 "type": "content_block_start", "index": 1,
                 "content_block": {"type": "server_tool_use", "id": "call_zz",
                                   "name": "web_search", "input": {}}}),
+            _sse("content_block_delta", {
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            _sse("content_block_stop", {
+                "type": "content_block_stop", "index": 1}),
             _sse("message_stop", {"type": "message_stop"}),
         ]
         resp = await self.client.post(
@@ -717,8 +711,10 @@ class VendorToolIdIntegrationTests(GatewayTestBase):
             json={"model": "claude-gw/glm-5.3", "messages": [], "stream": True},
         )
         body = (await resp.read()).decode()
-        self.assertNotIn("analyze_image", body)
-        self.assertIn("srvtoolu_vct_call_zz", body)
+        self.assertNotIn('"type":"server_tool_use"', body)
+        self.assertNotIn("input_json_delta", body)
+        self.assertIn("analyze_image", body)
+        self.assertIn("web_search", body)
         self.assertIn("message_stop", body)
 
     async def test_an_anthropic_sse_stream_is_relayed_untouched(self) -> None:
