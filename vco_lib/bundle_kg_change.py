@@ -23,10 +23,23 @@ both keys (it reads ``actions`` only), so either pairing degrades to today's
 behaviour, never to a skipped sync.
 
 What the sync ingests (``templates/scripts/sync_knowledge_graph.py``):
-``knowledge/**/*.md`` minus the excluded meta files
+``KNOWLEDGE_ROOT.rglob("*.md")`` minus the excluded meta files
 (:data:`vco_lib.kg_sync_drift.EXCLUDED_SYNC_BASENAMES`), and
-``docs/**/*.md``. A path with a dot-prefixed component (``.node_formats.json``,
-a ``.cache/`` dir) is a sidecar, never a node.
+``DOCS_ROOT.rglob("*.md")``. ``rglob`` does not skip dot-prefixed names, so
+neither does :func:`is_synced_kg_path` (v0.2.107 U-5: it used to, and was
+therefore narrower than the sync — a node under a ``.dir/`` was ingested but
+never stated as changed). Sidecars such as ``.node_formats.json`` or
+``.node_embeddings.README.txt`` stay out because they are not ``.md``.
+
+The sync script has no importable selection predicate (its walk is inline,
+behind a module-level hub resolution and a ``weaviate`` import), so this is a
+MIRROR of it, locked by ``tests/test_v02107_update_all_gating.py`` against
+:func:`vco_lib.kg_sync_drift._collect_candidate_nodes` — the drift probe's
+own mirror of the same walk — over a tree that includes dot paths. MUST MATCH
+``sync_knowledge_graph.py::sync_all_nodes`` / ``sync_all_docs``. One
+deliberate difference: the ``.md`` suffix is matched case-insensitively here
+(``rglob`` is case-sensitive on POSIX, insensitive on Windows); stating a
+change the POSIX sync then skips costs one redundant sync, never a missed one.
 """
 
 from __future__ import annotations
@@ -59,8 +72,6 @@ def is_synced_kg_path(rel: str) -> bool:
         norm = norm[2:]
     parts = [p for p in norm.split("/") if p]
     if len(parts) < 2 or parts[0] not in _SYNCED_ROOTS:
-        return False
-    if any(p.startswith(".") for p in parts[1:]):
         return False
     name = parts[-1]
     if not name.lower().endswith(".md"):
