@@ -337,7 +337,8 @@ impl StepRunner for RealRunner {
         let remote = plan.upstream_remote.as_deref().unwrap_or("vco_upstream");
         let branch = plan.branch.as_deref().unwrap_or("main");
         // Fetch then ff-only pull from the pinned upstream. The launcher's
-        // richer pre-merge gating (installer.rs) is NOT duplicated here — for
+        // richer pre-merge gating (`update_pipeline::pull_to_upstream`) is
+        // NOT duplicated here — for
         // the inverted path the stub set up the remote + the engine does the
         // minimal pull; v0.3.0 may thread more of the gate in.
         let fetch = Command::new("git")
