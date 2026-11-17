@@ -419,10 +419,11 @@ def _default_kg_counter(class_name: str) -> Optional[int]:
     """The real :param:`count_kg_objects` default — object count for
     ``class_name`` via the Weaviate Aggregate endpoint.
 
-    Delegates to :func:`vco_lib.weaviate_helpers.http_count_objects`, whose
-    contract is the one :func:`gate` depends on: ``int`` on success (0 for
-    a genuinely empty OR not-yet-created class), ``None`` for unreachable
-    / malformed — i.e. UNKNOWN, never zero. Resolved at CALL time from
+    Delegates to :func:`vco_lib.weaviate_helpers.http_count_objects` with
+    ``absent_is_zero=True``, the contract :func:`gate` depends on: ``int`` on
+    success (0 for a genuinely empty class, or one the schema endpoint
+    positively reports as not yet created), ``None`` for unreachable / an
+    error reply / malformed — i.e. UNKNOWN, never zero. Resolved at CALL time from
     this module's namespace so tests can exercise the production
     ``install_project_bundle`` path with a patched counter instead of a
     live Weaviate.
@@ -430,7 +431,7 @@ def _default_kg_counter(class_name: str) -> Optional[int]:
     try:
         from vco_lib.weaviate_helpers import http_count_objects
 
-        return http_count_objects(class_name)
+        return http_count_objects(class_name, absent_is_zero=True)
     except Exception:  # noqa: BLE001 — a probe must never break the gate
         return None
 
@@ -538,9 +539,9 @@ def gate(
             # evidence before concluding "fresh": does this project's
             # REGISTERED bound KG class already hold objects? A re-clone's
             # collection is non-empty; a genuinely fresh add's is empty or
-            # not yet created (Aggregate over a missing class is 0, not
-            # unknown). The probe runs ONLY on this path, so a fresh add
-            # pays one cheap count and stays silent.
+            # not yet created (the counter reads a class the schema endpoint
+            # reports absent as 0, not unknown). The probe runs ONLY on this
+            # path, so a fresh add pays one cheap count and stays silent.
             kg_class = _registered_kg_class(folder)
             if kg_class is None:
                 # Not resolvable / not registered: we cannot POSITIVELY

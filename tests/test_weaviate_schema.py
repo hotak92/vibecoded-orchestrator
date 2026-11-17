@@ -79,34 +79,32 @@ class _FakeFetcher:
         return self.responses.get(name)
 
 
-class _FakeRebuilder:
-    """Callable matching the `collection_rebuilder` signature.
+class _FakeSlotAdder:
+    """Callable matching the `slot_adder` signature (v0.2.107: a slot is
+    added IN PLACE — the drop + recreate + copy rebuilder is retired).
 
-    Records every invocation so tests can assert the new target slot
-    list passed in. Updates the linked `_FakeFetcher`'s response so a
-    subsequent `add_named_vector_slot` call sees the new schema (the
-    actual rebuilder mutates server state; the fake mutates the fetcher
-    cache).
+    Records every invocation so tests can assert which NEW slots were asked
+    for. Adds them to the linked `_FakeFetcher`'s schema beside the existing
+    ones, the way the real adder's schema PUT does.
     """
-    def __init__(self, fetcher: _FakeFetcher, objects_copied: int = 0):
+    def __init__(self, fetcher: _FakeFetcher):
         self.fetcher = fetcher
-        self.objects_copied = objects_copied
         self.calls: list[tuple] = []
 
     def __call__(
         self,
         collection: str,
-        target_slots: list[ws.NamedVectorSlot],
+        new_slots: list[ws.NamedVectorSlot],
         *,
         weaviate_url: Optional[str] = None,
-    ) -> int:
-        self.calls.append((collection, [s.name for s in target_slots]))
-        # Mutate the fetcher's view so subsequent diff sees the new slot set.
-        new_schema = _fake_schema(
-            [s.name for s in target_slots], class_name=collection,
+    ) -> list[str]:
+        self.calls.append((collection, [s.name for s in new_slots]))
+        existing = list((self.fetcher.responses[collection].get("vectorConfig") or {}).keys())
+        self.fetcher.responses[collection] = _fake_schema(
+            existing + [s.name for s in new_slots if s.name not in existing],
+            class_name=collection,
         )
-        self.fetcher.responses[collection] = new_schema
-        return self.objects_copied
+        return [s.name for s in new_slots]
 
 
 # ---------------------------------------------------------------------------
@@ -253,31 +251,33 @@ class DiffTests(unittest.TestCase):
 class AddNamedVectorSlotTests(unittest.TestCase):
     def test_created_when_slot_absent(self):
         fetcher = _FakeFetcher({"X": _fake_schema(["qwen3_embed"])})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         slot = ws.NamedVectorSlot("new_slot", 1024)
         result = ws.add_named_vector_slot(
             "X", slot,
             schema_fetcher=fetcher,
-            collection_rebuilder=rebuilder,
+            slot_adder=rebuilder,
         )
         self.assertEqual(result, ws.AddSlotResult.Created)
         self.assertEqual(len(rebuilder.calls), 1)
-        # The rebuilder was called with union(existing, new_slot).
+        # The adder is asked for the NEW slot only: the existing ones stay
+        # where they are (nothing is recreated or copied).
         _, target_names = rebuilder.calls[0]
-        self.assertIn("qwen3_embed", target_names)
-        self.assertIn("new_slot", target_names)
+        self.assertEqual(target_names, ["new_slot"])
+        self.assertEqual(set(fetcher.responses["X"]["vectorConfig"]),
+                         {"qwen3_embed", "new_slot"})
 
     def test_skipped_when_slot_present_with_matching_dim(self):
         # Slot present and probing dim returns matching value (the
         # `_existing_slot_dim` probe is patched to return the catalog dim).
         slot = ws.NamedVectorSlot("qwen3_embed", 1024)
         fetcher = _FakeFetcher({"X": _fake_schema(["qwen3_embed"])})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=1024):
             result = ws.add_named_vector_slot(
                 "X", slot,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         self.assertEqual(result, ws.AddSlotResult.Skipped)
         # No rebuild should fire when slot already exists.
@@ -287,12 +287,12 @@ class AddNamedVectorSlotTests(unittest.TestCase):
         # No data stored yet → can't probe → treat as Skipped, not error.
         slot = ws.NamedVectorSlot("qwen3_embed", 1024)
         fetcher = _FakeFetcher({"X": _fake_schema(["qwen3_embed"])})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=None):
             result = ws.add_named_vector_slot(
                 "X", slot,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         self.assertEqual(result, ws.AddSlotResult.Skipped)
 
@@ -300,12 +300,12 @@ class AddNamedVectorSlotTests(unittest.TestCase):
         # Slot present with 768d stored vectors; target says 1024d.
         slot = ws.NamedVectorSlot("qwen3_embed", 1024)
         fetcher = _FakeFetcher({"X": _fake_schema(["qwen3_embed"])})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=768):
             result = ws.add_named_vector_slot(
                 "X", slot,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         self.assertEqual(result, ws.AddSlotResult.DimMismatchError)
         # No rebuild attempted on dim-mismatch.
@@ -313,13 +313,13 @@ class AddNamedVectorSlotTests(unittest.TestCase):
 
     def test_missing_collection_raises(self):
         fetcher = _FakeFetcher({})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         slot = ws.NamedVectorSlot("new_slot", 1024)
         with self.assertRaises(RuntimeError) as ctx:
             ws.add_named_vector_slot(
                 "X", slot,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         self.assertIn("not found", str(ctx.exception))
 
@@ -334,9 +334,9 @@ class AddNamedVectorSlotTests(unittest.TestCase):
             ws.add_named_vector_slot(
                 "X", slot,
                 schema_fetcher=fetcher,
-                collection_rebuilder=failing_rebuilder,
+                slot_adder=failing_rebuilder,
             )
-        self.assertIn("failed to rebuild", str(ctx.exception))
+        self.assertIn("failed to add slot", str(ctx.exception))
         self.assertIn("new_slot", str(ctx.exception))
 
 
@@ -349,12 +349,12 @@ class MigrateCollectionToTargetTests(unittest.TestCase):
     def test_idempotent_when_at_target(self):
         all_names = [s.name for s in ws.KG_NAMED_VECTORS]
         fetcher = _FakeFetcher({"X": _fake_schema(all_names)})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=None):
             report = ws.migrate_collection_to_target(
                 "X", ws.KG_NAMED_VECTORS,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         self.assertEqual(report.added_slots, [])
         self.assertEqual(set(report.skipped_slots), set(all_names))
@@ -367,12 +367,12 @@ class MigrateCollectionToTargetTests(unittest.TestCase):
         # Start with v0.2.17 trio; target is full v0.2.18 catalog.
         legacy = ["qwen3_embed", "ollama_embed", "openai_embed"]
         fetcher = _FakeFetcher({"X": _fake_schema(legacy)})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=None):
             report = ws.migrate_collection_to_target(
                 "X", ws.KG_NAMED_VECTORS,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         # Legacy 3 should be Skipped, new 2 should be Added.
         self.assertEqual(set(report.skipped_slots), set(legacy))
@@ -384,19 +384,19 @@ class MigrateCollectionToTargetTests(unittest.TestCase):
     def test_second_run_is_noop_after_first(self):
         legacy = ["qwen3_embed"]
         fetcher = _FakeFetcher({"X": _fake_schema(legacy)})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=None):
             ws.migrate_collection_to_target(
                 "X", ws.KG_NAMED_VECTORS,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
             # Reset call log; second invocation must produce 0 additions.
             rebuilder.calls.clear()
             report = ws.migrate_collection_to_target(
                 "X", ws.KG_NAMED_VECTORS,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         self.assertEqual(report.added_slots, [])
         self.assertEqual(rebuilder.calls, [])
@@ -404,12 +404,12 @@ class MigrateCollectionToTargetTests(unittest.TestCase):
     def test_dim_mismatch_recorded_in_errors(self):
         # qwen3_embed exists but stored vectors are 768d (catalog says 1024d).
         fetcher = _FakeFetcher({"X": _fake_schema(["qwen3_embed"])})
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         with mock.patch.object(ws, "_existing_slot_dim", return_value=768):
             report = ws.migrate_collection_to_target(
                 "X", ws.KG_NAMED_VECTORS,
                 schema_fetcher=fetcher,
-                collection_rebuilder=rebuilder,
+                slot_adder=rebuilder,
             )
         # qwen3_embed surfaces in errors[]; ok() is False.
         err_slots = {e["slot"] for e in report.errors}
@@ -418,12 +418,12 @@ class MigrateCollectionToTargetTests(unittest.TestCase):
 
     def test_missing_collection_records_error_per_slot(self):
         fetcher = _FakeFetcher({})  # absent
-        rebuilder = _FakeRebuilder(fetcher)
+        rebuilder = _FakeSlotAdder(fetcher)
         # Pass a single slot for compactness; expect a "not found" error.
         report = ws.migrate_collection_to_target(
             "X", [ws.NamedVectorSlot("any", 1024)],
             schema_fetcher=fetcher,
-            collection_rebuilder=rebuilder,
+            slot_adder=rebuilder,
         )
         self.assertEqual(len(report.errors), 1)
         self.assertIn("not found", report.errors[0]["reason"].lower())

@@ -24,13 +24,22 @@ WHY THESE THREE SETS
 (``project_init._classify_action``); this module says what each action MEANS
 for consent:
 
-* :data:`ADDITIVE_ACTIONS` — ``copy`` and ``patch_props``. Lossless, and
-  provably so: ``copy`` round-trips every existing UUID, named vector and
-  property byte-for-byte through staging (``_copy_collection_with_vectors``)
-  and never drops the live collection until the swap's count-match assertion
-  passes; ``patch_props`` POSTs new properties onto the live class. Neither
-  re-embeds. That proof — not convenience — is the whole justification for
-  applying them unattended.
+* :data:`ADDITIVE_ACTIONS` — ``add_slots``, ``patch_props`` and ``copy``.
+  Lossless, and provably so. ``add_slots`` (v0.2.107) adds a named vector to
+  the live class with one schema PUT and ``patch_props`` POSTs new properties
+  onto it: neither creates, copies or drops anything, and a server that
+  cannot add the slot refuses with "update Weaviate". ``copy`` is what remains
+  for the two settings Weaviate cannot change on a live class
+  (``indexNullState``, ``vectorIndexType``): it round-trips every existing
+  UUID, named vector and property through staging
+  (``project_init._swap_through_staging``) and drops the live collection only
+  AFTER the staging copy's row tally AND staging's own object count both equal
+  the source count read through the one count helper
+  (``weaviate_helpers.http_count_objects``); an unreadable count or a mismatch
+  refuses with the live collection untouched. Until v0.2.107 the drop came
+  BEFORE the only comparison, and the comparison was between two numbers the
+  copier itself produced. None of the three re-embeds. That proof — not
+  convenience — is the whole justification for applying them unattended.
 * :data:`LOSSY_ACTIONS` — ``rebuild``. Drop + re-embed. Consent-gated, always;
   it is what ``schema_migration_required`` exists to defer.
 * Everything else (``noop``, ``create``, anything a future
@@ -70,7 +79,7 @@ __all__ = [
 ]
 
 #: Lossless actions — safe to apply unattended (see the module docstring).
-ADDITIVE_ACTIONS = frozenset({"copy", "patch_props"})
+ADDITIVE_ACTIONS = frozenset({"add_slots", "copy", "patch_props"})
 
 #: Data-destroying actions — always consent-gated via `schema_migration_required`.
 LOSSY_ACTIONS = frozenset({"rebuild"})
@@ -129,7 +138,8 @@ def classify_migration_plan(result: Mapping[str, Any]) -> Dict[str, Any]:
     Returns a dict with:
 
     ``has_additive``
-        at least one `copy` / `patch_props` entry — something to apply.
+        at least one `add_slots` / `patch_props` / `copy` entry — something
+        to apply.
     ``has_lossy``
         at least one `rebuild` entry — consent required.
     ``errors_empty``

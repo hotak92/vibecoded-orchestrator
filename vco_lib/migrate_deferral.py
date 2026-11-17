@@ -79,10 +79,13 @@ def _emit_migrate_required_deferral(
     deferral entry that names each collection + its required action and tells
     the user the explicit command to consent.
 
-    v0.2.70: additive `copy` migrations are LOSSLESS (staging double-copy
-    that round-trips every UUID + named vector + property byte-for-byte; copy
-    never re-embeds and never drops the live collection) and are AUTO-APPLIED
-    without a deferral. The caller (`_cmd_migrate_collections` gate) filters
+    v0.2.70: additive migrations are LOSSLESS and AUTO-APPLIED without a
+    deferral. Since v0.2.107 they are: `add_slots` (a named vector added in
+    place - nothing dropped or copied), `patch_props`, and `copy` (a staging
+    swap for the two settings Weaviate cannot change on a live class; it
+    round-trips every UUID + named vector + property, never re-embeds, and
+    drops the live class only AFTER the staging copy matches a source count
+    read through the one count helper). The caller (`_cmd_migrate_collections` gate) filters
     the plan to `action == "rebuild"` before calling this emitter, so it is
     only ever invoked with lossy rebuild entries.
 
@@ -92,7 +95,7 @@ def _emit_migrate_required_deferral(
         weaviate_url: the URL the dry-run probed (echoed in the command_to_apply).
         plan_entries: list of `{"collection", "action"}` dicts where action is
             `rebuild` (legacy single-vector or unhandled escape). The gate
-            filters out additive `copy` before this call.
+            filters out the additive actions before this call.
 
     Severity is `warning`: the project is functional with the existing schema
     (read paths still work), but new schema features (e.g. `index_null_state`)
@@ -112,7 +115,7 @@ def _emit_migrate_required_deferral(
         # v0.2.70: the gate (`_cmd_migrate_collections`) filters the plan to
         # `action == "rebuild"` before calling this emitter, so every entry
         # here is a lossy rebuild (legacy single-vector or unhandled escape).
-        # Additive `copy` is auto-applied, never deferred.
+        # Additive actions are auto-applied, never deferred.
         detected_lines.append(
             f"  - `{coll}` → **rebuild** (drop + re-embed; legacy single-vector format)"
         )

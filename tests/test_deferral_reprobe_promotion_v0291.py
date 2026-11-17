@@ -325,6 +325,8 @@ class OrphanDeleteConsentTests(unittest.TestCase):
         self._orig_urlopen = install.urllib.request.urlopen
 
         class _Resp:
+            status = 200  # the ONE count helper's transport reads it (v0.2.107)
+
             def __init__(self, payload: bytes):
                 self._payload = payload
 

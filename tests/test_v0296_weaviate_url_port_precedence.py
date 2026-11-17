@@ -748,7 +748,9 @@ class TestParameterDefaultsConsultTheEnvironment(unittest.TestCase):
             raise OSError("unroutable by design — no network in this suite")
 
         with _PortEnv():
-            with mock.patch.object(kbh.urllib.request, "urlopen", _fake_urlopen):
+            import urllib.request as _ur  # v0.2.107: the count goes through the ONE helper
+
+            with mock.patch.object(_ur, "urlopen", _fake_urlopen):
                 # Falsy url → must resolve from env, not from a literal.
                 kbh._count_weaviate_class_objects("", "SomeClass")
         self.assertTrue(seen, "the counter never issued a request")

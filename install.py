@@ -7273,23 +7273,11 @@ def _apply_deferred_entries(
                             current_run_report.mark_resolved(cid)
                             continue
                         raise
-                    # Sanity-check row count via aggregate (GraphQL):
-                    count_gql = (
-                        '{"query":"{ Aggregate { '
-                        'VibeCodedOrchestrator_Development { meta { count } } } }"}'
-                    )
-                    req = urllib.request.Request(
-                        f"{weaviate_url}/v1/graphql",
-                        data=count_gql.encode("utf-8"),
-                        method="POST",
-                        headers={"Content-Type": "application/json"},
-                    )
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        body = json.loads(resp.read())
-                    count = (body.get("data", {})
-                                 .get("Aggregate", {})
-                                 .get("VibeCodedOrchestrator_Development", [{}])
-                                 [0].get("meta", {}).get("count"))
+                    # Sanity-check row count through the ONE count helper
+                    # (None = could not be read = never a licence to delete).
+                    from vco_lib.weaviate_helpers import http_count_objects
+                    count = http_count_objects(
+                        "VibeCodedOrchestrator_Development", weaviate_url)
                     if count is None or count > 0:
                         print(
                             f"  [skip] {cid}: collection has {count} rows "
@@ -14779,7 +14767,7 @@ def _w40_run_adoption_uplifts(
             else:
                 smart_action = "noop"  # nothing to do
 
-            if smart_action in ("noop", "patch_props", "copy"):
+            if smart_action in ("noop", "patch_props", "add_slots", "copy"):
                 applied = True
                 _log_install_event(
                     "7e/10", "ok",

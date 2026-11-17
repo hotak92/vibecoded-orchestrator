@@ -20,7 +20,8 @@ both stores, so it lives here once:
 * :func:`scan_slot_counts` — the objective completeness measure: a cursor scan
   counting, per slot, the objects that hold a vector there;
 * :func:`ensure_slot` — check or make (additively) a set of classes declare a
-  slot (:func:`vco_lib.weaviate_schema.add_named_vector_slot`, vector-preserving);
+  slot (:func:`vco_lib.weaviate_schema.add_named_vector_slot`: added in place,
+  no class is dropped, recreated or copied);
 * :func:`same_model` — "do two model ids embed into the same vector space?".
 
 Every reader soft-fails to "no verdict" (``None`` / ``{}`` / ``0``) — never a
@@ -88,19 +89,17 @@ def sample_common_vectors(name: str, weaviate_url: Optional[str], limit: int) ->
 
 
 def object_count(name: str, weaviate_url: Optional[str]) -> int:
-    """Objects in ``name`` (GraphQL aggregate); 0 when it cannot be asked."""
+    """Objects in ``name``, read through the ONE count helper
+    (:func:`vco_lib.weaviate_helpers.http_count_objects`); a class the schema
+    endpoint reports absent counts 0. Raises ``RuntimeError`` when the count
+    cannot be read - never a made-up 0 (v0.2.107: a non-200 used to read 0).
+    Every caller wraps this for a display line or a size hint."""
     from vco_lib import weaviate_helpers as _wh
 
-    base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
-    status, body = _wh.http_request(
-        "POST", f"{base}/v1/graphql",
-        body={"query": f"{{ Aggregate {{ {name} {{ meta {{ count }} }} }} }}"},
-        timeout=10.0,
-    )
-    if status != 200:
-        return 0
-    data = json.loads(body.decode("utf-8"))
-    return int(data["data"]["Aggregate"][name][0]["meta"]["count"])
+    count = _wh.http_count_objects(name, weaviate_url, absent_is_zero=True)
+    if count is None:
+        raise RuntimeError(f"object count of {name} could not be read")
+    return count
 
 
 def _default_client():
@@ -157,9 +156,12 @@ def ensure_slot(
     """Check (``add=False``) or make (``add=True``) every EXISTING class in
     ``collections`` declare ``slot``. Returns an error message, or None.
 
-    The add is the additive, vector-preserving slot-add
-    (:func:`vco_lib.weaviate_schema.add_named_vector_slot`); it never drops
-    data. An unreachable Weaviate gives no verdict (the caller's own connect
+    The add is the in-place slot-add
+    (:func:`vco_lib.weaviate_schema.add_named_vector_slot`: one schema PUT on
+    the live class). It never drops, recreates or copies a class - true since
+    v0.2.107; until then it was a drop + recreate + double copy. A Weaviate
+    that cannot add the slot in place makes this return an error that says to
+    update Weaviate. An unreachable Weaviate gives no verdict (the caller's own connect
     reports it); a class that does not exist yet needs no slot."""
     from vco_lib.weaviate_schema import AddSlotResult, NamedVectorSlot
 

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A count that cannot be read never authorises a delete.** Four copies of the Weaviate object count read an
+  error-shaped reply (HTTP 200 with an `errors` array and a null class field: a shard not ready, memory pressure, a
+  timeout inside the server) as "0 objects", and 0 was the licence to drop. There is now one count
+  (`vco_lib.weaviate_helpers.http_count_objects`) that returns "unknown" for anything but an integer count from the
+  server, and every caller that deletes, drops, verifies a copy, recovers a staging class or stamps a collection as
+  new leaves the data alone on "unknown": the automatic drop of empty legacy code-graph classes, the rename
+  verification and `drop-retired`, the staging recovery (it counted by listing the class, and a listing that ended
+  early read a populated class as empty), and the
+  migration runner's "born at the current version" stamp.
+- **Adding a named-vector slot no longer drops and re-copies the collection.** Selecting an embedding model, install
+  step 7d and every bundle update added a missing vector slot by creating a staging class, copying every object into
+  it, dropping the live class and copying everything back - and the only check compared two numbers the copier itself
+  produced, so a listing that returned nothing emptied the class and reported success. The slot is now added in place
+  with one schema update: nothing is dropped, copied or re-embedded. This needs the Weaviate version VCO ships; an
+  older server gets a refusal that says to update Weaviate, never a drop. The staging swap remains only for the two
+  settings Weaviate cannot change on a live collection (`indexNullState`, the vector index type) and now drops the
+  live class only after the staging copy matches an object count read from the server first; it refuses a staging
+  class it did not create.
+- **`--prune-stale` deletes nothing after a walk that is no evidence.** A walk that discovered no file (an empty mount
+  point, a checkout of an empty branch), whose root is missing, or that was scoped to named files now prunes nothing
+  and says why; an extra code folder that yielded no file keeps its rows while the other roots are pruned. A file
+  whose module row was written and whose entity writes then failed (embedding backend down) keeps its old entity
+  rows instead of losing them at the end of the walk.
+
 ## [0.2.106] - 2026-11-12
 
 ### Added

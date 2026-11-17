@@ -1612,8 +1612,11 @@ def migrate_kg_named_vector_slots(deferral_report, *, log_event=None) -> None:
     two new slots (so basic search still works), but every install/update
     should silently patch them in when missing.
 
-    Strategy: additive patch_props (UNION) — vector slots can be added
-    without re-embedding existing data. The new slots start empty; the
+    Strategy: each missing slot is added IN PLACE (one schema PUT on the live
+    class; no drop, no recreate, no copy, no re-embed - true since v0.2.107,
+    when the staging double-copy was retired). A Weaviate that cannot add a
+    slot in place gets a per-slot error that says to update Weaviate, recorded
+    as a deferral entry. The new slots start empty; the
     embedding-enrichment step (commit 9 / EmbeddingService) fills them
     lazily as the user runs sync or queries.
 

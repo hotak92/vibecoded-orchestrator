@@ -27,7 +27,9 @@ Extracted from the analyzer monolith (P2f line-count ratchet:
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -369,6 +371,111 @@ def prune_collection(
             f"folders — attribution unknown)"
         )
     return pruned, failures
+
+
+@dataclass
+class PruneWalkGuard:
+    """What a finished walk is evidence of, for the ``--prune-stale`` pass
+    (:func:`prune_walk_guard`)."""
+
+    #: Non-empty = the prune must delete NOTHING this run; the text says why.
+    refusal: str = ""
+    #: ``discovered - walked`` PLUS the files whose write did not complete:
+    #: the preserve set (rows anchored to these files are never judged stale).
+    skipped: Set[Any] = field(default_factory=set)
+    #: The part of ``skipped`` that was walked but not fully written.
+    incomplete: Set[Any] = field(default_factory=set)
+    #: ``project_source`` values whose rows are kept whole: the refused extras
+    #: plus every walked extra root under which no file was discovered.
+    preserve_sources: Set[str] = field(default_factory=set)
+    #: The walked extra roots under which no file was discovered.
+    silent_roots: List[str] = field(default_factory=list)
+
+
+def _same_root(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:  # noqa: BLE001 - an unresolvable form is simply not equal
+        return False
+
+
+def prune_walk_guard(analyzer: Any) -> PruneWalkGuard:
+    """Decide what the walk that just ended lets ``--prune-stale`` delete.
+
+    v0.2.107 (DESTRUCTIVE-03). The prune deletes every row of the walked
+    root(s) that this run did not write. That is only sound when the walk is
+    evidence of what exists on disk, and of what a file now contains. A walk
+    that found nothing is NOT evidence of deletion, and a half-written file is
+    not evidence that its old entities are gone. Four rules, all in the
+    leave-alone direction:
+
+    1. **Scoped walk** (``--only-file`` / ``--only-files-from``): it never saw
+       the other files - refuse. (``main()`` rejects the flag pair; a direct
+       ``analyze_repository(prune_stale=True, only_file=...)`` caller did not
+       pass through that check.)
+    2. **Root missing**: the walked root is not a directory now (unmounted
+       drive, removed checkout) - refuse.
+    3. **No file discovered** by the whole walk, or none under the PRIMARY
+       root (empty mount point, a checkout of an empty branch, a finder that
+       failed upstream) - refuse. A walked EXTRA root with no discovered file
+       does not stop the run: its rows are kept whole (``preserve_sources``)
+       while the other roots are pruned as usual.
+    4. **Half-written file**: a file is "walked" as soon as its module row is
+       written. If a later entity write failed (embedding backend down,
+       Weaviate refusing) its old entity rows are unvisited although the code
+       is still on disk. The per-file reconcile already knows which files
+       were written completely (``_reconcile_walked`` holds a file only after
+       its LAST pass committed); a walked file absent from it joins the
+       preserve set. An analyzer without that state (a minimal test stub)
+       keeps the pre-v0.2.107 reading of ``walked``.
+
+    Reads the analyzer's own state (duck-typed, ``getattr``-defensive - this
+    module never imports the analyzer) and performs no I/O beyond one
+    ``isdir`` per walked root.
+    """
+    discovered = set(getattr(analyzer, "_prune_discovered_paths", None) or ())
+    walked = set(getattr(analyzer, "_prune_walked_paths", None) or ())
+    guard = PruneWalkGuard(
+        skipped=discovered - walked,
+        preserve_sources=set(getattr(analyzer, "_refused_extra_sources", None) or ()),
+    )
+    if not getattr(analyzer, "_analyze_whole_repo", True):
+        guard.refusal = ("this walk was scoped to named files, so it is no "
+                         "evidence about any other file")
+        return guard
+    primary = str(getattr(analyzer, "_analyze_repo_root_raw", "") or "")
+    extras = [str(e) for e in (getattr(analyzer, "_walked_extra_roots", None) or ())]
+    for root in ([primary] if primary else []) + extras:
+        if not os.path.isdir(root):
+            guard.refusal = f"the walked root {root} is missing or not a directory"
+            return guard
+    if not discovered:
+        guard.refusal = ("this walk discovered no file - a walk that found "
+                         "nothing is not evidence that the code was deleted")
+        return guard
+    # Per-root evidence needs (root, rel) keys; a bare-str entry (a caller
+    # that cannot name the root) attributes to no root, so nothing is silent.
+    seen_roots = {e[0] for e in discovered if isinstance(e, tuple)}
+    if all(isinstance(e, tuple) for e in discovered):
+        if primary and not any(_same_root(primary, r) for r in seen_roots):
+            guard.refusal = (f"this walk discovered no file under the project "
+                             f"root {primary}")
+            return guard
+        for extra in extras:
+            if not any(_same_root(extra, r) for r in seen_roots):
+                from vco_lib.codegraph_source_scope import walk_own_sources
+
+                guard.silent_roots.append(extra)
+                guard.preserve_sources |= walk_own_sources(extra, extra)
+    committed = getattr(analyzer, "_reconcile_walked", None)
+    if isinstance(committed, dict):
+        guard.incomplete = {
+            e for e in walked if isinstance(e, tuple) and e not in committed
+        }
+        guard.skipped |= guard.incomplete
+    return guard
 
 
 def expand_preserve_entries(

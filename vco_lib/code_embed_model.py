@@ -19,7 +19,8 @@ Owner ruling 2026-10-10 — a selection is APPLIED, automatically and additively
 when the target differs from the record, the ordinary paths (every analyzer run
 that is not a single-file edit, the incremental sync, the launcher build, the
 bundle update's self-heal) add the target's named vector to the collections
-(:func:`vco_lib.weaviate_schema.add_named_vector_slot`, vector-preserving) and
+(:func:`vco_lib.weaviate_schema.add_named_vector_slot`: in place, no class is
+dropped or copied) and
 the walk embeds the rows that lack it (the P299-B5 vectorless veto under
 force-rewalk) while the old vectors stay. Searches keep the recorded model until
 the target slot is COMPLETE (every row has it); then the record flips. Switching

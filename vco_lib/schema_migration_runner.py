@@ -1117,54 +1117,22 @@ def _default_codegraph_drift_probe(
 def _weaviate_class_object_count(
     weaviate_url: str, class_name: str
 ) -> Optional[int]:
-    """Return the object count of ``class_name`` via Weaviate's GraphQL
-    Aggregate, or ``None`` when unreachable / malformed / absent-class-error.
+    """Object count of ``class_name``, or ``None`` when it could not be read.
 
-    Mirrors ``vco_lib.kg_binding_heal._count_weaviate_class_objects`` (kept a
-    thin local copy so the runner has no import cycle into the KG-heal module).
-    ``None`` means "unknown" — callers MUST NOT read it as zero (a transient
-    network blip must never make a populated collection look empty). ``0`` is a
-    genuine empty/absent class. Soft-fails throughout; never raises.
+    A thin delegate to the ONE count helper,
+    :func:`vco_lib.weaviate_helpers.http_count_objects` (v0.2.107: this was one
+    of four copies that read an error-shaped Aggregate reply - HTTP 200, an
+    ``errors`` array, a null class field - as 0, which stamped a populated
+    collection "born fresh" and skipped its edges for good).
+
+    ``None`` means "unknown" - callers MUST NOT read it as zero. ``0`` is a
+    class that answered an integer count of 0, or one the schema endpoint
+    positively reports absent (HTTP 404; ``absent_is_zero``) - a fresh project
+    has no code-graph classes yet and must still be stampable. Never raises.
     """
-    import json
-    import urllib.request
+    from vco_lib.weaviate_helpers import http_count_objects
 
-    from vco_lib.weaviate_helpers import weaviate_url_default
-
-    # A falsy ``weaviate_url`` resolves through the ONE home rather than a
-    # bare literal: the literal read NEITHER ``WEAVIATE_URL`` nor
-    # ``WEAVIATE_PORT``, so on a relocated Weaviate this counted objects in
-    # whatever answered on the canonical port. See
-    # ``vco_lib/weaviate_helpers.py::weaviate_url_default``.
-    base = (weaviate_url or weaviate_url_default()).rstrip("/")
-    # class_name is a derived Weaviate class name (prefix + fixed suffix) — shape
-    # -validate anyway to fail-closed against a future untrusted caller.
-    if not class_name or not class_name.replace("_", "").isalnum():
-        return None
-    query = "{ Aggregate { " f"{class_name} {{ meta {{ count }} }}" " } }"
-    try:
-        data = json.dumps({"query": query}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{base}/v1/graphql",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        resp = urllib.request.urlopen(req, timeout=10)  # noqa: S310 (localhost)
-    except Exception:
-        return None
-    try:
-        if resp.getcode() != 200:
-            return None
-        payload = json.loads(resp.read())
-        agg = payload.get("data", {}).get("Aggregate", {}) or {}
-        rows = agg.get(class_name) or []
-        if not rows:
-            return 0
-        count = (rows[0].get("meta") or {}).get("count")
-        return count if isinstance(count, int) else None
-    except Exception:
-        return None
+    return http_count_objects(class_name, weaviate_url, absent_is_zero=True)
 
 
 def _codegraph_collection_has_rows(
@@ -1434,7 +1402,8 @@ def run_schema_migrations(
                             (
                                 artifact_type,
                                 artifact_name,
-                                "Weaviate unreachable during the NEVER_"
+                                "object count unreadable (Weaviate unreachable "
+                                "or an error reply) during the NEVER_"
                                 "MATERIALIZED existence probe; NOT stamping "
                                 "born-at-canonical (would mask an existing "
                                 "collection); will retry next update "
