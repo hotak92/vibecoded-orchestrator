@@ -3624,8 +3624,13 @@ class EmbeddingService:
         # and the analyzer stores the entity as more rows (v0.2.106 "extra
         # rows in both places") — it must never be swallowed into a row with
         # no active vector.
+        # A 503 (the code-embed service reloading its model or past its queue
+        # bound) is retried within the tolerance, exactly as ``embed_code``
+        # does: this is the analyzer's default write path, and a bare call
+        # turned one busy answer into a row with no vector.
         try:
-            result[self._code_slot] = self._embed_code_via_active(code)
+            result[self._code_slot] = self._retry_once_on_503(
+                self._embed_code_via_active, code)
         except ChunkOverflowError:
             raise
         except Exception as exc:
@@ -3636,7 +3641,8 @@ class EmbeddingService:
         carry = self._code_carry_service
         if carry is not None and self._code_slot in result:
             try:
-                result[carry._code_slot] = carry._embed_code_via_active(code)
+                result[carry._code_slot] = carry._retry_once_on_503(
+                    carry._embed_code_via_active, code)
             except ChunkOverflowError:
                 raise
             except Exception as exc:

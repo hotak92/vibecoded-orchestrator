@@ -605,3 +605,66 @@ def test_inline_fallback_default_tolerance_is_the_batch_one(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# The analyzer's DEFAULT write path (named vectors: embed_code_all_configured)
+# ---------------------------------------------------------------------------
+def _bare_service(active_fn):
+    """An EmbeddingService with only what ``embed_code_all_configured`` reads:
+    one active code slot, no carry, no secondaries."""
+    from vco_lib.embedding_service import EmbeddingService
+
+    svc = EmbeddingService.__new__(EmbeddingService)
+    svc._code_slot = "codesage_embed"
+    svc._code_carry_service = None
+    svc._last_truncated_slots = {}
+    svc._embed_code_via_active = active_fn  # type: ignore[method-assign]
+    return svc
+
+
+def test_all_configured_code_embed_rides_out_a_503(monkeypatch):
+    """RED-PROOF: the analyzer embeds through ``embed_code_all_configured``
+    (named vectors are the default), and that path called the active backend
+    bare — one 503 + Retry-After (the service reloading its model after an
+    idle unload, or its queue bound) left the row with NO vector, although
+    ``embed_code`` beside it retries within the tolerance."""
+    monkeypatch.delenv("VCO_EMBED_503_RETRY_DELAY", raising=False)
+    monkeypatch.delenv("VCO_EMBED_503_TOLERANCE_SECS", raising=False)
+    monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "false")
+    sleeps: list = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+    calls = {"n": 0}
+
+    def _active(code):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _oom503(retry_after=7.0)
+        return [0.25]
+
+    out = _bare_service(_active).embed_code_all_configured("def f(): pass")
+    assert out == {"codesage_embed": [0.25]}
+    assert calls["n"] == 2 and sleeps == [7.0]
+
+
+def test_all_configured_code_embed_non_503_is_not_retried(monkeypatch):
+    """Leave-alone case: any other failure still degrades at once (no vector
+    for the slot, one attempt) and a refusal still reaches the row writer."""
+    from vco_lib.embed_split import ChunkOverflowError
+
+    monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "false")
+    monkeypatch.setattr(time, "sleep", lambda s: pytest.fail("must not sleep"))
+    calls = {"n": 0}
+
+    def _broken(code):
+        calls["n"] += 1
+        raise RuntimeError("connection reset")
+
+    assert _bare_service(_broken).embed_code_all_configured("x") == {}
+    assert calls["n"] == 1
+
+    def _refused(code):
+        raise ChunkOverflowError("codesage-large-v2", 9000, "refused whole")
+
+    with pytest.raises(ChunkOverflowError):
+        _bare_service(_refused).embed_code_all_configured("x")
