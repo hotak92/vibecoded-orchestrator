@@ -224,6 +224,26 @@ def test_unreadable_counts_after_the_move_are_a_mismatch_not_equality():
     assert cu.count_mismatches({"A": 0}, None)            # 0 == None must never pass
     assert cu.count_mismatches({"A": 0}, {"A": 0}) == []
     assert cu.count_mismatches({"A": 5, "B": 1}, {"A": 5}) == ["B: 1 before, absent after"]
+    assert cu.count_mismatches({"A": 5}, {"A": 4}) == ["A: 5 before, 4 after"]
+
+
+def test_objects_written_between_the_count_and_the_stop_are_not_a_loss():
+    # C-4: counts are read while sessions still write; more objects (or a new
+    # class) after the move is reported, never a failure.
+    assert cu.count_mismatches({"A": 5}, {"A": 7, "New": 1}) == []
+    assert cu.count_gains({"A": 5}, {"A": 7, "New": 1}) == [
+        "A: 5 before, 7 after", "New: absent before, 1 after"]
+    assert cu.count_gains({"A": 5}, {"A": 5}) == [] and cu.count_gains({"A": 5}, None) == []
+
+
+def test_a_row_written_during_the_move_does_not_roll_a_good_move_back(root, tmp_path):
+    eng = FakeEngine()
+    eng.on_new_start = lambda e: e.data.update(Alpha_KnowledgeGraph=121, Alpha_New=3)
+    out = _move(root, eng, tmp_path)
+    assert out.status == cu.MOVED and "restore" not in eng.calls
+    text = "\n".join(out.lines)
+    assert "Alpha_KnowledgeGraph: 120 before, 121 after" in text
+    assert "Alpha_New: absent before, 3 after" in text
 
 
 def test_every_class_is_counted_and_one_unreadable_class_fails_the_whole_read():
@@ -472,7 +492,8 @@ def test_a_passing_verify_removes_nothing_and_records_no_failure(root, tmp_path)
     eng = FakeEngine()
     out = _move(root, eng, tmp_path)
     assert out.status == cu.MOVED and "restore" not in eng.calls
-    assert not (tmp_path / "state" / "container-upgrade.json").exists()
+    state = json.loads((tmp_path / "state" / "container-upgrade.json").read_text())
+    assert "weaviate" not in state            # only the kept backup is recorded (C-2)
 
 
 # ─── no auto-heal loop ──────────────────────────────────────────────────
@@ -600,6 +621,7 @@ def test_the_guard_is_the_one_recreate_guard_without_its_compose_call(root, monk
     seen["verdict"] = ["weaviate"]
     assert eng.guard() == (True, "", ["entry"])
     assert seen["services"] == ["weaviate"] and seen["guard_only"] is True
+    assert seen["protected_move"] is True   # the one caller the version gate lets through
     assert seen["compose_dir"] == root / "infrastructure"
     seen["verdict"] = []
     cleared, why, entries = eng.guard()
@@ -1011,3 +1033,360 @@ def test_the_conditions_are_registered_with_their_class():
     assert deferral_registry.disposition_for(cu.CID_REFUSED) == "action_required"
     assert deferral_registry.disposition_for(cu.CID_ROLLED_BACK) == "action_required"
     assert deferral_registry.disposition_for(cu.CID_BACKUP_KEPT) == "informational_record"
+
+
+# ─── C-1: no recreate outside the protected move changes the version ────
+#
+# Every recreate path (install.py step 5, `service_lifecycle up` from the
+# session hooks and the launcher's Services actions, the port move, the
+# launcher's volume migration, hand-to-vco) asks
+# weaviate_raft_guard.upgrade_check; a recreate that would change the version a
+# live container runs is refused there unless the protected move asks.
+
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
+from tests.test_v02106_weaviate_raft_guard import Runtime  # noqa: E402
+from vco_lib import data_identity as di  # noqa: E402
+from vco_lib import service_lifecycle as sl  # noqa: E402
+from vco_lib import weaviate_raft_guard as rg  # noqa: E402
+
+
+@pytest.fixture()
+def wv_world(tmp_path):
+    """VCO's compose pins PINNED; the vco_managed row's container mounts a
+    bind holding a raft log (the shape of tests/test_v02106's fixture)."""
+    root = tmp_path / "orch"
+    infra = root / "infrastructure"
+    infra.mkdir(parents=True)
+    (infra / "docker-compose.yml").write_text(
+        f"services:\n  weaviate:\n    image: {PINNED}\n", encoding="utf-8")
+    data = tmp_path / "wvdata"
+    (data / "raft").mkdir(parents=True)
+    (data / "raft" / "raft.db").write_bytes(b"log")
+    db = make_launcher_db(tmp_path / "launcher.db")
+    bind = {"kind": "bind", "source": str(data), "destination": "/var/lib/weaviate"}
+    se.write_rows([se.EndpointRow(service="weaviate", mode="vco_managed", port=8081,
+                                  grpc_port=50052, container_name=NAME,
+                                  source="install_probe", data_mount=bind)], db_path=db)
+    live = {"Type": "bind", "Source": str(data), "Destination": "/var/lib/weaviate"}
+    return infra, db, data, live
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_stub(monkeypatch):
+    """The raft snapshot (stop, one-off run, poll) is tests/test_v02106's
+    subject: here it is answered at once, so a recreate that is NOT refused
+    by the version gate goes on to its rm / compose (what the red run shows)."""
+    monkeypatch.setattr(rg, "snapshot_with_container_image",
+                        lambda *_a, **_kw: rg.UpgradeVerdict(rg.PREPARED, "snapshot (stub)"))
+
+
+def _composed(box):
+    return [a for a in box.argv if "up" in a and a[-1] != "config"]
+
+
+@pytest.mark.real_raft_guard
+def test_a_zombie_on_another_version_is_started_by_name_never_removed(wv_world):
+    # The session hook's zombie arm after an opted-out / refused / rolled-back
+    # move: before C-1 the guard let it through and `rm --force` + compose
+    # made the 1.28 -> 1.37 move with no counts, copy, verify or rollback.
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, running="false", image=OLD)
+    box.compose_source = str(data)
+    lines = []
+    res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", recreate=["weaviate"], db_path=db, run=box.run,
+                         out=lines.append)
+    assert res.refused == ["weaviate"] and res.removed == [] and res.cleared == []
+    assert not any(a[1] == "rm" for a in box.argv)
+    assert box.verbs() == ["start vco_weaviate"]           # started BY NAME, nothing stopped
+    assert _composed(box) == [] and res.entries == []      # no compose, no ledger row here
+    assert any("python install.py --update" in line and "by name" in line for line in lines)
+
+
+@pytest.mark.real_raft_guard
+def test_a_zombie_on_the_pinned_version_is_still_recreated(wv_world):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, running="false", image=PINNED)
+    box.compose_source = str(data)
+    res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", recreate=["weaviate"], guard_only=True, db_path=db,
+                         run=box.run, out=lambda _l: None)
+    assert res.cleared == ["weaviate"] and res.removed == [NAME]
+    assert ["podman", "rm", "--force", NAME] in box.argv
+
+
+@pytest.mark.real_raft_guard
+@pytest.mark.parametrize("image", [OLD, "cr.weaviate.io/semitechnologies/weaviate:1.40.0"])
+def test_every_unprotected_guard_refuses_a_version_change_and_stops_nothing(wv_world, image):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, image=image)
+    box.compose_source = str(data)
+    rows = se.load_rows(db)
+    g = di.guard_recreate("weaviate", runtime="podman", infra_dir=infra,
+                          compose_argv=["podman", "compose"], row=rows["weaviate"], rows=rows,
+                          db_path=db, run=box.run)
+    assert g.verdict == di.REFUSE_VERSION and not g.ok
+    assert box.verbs() == []                                # no snapshot stop, no rm
+    assert g.deferral_entry().condition_id == cu.CID_REFUSED
+    assert "plan" in g.deferral_entry().command_to_apply
+
+
+@pytest.mark.real_raft_guard
+def test_install_step_5_ledgers_the_refused_version_change(wv_world):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, image=OLD)
+    box.compose_source = str(data)
+    added = []
+    refused = di.guard_compose_set(["weaviate"], runtime="podman", infra_dir=infra,
+                                   compose_argv=lambda: ["podman", "compose"],
+                                   rows=se.load_rows(db),
+                                   deferral_report=SimpleNamespace(add_entry=added.append),
+                                   run=box.run, out=lambda _l: None, db_path=db)
+    assert refused == {"weaviate"} and [e.condition_id for e in added] == [cu.CID_REFUSED]
+    assert box.verbs() == []
+
+
+@pytest.mark.real_raft_guard
+def test_the_launchers_volume_migration_check_refuses_a_version_change(wv_world):
+    infra, _db, _data, live = wv_world
+    box = Runtime(live_mount=live, image=OLD)
+    v = rg.prepare_for_compose(infra.parent, runtime="podman", run=box.run)
+    assert v.status == rg.VERSION_MOVE and not v.ok and box.verbs() == []
+
+
+@pytest.mark.real_raft_guard
+def test_only_the_protected_move_passes_the_version_gate(wv_world):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, image=OLD)
+    box.compose_source = str(data)
+    res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", guard_only=True, protected_move=True, db_path=db,
+                         run=box.run, out=lambda _l: None)
+    assert res.cleared == ["weaviate"] and res.refused == []
+
+
+# ─── hand-to-vco: the take-over keeps the version; the protected move changes it
+
+
+class _HandWorld:
+    """A foreign Weaviate under VCO's container name, recorded as adopted."""
+
+    def __init__(self, tmp_path, monkeypatch, image=OLD):
+        self.root = tmp_path / "orch"
+        (self.root / "infrastructure").mkdir(parents=True)
+        (self.root / "infrastructure" / "docker-compose.yml").write_text(
+            f"services:\n  weaviate:\n    image: {PINNED}\n", encoding="utf-8")
+        self.db = make_launcher_db(tmp_path / "launcher.db")
+        se.write_rows([se.EndpointRow("weaviate", "adopted_container", 8081, "user_cli",
+                                      grpc_port=50052, container_name=NAME)], db_path=self.db)
+        self.image = image
+        self.adopt_calls: list[dict] = []
+        self.moves: list[dict] = []
+        self.move_status = cu.MOVED
+        self.lines: list[str] = []
+        monkeypatch.setattr(sr, "_container_exists", lambda *_a: True)
+        monkeypatch.setattr(det, "list_containers_or_none",
+                            lambda *_a, **_kw: [_container(image=self.image)])
+
+    def adopt(self, root, **kw):
+        self.adopt_calls.append(kw)
+        return sr._service_adoption.AdoptionResult(adopted=list(kw["services"]))
+
+    def mover(self, **kw):
+        self.moves.append(kw)
+        return cu.MoveOutcome("weaviate", status=self.move_status,
+                              lines=[f"  [weaviate] {self.move_status}"])
+
+    def hand(self, environ=None):
+        return sr.hand_to_vco("weaviate", orchestrator_root=self.root, runtime="podman",
+                              db_path=self.db, adopt=self.adopt, mover=self.mover,
+                              environ=environ if environ is not None else {},
+                              out=self.lines.append)
+
+
+def test_a_hand_over_across_versions_keeps_the_version_then_makes_the_protected_move(
+        tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch)
+    assert w.hand() == 0
+    assert len(w.adopt_calls) == 1 and w.adopt_calls[0]["hold_weaviate_image"] == OLD
+    assert len(w.moves) == 1 and w.moves[0]["container"].name == NAME   # then THE move
+
+
+def test_a_hand_over_whose_move_fails_reports_it(tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch)
+    w.move_status = cu.ROLLED_BACK
+    assert w.hand() == 1 and len(w.moves) == 1
+    assert any("stays on its version" in line for line in w.lines)
+
+
+def test_a_hand_over_on_the_pinned_version_is_a_plain_take_over(tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch, image=PINNED)
+    assert w.hand() == 0
+    assert "hold_weaviate_image" not in w.adopt_calls[0] and w.moves == []
+
+
+@pytest.mark.parametrize("image, environ, rc", [
+    ("cr.weaviate.io/semitechnologies/weaviate:1.40.0", {}, 1),  # Weaviate does not downgrade
+    (OLD, {cu.MODE_ENV: "off"}, 1),
+    (OLD, {cu.MODE_ENV: "dry-run"}, 0),
+])
+def test_a_held_back_move_holds_the_hand_over_back_before_anything_is_touched(
+        tmp_path, monkeypatch, image, environ, rc):
+    w = _HandWorld(tmp_path, monkeypatch, image=image)
+    assert w.hand(environ) == rc
+    assert w.adopt_calls == [] and w.moves == []
+    assert any("not handed over" in line for line in w.lines)
+
+
+def test_the_take_over_composes_the_held_image_and_checks_against_it(tmp_path, monkeypatch):
+    from tests import test_v0296_service_adoption as t296
+
+    monkeypatch.setattr(cu, "state_path", lambda: tmp_path / "state" / "container-upgrade.json")
+    seen = []
+    monkeypatch.setattr(rg, "upgrade_check",
+                        lambda **kw: seen.append(kw) or rg.UpgradeVerdict(rg.NOT_NEEDED))
+    world = t296.World(tmp_path)
+    result, _lines = world.adopt(services=("weaviate",), hold_weaviate_image=OLD)
+    assert result.adopted == ["weaviate"]
+    assert seen[0]["target_image"] == OLD                 # judged against the KEPT version
+    ups = [a for a in result.argv_log if "up" in a and a[-1] == "weaviate"]
+    files = [a[i + 1] for a in ups for i, x in enumerate(a) if x == "-f"]
+    assert files[-1].endswith("container-upgrade-rollback-weaviate.yml")
+    import yaml
+
+    assert yaml.safe_load(Path(files[-1]).read_text())["services"]["weaviate"]["image"] == OLD
+
+
+def test_a_container_whose_image_cannot_be_read_is_not_handed_over(tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch)
+    monkeypatch.setattr(det, "list_containers_or_none", lambda *_a, **_kw: None)
+    assert w.hand() == 1 and w.adopt_calls == []
+
+
+def test_the_count_is_the_one_count_helper_with_this_modules_transport(monkeypatch):
+    # C-6: no second query / transport for the one count.
+    from vco_lib import weaviate_helpers
+
+    seen = {}
+
+    def helper(cls, url, **kw):
+        seen.update(cls=cls, url=url, **kw)
+        return 7
+
+    monkeypatch.setattr(weaviate_helpers, "http_count_objects", helper)
+    sent = []
+    assert cu.class_count("http://wv:1", "Cls", http=lambda *a: sent.append(a) or (200, b"")) == 7
+    assert (seen["cls"], seen["url"], seen["timeout"]) == ("Cls", "http://wv:1", 120.0)
+    seen["request"]("POST", "http://wv:1/v1/graphql", body={"q": 1}, timeout=5.0)
+    assert sent == [("POST", "http://wv:1/v1/graphql", {"q": 1}, 5.0)]
+
+
+def test_a_class_name_the_helper_rejects_is_unreadable_not_counted():
+    ok = _http({"data": {"Aggregate": {"Bad-Name": [{"meta": {"count": 3}}]}}})
+    assert cu.class_count("http://localhost:1", "Bad-Name", http=ok) is None
+
+
+@pytest.mark.parametrize("status, shown", [
+    (wm.APPLIED, True), (wm.FAILED, True), (wm.UNKNOWN, True),
+    (wm.OWN_LIMIT, False), (wm.OPTED_OUT, False), (wm.ALREADY, False)])
+def test_the_hooks_quiet_verb_prints_only_a_change_or_a_failure(tmp_path, monkeypatch, capsys,
+                                                                 status, shown):
+    # C-5: the hook comment promises one line "only when it changed something
+    # or could not"; OWN_LIMIT / OPTED_OUT printed at every ensure.
+    monkeypatch.setattr(wm, "ensure_foreign_limit_for_install",
+                        lambda root, dry_run=False: wm.ForeignLimit(status, "c", 0, "1g", "  line"))
+    wm.main(["ensure-foreign-limit", "--root", str(tmp_path), "--quiet"])
+    assert (capsys.readouterr().out.strip() == "line") is shown
+    wm.main(["ensure-foreign-limit", "--root", str(tmp_path)])   # by hand: always the line
+    assert capsys.readouterr().out.strip() == "line"
+
+
+@pytest.mark.parametrize("hook", ["ensure-containers.sh", "ensure-containers.ps1"])
+def test_both_hooks_call_the_quiet_verb(hook):
+    text = (REPO_ROOT / "templates" / "hooks" / hook).read_text(encoding="utf-8-sig")
+    calls = [line for line in text.splitlines()
+             if "weaviate_memory ensure-foreign-limit" in line and not line.lstrip().startswith("#")]
+    assert len(calls) == 1 and "--quiet" in calls[0]
+
+
+# ─── C-2: the pre-move copy stays on record while it exists ─────────────
+
+
+class VolumeEngine:
+    """``volume inspect`` only: *present* volumes exist; *unreadable* ones
+    cannot be asked."""
+
+    runtime = "podman"
+
+    def __init__(self, present=(), unreadable=()):
+        self.present, self.unreadable = set(present), set(unreadable)
+        self.asked: list[str] = []
+
+    def volume_exists(self, name):
+        self.asked.append(name)
+        if name in self.unreadable:
+            return None
+        return name in self.present
+
+
+def test_a_verified_move_records_its_backup_volume(root, tmp_path):
+    out = _move(root, FakeEngine(), tmp_path)
+    state = json.loads((tmp_path / "state" / "container-upgrade.json").read_text())
+    assert [b["volume"] for b in state["backups"]] == [out.backup]
+    assert state["backups"][0]["from"] == OLD and state["backups"][0]["to"] == PINNED
+    assert "weaviate" not in state            # no failed attempt is recorded
+
+
+def test_the_backup_entry_is_re_emitted_while_the_volume_exists(root, tmp_path):
+    state_file = tmp_path / "state" / "container-upgrade.json"
+    backup = _move(root, FakeEngine(), tmp_path).backup
+    eng = VolumeEngine(present={backup})
+    entries = cu.kept_backup_entries(eng, state_file=state_file)
+    assert [e.condition_id for e in entries] == [cu.CID_BACKUP_KEPT]
+    assert f"podman volume rm {backup}" in entries[0].command_to_apply
+    assert cu.kept_backup_entries(eng, skip=[backup], state_file=state_file) == []  # reported once per run
+    assert json.loads(state_file.read_text())["backups"][0]["volume"] == backup
+
+
+def test_a_removed_backup_volume_is_forgotten(root, tmp_path):
+    state_file = tmp_path / "state" / "container-upgrade.json"
+    _move(root, FakeEngine(), tmp_path)
+    assert cu.kept_backup_entries(VolumeEngine(), state_file=state_file) == []
+    assert json.loads(state_file.read_text())["backups"] == []
+
+
+def test_a_backup_volume_that_cannot_be_checked_stays_on_record(root, tmp_path):
+    state_file = tmp_path / "state" / "container-upgrade.json"
+    backup = _move(root, FakeEngine(), tmp_path).backup
+    entries = cu.kept_backup_entries(VolumeEngine(unreadable={backup}), state_file=state_file)
+    assert [e.condition_id for e in entries] == [cu.CID_BACKUP_KEPT]
+    assert json.loads(state_file.read_text())["backups"][0]["volume"] == backup
+
+
+@pytest.mark.parametrize("rc, stderr, want", [
+    (0, "", True), (125, "Error: no such volume vco-weaviate-backup-1", False),
+    (125, "Error: permission denied", None)])
+def test_volume_exists_reads_the_engine(root, rc, stderr, want):
+    run = mock.Mock(return_value=mock.Mock(returncode=rc, stdout="", stderr=stderr))
+    assert cu.ContainerEngine("podman", root, run=run).volume_exists("v") is want
+    assert run.call_args[0][0] == ["podman", "volume", "inspect", "v"]
+
+
+def test_an_update_with_nothing_to_move_re_emits_the_kept_backup(tmp_path, monkeypatch):
+    state_file = tmp_path / "vct" / "container-upgrade.json"
+    monkeypatch.setattr(cu, "state_path", lambda: state_file)
+    case, db, machine, rec, _root = _own_install(tmp_path)
+    cu.save_state({"backups": [{"service": "weaviate", "volume": "vco-weaviate-backup-1",
+                                "container": NAME, "from": OLD, "to": PINNED,
+                                "runtime": "podman", "at": "1"}]}, state_file)
+    plain = machine.run
+
+    def run(argv, **kw):
+        if list(argv[1:3]) == ["volume", "inspect"]:
+            return mock.Mock(returncode=0, stdout="[]", stderr="")
+        return plain(argv, **kw)
+
+    result, *_ = run_case(tmp_path, case, db=db, machine=machine, recorder=rec, run=run,
+                          mover=lambda **_kw: _outcome(cu.NOT_NEEDED))
+    kept = [e for e in result.entries if e.condition_id == cu.CID_BACKUP_KEPT]
+    assert len(kept) == 1 and "vco-weaviate-backup-1" in kept[0].detected

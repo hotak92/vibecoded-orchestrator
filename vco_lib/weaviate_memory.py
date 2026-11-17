@@ -49,7 +49,7 @@ alone.
 CLI::
 
     python -m vco_lib.weaviate_memory show
-    python -m vco_lib.weaviate_memory ensure-foreign-limit [--dry-run] [--json]
+    python -m vco_lib.weaviate_memory ensure-foreign-limit [--dry-run] [--json] [--quiet]
 """
 from __future__ import annotations
 
@@ -201,6 +201,10 @@ OPTED_OUT = "opted_out"        # VCO_WEAVIATE_FOREIGN_LIMIT=off, or the user's "
 UNKNOWN = "unknown"            # the limit or the container could not be read — nothing done
 WOULD_APPLY = "would_apply"    # --dry-run
 FAILED = "failed"              # the engine refused the update
+#: What ``ensure-foreign-limit --quiet`` (the hooks, at every ensure) still
+#: prints: it changed something, or it could not. A container that keeps its
+#: owner's limit, the user's opt-out and an already applied limit are silent.
+QUIET_SHOWN = frozenset({APPLIED, FAILED, UNKNOWN})
 
 
 @dataclass
@@ -362,6 +366,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ens.add_argument("--root", default=None)
     ens.add_argument("--dry-run", action="store_true")
     ens.add_argument("--json", action="store_true")
+    ens.add_argument("--quiet", action="store_true", help=(
+        "print the line only when the limit was applied or could not be "
+        "(the ensure-containers hooks, which run this at every ensure)"))
     args = parser.parse_args(argv)
     if args.verb == "show":
         host = args.host_ram_gb
@@ -378,7 +385,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     result = ensure_foreign_limit_for_install(root, dry_run=args.dry_run)
     if args.json:
         print(json.dumps(asdict(result), sort_keys=True))
-    elif result.line:
+    elif result.line and (not args.quiet or result.status in QUIET_SHOWN):
         print(result.line)
     return 1 if result.status == FAILED else 0
 

@@ -30,6 +30,15 @@ data crosses versions WITH its vectors — nothing is re-chunked or re-embedded
    recorded, so the next update does not try again by itself (no auto-heal
    loop) until the user asks (``retry``).
 
+This is the ONLY path that changes the version a Weaviate container runs:
+every other recreate (install.py step 5, the session hooks' zombie recovery
+and missing-container create through ``service_lifecycle up``, the launcher's
+Services actions, the port move, the launcher's volume migration) asks
+:func:`vco_lib.weaviate_raft_guard.upgrade_check`, which refuses a recreate
+that would change a live container's version unless this module's guard call
+asks (``protected_move=True``). A zombie whose recreate is refused that way is
+started by name instead (``service_lifecycle.up_services``).
+
 Only a container that is VCO's own reaches this module
 (:func:`vco_lib.service_reconcile.reclassify_own` decides that); a container
 VCO did not create is never recreated — it only gets the memory limit in
@@ -75,7 +84,9 @@ __all__ = [
     "class_count",
     "class_counts",
     "image_move",
+    "kept_backup_entries",
     "protect_weaviate_move",
+    "version_move_refused_entry",
 ]
 
 CID_REFUSED = "container_upgrade_refused"
@@ -125,19 +136,23 @@ def _default_http(method: str, url: str, body: Optional[dict], timeout: float) -
 def class_count(url: str, cls: str, *, http: Optional[HttpFn] = None) -> Optional[int]:
     """The number of objects in class *cls*, or ``None`` when it cannot be
     read: a transport error, a non-200 answer, an ``errors`` body, a missing
-    or null field, or a value that is not a non-negative integer. ``None`` is
-    never "zero" and never "equal".
+    or null field, a value that is not a non-negative integer, or a class
+    name that is not ``[A-Za-z0-9_]+``. ``None`` is never "zero" and never
+    "equal".
 
-    The reply is read by ``weaviate_helpers.parse_aggregate_count`` - the one
-    reading of an Aggregate reply every VCO count shares (lane SAFETY)."""
-    from vco_lib.weaviate_helpers import parse_aggregate_count  # noqa: PLC0415
+    THE count helper, ``weaviate_helpers.http_count_objects`` (one query, one
+    reading of the reply, one class-name check for every VCO count); this
+    module only lends it its own transport (*http*, the tests' fake engine
+    seam) through the helper's ``request`` parameter."""
+    from vco_lib.weaviate_helpers import http_count_objects  # noqa: PLC0415
 
-    query = {"query": "{ Aggregate { %s { meta { count } } } }" % cls}
-    try:
-        status, raw = (http or _default_http)("POST", f"{url.rstrip('/')}/v1/graphql", query, 120.0)
-    except Exception:  # noqa: BLE001 — could not be read
-        return None
-    return parse_aggregate_count(status, raw, cls)
+    send = http or _default_http
+
+    def request(method: str, target: str, *, body: Optional[dict] = None,
+                timeout: float = 120.0) -> tuple[int, bytes]:
+        return send(method, target, body, timeout)
+
+    return http_count_objects(cls, url, timeout=120.0, request=request)
 
 
 def schema_classes(url: str, *, http: Optional[HttpFn] = None) -> Optional[list[str]]:
@@ -176,17 +191,32 @@ def class_counts(url: str, *, http: Optional[HttpFn] = None
 
 
 def count_mismatches(before: Mapping[str, int], after: Optional[Mapping[str, int]]) -> list[str]:
-    """Human lines for every class whose count is not what it was (a class
-    that disappeared or appeared included). An unreadable *after* is one
-    line, never an empty list."""
+    """Human lines for every class that LOST objects or disappeared — the
+    failures of a move. An unreadable *after* is one line, never an empty
+    list. More objects than before (or a new class) is not a loss: the
+    counts are read while sessions can still write, before the container is
+    stopped (audit C-4) — :func:`count_gains` reports those."""
     if after is None:
         return ["the counts after the move could not be read"]
     lines = []
-    for name in sorted(set(before) | set(after)):
-        b, a = before.get(name), after.get(name)
-        if b != a:
-            lines.append(f"{name}: {b if b is not None else 'absent'} before, "
-                         f"{a if a is not None else 'absent'} after")
+    for name in sorted(before):
+        b, a = before[name], after.get(name)
+        if a is None or a < b:
+            lines.append(f"{name}: {b} before, {a if a is not None else 'absent'} after")
+    return lines
+
+
+def count_gains(before: Mapping[str, int], after: Optional[Mapping[str, int]]) -> list[str]:
+    """Human lines for every class that holds MORE objects than before, or
+    that appeared — written between the count and the stop; reported in the
+    success line, never a failure."""
+    if after is None:
+        return []
+    lines = []
+    for name in sorted(after):
+        b, a = before.get(name), after[name]
+        if b is None or a > b:
+            lines.append(f"{name}: {b if b is not None else 'absent'} before, {a} after")
     return lines
 
 
@@ -262,6 +292,22 @@ def previous_failure(service: str, move: ImageMove, path: Optional[Path] = None)
     return None
 
 
+def write_image_override(image: str) -> Path:
+    """The one-line compose file naming the image that ran on the data
+    before the move — appended LAST to the ``-f`` chain by the rollback, and
+    by ``hand-to-vco``'s take-over, which keeps the version the container
+    runs so that only the protected move changes it. Kept outside the
+    checkout, under the VCT state directory."""
+    from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
+
+    path = state_path().parent / "container-upgrade-rollback-weaviate.yml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, "# Written by vco_lib.container_upgrade: the image that ran on "
+                            "this data before the move.\n"
+                            f"services:\n  weaviate:\n    image: {json.dumps(image)}\n")
+    return path
+
+
 # ─── the engine ─────────────────────────────────────────────────────────
 
 
@@ -319,6 +365,16 @@ class ContainerEngine:
 
     def remove_volume(self, name: str) -> bool:
         return self._ok(["volume", "rm", name], 120)
+
+    def volume_exists(self, name: str) -> Optional[bool]:
+        """``True`` / ``False`` (the engine positively says "no such
+        volume") / ``None`` (it could not be asked)."""
+        res = self._rt(["volume", "inspect", name], 60)
+        if res is None:
+            return None
+        if res.returncode == 0:
+            return True
+        return False if "no such volume" in (res.stderr or "").lower() else None
 
     # -- one-off helper containers (the OLD image's own shell) ----------
     def _helper(self, image: str, mounts: Sequence[str], script: str, timeout: float
@@ -384,7 +440,8 @@ class ContainerEngine:
             return False, f"{self.runtime} has no compose available", []
         res = _sl.up_services(["weaviate"], compose_dir=self.root / "infrastructure",
                               compose_argv=compose, runtime=self.runtime, guard_only=True,
-                              db_path=self.db_path, run=self.run, out=self.log)
+                              protected_move=True, db_path=self.db_path, run=self.run,
+                              out=self.log)
         if "weaviate" in res.cleared:
             return True, "", list(res.entries)
         return False, "the recreate guard refused it (see the lines above)", list(res.entries)
@@ -428,16 +485,7 @@ class ContainerEngine:
             + f" (cd {infra} && {shlex.join(argv)})"
 
     def write_image_override(self, image: str) -> Path:
-        """The one-line compose file the rollback appends (kept outside the
-        checkout, under the VCT state directory)."""
-        from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
-
-        path = state_path().parent / "container-upgrade-rollback-weaviate.yml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, "# Written by vco_lib.container_upgrade (rollback): the image "
-                                "that ran on this data before the move.\n"
-                                f"services:\n  weaviate:\n    image: {json.dumps(image)}\n")
-        return path
+        return write_image_override(image)
 
     # -- Weaviate over HTTP ---------------------------------------------
     def wait_ready(self, url: str, timeout_s: float) -> bool:
@@ -539,6 +587,22 @@ def _refused_entry(name: str, move: ImageMove, reason: str, command: str) -> Def
     )
 
 
+def version_move_refused_entry(name: str, move: Optional[ImageMove], reason: str
+                               ) -> DeferralEntry:
+    """The ledger row of a recreate that the one recreate guard refused
+    because it would change the Weaviate version outside this module
+    (``data_identity.REFUSE_VERSION``) — install.py step 5 records it for a
+    container the protected move does not take (not provably VCO's own)."""
+    if move is None:  # never None from the guard; kept total
+        move = ImageMove("?", "?", "upgrade")
+    return _refused_entry(
+        name or "vco_weaviate", move, reason,
+        "# See what VCO's protected move would do with this container:\n"
+        f"{_CLI} plan\n"
+        "# A container another compose created is handed to VCO (and moved, protected) with:\n"
+        "python -m vco_lib.service_endpoints hand-to-vco --service weaviate")
+
+
 def _rolled_back_entry(name: str, move: ImageMove, reason: str, backup: str, restored: bool,
                        manual: str) -> DeferralEntry:
     state = (f"The data was restored from the copy and {move.live} runs on it again."
@@ -568,8 +632,8 @@ def _backup_kept_entry(name: str, move: ImageMove, backup: str, runtime: str,
     return DeferralEntry(
         condition_id=CID_BACKUP_KEPT,
         title="Weaviate now runs the supported version; the pre-move copy is kept",
-        detected=(f"Container {name} moved {move.live} -> {move.pinned}; every class holds the "
-                  f"object count it had. The data as it was before the move is in volume "
+        detected=(f"Container {name} moved {move.live} -> {move.pinned}; no class lost an "
+                  f"object. The data as it was before the move is in volume "
                   f"{backup}.{extra}"),
         why_deferred="Recorded for your information; VCO never deletes that copy itself.",
         command_to_apply=("# Once you are satisfied with the new version, free the space:\n"
@@ -605,31 +669,8 @@ def protect_weaviate_move(
         return out
     mount_obj = container.mount_at(_DATA_DEST)
     mount = mount_obj.to_row() if mount_obj is not None else None
-    if move.direction == "downgrade":
-        out.status, out.reason = REFUSED, (
-            f"{name} runs {move.live}, NEWER than the {move.pinned} VCO pins; Weaviate does "
-            "not downgrade, so VCO leaves it as it is")
-        out.say(f"  [weaviate] {out.reason}.")
+    if held_back(out, name, move, mount, environ=environ, state_file=state_file):
         return out
-    mode = upgrade_mode(environ)
-    if mode == "dry-run":
-        out.status, out.reason = DRY_RUN, f"{MODE_ENV}=dry-run"
-        out.say(f"  [weaviate] {MODE_ENV}=dry-run — nothing is changed. It would do this:")
-        out.say(plan_line(name, move, mount))
-        return out
-    if mode == "off":
-        out.status, out.reason = OPTED_OUT, f"{MODE_ENV}=off"
-        out.say(f"  [weaviate] {MODE_ENV}=off — {name} stays on {move.live} "
-                f"(VCO supports {move.pinned}); nothing is recreated.")
-        return out
-
-    retry_cmd = f"{_CLI} retry --service weaviate\npython install.py --update"
-    earlier = previous_failure("weaviate", move, state_file)
-    if earlier is not None:
-        return _refuse(out, name, move, (
-            f"an earlier attempt failed ({earlier.get('reason') or 'no reason recorded'}) and a "
-            "failed move is not repeated by itself"),
-            "# Ask for another attempt:\n" + retry_cmd)
     if mount is None:
         return _refuse(out, name, move, f"{name} mounts nothing at {_DATA_DEST}",
                        "python install.py --update")
@@ -690,7 +731,7 @@ def protect_weaviate_move(
     out.backup = backup
 
     # ── from here the old container is replaced; every failure rolls back ──
-    problem = ""
+    problem, gains = "", []
     if not eng.remove_container(name):
         return back_to_old(f"the old container {name} could not be removed (the copy is in "
                            f"volume {backup}; remove it with `{runtime} volume rm {backup}`)")
@@ -700,12 +741,14 @@ def protect_weaviate_move(
     elif not eng.wait_ready(url, ready_timeout_s(environ)):
         problem = f"{move.pinned} did not become ready at {url}"
     else:
-        problem = _verify(eng, name, url, move, mount, before, _di)
+        problem, gains = _verify(eng, name, url, move, mount, before, _di)
     if not problem:
         after_empty = sorted(c for c, n in before.items() if n == 0)
         out.status, out.empty_classes = MOVED, after_empty
+        _record_backup(out, name, move, backup, runtime, stamp, state_file)
         say(f"  [weaviate] verified: {move.pinned}, same data mount, every index present, "
-            f"all {len(before)} class counts equal")
+            f"no class lost an object (of {len(before)} counted)"
+            + (f"; written during the move: {'; '.join(gains[:10])}" if gains else ""))
         say(f"  [weaviate] the pre-move copy is kept in volume {backup}")
         out.entries.append(_backup_kept_entry(name, move, backup, runtime, after_empty))
         return out
@@ -727,6 +770,93 @@ def protect_weaviate_move(
     return out
 
 
+def held_back(out: MoveOutcome, name: str, move: ImageMove, mount: Optional[Mapping[str, str]],
+              *, environ: Optional[Mapping[str, str]] = None,
+              state_file: Optional[Path] = None) -> bool:
+    """The decisions made before anything is asked of the engine: a
+    downgrade (Weaviate does not downgrade), ``VCO_CONTAINER_UPGRADE=dry-run``
+    / ``off``, and an earlier failed attempt (not repeated by itself). Fills
+    *out* and returns ``True`` when the move is held back. Also asked by
+    ``hand-to-vco`` BEFORE it takes a container over, so a hand-over never
+    leaves a container VCO's own on a version it then cannot move."""
+    if move.direction == "downgrade":
+        out.status, out.reason = REFUSED, (
+            f"{name} runs {move.live}, NEWER than the {move.pinned} VCO pins; Weaviate does "
+            "not downgrade, so VCO leaves it as it is")
+        out.say(f"  [weaviate] {out.reason}.")
+        return True
+    mode = upgrade_mode(environ)
+    if mode == "dry-run":
+        out.status, out.reason = DRY_RUN, f"{MODE_ENV}=dry-run"
+        out.say(f"  [weaviate] {MODE_ENV}=dry-run — nothing is changed. It would do this:")
+        out.say(plan_line(name, move, mount))
+        return True
+    if mode == "off":
+        out.status, out.reason = OPTED_OUT, f"{MODE_ENV}=off"
+        out.say(f"  [weaviate] {MODE_ENV}=off — {name} stays on {move.live} "
+                f"(VCO supports {move.pinned}); nothing is recreated.")
+        return True
+    earlier = previous_failure("weaviate", move, state_file)
+    if earlier is not None:
+        _refuse(out, name, move, (
+            f"an earlier attempt failed ({earlier.get('reason') or 'no reason recorded'}) and a "
+            "failed move is not repeated by itself"),
+            f"# Ask for another attempt:\n{_CLI} retry --service weaviate\n"
+            "python install.py --update")
+        return True
+    return False
+
+
+def _record_backup(out: MoveOutcome, name: str, move: ImageMove, backup: str, runtime: str,
+                   stamp: str, state_file: Optional[Path]) -> None:
+    """Keep the name of the pre-move copy in ``container-upgrade.json``: the
+    ledger entry is re-emitted from it by every later update while the
+    volume exists (:func:`kept_backup_entries`, audit C-2)."""
+    state = load_state(state_file)
+    kept = [b for b in state.get("backups") or [] if isinstance(b, dict)]
+    kept.append({"service": "weaviate", "volume": backup, "container": name, "from": move.live,
+                 "to": move.pinned, "runtime": runtime, "at": stamp})
+    state["backups"] = kept
+    try:
+        save_state(state, state_file)
+    except OSError as exc:
+        out.say(f"  [weaviate] the backup volume {backup} could not be recorded ({exc}); "
+                "UPDATE_DEFERRED.md names it this once")
+
+
+def kept_backup_entries(engine: ContainerEngine, *, skip: Sequence[str] = (),
+                        state_file: Optional[Path] = None) -> list[DeferralEntry]:
+    """The :data:`CID_BACKUP_KEPT` entry for every recorded pre-move copy
+    that still exists (re-emitted by every update, so the one record of a
+    full copy of Weaviate's data is not dropped while the copy takes the
+    space; VCO never deletes the volume itself). A volume the engine
+    positively reports gone is forgotten; one that cannot be checked is kept
+    and still reported. *skip*: volumes this run already reported."""
+    state = load_state(state_file)
+    recorded = [b for b in state.get("backups") or [] if isinstance(b, dict) and b.get("volume")]
+    if not recorded:
+        return []
+    entries: list[DeferralEntry] = []
+    keep: list[dict] = []
+    for rec in recorded:
+        volume = str(rec["volume"])
+        if engine.volume_exists(volume) is False:
+            continue  # the user removed it: nothing left to report
+        keep.append(rec)
+        if volume in skip:
+            continue
+        move = ImageMove(str(rec.get("from") or "?"), str(rec.get("to") or "?"), "upgrade")
+        entries.append(_backup_kept_entry(str(rec.get("container") or "vco_weaviate"), move,
+                                          volume, str(rec.get("runtime") or engine.runtime), ()))
+    if len(keep) != len(recorded):
+        state["backups"] = keep
+        try:
+            save_state(state, state_file)
+        except OSError:
+            pass  # re-checked at the next update; nothing is deleted on this path
+    return entries
+
+
 def _refuse(out: MoveOutcome, name: str, move: ImageMove, reason: str, command: str) -> MoveOutcome:
     out.status, out.reason = REFUSED, reason
     out.say(f"  [weaviate] not moved — {reason}. {name} stays on {move.live}.")
@@ -735,29 +865,33 @@ def _refuse(out: MoveOutcome, name: str, move: ImageMove, reason: str, command: 
 
 
 def _verify(eng: ContainerEngine, name: str, url: str, move: ImageMove,
-            mount: Mapping[str, str], before: Mapping[str, int], _di: Any) -> str:
-    """``""`` when the recreated container is the pinned image on the same
-    data with every class intact, else the first thing that is not."""
+            mount: Mapping[str, str], before: Mapping[str, int], _di: Any
+            ) -> tuple[str, list[str]]:
+    """``("", gains)`` when the recreated container is the pinned image on
+    the same data with every class intact (*gains*: :func:`count_gains`),
+    else ``(the first thing that is not, [])``."""
     live = eng.inspect(name)
     if live is None:
-        return f"the new container {name} could not be inspected"
+        return f"the new container {name} could not be inspected", []
     if image_move(live.image, move.pinned) is not None:
-        return f"the new container runs {live.image}, not {move.pinned}"
+        return f"the new container runs {live.image}, not {move.pinned}", []
     new_mount = live.mount_at(_DATA_DEST)
     if new_mount is None or _di.mount_key(new_mount.to_row()) != _di.mount_key(dict(mount)):
         got = f"{new_mount.kind} {new_mount.source}" if new_mount is not None else "nothing"
         return (f"the new container mounts {got} at {_DATA_DEST}, not "
-                f"{mount.get('kind')} {mount.get('source')}")
+                f"{mount.get('kind')} {mount.get('source')}"), []
     missing = eng.indexes_missing(url, sorted(before))
     if missing is None:
-        return "whether every class still has its index could not be checked"
+        return "whether every class still has its index could not be checked", []
     if missing:
-        return "classes without their index: " + ", ".join(missing[:10])
+        return "classes without their index: " + ", ".join(missing[:10]), []
     after, why = eng.counts(url)
     if after is None:
-        return why
+        return why, []
     bad = count_mismatches(before, after)
-    return ("object counts differ — " + "; ".join(bad[:10])) if bad else ""
+    if bad:
+        return "object counts differ — " + "; ".join(bad[:10]), []
+    return "", count_gains(before, after)
 
 
 def _rollback(eng: ContainerEngine, name: str, url: str, move: ImageMove, source: str,

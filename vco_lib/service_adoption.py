@@ -1681,6 +1681,7 @@ def adopt_services(
     db_path: Optional[Path] = None,
     row_source: str = "user_cli",
     container_refs: Optional[Mapping[str, str]] = None,
+    hold_weaviate_image: Optional[str] = None,
 ) -> AdoptionResult:
     """The whole guarded adoption.  See the module docstring for the flow
     and the constraint map.  ``run``/``fetch``/``resolution`` are injection
@@ -1698,7 +1699,14 @@ def adopt_services(
     ``service_endpoints.commit_rows`` on ``db_path``) with ``row_source``.
     ``container_refs``: service → the exact container to adopt (see
     :func:`_plan_all`); without it the canonical/historical names are
-    searched (the v0.2.96 bulk adoption)."""
+    searched (the v0.2.96 bulk adoption).
+
+    ``hold_weaviate_image`` (v0.2.107, ``hand-to-vco``): the image the
+    Weaviate container runs. The take-over re-creates it on THAT image (a
+    one-line compose override appended last,
+    :func:`vco_lib.container_upgrade.write_image_override`), so the
+    ownership changes and the version does not — the version is then changed
+    by :func:`vco_lib.container_upgrade.protect_weaviate_move` alone."""
     run = run or subprocess.run  # type: ignore[assignment]
     fetch = fetch or _default_fetch
     log = log or _default_log()
@@ -1796,7 +1804,7 @@ def adopt_services(
     for plan in [p for p in adoptable if p.service == "weaviate"]:
         from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
 
-        target_image = _rg.pinned_target(root)
+        target_image = hold_weaviate_image or _rg.pinned_target(root)
         raft = _rg.upgrade_check(service="weaviate", live_state="present", ref=plan.container,
                                  target_image=target_image, data_mount=None, runtime=runtime,
                                  run=run, log=log)
@@ -1809,6 +1817,18 @@ def adopt_services(
                 target_image=target_image,
                 manual_cmd="python -m vco_lib.service_endpoints hand-to-vco --service weaviate"))
             log(f"  [adopt:{plan.service}] stays as it is — {raft.reason}")
+    held_file: Optional[Path] = None
+    if hold_weaviate_image and any(p.service == "weaviate" for p in adoptable):
+        from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+        try:
+            held_file = _cu.write_image_override(hold_weaviate_image)
+        except OSError as exc:
+            plan = next(p for p in adoptable if p.service == "weaviate")
+            adoptable.remove(plan)
+            result.refused["weaviate"] = (f"the compose file keeping {hold_weaviate_image} could "
+                                          f"not be written ({exc})")
+            log(f"  [adopt:weaviate] stays as it is — {result.refused['weaviate']}")
     if not adoptable:
         result.lines.append("  [adopt] nothing adoptable — nothing touched.")
         return result
@@ -1865,7 +1885,8 @@ def adopt_services(
             log(f"  [adopt:{service}] FAILED ({detail}) — rolled back under the "
                 f"owning project; later services untouched.")
             break
-        ok, err = _up_under_installer(compose_argv, files, own_project, service,
+        up_files = [*files, held_file] if service == "weaviate" and held_file else list(files)
+        ok, err = _up_under_installer(compose_argv, up_files, own_project, service,
                                       runtime, run, result,
                                       build=service in build_services)
         if not ok:

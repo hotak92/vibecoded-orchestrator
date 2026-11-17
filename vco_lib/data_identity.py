@@ -30,7 +30,10 @@ up``), and ``service_lifecycle.migrate_managed_service``:
 Verdicts: ``PRESERVES`` (compose mounts exactly the data), ``NOTHING_TO_LOSE``
 (no container and no recorded mount), ``REFUSE_UNKNOWN`` (something could not
 be read), ``REFUSE_DIFFERENT`` (compose would mount something else, or the
-recorded mount is not the live one). A refusal is never followed by an
+recorded mount is not the live one), ``REFUSE_RAFT`` (no raft snapshot for a
+Weaviate move) and ``REFUSE_VERSION`` (v0.2.107: the recreate would change the
+Weaviate version a live container runs — only
+:mod:`vco_lib.container_upgrade`'s protected move does that). A refusal is never followed by an
 ``rm``: the caller leaves the container alone and records
 ``service_recreate_refused_data_unknown``.
 """
@@ -56,6 +59,7 @@ __all__ = [
     "REFUSE_UNKNOWN",
     "REFUSE_DIFFERENT",
     "REFUSE_RAFT",
+    "REFUSE_VERSION",
     "CID_RECREATE_REFUSED",
     "LiveMount",
     "Effective",
@@ -77,6 +81,9 @@ REFUSE_DIFFERENT = "refuse_different"
 #: v0.2.106: the recreate would move Weaviate data onto a release with the
 #: 1.37 orphan drop without a raft snapshot (vco_lib.weaviate_raft_guard).
 REFUSE_RAFT = "refuse_raft_snapshot"
+#: v0.2.107: the recreate would change the Weaviate version a live container
+#: runs; only vco_lib.container_upgrade's protected move makes that change.
+REFUSE_VERSION = "refuse_version_move"
 
 CID_RECREATE_REFUSED = "service_recreate_refused_data_unknown"
 
@@ -521,6 +528,7 @@ def guard_recreate(
     names: Optional[Sequence[str]] = None,
     files: Optional[Sequence[Path]] = None,
     project: Optional[str] = None,
+    protected_move: bool = False,
 ) -> GuardResult:
     """May *service*'s container be (re)created without losing its data?
 
@@ -534,7 +542,10 @@ def guard_recreate(
     move its data onto a release with the 1.37 orphan drop, for the raft
     snapshot :func:`_raft_upgrade_guard` takes with its own image first.
     *compose_argv* may be a callable: it is resolved only when ``compose
-    config`` actually has to run."""
+    config`` actually has to run. *protected_move*: the caller is
+    :func:`vco_lib.container_upgrade.protect_weaviate_move` (the one caller
+    that may change the Weaviate version; every other one gets
+    :data:`REFUSE_VERSION` for such a recreate)."""
     infra = Path(infra_dir)
     live = capture_live_mount(service, runtime, run=run, names=names or container_names(service, row))
     early, why, target = _identity(service, row, live)
@@ -549,7 +560,8 @@ def guard_recreate(
             from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
 
             _raft_upgrade_guard(result, infra, runtime, run or _tsd.run,
-                                lambda: _rg.compose_data_mount(infra.parent))
+                                lambda: _rg.compose_data_mount(infra.parent),
+                                protected_move=protected_move)
         return result
     if row is not None:
         result.row = replace(row, data_mount=target)
@@ -592,17 +604,21 @@ def guard_recreate(
                                         if service == "weaviate" else None)
     result.verdict, result.reason = recreate_preserves_data(service, effective_row, live,
                                                             result.effective)
-    _raft_upgrade_guard(result, infra, runtime, run or _tsd.run, target)
+    _raft_upgrade_guard(result, infra, runtime, run or _tsd.run, target,
+                        protected_move=protected_move)
     return result
 
 
 def _raft_upgrade_guard(result: GuardResult, infra: Path, runtime: str, run: RunFn,
-                        data_mount: "Optional[dict] | Callable[[], Optional[dict]]") -> None:
+                        data_mount: "Optional[dict] | Callable[[], Optional[dict]]",
+                        *, protected_move: bool = False) -> None:
     """v0.2.106: a Weaviate recreate that would MOVE the data onto a release
     with the 1.37 orphan drop first gets a raft snapshot taken by the old
     image, or is refused (:func:`vco_lib.weaviate_raft_guard.upgrade_check`;
     the old container is stopped and started again for the snapshot, never
-    removed). Turns a passing verdict into :data:`REFUSE_RAFT`."""
+    removed). Turns a passing verdict into :data:`REFUSE_RAFT` — or, v0.2.107,
+    into :data:`REFUSE_VERSION` when the recreate would change the version a
+    live container runs and the caller is not the protected move."""
     if result.service != "weaviate" or not result.ok:
         return
     import sys  # noqa: PLC0415
@@ -613,8 +629,15 @@ def _raft_upgrade_guard(result: GuardResult, infra: Path, runtime: str, run: Run
     verdict = _rg.upgrade_check(
         service=result.service, live_state=result.live.state, ref=result.live.ref,
         target_image=target_image, data_mount=data_mount, runtime=runtime, run=run,
-        log=lambda m: print(m, file=sys.stderr))
+        log=lambda m: print(m, file=sys.stderr), protected_move=protected_move)
     if verdict.ok:
+        return
+    if verdict.status == _rg.VERSION_MOVE:
+        from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+        result.verdict, result.reason = REFUSE_VERSION, verdict.reason
+        result.entry = _cu.version_move_refused_entry(result.live.ref, verdict.move,
+                                                      verdict.reason)
         return
     result.verdict, result.reason = REFUSE_RAFT, verdict.reason
     result.entry = _rg.refusal_entry(result.service, result.live.ref, verdict.reason,
