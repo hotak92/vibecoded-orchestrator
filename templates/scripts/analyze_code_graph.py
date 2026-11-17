@@ -4525,16 +4525,10 @@ class CodeGraphAnalyzer:
         return count
 
     def _count_stale_rows_in_collection(self, coll) -> Optional[int]:
-        """Cheap count of rows NOT at the current embed revision (R-1 pre-check).
+        """Return 0 when no stale row exists, 1 when one does, else None.
 
-        Filtered aggregate: ``embed_revision != CURRENT OR embed_revision IS
-        NULL``. The IsNull leg is load-bearing — Weaviate comparisons ignore
-        NULLs, and pre-migration rows are exactly the NULL ones (a
-        ``min()``/``not_equal``-only probe would report "converged" over a
-        half-migrated collection). Returns ``None`` when the count cannot be
-        determined (Weaviate down, mocked collection, or an old collection
-        created without ``index_null_state=True`` where the IsNull leg
-        errors) — the caller then falls back to a full NULL-safe scan.
+        The caller only gates a full classified scan on zero/nonzero. A one-row,
+        property-free existence read answers that without a filtered Aggregate.
         """
         try:
             flt = (
@@ -4543,9 +4537,10 @@ class CodeGraphAnalyzer:
                 )
                 | Filter.by_property(_EMBED_REVISION_PROP).is_none(True)
             )
-            agg = coll.aggregate.over_all(filters=flt, total_count=True)
-            total = getattr(agg, "total_count", None)
-            return int(total) if total is not None else None
+            result = coll.query.fetch_objects(
+                filters=flt, limit=1, return_properties=[],
+            )
+            return 0 if not getattr(result, "objects", None) else 1
         except Exception:  # noqa: BLE001 — undeterminable, never a wrong 0
             return None
 
@@ -4890,7 +4885,7 @@ class CodeGraphAnalyzer:
                 _u for _k, _u in cache.items() if (_k == rel) or (
                     isinstance(_k, tuple) and len(_k) == 2 and _k[1] == rel and mine(_k[0]))), None)
             if uuid_to_fix is None:
-                result = coll.query.fetch_objects(filters=Filter.by_property("path").equal(rel), limit=64)
+                result = coll.query.fetch_objects(filters=Filter.by_property("path").equal(rel), limit=64, return_properties=["project_source"])
                 objs = [o for o in (getattr(result, "objects", None) or [])
                         if mine((getattr(o, "properties", None) or {}).get("project_source"))]
                 if not objs:
@@ -5028,6 +5023,7 @@ class CodeGraphAnalyzer:
                 filters=Filter.by_property("path").equal(path) &
                         Filter.by_property("file_hash").equal(file_hash),
                 limit=64,  # one row per root that holds this exact file
+                return_properties=["project_source", _EMBED_REVISION_PROP],
             )
             ctx = getattr(self, "_walk_own", None)  # (own sources, extra root) of the walk
             owned = [o for o in result.objects if ctx is None or _src_scope.row_owned_by_walk(
@@ -5299,6 +5295,7 @@ class CodeGraphAnalyzer:
                 flt = flt & Filter.by_property("project").equal(self.project_name)
             resp = self.functions_collection.query.fetch_objects(
                 filters=flt, limit=max(total_chunks + 4, 8),
+                return_properties=["function_body", "chunk_num"],
             )
             rows: List[tuple] = []
             for obj in resp.objects:
@@ -5327,17 +5324,14 @@ class CodeGraphAnalyzer:
 
         print("   Loading existing entities from Weaviate (merging with analysis cache)...")
 
-        # Load modules (including import_names for cross-ref linking)
-        # C-12 (v0.2.75 P2c): key by (project_source, path) so two extra-path
-        # roots sharing a relpath don't collide (see _create_or_update_module).
-        # v0.2.92: resolve the stored `imports` beacons in THIS scan (no extra
-        # round-trip; the R4 read-amp rule) — `reference_add` is not idempotent,
-        # so the linking pass must know what is already stored or it re-adds
-        # every edge on every analyze. See vco_lib/codegraph_references.py.
+        # Modules: cache by (source, path) and read stored import beacons in the
+        # same bounded scan so reference_add remains idempotent.
         self._xref_stored_import_refs: Dict[str, List[str]] = {}
         try:
             for obj in self.modules_collection.iterator(
-                    return_references=QueryReference(link_on="imports")):
+                    return_properties=["path", "project_source", "import_names"],
+                    return_references=QueryReference(
+                        link_on="imports", return_properties=["path"])):
                 path = str(obj.properties.get("path", "") or "")
                 if path:
                     src = str(obj.properties.get("project_source", "") or "")
@@ -5350,14 +5344,14 @@ class CodeGraphAnalyzer:
         except Exception as e:
             print(f"   ⚠️  Failed to load modules: {e}")
 
-        # Load classes. v0.2.72 (P3): with multi-chunk objects sharing a
-        # full_name, prefer the CANONICAL chunk (chunk_num == 0) so the cache
-        # maps full_name → the canonical UUID. `_prefer_canonical_chunk`
-        # returns True when this object should win the cache slot (chunk 0, OR
-        # a legacy row with no chunk_num, OR no incumbent yet).
+        # Classes: cache the canonical chunk and its file for scoped xref reads.
+        self._xref_class_file_path: Dict[str, str] = {}
         try:
-            for obj in self.classes_collection.iterator():
+            for obj in self.classes_collection.iterator(
+                    return_properties=["full_name", "chunk_num", "file_path"]):
                 full_name = obj.properties.get("full_name", "")
+                self._xref_class_file_path[str(obj.uuid)] = str(
+                    obj.properties.get("file_path") or "")
                 if full_name and self._prefer_canonical_chunk(
                     self.class_cache, full_name, obj
                 ):
@@ -5365,27 +5359,24 @@ class CodeGraphAnalyzer:
         except Exception as e:
             print(f"   ⚠️  Failed to load classes: {e}")
 
-        # Load functions (same canonical-chunk preference as classes).
-        # v0.2.74 (R4 read-amp fix): capture file_path / call_names / n_callers
-        # into per-uuid side-dicts DURING this single whole-collection scan the
-        # method already does. create_cross_references then reads these instead
-        # of issuing a per-function `fetch_object_by_id` point-read for all 23k
-        # rows (that per-row point-read WAS the read-amplification). Only
-        # changed-file functions still get a body point-read (for AST parse).
+        # Functions: one bounded scan supplies canonical ids, stored call data,
+        # source roots and call beacons for the cross-reference pass.
         self._xref_file_path: Dict[str, str] = {}
         self._xref_stored_calls: Dict[str, Any] = {}
         self._xref_stored_ncallers: Dict[str, Any] = {}
-        # v0.2.105 (#512C): the root each cached function row was walked from
-        # (`project_source`), so call-name resolution can prefer a candidate in
-        # the CALLER's own repo root instead of an arbitrary same-named
-        # function that an extra code folder's mirror contributed.
+        # Source roots let call resolution prefer the caller's own tree.
         self._xref_source: Dict[str, str] = {}
         # v0.2.92: the stored `calls` BEACONS (distinct from `call_names`, the
         # text property); same single-scan sourcing as the modules loop above.
         self._xref_stored_call_refs: Dict[str, List[str]] = {}
         try:
             for obj in self.functions_collection.iterator(
-                    return_references=QueryReference(link_on="calls")):
+                    return_properties=[
+                        "full_name", "chunk_num", "file_path", "call_names",
+                        "n_callers", "project_source",
+                    ],
+                    return_references=QueryReference(
+                        link_on="calls", return_properties=["full_name", "file_path"])):
                 full_name = obj.properties.get("full_name", "")
                 if full_name and self._prefer_canonical_chunk(
                     self.function_cache, full_name, obj
@@ -5550,7 +5541,10 @@ class CodeGraphAnalyzer:
                 # (chunk 0) UUID from the cache. F7: reassemble the FULL body
                 # from all chunk rows before AST parse (chunk-0 alone could be a
                 # partial slice → SyntaxError → lost calls on big hub functions).
-                canonical = self.functions_collection.query.fetch_object_by_id(func_uuid)
+                canonical = self.functions_collection.query.fetch_object_by_id(
+                    func_uuid,
+                    return_properties=["function_body", "total_chunks", "language"],
+                )
                 body = canonical.properties.get("function_body", "") if canonical is not None else ""
                 if not body:
                     continue
@@ -5703,14 +5697,19 @@ class CodeGraphAnalyzer:
 
         # --- 2. Class extends ---
         print("   Linking class inheritance...")
+        class_file_by_uuid = getattr(self, "_xref_class_file_path", {}) or {}
         for full_name, class_uuid in self.class_cache.items():
+            if incremental_scope and class_file_by_uuid.get(class_uuid, "") not in changed_files:
+                continue
             try:
                 # v0.2.92: point-read the CANONICAL row by uuid — same single
                 # read, but `fetch_objects(full_name==, limit=1)` returned an
                 # ARBITRARY chunk, so both `signature` and the stored `extends`
                 # beacons could come from a row other than the write target.
                 canonical = self.classes_collection.query.fetch_object_by_id(
-                    class_uuid, return_references=QueryReference(link_on="extends"))
+                    class_uuid, return_properties=["signature"],
+                    return_references=QueryReference(
+                        link_on="extends", return_properties=["full_name"]))
                 if canonical is None:
                     continue
                 bases_to_add = _resolve_base_class_targets(

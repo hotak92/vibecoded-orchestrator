@@ -39,7 +39,9 @@ _BASES = ("CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction
 class _SweepColl:
     """A code-graph collection fake supporting the two reads the sweep uses:
     ``iterator(return_properties=["project"])`` (identity enumeration) and
-    ``aggregate.over_all(filters=..., total_count=True)`` (the cheap probe)."""
+    the cheap probe — since v0.2.107 (CG-1) a one-row, property-free
+    ``query.fetch_objects(filters=project != canonical, limit=1)`` existence
+    read; ``agg_raises`` makes that probe read fail."""
 
     def __init__(self, name, project_values, *, agg_raises=False,
                  iter_raises=False):
@@ -59,6 +61,16 @@ class _SweepColl:
             return types.SimpleNamespace(total_count=n)
 
         self.aggregate = types.SimpleNamespace(over_all=_over_all)
+
+        def _fetch_objects(filters=None, limit=100, **_kw):
+            if agg_raises:
+                raise RuntimeError("probe read failed (injected)")
+            canonical = getattr(filters, "value", None)
+            rows = [types.SimpleNamespace(properties={})
+                    for v in self._project_values if v != canonical]
+            return types.SimpleNamespace(objects=rows[:limit])
+
+        self.query = types.SimpleNamespace(fetch_objects=_fetch_objects)
 
     def iterator(self, return_properties=None, **_kw):
         if self._iter_raises:

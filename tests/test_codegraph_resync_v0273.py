@@ -202,6 +202,14 @@ class _AggColl:
             self.aggregate = _t.SimpleNamespace(
                 over_all=lambda **kw: _t.SimpleNamespace(total_count=agg_count)
             )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if agg_raises or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return _t.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = _t.SimpleNamespace(fetch_objects=_probe)
 
     def iterator(self, return_properties=None):
         import types as _t
@@ -237,8 +245,11 @@ def _client_for(prefix, module_coll, class_coll, func_coll):
 
 def test_count_stale_rows_aggregate_path(monkeypatch):
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    # v0.2.107 CG-1: a positive existence probe pays one exact scan, which
+    # supplies the count (2 stale of 3 rows), instead of a filtered Aggregate.
     client = _client_for(
-        "Proj", _AggColl(agg_count=0), _AggColl(agg_count=2), _AggColl(agg_count=0)
+        "Proj", _AggColl(agg_count=0), _AggColl(agg_count=2, rows=[0, None, 1]),
+        _AggColl(agg_count=0),
     )
     counts = cr.count_stale_rows("Proj", current_revision=1, client=client)
     assert counts == {
@@ -291,6 +302,14 @@ class _R3PathColl:
         self.aggregate = _t.SimpleNamespace(
             over_all=lambda **kw: _t.SimpleNamespace(total_count=agg_count)
         )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if False or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return _t.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = _t.SimpleNamespace(fetch_objects=_probe)
 
     def iterator(self, return_properties=None):
         import types as _t

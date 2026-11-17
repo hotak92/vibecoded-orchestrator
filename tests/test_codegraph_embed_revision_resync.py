@@ -560,12 +560,17 @@ class _ProbeColl:
         self._rows = rows or []
         self.aggregate = _ProbeAgg(agg_count, raises=agg_raises)
         self._iter_raises = iter_raises
+        self._module_objects = module_objects or []
         self.iter_calls = 0
-        self.query = types.SimpleNamespace(
-            fetch_objects=lambda **kw: types.SimpleNamespace(
-                objects=module_objects or []
-            )
-        )
+        self.query = types.SimpleNamespace(fetch_objects=self._fetch_objects)
+
+    def _fetch_objects(self, **kwargs):
+        if kwargs.get("limit") == 1 and kwargs.get("return_properties") == []:
+            if self.aggregate._raises or self.aggregate._count is None:
+                raise RuntimeError("existence probe unavailable")
+            objects = [] if self.aggregate._count == 0 else [object()]
+            return types.SimpleNamespace(objects=objects)
+        return types.SimpleNamespace(objects=self._module_objects or [])
 
     def iterator(self, return_properties=None):
         self.iter_calls += 1
@@ -636,8 +641,8 @@ def test_r1_null_revision_entity_row_forces_rewalk(analyzer_mod):
 
 
 def test_r1_converged_collections_skip_file_without_scanning(analyzer_mod):
-    """Steady state: all three aggregates report 0 stale → NO iteration runs
-    (the per-edit hook's cost bound) and the current-revision file skips."""
+    """Steady state: all three existence reads report 0 stale → NO iteration
+    runs (the per-edit hook's cost bound) and the current-revision file skips."""
     modules = _ProbeColl(
         "P_CodeModule", agg_count=0,
         module_objects=_current_module_row(analyzer_mod),

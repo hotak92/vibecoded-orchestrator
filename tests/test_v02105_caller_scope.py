@@ -319,13 +319,21 @@ def test_legacy_rows_without_project_source_are_still_listed(monkeypatch) -> Non
                         "legacy.thing.target") == ["legacy.thing.caller"]
 
 
-def test_legacy_schema_without_the_property_is_left_alone(monkeypatch) -> None:
-    """A collection that ERRORS on `return_properties=['project_source']`
-    must not break `callers`: the read falls back and filters nothing."""
+def test_legacy_schema_without_the_property_fails_loudly(monkeypatch) -> None:
+    """v0.2.107 CG-1 (owner: no compatibility code for old layouts): the
+    callers read names its properties, `project_source` included. A class
+    that lacks it is an old layout; the MCP answers the classified schema
+    error with its additive-migration hint instead of a silent unscoped read."""
+    srv = pytest.importorskip("claude_mcp_servers.weaviate_mcp.server")
     coll = _Coll(_legacy_rows(), legacy_schema=True)
-    assert _mcp_callers(monkeypatch, coll, "legacy.thing.target") == [
-        "legacy.thing.caller"
-    ]
+    with mock.patch.object(srv, "get_weaviate_client", return_value=_Client(coll)), \
+         mock.patch.object(srv, "Filter", _Filter), \
+         mock.patch.object(srv, "CODE_GRAPH_PROJECT", "", create=True):
+        payload = json.loads(
+            srv.query_code_structure("callers", "legacy.thing.target", project=""))
+    assert not payload.get("success"), payload
+    assert payload.get("error_class") == "WeaviateSchemaError", payload
+    assert "project_source" in payload.get("hint", ""), payload
 
 
 def test_cli_legacy_rows_are_still_listed(monkeypatch, capsys) -> None:
