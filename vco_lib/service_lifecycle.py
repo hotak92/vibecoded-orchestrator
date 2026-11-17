@@ -962,6 +962,7 @@ def up_services(
     recreate: Sequence[str] = (),
     build: bool = False,
     guard_only: bool = False,
+    protected_move: bool = False,
     rows: Optional[Mapping[str, "_se.EndpointRow"]] = None,
     db_path: Optional[Path] = None,
     run: Optional[RunFn] = None,
@@ -976,7 +977,16 @@ def up_services(
     retry/heal home: ``--build`` is dropped only on positive "unsupported"
     evidence, a build failure is reported, a refused heal is ledgered).
     ``guard_only``: guard (and remove cleared zombies), but leave the compose
-    call to the caller (the CDI-wait wrapper)."""
+    call to the caller (the CDI-wait wrapper).
+
+    v0.2.107 (audit C-1): a Weaviate whose recreate would change the version
+    its live container runs is refused by the guard
+    (``data_identity.REFUSE_VERSION``) — the container is never removed and
+    never composed; it is STARTED BY NAME instead (a zombie the hook cleaned
+    up runs again on its own version). The version changes only through
+    :mod:`vco_lib.container_upgrade`, whose guard call alone passes
+    *protected_move*. No ledger row from here: the update that owns the move
+    records why it was not made (or the user switched it off)."""
     from vco_lib import code_embed_image as _cei  # noqa: PLC0415
     from vco_lib import compose_provider as _cp  # noqa: PLC0415
     from vco_lib import compose_recovery as _cr  # noqa: PLC0415
@@ -1006,7 +1016,7 @@ def up_services(
             continue
         g = _di.guard_recreate(service, runtime=runtime, infra_dir=infra, compose_argv=compose_argv,
                                row=row, rows=current, db_path=db_path, run=_run, files=files,
-                               project=project)
+                               project=project, protected_move=protected_move)
         if g.row is not None:
             current[service] = g.row
         if registry_error and g.ok and g.live.state == _di.LIVE_PRESENT:
@@ -1020,6 +1030,19 @@ def up_services(
         _di.compose_name_conflict(g, will_remove=service in recreate)
         for note in g.notes:
             out(f"  [{service}] {note}")
+        if g.verdict == _di.REFUSE_VERSION:
+            name = g.live.ref
+            try:
+                started = _run([runtime, "start", name], capture_output=True, text=True,
+                               timeout=120).returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                started = False
+            out(f"  [{service}] {name} is not recreated — a version move is made only by "
+                "`python install.py --update`; "
+                + ("started it by name instead." if started
+                   else f"starting it by name failed too (`{runtime} start {name}`)."))
+            result.refused.append(service)
+            continue
         if not g.ok:
             out(f"  [{service}] recreate refused — {g.reason}. Left as it is; nothing removed.")
             result.refused.append(service)

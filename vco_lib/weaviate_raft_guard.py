@@ -35,6 +35,12 @@ WHAT THIS MODULE DOES (one home for every rule above)
   is not known — the recreate is REFUSED (:data:`CID_UPGRADE_REFUSED`); VCO
   never starts a release with the orphan drop on data whose snapshot state it
   does not know.
+  v0.2.107: a recreate that would CHANGE the version a live container runs
+  (:func:`vco_lib.container_upgrade.image_move`) is refused outright
+  (:data:`VERSION_MOVE`) unless the caller is that module's protected move
+  (``protected_move=True``) — every recreate path reaches this one function,
+  so an image change only ever happens with the class counts, the copy of the
+  data, the verification and the rollback.
 * :func:`scan` + the doctor probes — a live Weaviate whose log is not covered
   by a snapshot while VCO's records show a case-variant class history
   (:data:`CID_REPLAY_EXPOSED`), classes present in the schema without their
@@ -124,6 +130,9 @@ DEFAULT_DATA_PATH = "/var/lib/weaviate"
 NOT_NEEDED = "not_needed"
 PREPARED = "prepared"
 REFUSED = "refused"
+#: v0.2.107: the recreate would change the Weaviate version a live container
+#: runs, outside :mod:`vco_lib.container_upgrade`'s protected move — refused.
+VERSION_MOVE = "version_move"
 #: :func:`pinned_target`'s answer when VCO's compose (read and parsed) runs
 #: no Weaviate image at all — nothing it starts can open the data.
 NO_IMAGE = "<compose runs no weaviate image>"
@@ -232,10 +241,12 @@ class UpgradeVerdict:
     status: str
     reason: str = ""
     lines: list[str] = field(default_factory=list)
+    #: :data:`VERSION_MOVE` only: the ``container_upgrade.ImageMove`` refused.
+    move: Any = None
 
     @property
     def ok(self) -> bool:
-        return self.status != REFUSED
+        return self.status not in (REFUSED, VERSION_MOVE)
 
 
 def timeout_s(environ: Optional[Mapping[str, str]] = None) -> float:
@@ -512,6 +523,7 @@ def upgrade_check(
     log: Optional[LogFn] = None,
     environ: Optional[Mapping[str, str]] = None,
     snapshot: Optional[Callable[..., UpgradeVerdict]] = None,
+    protected_move: bool = False,
 ) -> UpgradeVerdict:
     """May *service*'s container be (re)created on *target_image*?
 
@@ -519,11 +531,21 @@ def upgrade_check(
     for the container *ref*; *data_mount* is the data location the new
     container will mount (or a callable producing it, called only when no
     container exists). Only Weaviate moving onto a release with the orphan
-    drop is ever touched; see the module docstring for the rules."""
+    drop is ever touched; see the module docstring for the rules.
+
+    v0.2.107: a live container whose image the recreate would replace by
+    another VERSION of the same image (:func:`vco_lib.container_upgrade.image_move`,
+    either direction) is refused with :data:`VERSION_MOVE` — nothing is
+    stopped — unless *protected_move* says the caller is
+    :func:`vco_lib.container_upgrade.protect_weaviate_move` itself."""
     if service != "weaviate":
         return UpgradeVerdict(NOT_NEEDED)
     if target_image == NO_IMAGE:
         return UpgradeVerdict(NOT_NEEDED, "VCO's compose runs no Weaviate image")
+    if live_state == "present" and ref and not protected_move:
+        refused = version_move_refusal(ref, target_image, runtime, run)
+        if refused is not None:
+            return refused
     target = parse_version(target_image)
     if target is not None and not has_orphan_drop(target):
         return UpgradeVerdict(NOT_NEEDED, f"target {target_image} has no orphan drop")
@@ -555,6 +577,25 @@ def upgrade_check(
         f"{where} {'holds' if has_log else 'may hold'} a Weaviate raft log but no container "
         "names the version that wrote it, so VCO cannot take a snapshot with that version "
         f"before starting {target_image or 'the pinned image'} on it"))
+
+
+def version_move_refusal(ref: str, target_image: Optional[str], runtime: str,
+                         run: RunFn) -> Optional[UpgradeVerdict]:
+    """The :data:`VERSION_MOVE` verdict when recreating container *ref* on
+    *target_image* would change the Weaviate version it runs, else ``None``
+    (same version, another repository, an unversioned tag, an image that
+    cannot be read — those are judged by the rest of :func:`upgrade_check`)."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415 — it imports this module
+
+    live = _inspect(ref, "{{.Config.Image}}", runtime, run)
+    move = _cu.image_move(live or "", target_image)
+    if move is None:
+        return None
+    return UpgradeVerdict(VERSION_MOVE, (
+        f"container '{ref}' runs {move.live} and VCO's compose pins {move.pinned}: a recreate "
+        "would change its Weaviate version, and VCO makes that change only through its "
+        "protected move at `python install.py --update` (class counts, a copy of the data, "
+        "verification, rollback) — never a plain recreate"), move=move)
 
 
 def _compose_cfg(root: Path) -> Optional[dict]:

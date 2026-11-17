@@ -600,6 +600,7 @@ def test_the_guard_is_the_one_recreate_guard_without_its_compose_call(root, monk
     seen["verdict"] = ["weaviate"]
     assert eng.guard() == (True, "", ["entry"])
     assert seen["services"] == ["weaviate"] and seen["guard_only"] is True
+    assert seen["protected_move"] is True   # the one caller the version gate lets through
     assert seen["compose_dir"] == root / "infrastructure"
     seen["verdict"] = []
     cleared, why, entries = eng.guard()
@@ -1011,3 +1012,126 @@ def test_the_conditions_are_registered_with_their_class():
     assert deferral_registry.disposition_for(cu.CID_REFUSED) == "action_required"
     assert deferral_registry.disposition_for(cu.CID_ROLLED_BACK) == "action_required"
     assert deferral_registry.disposition_for(cu.CID_BACKUP_KEPT) == "informational_record"
+
+
+# ─── C-1: no recreate outside the protected move changes the version ────
+#
+# Every recreate path (install.py step 5, `service_lifecycle up` from the
+# session hooks and the launcher's Services actions, the port move, the
+# launcher's volume migration, hand-to-vco) asks
+# weaviate_raft_guard.upgrade_check; a recreate that would change the version a
+# live container runs is refused there unless the protected move asks.
+
+from tests.common.launcher_db_fixture import make_launcher_db  # noqa: E402
+from tests.test_v02106_weaviate_raft_guard import Runtime  # noqa: E402
+from vco_lib import data_identity as di  # noqa: E402
+from vco_lib import service_lifecycle as sl  # noqa: E402
+from vco_lib import weaviate_raft_guard as rg  # noqa: E402
+
+
+@pytest.fixture()
+def wv_world(tmp_path):
+    """VCO's compose pins PINNED; the vco_managed row's container mounts a
+    bind holding a raft log (the shape of tests/test_v02106's fixture)."""
+    root = tmp_path / "orch"
+    infra = root / "infrastructure"
+    infra.mkdir(parents=True)
+    (infra / "docker-compose.yml").write_text(
+        f"services:\n  weaviate:\n    image: {PINNED}\n", encoding="utf-8")
+    data = tmp_path / "wvdata"
+    (data / "raft").mkdir(parents=True)
+    (data / "raft" / "raft.db").write_bytes(b"log")
+    db = make_launcher_db(tmp_path / "launcher.db")
+    bind = {"kind": "bind", "source": str(data), "destination": "/var/lib/weaviate"}
+    se.write_rows([se.EndpointRow(service="weaviate", mode="vco_managed", port=8081,
+                                  grpc_port=50052, container_name=NAME,
+                                  source="install_probe", data_mount=bind)], db_path=db)
+    live = {"Type": "bind", "Source": str(data), "Destination": "/var/lib/weaviate"}
+    return infra, db, data, live
+
+
+def _composed(box):
+    return [a for a in box.argv if "up" in a and a[-1] != "config"]
+
+
+@pytest.mark.real_raft_guard
+def test_a_zombie_on_another_version_is_started_by_name_never_removed(wv_world):
+    # The session hook's zombie arm after an opted-out / refused / rolled-back
+    # move: before C-1 the guard let it through and `rm --force` + compose
+    # made the 1.28 -> 1.37 move with no counts, copy, verify or rollback.
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, running="false", image=OLD)
+    box.compose_source = str(data)
+    lines = []
+    res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", recreate=["weaviate"], db_path=db, run=box.run,
+                         out=lines.append)
+    assert res.refused == ["weaviate"] and res.removed == [] and res.cleared == []
+    assert not any(a[1] == "rm" for a in box.argv)
+    assert box.verbs() == ["start vco_weaviate"]           # started BY NAME, nothing stopped
+    assert _composed(box) == [] and res.entries == []      # no compose, no ledger row here
+    assert any("python install.py --update" in line and "by name" in line for line in lines)
+
+
+@pytest.mark.real_raft_guard
+def test_a_zombie_on_the_pinned_version_is_still_recreated(wv_world):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, running="false", image=PINNED)
+    box.compose_source = str(data)
+    res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", recreate=["weaviate"], guard_only=True, db_path=db,
+                         run=box.run, out=lambda _l: None)
+    assert res.cleared == ["weaviate"] and res.removed == [NAME]
+    assert ["podman", "rm", "--force", NAME] in box.argv
+
+
+@pytest.mark.real_raft_guard
+@pytest.mark.parametrize("image", [OLD, "cr.weaviate.io/semitechnologies/weaviate:1.40.0"])
+def test_every_unprotected_guard_refuses_a_version_change_and_stops_nothing(wv_world, image):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, image=image)
+    box.compose_source = str(data)
+    rows = se.load_rows(db)
+    g = di.guard_recreate("weaviate", runtime="podman", infra_dir=infra,
+                          compose_argv=["podman", "compose"], row=rows["weaviate"], rows=rows,
+                          db_path=db, run=box.run)
+    assert g.verdict == di.REFUSE_VERSION and not g.ok
+    assert box.verbs() == []                                # no snapshot stop, no rm
+    assert g.deferral_entry().condition_id == cu.CID_REFUSED
+    assert "plan" in g.deferral_entry().command_to_apply
+
+
+@pytest.mark.real_raft_guard
+def test_install_step_5_ledgers_the_refused_version_change(wv_world):
+    infra, db, data, live = wv_world
+    box = Runtime(live_mount=live, image=OLD)
+    box.compose_source = str(data)
+    added = []
+    refused = di.guard_compose_set(["weaviate"], runtime="podman", infra_dir=infra,
+                                   compose_argv=lambda: ["podman", "compose"],
+                                   rows=se.load_rows(db),
+                                   deferral_report=SimpleNamespace(add_entry=added.append),
+                                   run=box.run, out=lambda _l: None, db_path=db)
+    assert refused == {"weaviate"} and [e.condition_id for e in added] == [cu.CID_REFUSED]
+    assert box.verbs() == []
+
+
+@pytest.mark.real_raft_guard
+def test_the_launchers_volume_migration_check_refuses_a_version_change(wv_world):
+    infra, _db, _data, live = wv_world
+    box = Runtime(live_mount=live, image=OLD)
+    v = rg.prepare_for_compose(infra.parent, runtime="podman", run=box.run)
+    assert v.status == rg.VERSION_MOVE and not v.ok and box.verbs() == []
+
+
+@pytest.mark.real_raft_guard
+def test_only_the_protected_move_passes_the_version_gate(wv_world, monkeypatch):
+    infra, db, data, live = wv_world
+    monkeypatch.setattr(rg, "snapshot_with_container_image",
+                        lambda *_a, **_kw: rg.UpgradeVerdict(rg.PREPARED, "snapshot taken"))
+    box = Runtime(live_mount=live, image=OLD)
+    box.compose_source = str(data)
+    res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", guard_only=True, protected_move=True, db_path=db,
+                         run=box.run, out=lambda _l: None)
+    assert res.cleared == ["weaviate"] and res.refused == []

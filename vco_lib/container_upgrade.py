@@ -30,6 +30,15 @@ data crosses versions WITH its vectors — nothing is re-chunked or re-embedded
    recorded, so the next update does not try again by itself (no auto-heal
    loop) until the user asks (``retry``).
 
+This is the ONLY path that changes the version a Weaviate container runs:
+every other recreate (install.py step 5, the session hooks' zombie recovery
+and missing-container create through ``service_lifecycle up``, the launcher's
+Services actions, the port move, the launcher's volume migration) asks
+:func:`vco_lib.weaviate_raft_guard.upgrade_check`, which refuses a recreate
+that would change a live container's version unless this module's guard call
+asks (``protected_move=True``). A zombie whose recreate is refused that way is
+started by name instead (``service_lifecycle.up_services``).
+
 Only a container that is VCO's own reaches this module
 (:func:`vco_lib.service_reconcile.reclassify_own` decides that); a container
 VCO did not create is never recreated — it only gets the memory limit in
@@ -76,6 +85,7 @@ __all__ = [
     "class_counts",
     "image_move",
     "protect_weaviate_move",
+    "version_move_refused_entry",
 ]
 
 CID_REFUSED = "container_upgrade_refused"
@@ -384,7 +394,8 @@ class ContainerEngine:
             return False, f"{self.runtime} has no compose available", []
         res = _sl.up_services(["weaviate"], compose_dir=self.root / "infrastructure",
                               compose_argv=compose, runtime=self.runtime, guard_only=True,
-                              db_path=self.db_path, run=self.run, out=self.log)
+                              protected_move=True, db_path=self.db_path, run=self.run,
+                              out=self.log)
         if "weaviate" in res.cleared:
             return True, "", list(res.entries)
         return False, "the recreate guard refused it (see the lines above)", list(res.entries)
@@ -537,6 +548,22 @@ def _refused_entry(name: str, move: ImageMove, reason: str, command: str) -> Def
         severity="warning",
         dismiss_fields={"service": "weaviate", "container": name},
     )
+
+
+def version_move_refused_entry(name: str, move: Optional[ImageMove], reason: str
+                               ) -> DeferralEntry:
+    """The ledger row of a recreate that the one recreate guard refused
+    because it would change the Weaviate version outside this module
+    (``data_identity.REFUSE_VERSION``) — install.py step 5 records it for a
+    container the protected move does not take (not provably VCO's own)."""
+    if move is None:  # never None from the guard; kept total
+        move = ImageMove("?", "?", "upgrade")
+    return _refused_entry(
+        name or "vco_weaviate", move, reason,
+        "# See what VCO's protected move would do with this container:\n"
+        f"{_CLI} plan\n"
+        "# A container another compose created is handed to VCO (and moved, protected) with:\n"
+        "python -m vco_lib.service_endpoints hand-to-vco --service weaviate")
 
 
 def _rolled_back_entry(name: str, move: ImageMove, reason: str, backup: str, restored: bool,
