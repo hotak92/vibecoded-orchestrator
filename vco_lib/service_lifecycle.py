@@ -1040,7 +1040,9 @@ def up_services(
             out(f"  [{service}] {name} is not recreated — a version move is made only by "
                 "`python install.py --update`; "
                 + ("started it by name instead." if started
-                   else f"starting it by name failed too (`{runtime} start {name}`)."))
+                   else f"starting it by name failed too (`{runtime} start {name}`); fix that "
+                        "(or check it with its owner), then run `python install.py --update` — "
+                        "VCO recreates it only through that protected move."))
             result.refused.append(service)
             continue
         if not g.ok:

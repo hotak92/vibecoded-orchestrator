@@ -602,7 +602,11 @@ if [ "${#compose_list[@]}" -gt 0 ]; then
                 fi
                 ;;
             *)
-                log_recovery "$name" "left_as_is" "zombie pid; recreate refused or not run (data identity not proven)"
+                if [ "$($RUNTIME inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]; then
+                    log_recovery "$name" "left_as_is" "zombie pid; not recreated, started by name instead (a version move is made only by python install.py --update)"
+                else
+                    log_recovery "$name" "left_as_is" "zombie pid; recreate refused or not run (data identity not proven or version differs; a version move is made only by python install.py --update)"
+                fi
                 ;;
         esac
     done

@@ -732,7 +732,12 @@ if ($script:ComposeList.Count -gt 0) {
                 Write-RecoveryLog -Container $name -Action "failed" -Reason "removed; compose up failed"
             }
         } else {
-            Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; recreate refused or not run (data identity not proven)"
+            $zRunning = (& $Runtime inspect -f '{{.State.Running}}' $name 2>$null | Out-String).Trim()
+            if ($zRunning -eq "true") {
+                Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; not recreated, started by name instead (a version move is made only by python install.py --update)"
+            } else {
+                Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; recreate refused or not run (data identity not proven or version differs; a version move is made only by python install.py --update)"
+            }
         }
     }
 }

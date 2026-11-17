@@ -684,7 +684,8 @@ def protect_weaviate_move(
         if not eng.start(name) or not eng.wait_ready(url, ready_timeout_s(environ)):
             return _refuse(out, name, move, (
                 f"{name} is stopped and did not come up, so its classes could not be counted"),
-                f"# Start it, then update again:\n{runtime} start {name}\npython install.py --update")
+                f"# Start it (VCO only recreates it through this update, so it must answer first),\n"
+                f"# then update again:\n{runtime} start {name}\npython install.py --update")
     before, why = eng.counts(url)
     if before is None:
         return _refuse(out, name, move, f"{why} on the running {move.live}",
