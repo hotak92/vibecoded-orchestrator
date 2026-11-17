@@ -655,6 +655,12 @@ def _run_project_sync(ctx: RetryContext, script: Path, args: Sequence[str]) -> i
                 os.environ[key] = value
 
 
+# Q-1: above either bound the narrow sync-failure retry runs the whole-tree
+# `--all` instead of passing every failed path on the command line.
+MAX_NARROW_SYNC_PATHS = 200
+MAX_NARROW_SYNC_ARG_CHARS = 24_000
+
+
 def retry_kg_sync_paths(ctx: RetryContext) -> RetryResult:
     """v0.2.107 (A-003): ``kg_sync_failures_pending`` re-syncs ONLY the paths
     that failed (``owed_work.owed_failed_sync_paths``). The child's file-list
@@ -667,10 +673,20 @@ def retry_kg_sync_paths(ctx: RetryContext) -> RetryResult:
     paths = owed_failed_sync_paths(ctx.folder)
     if not paths:
         return retry_kg_seed(ctx)
+    if (len(paths) > MAX_NARROW_SYNC_PATHS
+            or sum(len(str(p)) + 1 for p in paths) > MAX_NARROW_SYNC_ARG_CHARS):
+        # Q-1: a long list would overflow the Windows command line (32 767
+        # characters). `--all` is content-hash gated, so it re-embeds only
+        # what never landed.
+        return retry_kg_seed(ctx)
     script = _sync_script(ctx.folder)
     if script is None:
         return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
-    rc = _run_project_sync(ctx, script, paths)
+    try:
+        rc = _run_project_sync(ctx, script, paths)
+    except OSError as exc:  # the command could not be started — a failed attempt
+        return RetryResult(ctx.condition_id, FAILED,
+                           f"kg sync of the {len(paths)} failed path(s) could not start: {exc}")
     if rc == 0:
         return RetryResult(ctx.condition_id, RETRIED,
                            f"kg sync of the {len(paths)} failed path(s) completed")

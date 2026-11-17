@@ -474,6 +474,65 @@ def test_a_sync_failure_resyncs_only_the_failed_paths(tmp_path):
     assert call[-2:] == [str(folder / "knowledge" / "a.md"), str(folder / "knowledge" / "c.md")]
 
 
+def _owe_failed_paths(folder: Path, count: int, stem: str = "n", subdir: str = "") -> None:
+    from vco_lib import owed_work
+
+    rels = []
+    for i in range(count):
+        rel = f"knowledge/{subdir}{stem}{i}.md"
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_text("# n\n", encoding="utf-8")
+        rels.append(rel)
+    prior = owed_work.failed_paths_state(folder)
+    _owe(folder, FAIL_CID)
+    owed_work.record_sync_failures(folder, rels, whole_tree=True, prior=prior)
+
+
+def test_just_below_the_threshold_the_retry_stays_narrow(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, dr.MAX_NARROW_SYNC_PATHS)
+    runner = _Runner()
+    with mock.patch.object(dr, "_record_resolution"):
+        dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                    runner=runner, single_instance=False)
+    assert "--all" not in runner.calls[0]
+    assert len(runner.calls[0]) == 2 + 200
+
+
+def test_above_the_path_count_the_retry_falls_back_to_the_whole_tree(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, dr.MAX_NARROW_SYNC_PATHS + 1)
+    runner = _Runner()
+    with mock.patch.object(dr, "_record_resolution"):
+        dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                    runner=runner, single_instance=False)
+    assert runner.calls[0][-1] == "--all"
+    assert len(runner.calls[0]) == 3
+
+
+def test_above_the_argument_length_the_retry_falls_back_to_the_whole_tree(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, 30, subdir="".join(c * 240 + "/" for c in "dfgh"), stem="x")
+    runner = _Runner()
+    with mock.patch.object(dr, "_record_resolution"):
+        dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                    runner=runner, single_instance=False)
+    assert runner.calls[0][-1] == "--all"
+
+
+def test_a_spawn_that_cannot_start_is_a_failed_attempt_not_a_crash(tmp_path):
+    folder = _project(tmp_path, "p")
+    _owe_failed_paths(folder, 3)
+
+    def boom(argv, cwd):
+        raise OSError("command line too long")
+
+    results = dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
+                          runner=boom, single_instance=False)
+    assert [r.status for r in results] == [dr.FAILED]
+    assert dr.attempt_count(folder, FAIL_CID) == 1
+
+
 def test_a_failure_entry_without_a_record_still_owes_the_whole_tree(tmp_path):
     """LEAVE-ALONE: install.py's enqueued seed re-emits the same condition for
     a WHOLE-TREE seed — a record left by an earlier entry must not narrow it."""
