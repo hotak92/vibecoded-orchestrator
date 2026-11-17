@@ -359,7 +359,7 @@ If you upgrade VCO in place (e.g. `python install.py --update` on top of an exis
 Workaround:
 
 1. From the install root, locate both binaries: `find . -name 'vct-launcher*' -o -name 'vct-hub*'` (expect 2-4 hits).
-2. The canonical paths are `launcher/dist/<os>-<arch>/vct-launcher{,.exe}` and `vct-hub/dist/<os>-<arch>/vct-hub{,.exe}`. Any binaries at non-canonical paths are stale.
+2. The canonical paths are `launcher/dist/<os>-<arch>/vct-launcher{,.exe}` and `launcher/dist/<os>-<arch>/vct-hub{,.exe}` (both binaries live in the same folder). Any binaries at non-canonical paths are stale.
 3. Delete the stale copies (NOT the canonical ones).
 4. Quit + relaunch the launcher. The next boot picks up the canonical binary; if it doesn't, run `python install.py --update --force` to re-stamp the launcher's recorded binary path back to the canonical one.
 
