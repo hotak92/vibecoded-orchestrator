@@ -10,13 +10,14 @@ orchestrator-level migration store for the schema artifacts tracked in the
 launcher.db `artifact_schema_versions` registry (Weaviate collection schemas,
 the KG-summary cache, launcher.db row shapes, vocabularies, etc.).
 
-**Today it ships EMPTY** (this README + `.gitkeep` only). With zero edge files
-the runner is a verified **no-op**: every artifact is either registered at its
-current canonical version (never-materialized) or left untouched
-(up-to-date + not stale). No schema is mutated. The mechanism exists so a
-**future** release whose schema actually changes can drop ONE edge file that
-runs automatically at update time, gated on the DB-tracked version — without
-any code change to "turn the runner on".
+**Today it ships five edges, all for one artifact type**:
+`codegraph_collection/4_to_5.py` … `8_to_9.py` (each adds properties to the
+five code-graph classes; none drops a class). Every other artifact type has no
+edge file, and for those the runner is a verified **no-op**: the artifact is
+either registered at its current canonical version (never-materialized) or
+left untouched (up-to-date + not stale). A release whose schema changes drops
+ONE more edge file, which runs automatically at update time, gated on the
+DB-tracked version — without any code change to "turn the runner on".
 
 See the ratified design: `.claude/context/plans/SPEC-v0260-migration-runner.md`
 and the binding policy in
