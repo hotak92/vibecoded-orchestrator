@@ -492,7 +492,8 @@ def test_a_passing_verify_removes_nothing_and_records_no_failure(root, tmp_path)
     eng = FakeEngine()
     out = _move(root, eng, tmp_path)
     assert out.status == cu.MOVED and "restore" not in eng.calls
-    assert not (tmp_path / "state" / "container-upgrade.json").exists()
+    state = json.loads((tmp_path / "state" / "container-upgrade.json").read_text())
+    assert "weaviate" not in state            # only the kept backup is recorded (C-2)
 
 
 # ─── no auto-heal loop ──────────────────────────────────────────────────
@@ -1306,3 +1307,86 @@ def test_both_hooks_call_the_quiet_verb(hook):
     calls = [line for line in text.splitlines()
              if "weaviate_memory ensure-foreign-limit" in line and not line.lstrip().startswith("#")]
     assert len(calls) == 1 and "--quiet" in calls[0]
+
+
+# ─── C-2: the pre-move copy stays on record while it exists ─────────────
+
+
+class VolumeEngine:
+    """``volume inspect`` only: *present* volumes exist; *unreadable* ones
+    cannot be asked."""
+
+    runtime = "podman"
+
+    def __init__(self, present=(), unreadable=()):
+        self.present, self.unreadable = set(present), set(unreadable)
+        self.asked: list[str] = []
+
+    def volume_exists(self, name):
+        self.asked.append(name)
+        if name in self.unreadable:
+            return None
+        return name in self.present
+
+
+def test_a_verified_move_records_its_backup_volume(root, tmp_path):
+    out = _move(root, FakeEngine(), tmp_path)
+    state = json.loads((tmp_path / "state" / "container-upgrade.json").read_text())
+    assert [b["volume"] for b in state["backups"]] == [out.backup]
+    assert state["backups"][0]["from"] == OLD and state["backups"][0]["to"] == PINNED
+    assert "weaviate" not in state            # no failed attempt is recorded
+
+
+def test_the_backup_entry_is_re_emitted_while_the_volume_exists(root, tmp_path):
+    state_file = tmp_path / "state" / "container-upgrade.json"
+    backup = _move(root, FakeEngine(), tmp_path).backup
+    eng = VolumeEngine(present={backup})
+    entries = cu.kept_backup_entries(eng, state_file=state_file)
+    assert [e.condition_id for e in entries] == [cu.CID_BACKUP_KEPT]
+    assert f"podman volume rm {backup}" in entries[0].command_to_apply
+    assert cu.kept_backup_entries(eng, skip=[backup], state_file=state_file) == []  # reported once per run
+    assert json.loads(state_file.read_text())["backups"][0]["volume"] == backup
+
+
+def test_a_removed_backup_volume_is_forgotten(root, tmp_path):
+    state_file = tmp_path / "state" / "container-upgrade.json"
+    _move(root, FakeEngine(), tmp_path)
+    assert cu.kept_backup_entries(VolumeEngine(), state_file=state_file) == []
+    assert json.loads(state_file.read_text())["backups"] == []
+
+
+def test_a_backup_volume_that_cannot_be_checked_stays_on_record(root, tmp_path):
+    state_file = tmp_path / "state" / "container-upgrade.json"
+    backup = _move(root, FakeEngine(), tmp_path).backup
+    entries = cu.kept_backup_entries(VolumeEngine(unreadable={backup}), state_file=state_file)
+    assert [e.condition_id for e in entries] == [cu.CID_BACKUP_KEPT]
+    assert json.loads(state_file.read_text())["backups"][0]["volume"] == backup
+
+
+@pytest.mark.parametrize("rc, stderr, want", [
+    (0, "", True), (125, "Error: no such volume vco-weaviate-backup-1", False),
+    (125, "Error: permission denied", None)])
+def test_volume_exists_reads_the_engine(root, rc, stderr, want):
+    run = mock.Mock(return_value=mock.Mock(returncode=rc, stdout="", stderr=stderr))
+    assert cu.ContainerEngine("podman", root, run=run).volume_exists("v") is want
+    assert run.call_args[0][0] == ["podman", "volume", "inspect", "v"]
+
+
+def test_an_update_with_nothing_to_move_re_emits_the_kept_backup(tmp_path, monkeypatch):
+    state_file = tmp_path / "vct" / "container-upgrade.json"
+    monkeypatch.setattr(cu, "state_path", lambda: state_file)
+    case, db, machine, rec, _root = _own_install(tmp_path)
+    cu.save_state({"backups": [{"service": "weaviate", "volume": "vco-weaviate-backup-1",
+                                "container": NAME, "from": OLD, "to": PINNED,
+                                "runtime": "podman", "at": "1"}]}, state_file)
+    plain = machine.run
+
+    def run(argv, **kw):
+        if list(argv[1:3]) == ["volume", "inspect"]:
+            return mock.Mock(returncode=0, stdout="[]", stderr="")
+        return plain(argv, **kw)
+
+    result, *_ = run_case(tmp_path, case, db=db, machine=machine, recorder=rec, run=run,
+                          mover=lambda **_kw: _outcome(cu.NOT_NEEDED))
+    kept = [e for e in result.entries if e.condition_id == cu.CID_BACKUP_KEPT]
+    assert len(kept) == 1 and "vco-weaviate-backup-1" in kept[0].detected

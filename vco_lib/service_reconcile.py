@@ -1651,6 +1651,7 @@ def reconcile(
         if protect_moves is None or protect_moves:
             _protect_weaviate_move(result, root, runtime, installer_project, infra_dir,
                                    installer_mounts.get("weaviate"), db_path, run, env, mover)
+            _report_kept_backups(result, root, runtime, run)
         _limit_foreign_weaviate(result, root, runtime, run, env, limiter)
     result.entries.extend(_outcome_entries(result, root))
     return result
@@ -1719,6 +1720,19 @@ def _protect_weaviate_move(result: ReconcileResult, root: Path, runtime: str,
         result.lines.extend(outcome.lines)
     result.moves["weaviate"] = outcome
     result.entries.extend(outcome.entries)
+
+
+def _report_kept_backups(result: ReconcileResult, root: Path, runtime: str,
+                         run: Optional[RunFn]) -> None:
+    """Every update re-emits ``container_upgrade_backup_kept`` while a
+    pre-move copy of Weaviate's data still exists (audit C-2): the entry is
+    the user's one record of that volume, and VCO never deletes it."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+    moved = result.moves.get("weaviate")
+    skip = [moved.backup] if moved is not None and getattr(moved, "backup", "") else []
+    result.entries.extend(_cu.kept_backup_entries(_cu.ContainerEngine(runtime, root, run=run),
+                                                  skip=skip))
 
 
 def _limit_foreign_weaviate(result: ReconcileResult, root: Path, runtime: str,

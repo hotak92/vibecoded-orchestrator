@@ -84,6 +84,7 @@ __all__ = [
     "class_count",
     "class_counts",
     "image_move",
+    "kept_backup_entries",
     "protect_weaviate_move",
     "version_move_refused_entry",
 ]
@@ -364,6 +365,16 @@ class ContainerEngine:
 
     def remove_volume(self, name: str) -> bool:
         return self._ok(["volume", "rm", name], 120)
+
+    def volume_exists(self, name: str) -> Optional[bool]:
+        """``True`` / ``False`` (the engine positively says "no such
+        volume") / ``None`` (it could not be asked)."""
+        res = self._rt(["volume", "inspect", name], 60)
+        if res is None:
+            return None
+        if res.returncode == 0:
+            return True
+        return False if "no such volume" in (res.stderr or "").lower() else None
 
     # -- one-off helper containers (the OLD image's own shell) ----------
     def _helper(self, image: str, mounts: Sequence[str], script: str, timeout: float
@@ -734,6 +745,7 @@ def protect_weaviate_move(
     if not problem:
         after_empty = sorted(c for c, n in before.items() if n == 0)
         out.status, out.empty_classes = MOVED, after_empty
+        _record_backup(out, name, move, backup, runtime, stamp, state_file)
         say(f"  [weaviate] verified: {move.pinned}, same data mount, every index present, "
             f"no class lost an object (of {len(before)} counted)"
             + (f"; written during the move: {'; '.join(gains[:10])}" if gains else ""))
@@ -793,6 +805,56 @@ def held_back(out: MoveOutcome, name: str, move: ImageMove, mount: Optional[Mapp
             "python install.py --update")
         return True
     return False
+
+
+def _record_backup(out: MoveOutcome, name: str, move: ImageMove, backup: str, runtime: str,
+                   stamp: str, state_file: Optional[Path]) -> None:
+    """Keep the name of the pre-move copy in ``container-upgrade.json``: the
+    ledger entry is re-emitted from it by every later update while the
+    volume exists (:func:`kept_backup_entries`, audit C-2)."""
+    state = load_state(state_file)
+    kept = [b for b in state.get("backups") or [] if isinstance(b, dict)]
+    kept.append({"service": "weaviate", "volume": backup, "container": name, "from": move.live,
+                 "to": move.pinned, "runtime": runtime, "at": stamp})
+    state["backups"] = kept
+    try:
+        save_state(state, state_file)
+    except OSError as exc:
+        out.say(f"  [weaviate] the backup volume {backup} could not be recorded ({exc}); "
+                "UPDATE_DEFERRED.md names it this once")
+
+
+def kept_backup_entries(engine: ContainerEngine, *, skip: Sequence[str] = (),
+                        state_file: Optional[Path] = None) -> list[DeferralEntry]:
+    """The :data:`CID_BACKUP_KEPT` entry for every recorded pre-move copy
+    that still exists (re-emitted by every update, so the one record of a
+    full copy of Weaviate's data is not dropped while the copy takes the
+    space; VCO never deletes the volume itself). A volume the engine
+    positively reports gone is forgotten; one that cannot be checked is kept
+    and still reported. *skip*: volumes this run already reported."""
+    state = load_state(state_file)
+    recorded = [b for b in state.get("backups") or [] if isinstance(b, dict) and b.get("volume")]
+    if not recorded:
+        return []
+    entries: list[DeferralEntry] = []
+    keep: list[dict] = []
+    for rec in recorded:
+        volume = str(rec["volume"])
+        if engine.volume_exists(volume) is False:
+            continue  # the user removed it: nothing left to report
+        keep.append(rec)
+        if volume in skip:
+            continue
+        move = ImageMove(str(rec.get("from") or "?"), str(rec.get("to") or "?"), "upgrade")
+        entries.append(_backup_kept_entry(str(rec.get("container") or "vco_weaviate"), move,
+                                          volume, str(rec.get("runtime") or engine.runtime), ()))
+    if len(keep) != len(recorded):
+        state["backups"] = keep
+        try:
+            save_state(state, state_file)
+        except OSError:
+            pass  # re-checked at the next update; nothing is deleted on this path
+    return entries
 
 
 def _refuse(out: MoveOutcome, name: str, move: ImageMove, reason: str, command: str) -> MoveOutcome:

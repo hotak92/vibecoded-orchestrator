@@ -1039,7 +1039,7 @@ class = "informational_record"
 owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = """v0.2.107. One-shot record of a verified move of VCO's own Weaviate to the pinned image: names the backup volume holding the data as it was before the move and the command that frees it. VCO never deletes that copy itself."""
+notes = """v0.2.107. Record of a verified move of VCO's own Weaviate to the pinned image: names the backup volume holding the data as it was before the move and the command that frees it. VCO never deletes that copy itself. The volume's name is kept in <vct_root>/state/container-upgrade.json ("backups"), and every later update re-emits this entry while `<runtime> volume inspect` still finds the volume (container_upgrade.kept_backup_entries, audit C-2); once the user removed it, the record and the entry are dropped. A volume that cannot be checked keeps both."""
 
 [conditions.code_embed_image_stale]
 class = "action_required"
