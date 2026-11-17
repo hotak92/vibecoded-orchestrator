@@ -538,6 +538,32 @@ def test_resync_and_vector_copy_route_through_shared_connect(monkeypatch):
     assert out_copy is sentinel, "vector_copy must connect via the shared factory"
 
 
+def test_the_mcp_servers_own_connect_disables_the_pypi_check(monkeypatch):
+    """The weaviate-kg MCP server builds its client with its own
+    ``connect_to_custom`` call (not ``connect_v4``), so it must apply the
+    shared disable itself. Measured on v0.2.106: the server's first connect
+    logged ``GET https://pypi.org/pypi/weaviate-client/json`` — the "per MCP
+    start" lookup the disable was written to remove. RED-PROOF: without the
+    call in ``server.get_weaviate_client`` the disable is never invoked."""
+    import weaviate
+    import weaviate_mcp.server as srv
+    import vco_lib.weaviate_helpers as wh
+
+    order: list[str] = []
+    monkeypatch.setattr(
+        wh, "disable_weaviate_client_pypi_check",
+        lambda: order.append("disable") or True,
+    )
+    monkeypatch.setattr(
+        weaviate, "connect_to_custom",
+        lambda **kw: order.append("connect") or mock.MagicMock(),
+    )
+    monkeypatch.setattr(srv, "weaviate_client", None)
+    monkeypatch.setattr(srv, "_shared_kg_probe_done", True)
+    srv.get_weaviate_client()
+    assert order == ["disable", "connect"]
+
+
 # ── Review fixes (E1 / E2 / E3) ───────────────────────────────────────────
 
 

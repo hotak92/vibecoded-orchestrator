@@ -453,14 +453,12 @@ def _config_field(
 # ── MIRROR (category C) — must match `vco_lib/weaviate_helpers.py::
 #    weaviate_url_default`, which is the SHARED HOME for this resolution.
 #
-# Why a mirror and not a call: this MCP deliberately does NOT import vco_lib.
-# It boots on half-installed environments where vco_lib is not importable,
-# and adding a boot-critical import here would trade a real failure mode for
-# a cosmetic convergence (same reasoning as `get_weaviate_client`, recorded
-# in knowledge/concepts/weaviate-helper-convergence-mock-surface-pattern.md).
-#
-# The precedence below is therefore copied, and must stay byte-equivalent in
-# BEHAVIOUR to the shared home:
+# Why it is still a mirror: when it was written this MCP avoided importing
+# vco_lib at boot. That is no longer true — vco_lib is a hard dependency of
+# this module (see the import guards above: a failed import is a broken
+# install and fails loudly), so nothing prevents calling the shared home.
+# Until that call replaces this copy, the precedence below must stay
+# byte-equivalent in BEHAVIOUR to the shared home:
 #   1. WEAVIATE_URL  — a full URL the user stated (scheme+host+port); wins
 #                      even when WEAVIATE_PORT disagrees.
 #   2. WEAVIATE_PORT — a port for the canonical localhost host. Honouring it
@@ -1113,10 +1111,10 @@ KG_COLLECTION, _KG_COLLECTION_SOURCE = _config_field_with_source(
 # copies of the curated set; they read it here via the shared-read fan-out
 # (_kg_search_collections), opt-out via SHARED_KG_READ_DISABLED.
 #
-# Asymmetric access (2026-05-01): SHARED_KG_COLLECTION is ALWAYS exposed to
-# read paths when set. There is no per-project read opt-out — every project
-# always reads the shared KG. The per-project gate below restricts WRITES
-# only.
+# Access (2026-05-01, read gate added in v0.2.46): SHARED_KG_COLLECTION is
+# exposed to read paths when set, unless the project set
+# SHARED_KG_READ_DISABLED=true (`_resolve_shared_kg_read_disabled` below).
+# SHARED_KG_WRITE_DISABLED restricts WRITES; the two gates are independent.
 _SHARED_KG_DEFAULT = "VibeCodedOrchestrator_KnowledgeGraph"
 # v0.2.21 Step 18: resolved via vct-hub when reachable; env-fallback
 # otherwise. When the hub is reachable, an explicit empty value means
