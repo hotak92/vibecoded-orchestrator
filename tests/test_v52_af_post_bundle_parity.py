@@ -382,7 +382,7 @@ def test_apply_post_bundle_steps_contains_all_six_ordered_steps() -> None:
       1. populate_project_state_from_filesystem (post-bundle re-walk)
       2. seed_enabled_rows_for_new_project (global modules → this project)
       3. set_project_module_enabled('diagrams', true)
-      4. upsert_code_graph_build + codegraph::spawn_initial_build
+      4. queue_code_graph_build_with_mode + codegraph::spawn_build
       5. upsert_kg_sync + kg_sync::spawn_initial_sync
       6. upsert_kg_summary + kg_summary::spawn_initial_summary
 
@@ -402,7 +402,10 @@ def test_apply_post_bundle_steps_contains_all_six_ordered_steps() -> None:
          "step 2: seed enabled_for_project=true for global modules (audit AF-2)"),
         (3, "set_project_module_enabled",
          "step 3: seed project_modules('diagrams') = true (opt-out default)"),
-        (4, "upsert_code_graph_build",
+        # v0.2.107 (U-1): the PENDING row is queued WITH the decided pass
+        # shape (`queue_code_graph_build_with_mode`), so a launcher restart
+        # resumes it with that shape.
+        (4, "queue_code_graph_build_with_mode",
          "step 4a: queue PENDING code-graph build row"),
         # v0.2.107 (UPDATE-ALL): the spawn takes the DECIDED pass
         # (`decide_post_bundle_codegraph_pass` → `spawn_build(mode)`).

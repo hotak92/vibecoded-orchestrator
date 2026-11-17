@@ -358,7 +358,39 @@ pub(crate) fn spawn_build(
     });
 }
 
-/// Launcher-boot resume sweep (2026-05-12). Runs in two phases:
+/// v0.2.107 (U-1): boot-resume of a queued build with the shape its row
+/// stored (`code_graph_builds.pending_mode`). The git probe runs only for a
+/// stored incremental pass, inside the task (boot never waits on git); the
+/// shape itself is [`resumed_build_mode`]'s.
+pub(crate) fn spawn_resumed_build(
+    app: AppHandle,
+    project_id: String,
+    project_name: String,
+    folder_path: String,
+    stored: Option<BuildMode>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let git = match &stored {
+            Some(BuildMode::Incremental { since_commit }) => {
+                probe_git_facts(std::path::Path::new(&folder_path), Some(since_commit.as_str()))
+                    .await
+            }
+            _ => GitFacts::default(),
+        };
+        let mode = resumed_build_mode(stored, &git);
+        tracing::info!("[vct] code-graph boot-resume of {}: {:?}", project_id, mode);
+        run_build_task(app, project_id, project_name, folder_path, mode).await;
+    });
+}
+
+/// Launcher-boot resume sweep (2026-05-12). Runs in two phases, after a
+/// v0.2.107 (U-1) phase 0:
+///
+/// 0. **Requeue interrupted decided passes.** A launcher-run 'running' row
+///    that still carries the pass shape a post-bundle decision stored
+///    (`pending_mode`) goes back to 'pending' and is resumed in phase 2
+///    with that shape — the exception to phase 1's "no silent re-spawn":
+///    the pass is owed by the update, not a user action to re-confirm.
 ///
 /// 1. **Mark stale-running rows as failed.** A 'running' row left over
 ///    from a previous launcher process is a stale ghost — its subprocess
@@ -369,8 +401,9 @@ pub(crate) fn spawn_build(
 ///
 /// 2. **Re-spawn pending rows.** A 'pending' row means the previous
 ///    `create_project_v2` / `rebuild_code_graph` inserted the row but
-///    crashed before `spawn_initial_build` actually ran. Re-spawn here
-///    so the build picks up on next boot.
+///    crashed before `spawn_initial_build` actually ran (or phase 0 put it
+///    back). Re-spawn here so the build picks up on next boot, with its
+///    stored shape when it has one ([`resumed_build_mode`]).
 ///
 /// Soft-fail everywhere: a DB lookup hiccup or a missing project FK
 /// must NOT block launcher boot. Each failure is logged + continued
@@ -391,6 +424,28 @@ pub fn resume_pending_builds(
     skip: &std::collections::HashSet<String>,
 ) -> (usize, usize) {
     let db = app.state::<Db>();
+
+    // Phase 0 (v0.2.107 U-1): a launcher-run `running` row that still carries
+    // the pass shape a post-bundle decision queued is a pass the launcher
+    // owed and lost to its own restart (most never left the admission queue,
+    // where the row reads `running`). Put it back to `pending` so phase 2
+    // resumes it with that shape; failing it would turn an owed forced walk
+    // into a Retry without `--force-rewalk`. Shapeless rows are untouched and
+    // swept below exactly as before.
+    match db.requeue_interrupted_decided_code_graph_builds() {
+        Ok(ids) if !ids.is_empty() => tracing::info!(
+            "[vct] code-graph boot-resume: requeued {} interrupted decided pass(es) \
+             (project ids: {:?})",
+            ids.len(),
+            ids
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            "[vct] warning: code-graph requeue of interrupted decided passes failed: {}. \
+             Those rows are swept to failed below; the next update decides again.",
+            e
+        ),
+    }
 
     // Phase 1: stale-running sweep — pid-aliveness-aware since R-4
     // (v0.2.73). Two row classes:
@@ -438,7 +493,7 @@ pub fn resume_pending_builds(
     }
 
     // Phase 2: respawn pending. We resolve project name/folder per id
-    // because `spawn_initial_build` needs both. Drop projects that no
+    // because `spawn_resumed_build` needs both. Drop projects that no
     // longer exist (cascade-delete should already have removed their
     // build row, but defend against missed-cascades just in case).
     let pending_ids = match db.list_pending_code_graph_builds() {
@@ -505,7 +560,7 @@ pub fn resume_pending_builds(
             // root-skip's fire-and-forget in projects_v2.rs), NOT by boot. A
             // stale root identity is healed at the next update, not on every
             // launcher start. (Non-root boot-resume respawns run the normal
-            // `spawn_initial_build` → `migrate_stale_identities_for_build`
+            // `spawn_resumed_build` → `migrate_stale_identities_for_build`
             // sweep as part of their build; only the root skip is sweep-free.)
             tracing::warn!(
                 "[vct] code-graph boot-resume: skipping + clearing PENDING build \
@@ -537,17 +592,42 @@ pub fn resume_pending_builds(
             continue;
         }
 
-        // Boot-resume of a pending row: we don't know whether the
-        // original rebuild_code_graph asked for prune_stale, and a
-        // resumed build is more conservative than an explicit user
-        // re-analyze action. Default to `false` so we don't prune
-        // rows the previous (interrupted) build would have visited.
-        spawn_initial_build(
+        // Boot-resume of a pending row. v0.2.107 (U-1): a row queued by the
+        // post-bundle decision stored its pass shape and resumes with it
+        // (`resumed_build_mode`: a forced walk keeps --force-rewalk, an
+        // incremental pass keeps its since-commit while that is still an
+        // ancestor of HEAD). A row without a stored shape (first build, user
+        // re-analyse) resumes as before: we don't know whether the original
+        // rebuild_code_graph asked for prune_stale, and a resumed build is
+        // more conservative than an explicit user re-analyze action, so
+        // `prune_stale: false`.
+        let stored = match db.code_graph_build_pending_mode(&project.id) {
+            Ok(raw) => {
+                let decoded = decode_pending_mode(raw.as_deref());
+                if raw.is_some() && decoded.is_none() {
+                    tracing::warn!(
+                        "[vct] warning: unreadable stored pass shape for {} ({:?}); \
+                         resuming as a plain full pass",
+                        project.id, raw
+                    );
+                }
+                decoded
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[vct] warning: could not read the stored pass shape for {}: {}; \
+                     resuming as a plain full pass",
+                    project.id, e
+                );
+                None
+            }
+        };
+        spawn_resumed_build(
             app.clone(),
             project.id,
             project.name,
             project.folder_path,
-            false,
+            stored,
         );
         respawned += 1;
     }
@@ -951,7 +1031,7 @@ async fn run_build_task(
     //
     // A queued task's DB row stays RUNNING with a "queued" phase (piggybacks
     // the existing status rows — no new state). This gate covers the
-    // boot-resume path too (`resume_pending_builds` → `spawn_initial_build` →
+    // boot-resume path too (`resume_pending_builds` → `spawn_resumed_build` →
     // here), which can also fire N tasks at launcher boot.
     emit_build(&app, &project_id, build_status::RUNNING, 0, Some("queued"), None);
     let _admission = {
@@ -1923,7 +2003,12 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
 use crate::commands::projects_v2::BundleCodegraphWalk;
 
 /// The shape of one analyzer run the launcher starts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serialized (v0.2.107 U-1) into `code_graph_builds.pending_mode` so a
+/// queued pass resumes with the shape it was decided with — see
+/// [`encode_pending_mode`] / [`decode_pending_mode`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum BuildMode {
     /// Whole-repo walk. `prune_stale` reaps rows of files that no longer exist
     /// (guarded by the analyzer's discovered-vs-walked preserve set);
@@ -1956,6 +2041,50 @@ pub(crate) fn build_mode_args(mode: &BuildMode) -> Vec<String> {
             "--since-commit".to_string(),
             since_commit.clone(),
         ],
+    }
+}
+
+/// The stored form of a decided pass shape (`code_graph_builds.pending_mode`,
+/// migration 052). JSON, e.g. `{"kind":"full","prune_stale":true,
+/// "force_rewalk":true}` or `{"kind":"incremental","since_commit":"<sha>"}`.
+pub(crate) fn encode_pending_mode(mode: &BuildMode) -> String {
+    // A two-variant enum of bools and a String cannot fail to serialize.
+    serde_json::to_string(mode).unwrap_or_default()
+}
+
+/// Read a stored pass shape back. `None` for no value or one this build
+/// cannot read (a row written by a newer launcher) — the caller then
+/// resumes the row as a plain pass, which is what it did before U-1.
+pub(crate) fn decode_pending_mode(stored: Option<&str>) -> Option<BuildMode> {
+    serde_json::from_str(stored?).ok()
+}
+
+/// PURE (v0.2.107 U-1): the shape a RESUMED build runs with, from the shape
+/// its row stored and — for an incremental pass only — what git says now.
+///
+/// * no stored shape → `Full { prune_stale: false, force_rewalk: false }`,
+///   the boot-resume default since 2026-05-12 (first builds, re-analyses);
+/// * a stored full pass → exactly that pass, so an owed forced walk keeps
+///   `--force-rewalk` and writes its generation stamp;
+/// * a stored incremental pass → the same `--since-commit` while that commit
+///   is still HEAD or an ancestor of it (`<since>..HEAD` still names every
+///   committed change since the last build); otherwise — history rewritten
+///   while the launcher was down, git not runnable, no HEAD — one full pass
+///   with prune, which is what the decision itself chooses when the recorded
+///   commit is not an ancestor of HEAD.
+pub(crate) fn resumed_build_mode(stored: Option<BuildMode>, git: &GitFacts) -> BuildMode {
+    match stored {
+        None => BuildMode::Full { prune_stale: false, force_rewalk: false },
+        Some(full @ BuildMode::Full { .. }) => full,
+        Some(BuildMode::Incremental { since_commit }) => {
+            let still_valid = git.head.as_deref() == Some(since_commit.as_str())
+                || git.recorded_is_ancestor == Some(true);
+            if still_valid {
+                BuildMode::Incremental { since_commit }
+            } else {
+                BuildMode::Full { prune_stale: true, force_rewalk: false }
+            }
+        }
     }
 }
 
@@ -2016,6 +2145,10 @@ pub(crate) struct GitFacts {
     pub head: Option<String>,
     /// Is the recorded commit an ancestor of HEAD? Asked only when the two differ.
     pub recorded_is_ancestor: Option<bool>,
+    /// v0.2.107 (U-4): `git` itself could not be run (not on the launcher's
+    /// PATH, spawn error) — distinct from a `rev-parse` that ran and found no
+    /// HEAD (`head: None` with this `false`).
+    pub git_unavailable: bool,
 }
 
 /// The decision's answer: at most one pass, always with a reason the user sees.
@@ -2023,14 +2156,6 @@ pub(crate) struct GitFacts {
 pub(crate) enum CodegraphPass {
     Nothing { reason: String },
     Run { mode: BuildMode, reason: String },
-}
-
-impl CodegraphPass {
-    pub(crate) fn reason(&self) -> &str {
-        match self {
-            CodegraphPass::Nothing { reason } | CodegraphPass::Run { reason, .. } => reason,
-        }
-    }
 }
 
 fn short_sha(sha: &str) -> &str {
@@ -2045,7 +2170,11 @@ fn short_sha(sha: &str) -> &str {
 ///    forced walk stays owed: no stamp is written, the next update asks again);
 /// 4. an owed forced walk handed to us → ONE full `--force-rewalk` pass;
 /// 5. no completed build, or a failed one → one full pass;
-/// 6. no git HEAD → nothing (the graph follows commits; Re-analyze is the
+/// 6. git could not be run at all → one full pass, as before v0.2.107 (the
+///    launcher cannot tell whether HEAD moved; a short GUI PATH must not
+///    silently stop every re-index);
+/// 6b. no git HEAD (a `rev-parse` that ran and failed: not a repository, no
+///    commit yet) → nothing (the graph follows commits; Re-analyze is the
 ///    user's full pass);
 /// 7. no recorded commit → one full pass (the baseline is re-proven);
 /// 8. HEAD equals the recorded commit → nothing. A dirty tree does not change
@@ -2102,6 +2231,13 @@ pub(crate) fn decide_post_bundle_codegraph_pass(
         }
         LastBuild::Completed | LastBuild::InFlight { .. } => {}
     }
+    if git.git_unavailable {
+        return full(
+            true,
+            false,
+            "git could not be run by the launcher, so whether HEAD moved is unknown".to_string(),
+        );
+    }
     let Some(head) = git.head.as_deref() else {
         return CodegraphPass::Nothing {
             reason: "no git HEAD in the project folder — the code graph follows \
@@ -2153,7 +2289,9 @@ pub(crate) fn codegraph_pass_notice(pass: &CodegraphPass) -> String {
 }
 
 /// The I/O half: HEAD of `folder` and, when it differs from `recorded`,
-/// whether `recorded` is its ancestor. Soft-fail to `None` everywhere.
+/// whether `recorded` is its ancestor. Soft-fail to `None` everywhere; a
+/// `git` that could not be spawned at all is reported as `git_unavailable`
+/// (U-4), never as "no HEAD".
 pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&str>) -> GitFacts {
     async fn git(folder: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
         tokio::process::Command::new("git")
@@ -2166,8 +2304,10 @@ pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&
             .await
             .ok()
     }
-    let head = git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"])
-        .await
+    let Some(rev_parse) = git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"]).await else {
+        return GitFacts { git_unavailable: true, ..GitFacts::default() };
+    };
+    let head = Some(rev_parse)
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
@@ -2183,7 +2323,7 @@ pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&
         }
         _ => None,
     };
-    GitFacts { head, recorded_is_ancestor }
+    GitFacts { head, recorded_is_ancestor, git_unavailable: false }
 }
 
 /// Persist code-graph provenance into the project's binding after a successful
@@ -3663,7 +3803,7 @@ mod v02107_post_bundle_pass_tests {
     const OLD: &str = "0000000000000000000000000000000000000000";
 
     fn git(head: Option<&str>, ancestor: Option<bool>) -> GitFacts {
-        GitFacts { head: head.map(str::to_string), recorded_is_ancestor: ancestor }
+        GitFacts { head: head.map(str::to_string), recorded_is_ancestor: ancestor, git_unavailable: false }
     }
 
     fn decide(walk: BundleCodegraphWalk, last: LastBuild, recorded: Option<&str>, g: GitFacts) -> CodegraphPass {
@@ -3674,20 +3814,23 @@ mod v02107_post_bundle_pass_tests {
     #[test]
     fn head_equal_to_the_recorded_commit_runs_nothing() {
         let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(Some(HEAD), None));
-        assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
-        assert!(p.reason().contains("unchanged"), "{p:?}");
+        assert!(
+            matches!(&p, CodegraphPass::Nothing { reason } if reason.contains("unchanged")),
+            "{p:?}"
+        );
     }
 
     /// A-016 act: HEAD moved, recorded commit is an ancestor → incremental since it.
     #[test]
     fn head_moved_runs_an_incremental_pass_since_the_recorded_commit() {
         let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(OLD), git(Some(HEAD), Some(true)));
-        assert_eq!(
-            p,
-            CodegraphPass::Run {
-                mode: BuildMode::Incremental { since_commit: OLD.to_string() },
-                reason: p.reason().to_string(),
-            }
+        assert!(
+            matches!(
+                &p,
+                CodegraphPass::Run { mode: BuildMode::Incremental { since_commit }, .. }
+                    if since_commit == OLD
+            ),
+            "{p:?}"
         );
     }
 
@@ -3745,6 +3888,42 @@ mod v02107_post_bundle_pass_tests {
     fn no_git_head_runs_nothing_once_a_build_completed() {
         let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(None, None));
         assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
+    }
+
+    /// U-4: git that could not be RUN is not "no HEAD" — one full pass with
+    /// prune (the pre-v0.2.107 pass), with a reason that names git, not the
+    /// folder. Leave-alone: a rev-parse that ran and found no HEAD still
+    /// queues nothing.
+    #[test]
+    fn git_that_cannot_run_queues_a_full_pass_not_nothing() {
+        let unavailable = GitFacts { git_unavailable: true, ..GitFacts::default() };
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), unavailable);
+        assert!(
+            matches!(
+                &p,
+                CodegraphPass::Run { mode: BuildMode::Full { prune_stale: true, force_rewalk: false }, reason }
+                    if reason.contains("git could not be run")
+            ),
+            "{p:?}"
+        );
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(None, None));
+        assert!(
+            matches!(&p, CodegraphPass::Nothing { reason } if reason.contains("no git HEAD")),
+            "{p:?}"
+        );
+    }
+
+    /// U-4, the I/O half: a folder where git runs but there is no repository
+    /// reads as "ran, no HEAD", not as "git unavailable".
+    #[tokio::test]
+    async fn probe_tells_no_repository_from_no_git() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return; // no git on this machine: nothing to tell apart
+        }
+        let td = tempfile::tempdir().expect("tempdir");
+        // (head is not asserted: a TMPDIR inside some repository has one)
+        let facts = probe_git_facts(td.path(), Some(OLD)).await;
+        assert!(!facts.git_unavailable, "{facts:?}");
     }
 
     #[test]
@@ -3805,6 +3984,76 @@ mod v02107_post_bundle_pass_tests {
         assert!(matches!(classify_last_build(Some(&row("running", None, Some(6000))), now, 600), LastBuild::Failed { .. }));
         assert!(matches!(classify_last_build(Some(&row("running", Some(42), None)), now, 600), LastBuild::InFlight { .. }));
         assert!(matches!(classify_last_build(Some(&row("pending", None, None)), now, 600), LastBuild::InFlight { .. }));
+    }
+
+    // ─── U-1: the decided shape survives a launcher restart ────────────
+
+    /// The stored form round-trips every shape the decision can produce, and
+    /// an absent / unreadable value decodes to "no stored shape".
+    #[test]
+    fn pending_mode_round_trips_every_decided_shape() {
+        for mode in [
+            BuildMode::Full { prune_stale: true, force_rewalk: true },
+            BuildMode::Full { prune_stale: true, force_rewalk: false },
+            BuildMode::Full { prune_stale: false, force_rewalk: false },
+            BuildMode::Incremental { since_commit: OLD.into() },
+        ] {
+            let stored = encode_pending_mode(&mode);
+            assert_eq!(decode_pending_mode(Some(stored.as_str())), Some(mode), "{stored}");
+        }
+        assert_eq!(
+            encode_pending_mode(&BuildMode::Full { prune_stale: true, force_rewalk: true }),
+            r#"{"kind":"full","prune_stale":true,"force_rewalk":true}"#
+        );
+        assert_eq!(decode_pending_mode(None), None);
+        assert_eq!(decode_pending_mode(Some("{\"kind\":\"from-the-future\"}")), None);
+    }
+
+    /// U-1 act: a pending FORCED walk, launcher restarted → the resumed run's
+    /// argv carries --force-rewalk (and the decided prune), so the analyzer
+    /// writes its generation stamp. Git is not consulted for a full pass.
+    #[test]
+    fn a_resumed_forced_walk_keeps_force_rewalk() {
+        let decided = decide(BundleCodegraphWalk::Forced, LastBuild::Completed, Some(HEAD), git(Some(HEAD), None));
+        let CodegraphPass::Run { mode, .. } = decided else { panic!("expected a pass") };
+        let stored = decode_pending_mode(Some(encode_pending_mode(&mode).as_str()));
+        for g in [GitFacts::default(), git(Some(HEAD), Some(false))] {
+            let resumed = resumed_build_mode(stored.clone(), &g);
+            assert_eq!(build_mode_args(&resumed), vec!["--prune-stale", "--force-rewalk"]);
+        }
+    }
+
+    /// Leave-alone: a row with no stored shape (first build, user re-analyse,
+    /// a pre-052 row) resumes exactly as before — plain full, no prune, no force.
+    #[test]
+    fn a_resumed_row_without_a_shape_runs_the_old_plain_pass() {
+        let resumed = resumed_build_mode(None, &git(Some(HEAD), Some(true)));
+        assert_eq!(resumed, BuildMode::Full { prune_stale: false, force_rewalk: false });
+        assert!(build_mode_args(&resumed).is_empty());
+    }
+
+    /// U-1 incremental rule: the stored since-commit is kept while it is HEAD
+    /// or an ancestor of HEAD; once it cannot be trusted (rewritten history,
+    /// git could not tell, no HEAD) the resume is one full pass with prune —
+    /// what the decision itself picks for a non-ancestor recorded commit.
+    #[test]
+    fn a_resumed_incremental_pass_keeps_its_since_commit_only_while_it_is_trusted() {
+        let stored = Some(BuildMode::Incremental { since_commit: OLD.into() });
+        let incremental = BuildMode::Incremental { since_commit: OLD.into() };
+        assert_eq!(resumed_build_mode(stored.clone(), &git(Some(HEAD), Some(true))), incremental);
+        assert_eq!(resumed_build_mode(stored.clone(), &git(Some(OLD), None)), incremental);
+        for g in [
+            git(Some(HEAD), Some(false)),
+            git(Some(HEAD), None),
+            git(None, None),
+            GitFacts::default(),
+        ] {
+            assert_eq!(
+                resumed_build_mode(stored.clone(), &g),
+                BuildMode::Full { prune_stale: true, force_rewalk: false },
+                "{g:?}"
+            );
+        }
     }
 
     #[test]

@@ -273,6 +273,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "clear the SEEDED host-wide RL scoring 'off' row once (v0.2.106, owner ruling 2026-11-12). Installers v0.2.52-v0.2.105 wrote a host-wide (project_id IS NULL) vct-rl-reranker enabled_for_project = false row on every install; v0.2.106 retired that seed (RL scoring's unset default follows the bundled weights, vco_lib/rl_scoring_default.py), and a seeded row would pin existing installs off after a trained model ships. Deletes that row unless the latest audited user write of the host-wide RL row (module_global_enabled_changed) recorded false — a user's own choice stays. Per-project rows, a host-wide true and every other module are untouched. The runner's version record is the once-stamp: a host-wide choice made after this ran is never removed. Plain DELETE — not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 50->51 atomically with this migration.",
         sql: include_str!("migrations/051_rl_seeded_host_wide_off_clear_once.sql"),
     },
+    Migration {
+        version: 52,
+        description: "code_graph_builds.pending_mode (v0.2.107 UPDATE-ALL fix round, audit U-1). Nullable TEXT holding the pass shape decide_post_bundle_codegraph_pass chose for a queued post-bundle build (JSON: full with prune_stale/force_rewalk, or incremental with since_commit). Written with the PENDING row by the post-bundle path, kept through RUNNING, cleared by every other lifecycle write. At boot a launcher-run RUNNING row that still carries it is requeued (not failed) and resumed with that shape, so an owed forced walk keeps --force-rewalk across a launcher restart. NULL = no decided shape; such rows resume and sweep exactly as before. Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 51->52 atomically with this migration.",
+        sql: include_str!("migrations/052_code_graph_build_pending_mode.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -3696,5 +3701,45 @@ mod tests {
             apply(&conn).expect("apply v51");
             assert_eq!(host_wide_rl(&conn), None, "latest user action {latest}");
         }
+    }
+
+    // ─── Migration 052 — code_graph_builds.pending_mode (U-1) ────────────
+
+    /// Upgrade on a POPULATED table: the column arrives nullable, existing
+    /// rows keep every value and read pending_mode NULL (= resume as before).
+    #[test]
+    fn migration_052_adds_pending_mode_preserving_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 51).expect("apply through v51");
+        seed_project_row_for_mig(&conn, "p1");
+        conn.execute(
+            "INSERT INTO code_graph_builds (project_id, status, started_at, files_analyzed, pid) \
+             VALUES ('p1', 'pending', 1000, 3, 777)",
+            [],
+        )
+        .unwrap();
+        apply(&conn).expect("apply v52");
+        apply(&conn).expect("re-apply is a no-op");
+
+        let (status, pid, mode): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT status, pid, pending_mode FROM code_graph_builds WHERE project_id='p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(pid, Some(777));
+        assert_eq!(mode, None, "a pre-052 row carries no decided shape");
+        let notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('code_graph_builds') \
+                 WHERE name = 'pending_mode'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notnull, 0, "pending_mode must be nullable");
     }
 }

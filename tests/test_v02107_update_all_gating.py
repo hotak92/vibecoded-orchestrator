@@ -48,7 +48,6 @@ _RUST = _REPO / "launcher" / "src-tauri" / "src" / "commands"
         "knowledge/.node_formats.json",
         "knowledge/TAG_HIERARCHY.md",  # excluded meta file (never synced)
         "knowledge/VOCABULARY.md",
-        "knowledge/.cache/x.md",  # a dot dir is a sidecar
         "knowledge",  # the folder itself
         ".claude/settings.json",
         "src/knowledge/a.md",  # not under the synced root
@@ -62,10 +61,53 @@ def test_files_the_sync_does_not_ingest_are_not_kg_content(rel):
 @pytest.mark.parametrize(
     "rel",
     ["knowledge/concepts/x.md", "knowledge/x.md", "docs/guide.md",
-     "knowledge\\concepts\\win.md", "./knowledge/a.md"],
+     "knowledge\\concepts\\win.md", "./knowledge/a.md",
+     # U-5: the sync's rglob("*.md") does not skip dot-prefixed names
+     "knowledge/.cache/x.md", "knowledge/.hidden.md", "docs/.drafts/d.md"],
 )
 def test_a_node_the_sync_ingests_is_kg_content(rel):
     assert bkc.is_synced_kg_path(rel) is True
+
+
+def test_the_predicate_agrees_with_the_syncs_own_walk(tmp_path):
+    """U-5 parity: over a tree with dot dirs, dot files, sidecars and the
+    excluded meta files, the knowledge paths the predicate accepts are
+    exactly the ones the drift probe's mirror of the sync walk collects
+    (``kg_sync_drift._collect_candidate_nodes``), and the docs paths are
+    exactly ``docs/**/*.md`` as ``sync_all_docs`` walks them."""
+    from vco_lib import kg_sync_drift
+
+    files = [
+        "knowledge/a.md", "knowledge/concepts/b.md", "knowledge/.cache/c.md",
+        "knowledge/.hidden.md", "knowledge/archive/old.md",
+        "knowledge/TAG_HIERARCHY.md", "knowledge/sub/VOCABULARY.md",
+        "knowledge/.node_formats.json", "knowledge/.node_embeddings.README.txt",
+        "knowledge/notes.txt",
+        "docs/guide.md", "docs/.drafts/d.md", "docs/img.png",
+    ]
+    for rel in files:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("---\ntitle: t\n---\nbody\n", encoding="utf-8")
+
+    nodes, _excluded = kg_sync_drift._collect_candidate_nodes(tmp_path / "knowledge")
+    walked = {rel for rel, _parts, _content in nodes}
+    walked |= {
+        "docs/" + p.relative_to(tmp_path / "docs").as_posix()
+        for p in (tmp_path / "docs").rglob("*.md")
+    }
+    accepted = {rel for rel in files if bkc.is_synced_kg_path(rel)}
+    assert accepted == walked
+    assert "knowledge/.cache/c.md" in accepted
+
+
+def test_the_sync_script_still_walks_with_plain_rglob():
+    """The mirror above is of THIS walk; a filter added to the sync must be
+    added to ``is_synced_kg_path`` (and to the drift probe) too."""
+    text = (_REPO / "templates" / "scripts" / "sync_knowledge_graph.py").read_text(
+        encoding="utf-8")
+    assert 'md_files = list(KNOWLEDGE_ROOT.rglob("*.md"))' in text
+    assert 'md_files = list(DOCS_ROOT.rglob("*.md"))' in text
 
 
 def test_readme_only_update_states_no_kg_change():
