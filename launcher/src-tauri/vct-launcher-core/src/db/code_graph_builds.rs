@@ -91,6 +91,13 @@ impl Db {
     /// no longer describes (the boot sweep would then aliveness-check
     /// the wrong process). Detached walks register through
     /// `register_running_code_graph_build` instead.
+    ///
+    /// v0.2.107 (U-1, migration 052): `pending_mode` — the pass shape a
+    /// post-bundle decision queued ([`Self::queue_code_graph_build_with_mode`])
+    /// — is KEPT by the transition to `running` (the queued build starting)
+    /// and CLEARED by every other transition, so a terminal row, or a pending
+    /// row queued through this writer (first build, user re-analyse), never
+    /// carries a stale shape into a later resume.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_code_graph_build(
         &self,
@@ -158,7 +165,9 @@ impl Db {
                     error_message  = excluded.error_message,
                     log_tail       = excluded.log_tail,
                     pid            = NULL,
-                    heartbeat_at   = NULL",
+                    heartbeat_at   = NULL,
+                    pending_mode   = CASE WHEN excluded.status = 'running'
+                                          THEN pending_mode ELSE NULL END",
                 params![
                     project_id,
                     status,
@@ -257,7 +266,8 @@ impl Db {
                     error_message  = NULL,
                     log_tail       = NULL,
                     pid            = excluded.pid,
-                    heartbeat_at   = NULL",
+                    heartbeat_at   = NULL,
+                    pending_mode   = NULL",
                 params![project_id, now_ms, pid as i64],
             )
             .map_err(|e| format!("register running code_graph_build: {}", e))?;
@@ -345,6 +355,100 @@ impl Db {
             )
             .map_err(|e| format!("finalize detached code_graph_build: {}", e))?;
         Ok(affected > 0)
+    }
+
+    /// Queue a `pending` build row carrying the pass shape the caller decided
+    /// (v0.2.107 U-1, migration 052). Same row as
+    /// `upsert_code_graph_build(project_id, PENDING, Some(started_at), None,
+    /// None, 0, None, false, None, None)`, plus `pending_mode` — ONE statement,
+    /// so no crash can leave the row queued without its shape. `pending_mode`
+    /// is opaque here (the launcher's `codegraph::encode_pending_mode` owns
+    /// the format); `None` queues a row that resumes as a plain pass.
+    pub fn queue_code_graph_build_with_mode(
+        &self,
+        project_id: &str,
+        started_at: i64,
+        pending_mode: Option<&str>,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        guard
+            .execute(
+                "INSERT INTO code_graph_builds
+                    (project_id, status, started_at, finished_at, duration_ms,
+                     files_analyzed, languages, joern_used, error_message, log_tail, pid,
+                     heartbeat_at, pending_mode)
+                 VALUES (?1, 'pending', ?2, NULL, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL, ?3)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                    status         = 'pending',
+                    started_at     = excluded.started_at,
+                    finished_at    = NULL,
+                    duration_ms    = NULL,
+                    files_analyzed = 0,
+                    languages      = NULL,
+                    joern_used     = 0,
+                    error_message  = NULL,
+                    log_tail       = NULL,
+                    pid            = NULL,
+                    heartbeat_at   = NULL,
+                    pending_mode   = excluded.pending_mode",
+                params![project_id, started_at, pending_mode],
+            )
+            .map_err(|e| format!("queue code_graph_build with mode: {}", e))?;
+        Ok(())
+    }
+
+    /// The pass shape stored with this project's build row (v0.2.107 U-1),
+    /// or `None` when the row has none or does not exist.
+    pub fn code_graph_build_pending_mode(&self, project_id: &str) -> Result<Option<String>, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT pending_mode FROM code_graph_builds WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|e| format!("read code_graph_build pending_mode: {}", e))
+    }
+
+    /// Boot step (v0.2.107 U-1): put every LAUNCHER-run `running` row that
+    /// still carries a decided pass shape back to `pending`, so
+    /// `resume_pending_builds` re-runs it with that shape instead of the
+    /// orphan sweep failing it. Such a row is a post-bundle pass the launcher
+    /// owed and lost to its own restart — most of them never left the
+    /// admission queue (the row reads `running` with a "queued" phase while
+    /// it waits) — and failing it would turn an owed forced walk into a Retry
+    /// that runs without `--force-rewalk`. Rows without a shape (first
+    /// builds, user re-analyses) and detached (pid-bearing) rows are left to
+    /// the existing sweeps, unchanged. Call BEFORE
+    /// [`Self::mark_orphaned_running_code_graph_builds_failed`]. Returns the
+    /// requeued project ids.
+    pub fn requeue_interrupted_decided_code_graph_builds(&self) -> Result<Vec<String>, String> {
+        let guard = self.lock();
+        let ids: Vec<String> = {
+            let mut stmt = guard
+                .prepare(
+                    "SELECT project_id FROM code_graph_builds
+                      WHERE status = 'running' AND pid IS NULL AND pending_mode IS NOT NULL",
+                )
+                .map_err(|e| format!("prepare list interrupted decided builds: {}", e))?;
+            let mapped = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("query interrupted decided builds: {}", e))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect interrupted decided builds: {}", e))?
+        };
+        guard
+            .execute(
+                "UPDATE code_graph_builds
+                    SET status = 'pending', heartbeat_at = NULL
+                  WHERE status = 'running' AND pid IS NULL AND pending_mode IS NOT NULL",
+                [],
+            )
+            .map_err(|e| format!("requeue interrupted decided builds: {}", e))?;
+        Ok(ids)
     }
 
     pub fn get_code_graph_build(
@@ -1289,6 +1393,76 @@ mod tests {
             db.get_code_graph_build(&pid_str).unwrap().unwrap().pid,
             Some(7)
         );
+    }
+
+    // ─── v0.2.107 U-1: the decided pass shape survives a restart ────────
+
+    const FORCED: &str = r#"{"kind":"full","prune_stale":true,"force_rewalk":true}"#;
+
+    /// The shape rides the queued row through RUNNING (the queued build
+    /// starting) and is cleared by the terminal transition.
+    #[test]
+    fn pending_mode_is_kept_through_running_and_cleared_at_the_end() {
+        let (db, id) = fresh_db_with_project();
+        db.queue_code_graph_build_with_mode(&id, 5, Some(FORCED)).unwrap();
+        let row = db.get_code_graph_build(&id).unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.started_at, Some(5));
+        assert_eq!(db.code_graph_build_pending_mode(&id).unwrap().as_deref(), Some(FORCED));
+
+        db.upsert_code_graph_build(&id, status::RUNNING, Some(6), None, None, 0, None, false, None, None)
+            .unwrap();
+        assert_eq!(db.code_graph_build_pending_mode(&id).unwrap().as_deref(), Some(FORCED));
+
+        db.upsert_code_graph_build(&id, status::SUCCESS, Some(6), Some(7), Some(1), 3, None, false, None, None)
+            .unwrap();
+        assert_eq!(db.code_graph_build_pending_mode(&id).unwrap(), None);
+    }
+
+    /// Leave-alone: a pending row queued through the generic writer (first
+    /// build, user re-analyse) and a detached registration carry no shape,
+    /// even over a row that had one.
+    #[test]
+    fn other_writers_clear_a_stale_pending_mode() {
+        let (db, id) = fresh_db_with_project();
+        db.queue_code_graph_build_with_mode(&id, 1, Some(FORCED)).unwrap();
+        db.upsert_code_graph_build(&id, status::PENDING, Some(2), None, None, 0, None, false, None, None)
+            .unwrap();
+        assert_eq!(db.code_graph_build_pending_mode(&id).unwrap(), None);
+
+        db.queue_code_graph_build_with_mode(&id, 3, Some(FORCED)).unwrap();
+        assert!(db.register_running_code_graph_build(&id, 4242, |_| false).unwrap());
+        assert_eq!(db.code_graph_build_pending_mode(&id).unwrap(), None);
+        assert_eq!(db.code_graph_build_pending_mode("no-such-project").unwrap(), None);
+    }
+
+    /// Act + leave-alone for the boot requeue: only a launcher-run RUNNING
+    /// row WITH a shape goes back to pending; a shapeless running row is
+    /// still the orphan sweep's (failed), and a detached row is untouched.
+    #[test]
+    fn boot_requeues_only_interrupted_decided_builds() {
+        let db = Db::open_in_memory().unwrap();
+        let decided = insert_build_project(&db, "u1-decided", status::PENDING);
+        db.queue_code_graph_build_with_mode(&decided, 1, Some(FORCED)).unwrap();
+        db.upsert_code_graph_build(&decided, status::RUNNING, Some(1), None, None, 0, None, false, None, None)
+            .unwrap();
+        db.touch_code_graph_build_heartbeat(&decided).unwrap();
+        let plain = insert_build_project(&db, "u1-plain", status::RUNNING);
+        let detached = insert_build_project(&db, "u1-detached", status::SUCCESS);
+        db.register_running_code_graph_build(&detached, 999, |_| false).unwrap();
+
+        let requeued = db.requeue_interrupted_decided_code_graph_builds().unwrap();
+        assert_eq!(requeued, vec![decided.clone()]);
+        let row = db.get_code_graph_build(&decided).unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.heartbeat_at, None);
+        assert_eq!(db.code_graph_build_pending_mode(&decided).unwrap().as_deref(), Some(FORCED));
+        assert_eq!(db.list_pending_code_graph_builds().unwrap(), vec![decided.clone()]);
+
+        assert_eq!(db.mark_orphaned_running_code_graph_builds_failed("crashed").unwrap(), 1);
+        assert_eq!(db.get_code_graph_build(&plain).unwrap().unwrap().status, "failed");
+        assert_eq!(db.get_code_graph_build(&detached).unwrap().unwrap().status, "running");
+        assert!(db.requeue_interrupted_decided_code_graph_builds().unwrap().is_empty());
     }
 
     #[test]

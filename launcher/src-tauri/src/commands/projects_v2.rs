@@ -14,7 +14,6 @@ use crate::commands::installer::{detect_system, find_local_repo_root};
 use crate::commands::kg_summary;
 use crate::commands::kg_sync;
 use crate::commands::project_env_settings;
-use crate::db::code_graph_builds::status as build_status;
 use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
@@ -1161,18 +1160,16 @@ pub(crate) async fn apply_post_bundle_steps(
             notices.push(codegraph::codegraph_pass_notice(&pass));
         }
         if let codegraph::CodegraphPass::Run { mode, .. } = pass {
-            if let Err(e) = db.upsert_code_graph_build(
-                project_id,
-                build_status::PENDING,
-                Some(now),
-                None,
-                None,
-                0,
-                None,
-                false,
-                None,
-                None,
-            ) {
+            // v0.2.107 (U-1): an UPDATE's decided shape is stored with the
+            // pending row, so a launcher restart before the pass finishes
+            // resumes it with that shape (a forced walk keeps --force-rewalk)
+            // instead of a plain full pass. A first create stores none: its
+            // resume (and its crash handling) stay as they were.
+            let stored_mode =
+                (!is_initial_create).then(|| codegraph::encode_pending_mode(&mode));
+            if let Err(e) =
+                db.queue_code_graph_build_with_mode(project_id, now, stored_mode.as_deref())
+            {
                 tracing::warn!(
                     "[vct] warning: could not queue code-graph build for {}: {}",
                     project_id, e
