@@ -260,7 +260,14 @@ class RegisterBlockShapeTests(unittest.TestCase):
             _response([block]), ti.BoundedIdMap(),
         )
         _assert_only_text_notes(self, response["content"])
-        anthropic, _ = ti.sanitise_for_anthropic(_request([block]))
+        # G-1: on the Anthropic route the conversion needs positive vendor
+        # evidence; a vendor-served turn (marked thinking) is that evidence.
+        # Without it the block is kept — AnthropicRouteAllowListTests.
+        vendor_turn = [
+            {"type": "thinking", "thinking": "synthetic", "signature": "vct_abc123"},
+            block,
+        ]
+        anthropic, _ = ti.sanitise_for_anthropic(_request(vendor_turn))
         _assert_only_text_notes(self, anthropic["messages"][0]["content"])
         vendor, _ = ti.sanitise_for_vendor(_request([block]))
         _assert_only_text_notes(self, vendor["messages"][0]["content"])
@@ -353,6 +360,148 @@ class RegisterBlockShapeTests(unittest.TestCase):
         vendor, stats = ti.sanitise_for_vendor(original)
         self.assertFalse(stats.changed)
         self.assertIs(vendor, original)
+
+
+def _first_party_named_blocks() -> list[dict]:
+    """The three id-less first-party shapes of WAVE1-CHECK-B G-1 (SDK fields)."""
+    return [
+        {
+            "type": "search_result", "source": "https://example.invalid/doc",
+            "title": "synthetic",
+            "content": [{"type": "text", "text": "synthetic"}],
+        },
+        {"type": "container_upload", "file_id": "file_01Synthetic"},
+        {"type": "compaction", "content": "synthetic summary"},
+    ]
+
+
+def _anthropic_bound_repairers() -> list[tuple[str, object]]:
+    """Both Anthropic-bound seams: the gateway request leg and fix-transcript."""
+    def fix_transcript(payload: dict) -> tuple[dict, tr.RepairStats]:
+        repairer = tr.TranscriptRepairer(
+            id_map={}, strip_nonportable=True, strip_vendor_origin=True,
+        )
+        messages, changed = repairer.repair_messages(payload["messages"])
+        return ({**payload, "messages": messages} if changed else payload), repairer.stats
+
+    return [
+        ("sanitise_for_anthropic", ti.sanitise_for_anthropic),
+        ("fix-transcript repairer", fix_transcript),
+    ]
+
+
+class AnthropicRouteAllowListTests(unittest.TestCase):
+    """G-1: on the Anthropic route only POSITIVE vendor evidence converts."""
+
+    def _assert_untouched(self, payload: dict) -> None:
+        snapshot = json.dumps(payload, sort_keys=True)
+        for name, seam in _anthropic_bound_repairers():
+            with self.subTest(seam=name):
+                result, stats = seam(payload)
+                self.assertFalse(stats.changed, stats.summary())
+                self.assertIs(result, payload)
+                self.assertEqual(json.dumps(result, sort_keys=True), snapshot)
+
+    def _assert_converted(self, payload: dict, kind: str) -> None:
+        for name, seam in _anthropic_bound_repairers():
+            with self.subTest(seam=name):
+                result, stats = seam(payload)
+                self.assertGreaterEqual(stats.blocks_converted, 1)
+                content = result["messages"][0]["content"]
+                self.assertNotIn(kind, [b.get("type") for b in content])
+                self.assertIn(
+                    f"[{kind} block from vendor:",
+                    "".join(b.get("text", "") for b in content),
+                )
+
+    def test_the_three_named_types_are_byte_identical_in_either_role(self) -> None:
+        for role in ("user", "assistant"):
+            with self.subTest(role=role):
+                self._assert_untouched(
+                    _request(_first_party_named_blocks(), role=role),
+                )
+
+    def test_every_type_the_catch_all_sees_on_the_allow_list_is_kept(self) -> None:
+        # Types with their own branch (id-bearing families) are decided there;
+        # every other allow-listed type must reach the catch-all and stay.
+        own_branch = {
+            tr.THINKING_BLOCK_TYPE, "server_tool_use", tr.MCP_TOOL_USE_TYPE,
+            tr.CLIENT_TOOL_RESULT_TYPE,
+        }
+        for kind in sorted(tr.ANTHROPIC_REQUEST_BLOCK_TYPES - own_branch):
+            if tr.is_server_tool_result_type(kind):
+                continue
+            with self.subTest(kind=kind):
+                self._assert_untouched(_request([{"type": kind}]))
+
+    def test_an_unknown_first_party_block_without_evidence_is_kept(self) -> None:
+        for block in (
+            {"type": "future_first_party_block", "payload": {"k": "v"}},
+            {"type": "future_first_party_block", "id": "toolu_01Future"},
+        ):
+            with self.subTest(block=block):
+                self._assert_untouched(_request([block]))
+
+    def test_a_user_block_is_never_converted_on_the_anthropic_route(self) -> None:
+        for block in (
+            {"type": "future_first_party_block"},
+            {"type": "vendor_widget", "id": "call_fixture"},
+            {"type": "vendor_widget", "id": "srvtoolu_vct_call_fixture"},
+            {"type": "vendor_widget", "signature": "vct_abc"},
+        ):
+            with self.subTest(block=block):
+                self._assert_untouched(_request([block], role="user"))
+        # The vendor-bound leg keeps its own rule: outside ROUTE_SAFE, converted.
+        vendor, _ = ti.sanitise_for_vendor(
+            _request([{"type": "vendor_widget", "id": "call_fixture"}], role="user"),
+        )
+        self.assertEqual(vendor["messages"][0]["content"][0]["type"], "text")
+
+    def test_a_vendor_originated_unknown_block_is_converted(self) -> None:
+        cases = {
+            "non-Anthropic id": [{"type": "vendor_widget", "id": "call_fixture"}],
+            "non-Anthropic reference": [
+                {"type": "vendor_widget", "tool_use_id": "call_fixture"},
+            ],
+            "gateway-marked id": [
+                {"type": "vendor_widget", "id": "srvtoolu_vct_call_fixture"},
+            ],
+            "gateway-marked signature": [
+                {"type": "vendor_widget", "signature": "vct_abc"},
+            ],
+            "recorded vendor producer": [
+                {
+                    "type": "mcp_tool_use", "id": "toolu_vendorShaped",
+                    "server_name": "web_reader", "name": "webReader",
+                    "input": {"url": FIXTURE_URL},
+                },
+                {"type": "vendor_widget", "tool_use_id": "toolu_vendorShaped"},
+            ],
+            "vendor-served turn": [
+                {"type": "thinking", "thinking": "synthetic", "signature": "vct_abc"},
+                {"type": "vendor_widget", "payload": {"url": FIXTURE_URL}},
+            ],
+        }
+        for name, blocks in cases.items():
+            with self.subTest(case=name):
+                self._assert_converted(_request(blocks), "vendor_widget")
+
+    def test_an_unknown_id_less_assistant_block_still_converts_on_vendor_legs(self) -> None:
+        block = {"type": "future_first_party_block", "payload": {"k": "v"}}
+        response, stats = ti.normalise_vendor_response(
+            _response([block]), ti.BoundedIdMap(),
+        )
+        self.assertEqual(stats.blocks_converted, 1)
+        self.assertEqual(response["content"][0]["type"], "text")
+        vendor, stats = ti.sanitise_for_vendor(_request([block]))
+        self.assertEqual(stats.blocks_converted, 1)
+        self.assertEqual(vendor["messages"][0]["content"][0]["type"], "text")
+
+    def test_the_lost_chat_pair_is_still_converted_on_the_anthropic_route(self) -> None:
+        for name, seam in _anthropic_bound_repairers():
+            with self.subTest(seam=name):
+                result, _ = seam(_request(_mcp_pair()))
+                _assert_only_text_notes(self, result["messages"][0]["content"])
 
 
 class ToolInputIsolationTests(unittest.TestCase):

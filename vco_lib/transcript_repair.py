@@ -179,9 +179,12 @@ EMPTY_PLACEHOLDER_TEXT = "[vendor tool block removed by vco fix-transcript]"
 THINKING_PLACEHOLDER_TEXT = "[vendor thinking block removed by vco fix-transcript]"
 
 #: Block types every route can carry without a destination-specific tool
-#: contract. Everything else is handled explicitly below or converted to a
-#: text note; an unfamiliar type beside an Anthropic-minted id is the one
-#: conservative exception (it may be a first-party block newer than this table).
+#: contract. On the vendor routes everything else is handled explicitly below
+#: or converted to a text note; an unfamiliar type beside an Anthropic-minted
+#: id is the one conservative exception (it may be a first-party block newer
+#: than this table). The Anthropic-bound route is wider — see
+#: :data:`ANTHROPIC_REQUEST_BLOCK_TYPES`: there a block is converted only on
+#: positive vendor evidence, and a USER block never.
 ROUTE_SAFE_BLOCK_TYPES = frozenset(
     {
         "text",
@@ -193,6 +196,60 @@ ROUTE_SAFE_BLOCK_TYPES = frozenset(
         "tool_reference",
     }
 )
+
+#: Every top-level content-block type the Anthropic Messages API accepts in a
+#: REQUEST. Used only on the Anthropic-bound route (no ``convert_server_tools``)
+#: by the catch-all in :meth:`TranscriptRepairer.repair_content`: a block of
+#: one of these types that reaches it is Anthropic's own shape and passes
+#: through unchanged. The id-bearing families (``server_tool_use``,
+#: ``*_tool_result``, ``mcp_tool_use``, ``tool_result``, ``thinking``) are
+#: still decided by their own branches first — membership here does not
+#: exempt a vendor-origin pair from them.
+#:
+#: Source: the ``anthropic`` Python SDK 0.102.0 type definitions — the union
+#: ``ContentBlockParam`` (``types/content_block_param.py``) and the beta union
+#: ``BetaContentBlockParam`` (``types/beta/beta_content_block_param.py``, which
+#: also admits every response ``BetaContentBlock``), each member's
+#: ``type: Required[Literal[...]]``. ``tool_reference`` is not a top-level
+#: member there (the SDK nests it inside ``tool_result`` content); it is kept
+#: because the client sends it and :data:`ROUTE_SAFE_BLOCK_TYPES` already
+#: carries it. Nested-only types (``web_search_result``,
+#: ``code_execution_result``, …) are not listed: this walk never descends.
+#: Not a place to add vendor types — a type outside this set is still passed
+#: through on the Anthropic route unless it is positively vendor-originated
+#: (see ``_unknown_is_vendor_origin``); the set only decides that a KNOWN type
+#: is never second-guessed.
+ANTHROPIC_REQUEST_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "document",
+        "search_result",
+        THINKING_BLOCK_TYPE,
+        REDACTED_THINKING_BLOCK_TYPE,
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "advisor_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+        "mcp_tool_use",
+        "mcp_tool_result",
+        "container_upload",
+        "compaction",
+        "tool_reference",
+    }
+)
+
+#: Plain client ``tool_use`` ids Anthropic mints (``toolu_01…``). Not part of
+#: :data:`ANTHROPIC_MINTED_ID_RE` because the server-tool gates must not treat
+#: them as server-tool provenance; used only to decide that an unknown block's
+#: id is NOT a vendor's.
+_ANTHROPIC_CLIENT_TOOL_ID_RE = re.compile(r"^toolu_[a-zA-Z0-9_]+$")
 
 #: Suffix identifying a SERVER-tool result block. Matched by suffix rather
 #: than by an enumerated list because the point of the exercise is vendor
@@ -828,6 +885,12 @@ class TranscriptRepairer:
 
         stats = RepairStats()
         out: list[Any] = []
+        vendor_turn = role == "assistant" and any(
+            isinstance(block, dict)
+            and block.get("type") == THINKING_BLOCK_TYPE
+            and thinking_signature_is_vendor_origin(block.get("signature"))
+            for block in blocks
+        )
         for block in blocks:
             if not isinstance(block, dict):
                 out.append(block)
@@ -867,6 +930,19 @@ class TranscriptRepairer:
             if minted_by_anthropic(block.get("id")) or minted_by_anthropic(
                 block.get("tool_use_id"),
             ):
+                out.append(block)
+                continue
+            if not self._convert_server_tools and (
+                role == "user"
+                or kind in ANTHROPIC_REQUEST_BLOCK_TYPES
+                or not self._unknown_is_vendor_origin(block, vendor_turn)
+            ):
+                # Anthropic-bound: a USER block is the client's own; a type
+                # the Messages API accepts is first-party; and an unfamiliar
+                # type with no vendor evidence may be a first-party block
+                # newer than the table — destroying it would change what the
+                # conversation means, while a truly foreign one gets
+                # Anthropic's own clear error (the pre-GW-1 behaviour).
                 out.append(block)
                 continue
             stats.blocks_converted += 1
@@ -948,6 +1024,49 @@ class TranscriptRepairer:
         return (out, True) if changed else (messages, False)
 
     # ── per-block-kind helpers ───────────────────────────────────────────
+    def _unknown_is_vendor_origin(self, block: dict, vendor_turn: bool) -> bool:
+        """POSITIVE evidence that an unfamiliar block was written by a vendor.
+
+        Only asked on the Anthropic-bound route, for a type outside
+        :data:`ANTHROPIC_REQUEST_BLOCK_TYPES` in a non-user message. Any one of:
+
+        * a gateway marker — an ``id`` / ``tool_use_id`` this module minted
+          (:data:`GATEWAY_ID_MARKER`), or a ``signature`` carrying
+          :data:`THINKING_SIGNATURE_MARKER`;
+        * a non-Anthropic id — an ``id`` / ``tool_use_id`` string that is not
+          Anthropic-shaped (``srvtoolu_`` / ``mcptoolu_`` / ``toolu_``,
+          unmarked), e.g. a vendor's ``call_…``;
+        * a recorded vendor producer — the reference names a block this pass
+          already converted or stripped as vendor-origin;
+        * a recorded vendor turn — the same assistant message carries a
+          ``thinking`` block whose signature is vendor-origin
+          (:func:`thinking_signature_is_vendor_origin`), i.e. the turn was
+          served by a vendor route.
+
+        No evidence means "keep": an unknown block might be first-party.
+        """
+        if vendor_turn:
+            return True
+        signature = block.get("signature")
+        if isinstance(signature, str) and signature.startswith(
+            THINKING_SIGNATURE_MARKER,
+        ):
+            return True
+        for key in ("id", "tool_use_id"):
+            ref = block.get(key)
+            if not isinstance(ref, str):
+                continue
+            if ref in self._converted or ref in self._dropped:
+                return True
+            if _GATEWAY_MINTED_RE.match(ref):
+                return True
+            if not (
+                minted_by_anthropic(ref)
+                or _ANTHROPIC_CLIENT_TOOL_ID_RE.match(ref)
+            ):
+                return True
+        return False
+
     def _remember(self, original: str, new: str) -> None:
         self._forward[original] = new
         if self._id_map is not None:
