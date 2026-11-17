@@ -218,7 +218,7 @@ def test_whole_repo_sweep_never_deletes_extra_path_rows(analyzer_mod, tmp_path):
     PRIMARY root must NOT be swept — it converges on its own root's walk and this
     walk cannot judge its reachability."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
-    root = _make_repo(tmp_path, [])  # nothing under primary
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file; an EMPTY root sweeps nothing
     rows = [
         # primary current-revision orphan → sweep it
         _Obj("prim", {"file_path": "pkg/gone.py", "embed_revision": rev,
@@ -306,7 +306,7 @@ def test_sweep_delete_failure_feeds_prune_failures(analyzer_mod, tmp_path):
     """A sweep delete_by_id failure feeds the prune-failure accounting (the same
     status chain the orphan-clear uses) and never raises."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
-    root = _make_repo(tmp_path, [])
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file; an EMPTY root sweeps nothing
     rows = [
         _Obj("orphan", {"file_path": "pkg/gone.py", "embed_revision": rev,
                         "project_source": root.as_posix()}),

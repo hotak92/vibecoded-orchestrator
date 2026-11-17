@@ -306,7 +306,7 @@ def test_orphan_clear_never_deletes_extra_path_rows(analyzer_mod, tmp_path):
     primary-matching project_source) are eligible."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
     # Primary root has NOTHING on disk → both rows are absent-under-primary.
-    root = _make_repo(tmp_path, [])
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file; an EMPTY root sweeps nothing
     rows = [
         # Primary-source stale+absent row → legitimately an orphan → delete.
         _Obj("prim", {
@@ -398,7 +398,7 @@ def test_orphan_clear_never_touches_current_revision_row(analyzer_mod, tmp_path)
     """A CURRENT-revision row for a deleted file must NOT be deleted by the
     orphan-clear (scoped to stale rows only)."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
-    root = tmp_path  # nothing on disk
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file on disk
     rows = [
         # current-revision row whose file is gone — out of orphan-clear scope
         _Obj("cur", {"file_path": "pkg/gone.py", "embed_revision": rev}),
@@ -536,7 +536,7 @@ def test_cg4_zero_dispatch_whole_repo_walk_still_sweeps(analyzer_mod, tmp_path):
     (zero-dispatch analogue); the end-of-walk force-trigger `_get_stale_file_set`
     still runs `_build_stale_file_set`, whose whole-repo sweep purges them."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
-    root = _make_repo(tmp_path, [])  # nothing on disk → every stored row orphaned
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file; an EMPTY root sweeps nothing
     rows = [
         _Obj("gone1", {
             "file_path": "pkg/a.py", "embed_revision": rev, "project_source": "",
