@@ -212,6 +212,16 @@ export interface UpdateSummary {
    *  now diffs the two declarations so a third instance fails a test instead
    *  of shipping. */
   kg_or_docs_content_changed: boolean;
+  /** v0.2.107 (A-015): the changed paths the KG sync ingests, as the bundle
+   *  envelope names them. Empty when nothing the sync reads changed (or for an
+   *  older envelope). The "why was a sync queued" line arrives in `notices`. */
+  kg_content_changed_paths: string[];
+  /** v0.2.107 (CGWRITE-03): which side walks the code graph after this update
+   *  — `background` (the bundle step's detached driver), `forced` (an owed
+   *  full re-walk the launcher's build runs) or `not_owed`. */
+  codegraph_walk: 'not_owed' | 'background' | 'forced';
+  /** Reason text of an owed walk, when known. */
+  codegraph_walk_reason: string | null;
 }
 
 /**

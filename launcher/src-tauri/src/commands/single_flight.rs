@@ -43,8 +43,14 @@
 //! `update_all_projects` (manifest-driven bundle reconcile over registered
 //! projects) and the orchestrator update (`update_run::run_update`, the
 //! launcher's own clone) are SEPARATE operations on separate targets. They
-//! get separate keys, so guarding one never blocks the other. Do not merge
-//! them into a single "an update is running" flag. (v0.2.100, owner Q1: a
+//! get separate keys, so a claim on one never reads as the other running. Do
+//! not merge them into a single "an update is running" flag.
+//!
+//! They DO exclude each other (v0.2.107, UPDATER-07), through a separate
+//! mechanism with its own wording: the orchestrator update stops the hub that
+//! "Update all" and its index jobs need, so `embed_admission`'s index-work
+//! exclusion refuses the one while the other runs (see
+//! [`begin_orchestrator_update_or_refuse`]). (v0.2.100, owner Q1: a
 //! third key, for the per-clone file-copy command, was retired with that
 //! command.)
 //!
@@ -113,6 +119,10 @@ static IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
 #[derive(Debug)]
 pub struct SingleFlightGuard {
     key: String,
+    /// v0.2.107 (UPDATER-07): the orchestrator-update claim also holds its
+    /// side of the index-work exclusion (`embed_admission`); `None` for every
+    /// other key. Released with the claim.
+    _index_exclusion: Option<crate::commands::embed_admission::OrchestratorUpdateExclusion>,
 }
 
 impl Drop for SingleFlightGuard {
@@ -140,7 +150,7 @@ pub fn try_begin(key: impl Into<String>) -> Option<SingleFlightGuard> {
         return None;
     }
     set.insert(key.clone());
-    Some(SingleFlightGuard { key })
+    Some(SingleFlightGuard { key, _index_exclusion: None })
 }
 
 /// True when `key` is currently claimed.
@@ -202,8 +212,17 @@ pub(crate) static ORCHESTRATOR_CLAIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// two cannot disagree. Prior review §4.8 is what a disagreement costs: a
 /// MenuBar click and a Preferences click interleaving a `git pull` and an
 /// `install.py --update` on one tree.
+///
+/// v0.2.107 (UPDATER-07): being the ONE entry point is also why the
+/// index-work exclusion lives here — every update surface takes it with the
+/// claim, and the update is refused (before anything is changed) while
+/// "Update all" runs or a code-graph / KG job is queued or running.
 pub fn begin_orchestrator_update_or_refuse() -> Result<SingleFlightGuard, String> {
-    begin_or_refuse(OP_UPDATE_ORCHESTRATOR_CLONE)
+    let mut claim = begin_or_refuse(OP_UPDATE_ORCHESTRATOR_CLONE)?;
+    // On refusal `claim` drops here, releasing the key again.
+    claim._index_exclusion =
+        Some(crate::commands::embed_admission::begin_orchestrator_update_exclusion()?);
+    Ok(claim)
 }
 
 // ---------------------------------------------------------------------------

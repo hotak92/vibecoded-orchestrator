@@ -5566,7 +5566,7 @@ def _trigger_extractor_generation_reindex(
     )
 
     phase = {
-        "launched": "ok", "stamped": "ok", "skipped": "ok",
+        "launched": "ok", "stamped": "ok", "skipped": "ok", "handed_off": "ok",
         "deferred": "warn", "failed": "warn",
     }.get(outcome.status, "warn")
     log("4.bundle.extractor_reindex", phase, outcome.message,
@@ -5599,13 +5599,18 @@ def _trigger_extractor_generation_reindex(
             f"{outcome.message}"
         )
     else:
+        # v0.2.107 (UPDATE-ALL): `handed_off` = owed, and the launcher's
+        # post-bundle build runs the forced walk (it reads this key).
         result["extractor_reindex"] = {
             "status": outcome.status, "reason": outcome.reason,
             "generation": outcome.generation,
+            "reason_text": outcome.reason_text,
         }
 
     if outcome.status != "launched":  # W1-C r4: one-time audits (a launched re-index runs them)
-        _cg_audit_step(Path(folder), project_name, index_dot_claude=bool(is_root_target), log=log)
+        _audit = _cg_audit_step(Path(folder), project_name, index_dot_claude=bool(is_root_target), log=log)
+        if _audit is not None:  # v0.2.107: the launcher reads it (one walk per project)
+            result["codegraph_audits"] = {"status": getattr(_audit, "status", "")}
 
 
 def current_chunker_revision() -> str:
@@ -10817,6 +10822,8 @@ def install_project_bundle(
             log=_log,
         ))
 
+    from vco_lib.bundle_kg_change import record_kg_content_change  # v0.2.107 A-015
+    record_kg_content_change(result)
     from vco_lib.bundle_run_log import append_run  # v0.2.100 F-W2-08(b)
     append_run(folder, result)
     return result
