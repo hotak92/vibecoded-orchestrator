@@ -11,7 +11,7 @@ tags:
 - python
 created: 2026-01-28 19:00:00+00:00
 updated: 2026-06-25T00:00:00Z
-status: deprecated
+status: superseded
 superseded_by: "Weaviate"
 ---
 
