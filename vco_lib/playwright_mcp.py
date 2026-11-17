@@ -489,7 +489,8 @@ def precache(
 ) -> str:
     """Pre-cache the pinned MCP package and the browser it will request.
 
-    Steps (each soft-fails; nothing here may abort an install):
+    Steps (each soft-fails; nothing here may abort an install). When
+    :func:`browser_state` already reads ``present`` none of them runs:
 
     1. ``npx -y <pin> --version`` — puts the exact pinned package in the npx
        cache (the one the registration will run).
@@ -522,6 +523,16 @@ def precache(
         return "no-npx"
 
     p = pin or load_pin()
+    # Converged install: the pinned package is already in the npx cache and
+    # the browser revision it names is complete on disk, so both npx runs
+    # below (a registry round trip and the installer) would change nothing.
+    # The check is local file reads only; anything short of a positive
+    # ``present`` falls through to the full fetch + install.
+    already = state_fn(p)
+    if already.state == STATE_PRESENT:
+        out(f"already cached ({already.path}).")
+        log_event("playwright", "ok", already.reason)
+        return "ok"
     out(f"({p.spec} + {p.browser}; may take a few minutes, ~170 MB)")
 
     def _defer(why: str) -> str:

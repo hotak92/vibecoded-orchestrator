@@ -13192,6 +13192,20 @@ def _seed_weaviate_shared_kg_only(
             orphan_kg
             and canonical != orphan_kg
             and isinstance(primary_count, int) and primary_count > 0
+            and canonical.lower() == orphan_kg.lower()
+        ):
+            # A case-only sibling shares the canonical class's lower-cased
+            # index in Weaviate: no drop of it is safe, so none is printed.
+            print(
+                f"  ⚠ Collection '{orphan_kg}' retains {primary_count} rows after "
+                f"rebind and differs only in case from '{canonical}', which "
+                f"this install now uses. Do not drop it by hand: the two share one "
+                f"on-disk index, and removing either can remove the other's data."
+            )
+        elif (
+            orphan_kg
+            and canonical != orphan_kg
+            and isinstance(primary_count, int) and primary_count > 0
         ):
             print(
                 f"  ⚠ Orphan collection '{orphan_kg}' retains "
@@ -13217,7 +13231,13 @@ def _seed_weaviate_shared_kg_only(
         rebind_errors = _rebind_orchestrator_root_to_canonical(canonical)
         if rebind_errors:
             for e in rebind_errors:
-                print(f"    ! rebind: {e}")
+                # A root the launcher has not registered yet (a fresh install,
+                # before its first start) is the expected state, not a fault.
+                if "(skipped)" in e or "reconciled on next launcher boot" in e:
+                    print(f"    · rebind: {e} — expected before the launcher's "
+                          "first start, which registers the root and its bindings")
+                else:
+                    print(f"    ! rebind: {e}")
             # v0.2.44 fix-now-2: propagate the "definitely broken" tier so
             # the audit-log "warn" entry fires on real DB write failures or
             # import errors. Two error classes stay non-propagated and
