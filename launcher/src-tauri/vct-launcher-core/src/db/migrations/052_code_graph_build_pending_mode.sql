@@ -19,7 +19,15 @@
 -- exactly while the decided pass is owed. NULL = no decided shape (first
 -- builds, user re-analyses, project moves): those resume as before.
 --
+-- pending_requeues (INTEGER NOT NULL DEFAULT 0, audit N-1) counts the boot
+-- requeues of that owed pass. Boot requeues a row only while the count is
+-- below 3 and increments it; at 3 the row is left to the orphan sweep
+-- (failed, "click Retry"), so a walk that takes the launcher down is not
+-- re-run at every start. Kept through RUNNING with pending_mode, reset to 0
+-- by every other lifecycle write (a completion, a new decision, a Retry).
+--
 -- Plain additive ALTER TABLE — idempotent via the runner's version check,
 -- not self-transactional.
 
 ALTER TABLE code_graph_builds ADD COLUMN pending_mode TEXT;
+ALTER TABLE code_graph_builds ADD COLUMN pending_requeues INTEGER NOT NULL DEFAULT 0;

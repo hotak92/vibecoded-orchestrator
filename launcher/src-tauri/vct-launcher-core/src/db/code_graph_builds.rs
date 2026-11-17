@@ -75,6 +75,20 @@ pub struct CodeGraphBuildRow {
 pub use super::log_tail::LOG_TAIL_MAX_BYTES;
 use super::log_tail::cap_log_tail;
 
+/// Audit N-1 (v0.2.107): how many launcher boots may put one interrupted
+/// decided pass back to pending. Matches the three attempts of v0.2.106's
+/// detached resync driver; the boot after the third leaves the row to the
+/// orphan sweep (failed, "click Retry").
+pub const MAX_BOOT_REQUEUES: u32 = 3;
+
+/// PURE (audit N-1): may boot requeue a row whose `pending_requeues` count
+/// reads `count`? `None` = the count could not be read → treated as at the
+/// cap (conservative: a walk that may be crashing the launcher is not re-run
+/// on a guess).
+pub fn boot_requeue_allowed(count: Option<u32>) -> bool {
+    matches!(count, Some(n) if n < MAX_BOOT_REQUEUES)
+}
+
 impl Db {
     /// UPSERT the build row for a project. Used by every transition
     /// (pending → running → success/failed/skipped). Caller is
@@ -97,7 +111,10 @@ impl Db {
     /// — is KEPT by the transition to `running` (the queued build starting)
     /// and CLEARED by every other transition, so a terminal row, or a pending
     /// row queued through this writer (first build, user re-analyse), never
-    /// carries a stale shape into a later resume.
+    /// carries a stale shape into a later resume. `pending_requeues` (audit
+    /// N-1) follows the same rule: kept through `running`, reset to 0 by
+    /// every other transition — a completion, success or failure, starts the
+    /// next owed pass with a fresh count.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_code_graph_build(
         &self,
@@ -167,7 +184,9 @@ impl Db {
                     pid            = NULL,
                     heartbeat_at   = NULL,
                     pending_mode   = CASE WHEN excluded.status = 'running'
-                                          THEN pending_mode ELSE NULL END",
+                                          THEN pending_mode ELSE NULL END,
+                    pending_requeues = CASE WHEN excluded.status = 'running'
+                                            THEN pending_requeues ELSE 0 END",
                 params![
                     project_id,
                     status,
@@ -267,7 +286,8 @@ impl Db {
                     log_tail       = NULL,
                     pid            = excluded.pid,
                     heartbeat_at   = NULL,
-                    pending_mode   = NULL",
+                    pending_mode   = NULL,
+                    pending_requeues = 0",
                 params![project_id, now_ms, pid as i64],
             )
             .map_err(|e| format!("register running code_graph_build: {}", e))?;
@@ -363,7 +383,8 @@ impl Db {
     /// None, 0, None, false, None, None)`, plus `pending_mode` — ONE statement,
     /// so no crash can leave the row queued without its shape. `pending_mode`
     /// is opaque here (the launcher's `codegraph::encode_pending_mode` owns
-    /// the format); `None` queues a row that resumes as a plain pass.
+    /// the format); `None` queues a row that resumes as a plain pass. A new
+    /// decision starts its boot-requeue count (`pending_requeues`) at 0.
     pub fn queue_code_graph_build_with_mode(
         &self,
         project_id: &str,
@@ -390,7 +411,8 @@ impl Db {
                     log_tail       = NULL,
                     pid            = NULL,
                     heartbeat_at   = NULL,
-                    pending_mode   = excluded.pending_mode",
+                    pending_mode   = excluded.pending_mode,
+                    pending_requeues = 0",
                 params![project_id, started_at, pending_mode],
             )
             .map_err(|e| format!("queue code_graph_build with mode: {}", e))?;
@@ -424,30 +446,61 @@ impl Db {
     /// the existing sweeps, unchanged. Call BEFORE
     /// [`Self::mark_orphaned_running_code_graph_builds_failed`]. Returns the
     /// requeued project ids.
+    ///
+    /// Bounded (audit N-1): a row is requeued only while
+    /// [`boot_requeue_allowed`] says so for its `pending_requeues` count, and
+    /// each requeue increments that count in the row itself (it must survive
+    /// the very restart it counts). A row at [`MAX_BOOT_REQUEUES`] — or one
+    /// whose count cannot be read — stays `running` and the orphan sweep fails
+    /// it with the Retry message, as before U-1, so a walk that takes the
+    /// launcher down is not re-run at every start. Such a row KEEPS its
+    /// `pending_mode` (the sweep does not touch it), which is what lets
+    /// `rebuild_code_graph` (Retry) run an owed forced walk as a forced walk.
     pub fn requeue_interrupted_decided_code_graph_builds(&self) -> Result<Vec<String>, String> {
         let guard = self.lock();
-        let ids: Vec<String> = {
+        let rows: Vec<(String, Option<u32>)> = {
             let mut stmt = guard
                 .prepare(
-                    "SELECT project_id FROM code_graph_builds
+                    "SELECT project_id, pending_requeues FROM code_graph_builds
                       WHERE status = 'running' AND pid IS NULL AND pending_mode IS NOT NULL",
                 )
                 .map_err(|e| format!("prepare list interrupted decided builds: {}", e))?;
             let mapped = stmt
-                .query_map([], |r| r.get::<_, String>(0))
+                .query_map([], |r| {
+                    // Per-row tolerance: a count of the wrong type or out of
+                    // range reads as None (= at the cap), never an error that
+                    // would abort the whole requeue.
+                    let count = r
+                        .get_ref(1)
+                        .ok()
+                        .and_then(|v| v.as_i64().ok())
+                        .and_then(|n| u32::try_from(n).ok());
+                    Ok((r.get::<_, String>(0)?, count))
+                })
                 .map_err(|e| format!("query interrupted decided builds: {}", e))?;
             mapped
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("collect interrupted decided builds: {}", e))?
         };
-        guard
-            .execute(
-                "UPDATE code_graph_builds
-                    SET status = 'pending', heartbeat_at = NULL
-                  WHERE status = 'running' AND pid IS NULL AND pending_mode IS NOT NULL",
-                [],
-            )
-            .map_err(|e| format!("requeue interrupted decided builds: {}", e))?;
+        let mut ids = Vec::new();
+        for (project_id, count) in rows {
+            if !boot_requeue_allowed(count) {
+                continue;
+            }
+            let next = count.map_or(MAX_BOOT_REQUEUES, |c| c + 1);
+            let affected = guard
+                .execute(
+                    "UPDATE code_graph_builds
+                        SET status = 'pending', heartbeat_at = NULL, pending_requeues = ?2
+                      WHERE project_id = ?1 AND status = 'running' AND pid IS NULL
+                        AND pending_mode IS NOT NULL",
+                    params![project_id, i64::from(next)],
+                )
+                .map_err(|e| format!("requeue interrupted decided build {}: {}", project_id, e))?;
+            if affected > 0 {
+                ids.push(project_id);
+            }
+        }
         Ok(ids)
     }
 
@@ -1463,6 +1516,119 @@ mod tests {
         assert_eq!(db.get_code_graph_build(&plain).unwrap().unwrap().status, "failed");
         assert_eq!(db.get_code_graph_build(&detached).unwrap().unwrap().status, "running");
         assert!(db.requeue_interrupted_decided_code_graph_builds().unwrap().is_empty());
+    }
+
+    // ─── v0.2.107 N-1: the boot requeue is bounded ──────────────────────
+
+    fn requeue_count(db: &Db, id: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT pending_requeues FROM code_graph_builds WHERE project_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Queue a decided pass and walk it to RUNNING, as the launcher would
+    /// just before it died.
+    fn running_decided(db: &Db, id: &str) {
+        db.upsert_code_graph_build(id, status::RUNNING, Some(1), None, None, 0, None, false, None, None)
+            .unwrap();
+    }
+
+    /// Pure decision: counts 0, 1, 2 requeue; 3 and above do not; an
+    /// unreadable count is treated as at the cap.
+    #[test]
+    fn boot_requeue_allowed_below_the_cap_only() {
+        assert_eq!(MAX_BOOT_REQUEUES, 3);
+        assert!(boot_requeue_allowed(Some(0)));
+        assert!(boot_requeue_allowed(Some(1)));
+        assert!(boot_requeue_allowed(Some(2)));
+        assert!(!boot_requeue_allowed(Some(3)));
+        assert!(!boot_requeue_allowed(Some(4)));
+        assert!(!boot_requeue_allowed(Some(u32::MAX)));
+        assert!(!boot_requeue_allowed(None));
+    }
+
+    /// Three boots requeue the same owed pass (the count rides RUNNING); the
+    /// fourth leaves it to the orphan sweep, which fails it with the Retry
+    /// message and keeps the stored shape for that Retry.
+    #[test]
+    fn fourth_boot_leaves_the_decided_build_to_the_sweep() {
+        let (db, id) = fresh_db_with_project();
+        db.queue_code_graph_build_with_mode(&id, 1, Some(FORCED)).unwrap();
+        assert_eq!(requeue_count(&db, &id), 0);
+        for boot in 1..=3_i64 {
+            running_decided(&db, &id);
+            assert_eq!(
+                db.requeue_interrupted_decided_code_graph_builds().unwrap(),
+                vec![id.clone()],
+                "boot {boot}"
+            );
+            assert_eq!(requeue_count(&db, &id), boot);
+            assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().status, "pending");
+        }
+        running_decided(&db, &id);
+        assert!(db.requeue_interrupted_decided_code_graph_builds().unwrap().is_empty());
+        assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().status, "running");
+        assert_eq!(requeue_count(&db, &id), 3);
+        assert_eq!(db.mark_orphaned_running_code_graph_builds_failed("crashed").unwrap(), 1);
+        let row = db.get_code_graph_build(&id).unwrap().unwrap();
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.error_message.as_deref(), Some("crashed"));
+        assert_eq!(db.code_graph_build_pending_mode(&id).unwrap().as_deref(), Some(FORCED));
+        assert!(db.list_pending_code_graph_builds().unwrap().is_empty());
+    }
+
+    /// A count that cannot be read is at the cap: the row is not requeued.
+    #[test]
+    fn unreadable_requeue_count_is_not_requeued() {
+        let (db, id) = fresh_db_with_project();
+        db.queue_code_graph_build_with_mode(&id, 1, Some(FORCED)).unwrap();
+        running_decided(&db, &id);
+        for bad in ["'not-a-number'", "-1"] {
+            db.lock()
+                .execute(
+                    &format!(
+                        "UPDATE code_graph_builds SET pending_requeues = {bad} WHERE project_id = ?1"
+                    ),
+                    params![id],
+                )
+                .unwrap();
+            assert!(
+                db.requeue_interrupted_decided_code_graph_builds().unwrap().is_empty(),
+                "{bad}"
+            );
+            assert_eq!(db.get_code_graph_build(&id).unwrap().unwrap().status, "running");
+        }
+    }
+
+    /// A completion — success or failure — and a new decision reset the
+    /// count, so the next owed pass gets its own three boots.
+    #[test]
+    fn completion_and_new_decision_reset_the_requeue_count() {
+        let (db, id) = fresh_db_with_project();
+        for terminal in [status::SUCCESS, status::FAILED] {
+            db.queue_code_graph_build_with_mode(&id, 1, Some(FORCED)).unwrap();
+            running_decided(&db, &id);
+            db.requeue_interrupted_decided_code_graph_builds().unwrap();
+            running_decided(&db, &id);
+            db.requeue_interrupted_decided_code_graph_builds().unwrap();
+            assert_eq!(requeue_count(&db, &id), 2);
+            running_decided(&db, &id);
+            db.upsert_code_graph_build(&id, terminal, Some(1), Some(2), Some(1), 0, None, false, None, None)
+                .unwrap();
+            assert_eq!(requeue_count(&db, &id), 0, "{terminal}");
+            assert_eq!(db.code_graph_build_pending_mode(&id).unwrap(), None, "{terminal}");
+        }
+
+        db.queue_code_graph_build_with_mode(&id, 1, Some(FORCED)).unwrap();
+        running_decided(&db, &id);
+        db.requeue_interrupted_decided_code_graph_builds().unwrap();
+        assert_eq!(requeue_count(&db, &id), 1);
+        db.queue_code_graph_build_with_mode(&id, 2, Some(FORCED)).unwrap();
+        assert_eq!(requeue_count(&db, &id), 0);
     }
 
     #[test]

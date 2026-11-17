@@ -275,7 +275,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 52,
-        description: "code_graph_builds.pending_mode (v0.2.107 UPDATE-ALL fix round, audit U-1). Nullable TEXT holding the pass shape decide_post_bundle_codegraph_pass chose for a queued post-bundle build (JSON: full with prune_stale/force_rewalk, or incremental with since_commit). Written with the PENDING row by the post-bundle path, kept through RUNNING, cleared by every other lifecycle write. At boot a launcher-run RUNNING row that still carries it is requeued (not failed) and resumed with that shape, so an owed forced walk keeps --force-rewalk across a launcher restart. NULL = no decided shape; such rows resume and sweep exactly as before. Plain additive ALTER TABLE — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 51->52 atomically with this migration.",
+        description: "code_graph_builds.pending_mode (v0.2.107 UPDATE-ALL fix round, audit U-1). Nullable TEXT holding the pass shape decide_post_bundle_codegraph_pass chose for a queued post-bundle build (JSON: full with prune_stale/force_rewalk, or incremental with since_commit). Written with the PENDING row by the post-bundle path, kept through RUNNING, cleared by every other lifecycle write. At boot a launcher-run RUNNING row that still carries it is requeued (not failed) and resumed with that shape, so an owed forced walk keeps --force-rewalk across a launcher restart. NULL = no decided shape; such rows resume and sweep exactly as before. Also code_graph_builds.pending_requeues (INTEGER NOT NULL DEFAULT 0, audit N-1): the boot requeues of that owed pass, kept through RUNNING and reset by every other lifecycle write; boot requeues only below 3, so a walk that takes the launcher down is failed (Retry) on the fourth start instead of re-run forever. Plain additive ALTER TABLEs — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 51->52 atomically with this migration.",
         sql: include_str!("migrations/052_code_graph_build_pending_mode.sql"),
     },
 ];
@@ -3741,5 +3741,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(notnull, 0, "pending_mode must be nullable");
+
+        // N-1: the boot-requeue count arrives as 0 on every existing row.
+        let requeues: i64 = conn
+            .query_row(
+                "SELECT pending_requeues FROM code_graph_builds WHERE project_id='p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(requeues, 0, "a pre-052 row starts with no boot requeues");
     }
 }
