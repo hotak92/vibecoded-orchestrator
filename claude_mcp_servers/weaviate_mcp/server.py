@@ -2826,6 +2826,12 @@ def get_weaviate_client():
     if weaviate_client is None:
         http_host, http_port = _weaviate_host_port(WEAVIATE_URL)
 
+        # This connect is the server's own (not ``connect_v4``), so it applies
+        # the shared disable itself: without it every MCP server's first
+        # connect sent ``GET https://pypi.org/pypi/weaviate-client/json``.
+        from vco_lib.weaviate_helpers import disable_weaviate_client_pypi_check
+
+        disable_weaviate_client_pypi_check()
         try:
             weaviate_client = weaviate.connect_to_custom(
                 http_host=http_host,
