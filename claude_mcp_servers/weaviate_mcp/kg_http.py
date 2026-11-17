@@ -60,7 +60,14 @@ class WeaviateUnreachable(Exception):
 
 
 class WeaviateHttpQueryError(Exception):
-    """A GraphQL/REST read failed (HTTP error or GraphQL ``errors``)."""
+    """A GraphQL/REST read failed (HTTP error or GraphQL ``errors``).
+
+    ``status`` is the HTTP status when the failure was an HTTP error, else
+    ``None`` (a GraphQL ``errors`` payload)."""
+
+    def __init__(self, msg: str, status: "Optional[int]" = None) -> None:
+        super().__init__(msg)
+        self.status = status
 
 
 #: Init / query timeouts — the weaviate-client v4 defaults (``Timeout(init=2,
@@ -456,6 +463,18 @@ class _Collections:
             self._cache[name] = HttpCollection(self._client, name)
         return self._cache[name]
 
+    def exists(self, name: str) -> bool:
+        """v4's ``collections.exists``: False only on a 404 for the class
+        schema; any other failure propagates (an unreachable or failing
+        Weaviate is not evidence that the collection is absent)."""
+        try:
+            self._client._get_json(f"/v1/schema/{name}")
+        except WeaviateHttpQueryError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
 
 class HttpWeaviateClient:
     """Read-only Weaviate client over plain HTTP (GraphQL + schema REST).
@@ -498,7 +517,7 @@ class HttpWeaviateClient:
             with urllib.request.urlopen(req, timeout=self._query_timeout) as resp:
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as exc:
-            raise WeaviateHttpQueryError(f"HTTP {exc.code} on {path}") from exc
+            raise WeaviateHttpQueryError(f"HTTP {exc.code} on {path}", status=exc.code) from exc
         except (urllib.error.URLError, OSError) as exc:
             # A refused/unreachable connection marks the endpoint down for
             # every hook (A-063); a slow query (timeout) does not — the

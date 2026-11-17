@@ -51,7 +51,10 @@ Mechanism (one interpreter, one home):
   retirement of ``_lib/query-cache.{sh,ps1}`` — the ``kgi``/``cgi``
   namespace split is the guard that must hold, so profile-gated blocks can
   never be served to the legacy
-  surfaces' keys (and vice-versa). Empty results are NEVER cached (§9).
+  surfaces' keys (and vice-versa). An empty result is cached (300 s) only
+  when the lookup FINISHED with nothing above its floor; a timeout or an
+  error (a raise, a non-zero producer exit, a KG query that failed on a
+  collection) is never cached as empty (v0.2.107; §9 before it).
 
 Kill switch: ``VCO_INJECT_PROFILE=off`` → exit 0 silently (checked first,
 beside the wrappers' own check). Per-surface: ``VCO_PROMPT_INJECT=off``
@@ -954,6 +957,24 @@ HOOK_QUERY_SLOTS = 2
 HOOK_QUERY_SLOT_WAIT_S = 5.0
 
 
+def _run_producer_main(mod) -> None:
+    """Run a producer's ``main()`` the way every leg must (v0.2.107 HR-1).
+
+    ``rl_kg_search.main`` is async; the ``VCO_ROUTER_KG_SCRIPT`` /
+    ``VCO_CG_SCRIPT`` seams may point at a SYNC stub — accept both (the
+    producer contract is "a main() whose argv is pinned"). A non-zero int
+    return (``query_code_graph.main`` returns 1 on a connect failure or an
+    exception) is an ERROR, raised as ``SystemExit`` so
+    ``hook_dual_search._run_leg`` records the leg as ``error``: never cached
+    as a finished-empty answer, and eligible for the warmer.
+    """
+    result = mod.main()
+    if inspect.iscoroutine(result):
+        result = asyncio.run(result)
+    if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+        raise SystemExit(result)
+
+
 @contextlib.contextmanager
 def _query_slot(wait_s: Optional[float] = None):
     """Hold one of ``HOOK_QUERY_SLOTS`` machine-wide query slots (A-008).
@@ -1115,13 +1136,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 def _kg_leg(script=kg_script, kg_argv=tuple(argv)) -> None:
                     mod = _hds._load_cg_module(script)
                     _hds._pin_argv(mod, list(kg_argv))
-                    # rl_kg_search.main is async; the VCO_ROUTER_KG_SCRIPT
-                    # test seam may point at a SYNC stub producer — accept
-                    # both (the documented producer contract is "a main()
-                    # whose argv is pinned", not "an async main").
-                    result = mod.main()
-                    if inspect.iscoroutine(result):
-                        asyncio.run(result)
+                    _run_producer_main(mod)
 
                 legs["kg"] = _kg_leg
             except BaseException as exc:  # noqa: BLE001 — never block the tool
@@ -1147,7 +1162,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                             if cg_module is None:
                                 cg_module = _hds._load_cg_module(script)
                             _hds._pin_argv(cg_module, [str(a) for a in cg_argv])
-                            cg_module.main()
+                            _run_producer_main(cg_module)
 
                     legs[f"cg_{index}"] = _cg_leg
             except BaseException as exc:  # noqa: BLE001
@@ -1412,16 +1427,25 @@ def _promote_warm_held(project_root: str, key: str) -> None:
             continue
 
 
+#: HR-3 (v0.2.107): the longest a ``--warm-legs`` child holds a machine-wide
+#: query slot for one leg (``VCO_WARM_LEG_TIMEOUT_S`` overrides). Far above a
+#: healthy lookup; it only stops a producer whose own network timeouts add up
+#: from starving every hook of a slot.
+WARM_LEG_TIMEOUT_S = 120.0
+
+
 def _warm_legs_main() -> int:
-    """The ``--warm-legs`` child: re-run the specced producer legs with NO
-    deadline and write their output into the query cache. Emits nothing,
-    records no seen-store, charges no budget and stages NO citation ctx —
-    the interactive run owns all of those; this process only warms the
-    cache. A citation ctx the producer would have staged is HELD beside the
+    """The ``--warm-legs`` child: re-run the specced producer legs with no
+    interactive deadline (each leg is bounded only by
+    :data:`WARM_LEG_TIMEOUT_S`, HR-3) and write their output into the query
+    cache. Emits nothing, records no seen-store, charges no budget and
+    stages NO citation ctx — the interactive run owns all of those; this
+    process only warms the cache. A citation ctx the producer would have staged is HELD beside the
     cache entry instead (:func:`_install_warm_hold_interceptor`): until an
     interactive run shows that entry, nobody has seen the retrieval, so it
     is not a training label (v0.2.105). A finished empty output is cached for
-    300 s and holds no ctx; a timeout/error remains uncached (v0.2.107)."""
+    300 s and holds no ctx; a timeout/error — partial output included —
+    remains uncached (v0.2.107)."""
     held: List[Dict] = []
     _install_warm_hold_interceptor(held)
     try:
@@ -1451,25 +1475,36 @@ def _warm_legs_main() -> int:
         _hds._pin_argv(mod, [str(a) for a in argv])
 
         def _run(mod=mod) -> None:
-            result = mod.main()
-            if inspect.iscoroutine(result):
-                asyncio.run(result)
+            _run_producer_main(mod)
 
         held.clear()
         with _query_slot() as acquired:
             if not acquired:
                 continue
-            leg_results = _hds.run_legs({str(name): _run})
+            # HR-3: the slot is held for at most WARM_LEG_TIMEOUT_S; a leg
+            # still running then is abandoned and this process ends (below),
+            # which releases the slot (an OS file lock) with it.
+            leg_results = _hds.run_legs(
+                {str(name): _run},
+                leg_timeout_s=env_float("VCO_WARM_LEG_TIMEOUT_S", WARM_LEG_TIMEOUT_S,
+                                        above=0))
+        if _hds.legs_abandoned():
+            _flush_and_exit(0)
         out = (leg_results or {}).get(str(name)) or ""
         status = getattr(leg_results, "status", {}).get(str(name), "error")
         out = out.strip()
+        if status != "finished":
+            # HR-1: an errored leg (a non-zero producer exit, a raise, or a
+            # KG search that failed on a collection) is never cached — not as
+            # empty, and not its partial output as the complete answer.
+            continue
         if out:
             cache_leg_output(project_root, key, out + "\n")
             if cache_get(project_root, key) is not None:
                 _write_warm_held(project_root, key, list(held))
-        elif status == "finished" and cache_get(project_root, key) is None:
-            # A warmer runs to completion without an interactive join deadline;
-            # an ordinary empty return is therefore a finished-empty answer.
+        elif cache_get(project_root, key) is None:
+            # A warmer's leg that FINISHED with nothing is a finished-empty
+            # answer.
             cache_finished_empty(project_root, key)
     return 0
 
@@ -2032,7 +2067,8 @@ def _flush_and_exit(rc: int) -> None:
 # :data:`_EMIT_LOCK`), i.e. it degrades to "no injection", never to a hook the
 # harness has to kill. It is armed only for a real hook run (``__main__``),
 # never for an in-process caller and never for the detached ``--warm-legs``
-# cache warmer (no deadline by design, L4).
+# cache warmer (no hard deadline by design, L4; its hold of a query slot is
+# bounded per leg by WARM_LEG_TIMEOUT_S, HR-3).
 
 #: Seconds from the run's anchor (:func:`_run_deadline_anchor` — the wrapper's
 #: start when it exported ``VCO_HOOK_STARTED_AT``) to the hard exit. Above the
