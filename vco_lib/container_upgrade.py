@@ -128,26 +128,16 @@ def class_count(url: str, cls: str, *, http: Optional[HttpFn] = None) -> Optiona
     or null field, or a value that is not a non-negative integer. ``None`` is
     never "zero" and never "equal".
 
-    SWAP POINT (lane SAFETY): this is the local stand-in for the one count
-    helper lane SAFETY adds to ``vco_lib`` with the same contract
-    (``Optional[int]``, ``None`` = could not be read). When that helper is
-    merged, this function body becomes a call to it; every caller here already
-    refuses on ``None``."""
+    The reply is read by ``weaviate_helpers.parse_aggregate_count`` - the one
+    reading of an Aggregate reply every VCO count shares (lane SAFETY)."""
+    from vco_lib.weaviate_helpers import parse_aggregate_count  # noqa: PLC0415
+
     query = {"query": "{ Aggregate { %s { meta { count } } } }" % cls}
     try:
         status, raw = (http or _default_http)("POST", f"{url.rstrip('/')}/v1/graphql", query, 120.0)
-        payload = json.loads(raw.decode("utf-8", "replace")) if status == 200 else None
     except Exception:  # noqa: BLE001 — could not be read
         return None
-    if not isinstance(payload, dict) or payload.get("errors"):
-        return None
-    try:
-        count = payload["data"]["Aggregate"][cls][0]["meta"]["count"]
-    except (KeyError, IndexError, TypeError):
-        return None
-    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-        return None
-    return count
+    return parse_aggregate_count(status, raw, cls)
 
 
 def schema_classes(url: str, *, http: Optional[HttpFn] = None) -> Optional[list[str]]:
