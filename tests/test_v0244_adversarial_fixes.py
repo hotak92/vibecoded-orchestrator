@@ -228,6 +228,40 @@ def test_orphan_collection_notice_fires(monkeypatch, tmp_path, capsys):
     assert "Orphan collection 'OldKG' retains 192 rows" in out
 
 
+def test_orphan_notice_never_prints_a_drop_for_a_case_only_sibling(monkeypatch, tmp_path, capsys):
+    """A class that differs from the canonical one only in case shares its
+    lower-cased index in Weaviate, so dropping it is not safe (the reason
+    `lowercase_codegraph_residual_*` prints no DELETE). The orphan notice must
+    not print a drop command for that pair."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    monkeypatch.delenv("SHARED_KG_WRITE_DISABLED", raising=False)
+    monkeypatch.delenv("SHARED_KG_OPT_OUT", raising=False)
+    monkeypatch.setattr(install, "_is_orchestrator_root_install", lambda: True)
+    monkeypatch.setattr(install, "_rebind_orchestrator_root_to_canonical", lambda c: [])
+    monkeypatch.setattr(install, "_write_app_state_key", lambda *a, **k: None)
+    monkeypatch.setattr(install, "_count_weaviate_class_objects",
+                        lambda _url, name: 192 if name == "Knowledgegraph" else 5)
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+
+    class _Args:
+        update = True
+
+    install._seed_weaviate_shared_kg_only(
+        args=_Args(),
+        venv_py=tmp_path / "py",
+        sync_kg=tmp_path / "sync",
+        weaviate_url="http://x",
+        current_shared_kg="KnowledgeGraph",
+        current_kg_collection="Knowledgegraph",
+    )
+    out = capsys.readouterr().out
+    assert "'Knowledgegraph' retains 192 rows" in out
+    assert "DELETE" not in out, out
+    assert "differs only in case from 'KnowledgeGraph'" in out
+
+
 def test_env_db_disagreement_keeps_the_bound_name_on_a_blind_read(monkeypatch, capsys, tmp_path):
     """Fix 4, re-pinned for v0.2.103: when the root's env names disagree
     with its launcher.db binding, the decision is `root_kg_identity`'s — the

@@ -13192,6 +13192,20 @@ def _seed_weaviate_shared_kg_only(
             orphan_kg
             and canonical != orphan_kg
             and isinstance(primary_count, int) and primary_count > 0
+            and canonical.lower() == orphan_kg.lower()
+        ):
+            # A case-only sibling shares the canonical class's lower-cased
+            # index in Weaviate: no drop of it is safe, so none is printed.
+            print(
+                f"  ⚠ Collection '{orphan_kg}' retains {primary_count} rows after "
+                f"rebind and differs only in case from '{canonical}', which "
+                f"this install now uses. Do not drop it by hand: the two share one "
+                f"on-disk index, and removing either can remove the other's data."
+            )
+        elif (
+            orphan_kg
+            and canonical != orphan_kg
+            and isinstance(primary_count, int) and primary_count > 0
         ):
             print(
                 f"  ⚠ Orphan collection '{orphan_kg}' retains "
