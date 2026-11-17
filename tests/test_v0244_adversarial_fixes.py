@@ -188,6 +188,34 @@ def test_first_boot_rebind_notes_are_not_printed_as_failures(monkeypatch, tmp_pa
     assert all("first start" in ln for ln in notes), notes
 
 
+def test_rebind_deferral_predicate_matches_the_real_emitters_messages(monkeypatch, tmp_path):
+    """The printer and the propagation loop share ONE predicate
+    (`_is_rebind_deferral`). Pin it at the emitter, not at a stubbed string:
+    the three messages `_rebind_orchestrator_root_to_canonical` really produces
+    for "nothing to rebind yet" (no project row, an unregistered root, the
+    dual-clone skip) must all be deferrals; a real failure must not."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    from vco_lib import launcher_db_reader
+
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(launcher_db_reader, "get_orchestrator_root_project_id", lambda: None)
+    monkeypatch.setattr(launcher_db_reader, "_discover_db_path", lambda: None)
+    monkeypatch.setattr(install, "_resolve_project_id_by_folder", lambda root: None)
+    emitted = install._rebind_orchestrator_root_to_canonical_locked("MyKG", [])
+    assert any("no orchestrator-root project row found" in m for m in emitted), emitted
+    assert any("reconciled on next launcher boot" in m for m in emitted), emitted
+
+    monkeypatch.setattr(install, "_DUAL_CLONE_DETECTED_THIS_RUN", True)
+    dual = install._rebind_orchestrator_root_to_canonical("MyKG")
+    assert len(dual) == 1 and "dual-clone" in dual[0], dual
+    emitted += dual
+
+    assert all(install._is_rebind_deferral(m) for m in emitted), emitted
+    assert not install._is_rebind_deferral("launcher.db UPDATE failed: simulated")
+    assert not install._is_rebind_deferral("config_projection apply failed: boom")
+
+
 def test_orphan_collection_notice_fires(monkeypatch, tmp_path, capsys):
     """Fix 3: notice prints when canonical differs AND primary has rows."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

@@ -473,6 +473,9 @@ def test_resume_does_not_recredit_a_tool_use_seen_before_the_offset(tmp_path: Pa
     _write_transcript(t, [_block_entry("r1", 10, block)])
     first = ctc.TranscriptScanner().scan(t)
     with open(t, "a", encoding="utf-8") as fh:
-        fh.write(_block_entry("r1", 10, block))  # the repeat lands after the offset
+        # The repeat lands after the offset under a DIFFERENT request id, so
+        # the request-id backscan cannot suppress it: only the seeded
+        # tool_use id can. Its own usage (10) is still credited.
+        fh.write(_block_entry("r2", 10, block))
     second = ctc.TranscriptScanner().scan(t, start_offset=first.end_offset)
-    assert second.work_units_total == 0
+    assert second.work_units_total == 10, "the edit body must not be credited twice"

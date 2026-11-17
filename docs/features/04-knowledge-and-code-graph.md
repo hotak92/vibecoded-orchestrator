@@ -50,8 +50,8 @@ A new install ships with pre-authored `.md` nodes under `templates/knowledge/`. 
 ### Root-only materialization (v0.2.81)
 The curated seed set lives in `templates/knowledge/`. As of **v0.2.81** it is materialized **once** — into the orchestrator root's `knowledge/` (which **is** the shared collection, by adopt-and-route) via `install.py` Step 4d → the Step 7c KG-sync. **Non-root projects no longer receive per-project copies** of the curated nodes; they reach them for free through the shared-read fan-out (`server.py:_kg_search_collections`), which merges `SHARED_KG_COLLECTION` into every `hybrid_search` by default. This removes ~115 duplicated `.md` files + ~115 duplicated embeddings **per added project** (the pre-.81 model copied the whole set into each project's own collection). Only four top-level files still ship per-project (the `_PER_PROJECT_KNOWLEDGE_FILES` allowlist: `TAG_HIERARCHY.md`, `VOCABULARY.md` — both sync-excluded authoring conventions — plus the regenerated `.node_formats.json` cache seed and its README sidecar). **Accept-loss opt-out**: a project with `SHARED_KG_READ_DISABLED=true` gets neither a per-project copy nor shared reads, so it does not see the bundled curated nodes — deliberate, documented, no fallback copy. Existing pre-.81 per-project copies are left on disk forever (never-delete-user-data) and their manifest entries are quietly retired on the first post-.81 bundle update (`knowledge-retired` action bucket — no disk op, no deferral, no re-embed).
 
-### 48 concept nodes
-`knowledge/concepts/` covers AI/ML and orchestration topics, grouped roughly:
+### 96 concept nodes
+`knowledge/concepts/` covers AI/ML and orchestration topics; the groups below are representative, not the full list:
 - **RL & alignment** — actor-critic, DPO, PPO, reward shaping, reinforcement learning, constitutional AI, LLM alignment.
 - **Retrieval & inference** — RAG, GraphRAG, hybrid search, semantic search, chunking strategies for LLM RAG, structured output, speculative decoding, LLM inference optimization, model quantization.
 - **Architecture topics** — transformer architecture, FlashAttention, LoRA, RoPE, sparse activation, fine-tuning techniques.
@@ -61,8 +61,8 @@ The curated seed set lives in `templates/knowledge/`. As of **v0.2.81** it is ma
 ### 6 model nodes
 `knowledge/models/` covers the models the orchestrator actually uses: `qwen3.5` (text + vision), `gemma4-e4b` (low-VRAM fallback), `qwen3-embedding` (text embeddings, primary), `snowflake-arctic-embed2` (legacy text embeddings), `codesage-large-v2` (code embeddings, GPU), `jina-embeddings-v2-base-code` (code embeddings, CPU fallback).
 
-### 9 tool nodes
-`knowledge/tools/` covers: `weaviate` (vector DB), `weaviate-usage-patterns` (collection design), `ollama` (local LLM server), `ollama-mcp-server` (MCP wrapper), `fastapi` (Python web framework), `fastmcp` (MCP boilerplate), `llama-cpp` (GGUF inference), `claude-code-cli-headless` (programmatic CLI), `claude-code-mcp-configuration` (MCP config patterns).
+### 12 tool nodes
+`knowledge/tools/` covers: `weaviate` (vector DB), `weaviate-usage-patterns` (collection design), `ollama` (local LLM server), `fastapi` (Python web framework), `fastmcp` (MCP boilerplate), `llama-cpp` (GGUF inference), `claude-code-cli-headless` (programmatic CLI), `claude-code-mcp-configuration` (MCP config patterns), `comfyui` (node-based image-generation UI), `crm-and-revops-stack-2026` (CRM and revenue-operations tooling), `scientific-python-stack-2026` (scientific Python libraries), `terraform-opentofu` (infrastructure as code).
 
 ### 1 pattern node
 `knowledge/patterns/` ships `prompt-engineering-2026` (Claude 4.x-era prompt patterns).
