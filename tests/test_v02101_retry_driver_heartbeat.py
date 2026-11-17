@@ -96,13 +96,21 @@ class _LongPassRunner:
         return 0
 
 
+#: v0.2.107: three DIFFERENT jobs. Conditions that need the same job are one
+#: run now (`plan_jobs`), so the two code-graph conditions this used would
+#: have been one handler; the shared seed is a third, distinct job.
+SHARED_CID = "kg_sync_shared_pending"
+
+
 def _run_long_pass(folder: Path) -> _LongPassRunner:
     runner = _LongPassRunner(folder)
     with mock.patch.object(deferral_retry, "_record_resolution"), \
          mock.patch.object(deferral_retry, "_code_embed_image_verdict",
-                           return_value="current"):
+                           return_value="current"), \
+         mock.patch.dict(os.environ, {
+             deferral_retry.SEED_CTX_ENV_SHARED_KG_COLLECTION: "Shared_KG"}):
         deferral_retry.dispatch(
-            folder, condition_ids=[KG_CID, CG_CID, CG_CODE_CID],
+            folder, condition_ids=[KG_CID, CG_CID, SHARED_CID],
             backend_probe=lambda f, k: True, runner=runner,
         )
     return runner

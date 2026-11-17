@@ -365,7 +365,7 @@ def test_full_seed_is_enqueued_and_not_awaited(seed_env, capsys):
         "the whole-tree KG seed must not be awaited in the foreground"
     )
     out = capsys.readouterr().out
-    assert "background" in out and "deferral-retry-*.log" in out, out
+    assert "background" in out and "owed-work-*.log" in out, out
 
 
 def test_enqueued_seed_carries_the_context_triple_and_leaves_one_owed_row(seed_env):
@@ -546,9 +546,16 @@ def test_seed_context_from_env_is_none_without_a_carried_context(monkeypatch):
         "active_embedding": "qwen3", "kg_collection": "", "shared_kg_collection": ""}
 
 
-def test_spawn_detached_overlays_extra_env(tmp_path):
+def test_spawn_detached_overlays_extra_env(tmp_path, monkeypatch):
+    """v0.2.107: the carried env travels WITH the project's queue entry (the
+    worker overlays it while that project's jobs run) — never into the
+    machine-wide worker's own environment, which serves every project."""
     from vco_lib import deferral_retry as dr
+    from vco_lib import owed_work
 
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    project = tmp_path / "proj"
+    project.mkdir()
     captured: dict = {}
 
     class _FakePopen:
@@ -557,12 +564,14 @@ def test_spawn_detached_overlays_extra_env(tmp_path):
             captured["env"] = kwargs["env"]
 
     with mock.patch("subprocess.Popen", _FakePopen):
-        assert dr.spawn_detached(tmp_path, python="python",
+        assert dr.spawn_detached(project, python="python",
                                  extra_env={"VCT_X": "1"}) is True
-    assert captured["env"]["VCT_X"] == "1"
-    assert captured["argv"][-2:] == ["--folder", str(tmp_path)]
+    [entry] = owed_work.read_queue()
+    assert entry.folder == str(project) and entry.env == {"VCT_X": "1"}
+    assert "VCT_X" not in captured["env"]
+    assert captured["argv"] == ["python", "-m", "vco_lib.owed_work", "worker"]
 
-def test_spawn_detached_never_hands_the_child_a_pipe(tmp_path):
+def test_spawn_detached_never_hands_the_child_a_pipe(tmp_path, monkeypatch):
     """v0.2.96 WP-1's deadlock cannot come back through the detached path.
 
     The v0.2.96 incident (`vco_lib/child_process.py` module docstring, commit
@@ -578,6 +587,7 @@ def test_spawn_detached_never_hands_the_child_a_pipe(tmp_path):
 
     from vco_lib import deferral_retry as dr
 
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
     captured: dict = {}
 
     class _FakePopen:
@@ -680,7 +690,7 @@ def test_shared_seed_is_enqueued_and_not_awaited(tmp_path, shared_env, capsys):
     assert len(owed) == 1, "the shared enqueue must leave exactly one owed row"
     assert "Shared_KG" in owed[0].title
     out = capsys.readouterr().out
-    assert "background" in out and "deferral-retry-*.log" in out, out
+    assert "background" in out and "owed-work-*.log" in out, out
 
 
 def test_shared_seed_spawn_failure_falls_back_to_the_foreground(tmp_path, shared_env):
@@ -1183,6 +1193,8 @@ def test_the_driver_env_cannot_inherit_a_foreign_kg_target(tmp_path, monkeypatch
                        ("KG_BASE_DIR", "/elsewhere"),
                        ("KG_SYNC_PROJECT_ROOT", "/elsewhere")):
         monkeypatch.setenv(key, value)
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
+    from vco_lib import owed_work
 
     captured: dict = {}
 
@@ -1202,7 +1214,9 @@ def test_the_driver_env_cannot_inherit_a_foreign_kg_target(tmp_path, monkeypatch
             f"{key} reaches the driver from the caller's shell — the handlers "
             "must resolve the target from --folder"
         )
-    assert captured["env"]["VCT_KG_SEED_CTX_KG_COLLECTION"] == "X", (
+    # v0.2.107: the carried context rides on the project's queue entry.
+    [entry] = owed_work.read_queue()
+    assert entry.env["VCT_KG_SEED_CTX_KG_COLLECTION"] == "X", (
         "an explicitly carried context must survive the strip"
     )
 

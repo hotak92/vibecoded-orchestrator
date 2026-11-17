@@ -1093,6 +1093,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = Path(args.repo_root) if args.repo_root else None
     if args.cmd == "revive":
         rv = revive_if_down(source=args.source, repo_root=repo_root)
+        # v0.2.107 (A-003): the same per-prompt moment restarts the machine's
+        # owed-work worker when work is queued and no worker runs (it exits
+        # when nothing can run, leaving the queue on disk). An empty queue
+        # costs one directory listing; never raises.
+        try:
+            from vco_lib.owed_work import ensure_worker
+
+            ensure_worker(origin=f"revive {args.source}")
+        except Exception:  # noqa: BLE001 — best-effort like the revive itself
+            pass
         if args.json:
             print(json.dumps(rv.to_dict(), sort_keys=True))
         elif not args.quiet:

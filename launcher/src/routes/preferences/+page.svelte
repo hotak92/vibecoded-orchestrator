@@ -50,6 +50,7 @@
   import KgEmbedStatus from '$lib/preferences/KgEmbedStatus.svelte';
   import OllamaIdleUnload from '$lib/preferences/OllamaIdleUnload.svelte';
   import LocalSummaryModel from '$lib/preferences/LocalSummaryModel.svelte';
+  import OwedWorkQueue from '$lib/preferences/OwedWorkQueue.svelte';
   // Machine-global Artifact-tool switch. Own component (this page is already
   // ~4k lines) and, unlike everything else here, it edits CLAUDE CODE's own
   // user-scope settings file rather than launcher.db — see
@@ -4010,6 +4011,8 @@
           onchange={toggleServicesWatcher}
         />
       </div>
+      <!-- v0.2.107 (A-003): the machine's owed-work queue (read-only). -->
+      <OwedWorkQueue />
     </section>
 
     <!-- v0.2.100: module-update automatic check (opt-out). -->

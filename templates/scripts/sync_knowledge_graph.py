@@ -6415,7 +6415,7 @@ def _run_check_drift() -> None:
 #: wrappers stay dumb forwarders so the vocabulary cannot drift between
 #: three entry points (v0.2.92 WP-B1; field report: "unknown flags
 #: degrade into sync targets").
-_ACCEPTED_MODE_FLAGS = ("--all", "--all-docs", "--check-drift")
+_ACCEPTED_MODE_FLAGS = ("--all", "--all-docs", "--check-drift", "--refresh-node-formats")
 _ACCEPTED_HELP_FLAGS = ("-h", "--help")
 
 
@@ -6429,6 +6429,7 @@ def _print_usage(stream=None) -> None:
     print("       sync_knowledge_graph.py --all              (knowledge/ + docs/)", file=stream)
     print("       sync_knowledge_graph.py --all-docs         (docs/ only)", file=stream)
     print("       sync_knowledge_graph.py --check-drift      (detect unsynced nodes, never repairs)", file=stream)
+    print("       sync_knowledge_graph.py --refresh-node-formats  (.node_formats.json summaries only)", file=stream)
     print("       sync_knowledge_graph.py <f1> <f2> ...      (explicit file list)", file=stream)
     print("       (any form accepts --project-root <path> to pin the target project)", file=stream)
     print("       (any form accepts --rechunk to force the chunk-plan comparison even", file=stream)
@@ -6570,6 +6571,14 @@ def main():
     if sys.argv[1] == "--check-drift":
         _run_check_drift()
         return
+
+    # v0.2.107 (A-003): the post-sync summary refresh ALONE — what the
+    # owed-work retry of `kg_node_formats_refresh_failed` runs instead of a
+    # whole-tree sync. It writes no Weaviate row (the generator fills the
+    # sidecar), and its own paired clear retires the entry on exit 0.
+    if sys.argv[1] == "--refresh-node-formats":
+        _regen_node_formats_after_full_sync()
+        sys.exit(0)
 
     # v0.2.94 W-WEAVIATE: refuse a write into a TEST-FIXTURE-named class
     # before anything connects. See `_refuse_fixture_shaped_targets`.
@@ -6803,6 +6812,7 @@ def main():
                         f"{kg_tally.failed} knowledge node(s), "
                         f"{doc_tally.failed} doc(s)"
                     ),
+                    failed_paths=_failed_paths(kg_tally, doc_tally),
                 )
             # This exit code is READ, and by more than a shell. install.py's
             # v0.2.95 WP-4 carve-out advances the context triple
@@ -6833,6 +6843,7 @@ def main():
                 _emit_sync_failures_deferral(
                     PROJECT_ROOT, doc_tally.failed, run_kind="--all-docs",
                     detail=f"{doc_tally.failed} doc(s)",
+                    failed_paths=_failed_paths(doc_tally),
                 )
             sys.exit(0 if doc_tally.failed == 0 else 1)
         elif len(sys.argv) > 2 or (len(sys.argv) == 2 and not sys.argv[1].startswith("--")):
@@ -6875,14 +6886,23 @@ def main():
             _print_metadata_repair_report()
             _print_run_details(tally, run_kind="file list")
             # v0.2.92 D17: explicit-file sync failures (the kg-sync-on-edit
-            # hook path) are owed work too. NO clear on a clean list run —
-            # it proves nothing about nodes an earlier run failed on
-            # (narrow clear lives in --all).
+            # hook path) are owed work too. A clean list run clears ONLY when
+            # it covered every path the CURRENT entry recorded as failed
+            # (v0.2.107 — the narrow retry's paired clear); an entry that owes
+            # the whole tree has no record and still needs a clean --all.
             if tally.failed:
                 _emit_sync_failures_deferral(
                     PROJECT_ROOT, tally.failed, run_kind="file list",
                     detail=f"{tally.failed} sync target(s)",
+                    failed_paths=_failed_paths(tally),
                 )
+            else:
+                try:
+                    from vco_lib.owed_work import settle_clean_sync_paths
+
+                    settle_clean_sync_paths(PROJECT_ROOT, raw_args)
+                except Exception as inner:  # noqa: BLE001 — best-effort
+                    print(f"   (failed-path settle skipped: {inner})", file=sys.stderr)
             sys.exit(0 if tally.failed == 0 else 1)
 
     except Exception as e:
@@ -7058,6 +7078,13 @@ def _clear_sync_failures_deferral(install_root: Path) -> None:
         resolve_conditions(install_root, (_SYNC_FAILURES_CID,))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+        return
+    try:
+        from vco_lib.owed_work import forget_failed_sync_paths
+
+        forget_failed_sync_paths(install_root)
+    except Exception:  # noqa: BLE001 — bookkeeping is best-effort
+        pass
 
 
 def _record_context_triple(failures: int) -> None:
@@ -7138,6 +7165,7 @@ def _emit_sync_failures_deferral(
     failed: int,
     run_kind: str,
     detail: str = "",
+    failed_paths: "Sequence[str]" = (),
 ) -> None:
     """Record per-node write FAILURES as owed, auto-retryable work (D17).
 
@@ -7150,9 +7178,20 @@ def _emit_sync_failures_deferral(
     defect never had. Last-write-wins per condition_id: a later failing
     run refreshes the count rather than stacking entries.
 
+    v0.2.107 (A-003): the entry's failed PATHS are recorded beside it
+    (``vco_lib.owed_work.record_sync_failures``), so the retry re-syncs only
+    those files; a whole-tree entry (no record) still gets ``--all``.
+
     Soft-fail on any IO / import error — the run's own exit code and
     ``_print_run_details`` output already carry the failure facts.
     """
+    prior = (False, None)
+    try:
+        from vco_lib.owed_work import failed_paths_state
+
+        prior = failed_paths_state(install_root)
+    except Exception:  # noqa: BLE001 — no record ⇒ the retry walks the tree
+        pass
     try:
         from vco_lib.deferral_emit import DeferralEntry, emit
 
@@ -7175,11 +7214,12 @@ def _emit_sync_failures_deferral(
                 "errors — one failed write must not block the rest of the "
                 "tree. This entry records the owed work so it is retried "
                 "instead of forgotten: the condition is auto-retryable, and "
-                "VCO's retry dispatcher re-runs "
-                "`sync_knowledge_graph.py --all` for this project once the "
-                "backend answers (content-hash gated — only what never "
-                "landed is re-embedded). It clears at the end of the next "
-                "FULLY successful `--all` tree sync; nothing else clears it."
+                "VCO's background owed-work worker re-syncs the files that "
+                "failed (the whole tree only when the failed files were not "
+                "recorded) once Weaviate and the embedding backend answer. "
+                "It clears when a sync covering every failed file finishes "
+                "with no failure, or at the end of the next FULLY successful "
+                "`--all` tree sync."
             ),
             command_to_apply=(
                 "# Re-run the tree sync (content-hash gated — unaffected nodes skip):\n"
@@ -7190,6 +7230,20 @@ def _emit_sync_failures_deferral(
         emit(install_root, entry)
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+        return
+    try:
+        from vco_lib.owed_work import record_sync_failures
+
+        record_sync_failures(install_root, list(failed_paths),
+                             whole_tree=run_kind == "--all", prior=prior)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (failed-path record skipped: {inner})", file=sys.stderr)
+
+
+def _failed_paths(*tallies: "SyncTally") -> "List[str]":
+    """The paths a run FAILED on (v0.2.107), for the failed-path record."""
+    return [o.path for t in tallies for o in t.records
+            if o.status == OUTCOME_FAILED and o.path]
 
 
 if __name__ == "__main__":

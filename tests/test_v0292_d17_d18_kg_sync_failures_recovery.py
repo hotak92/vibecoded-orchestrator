@@ -476,6 +476,54 @@ class SyncFailuresRecoveryTests(_SyncTestBase):
             "only a fully-successful --all may resolve the condition",
         )
 
+    # ── v0.2.107 (A-003): the retry re-syncs only the failed paths ──
+
+    def test_failing_all_run_records_the_failed_paths(self):
+        _write_node(self.root / "knowledge" / "concepts" / "a.md", "Node A")
+        _write_node(self.root / "knowledge" / "concepts" / "b.md", "Node B")
+        mod = self.load()
+        self.install_failing_backends(mod)
+        code, _out, _err = self.run_main(mod, ["kg-sync", "--all"])
+        self.assertEqual(code, 1)
+        from vco_lib.owed_work import owed_failed_sync_paths
+
+        self.assertEqual(
+            sorted(Path(p).name for p in owed_failed_sync_paths(self.root) or []),
+            ["a.md", "b.md"],
+        )
+
+    def test_clean_file_list_over_every_failed_path_resolves(self):
+        """The narrow retry's paired clear: a clean list run that covers EVERY
+        path the current entry recorded retires it (red before v0.2.107: only
+        a clean --all could)."""
+        a = self.root / "knowledge" / "concepts" / "a.md"
+        b = self.root / "knowledge" / "concepts" / "b.md"
+        _write_node(a, "Node A")
+        _write_node(b, "Node B")
+        mod = self.load()
+        harness = self.install_failing_backends(mod)
+        self.assertEqual(self.run_main(mod, ["kg-sync", "--all"])[0], 1)
+        harness.insert_error = None
+        code, _out, _err = self.run_main(mod, ["kg-sync", str(a), str(b)])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ledger_entries(), [])
+
+    def test_refresh_node_formats_mode_runs_only_the_refresh(self):
+        """`--refresh-node-formats` (the narrow retry of
+        kg_node_formats_refresh_failed): no embedding service, no Weaviate."""
+        mod = self.load()
+        calls: list = []
+
+        class _NoService:
+            @staticmethod
+            def for_project(root):  # noqa: ARG004
+                raise AssertionError("the refresh must not build an embedding service")
+
+        mod.EmbeddingService = _NoService
+        mod._regen_node_formats_after_full_sync = lambda: calls.append("regen")
+        code, _out, _err = self.run_main(mod, ["kg-sync", "--refresh-node-formats"])
+        self.assertEqual((code, calls), (0, ["regen"]))
+
 
 if __name__ == "__main__":
     unittest.main()

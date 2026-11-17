@@ -64,6 +64,8 @@ md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
 # v0.2.91 WP-H: owed-work retry trigger. MUST MATCH the .sh sibling — and it
 # does so by CALLING the same vco_lib helper rather than mirroring its rule.
+# v0.2.107: the helper puts the project in the MACHINE's owed-work queue (one
+# worker per machine, gated on Weaviate) — never a driver per project.
 # v0.2.105: BEFORE the ledger read (so also on an EMPTY ledger) — it first
 # detects owed work the ledger does not hold yet (lost extra-folder rows).
 owed = []
@@ -135,7 +137,7 @@ else:
 for cid, title, sev, _cmd in entries:
     lines.append("  - [%s] %s: %s" % (sev, cid, title))
 if owed:
-    lines.append("  VCO is retrying in the background (backend permitting): "
+    lines.append("  Queued for VCO's background worker (runs when Weaviate is ready): "
                  + ", ".join(owed))
 lines.append("  Details + apply commands: .claude/context/UPDATE_DEFERRED.md "
              "(run the command listed for each).")

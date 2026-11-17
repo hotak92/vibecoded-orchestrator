@@ -726,8 +726,9 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         # v0.2.101 B1: the owed row is written to the ON-DISK ledger BEFORE the
         # spawn (the driver reads that ledger once), so this reads disk.
         entries = DeferralReport.read(Path(self.tmp)).entries
+        # v0.2.107: the work runs in the machine's owed-work worker.
         self.assertIn(
-            "deferral-retry-*.log",
+            "owed-work-*.log",
             "".join(e.command_to_apply for e in entries),
             "the user must be told where the background seed's log is",
         )

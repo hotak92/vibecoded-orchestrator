@@ -242,9 +242,11 @@ def test_hook_supervisor_relay_uses_the_windowless_detach(as_windows, tmp_path, 
     assert rec.calls and rec.calls[0]["creationflags"] == NO_WINDOW_DETACHED
 
 
-def test_deferral_retry_driver_uses_the_windowless_detach(as_windows, tmp_path):
+def test_deferral_retry_driver_uses_the_windowless_detach(as_windows, tmp_path, monkeypatch):
     from vco_lib import deferral_retry
 
+    # v0.2.107: the spawned child is the machine's owed-work worker.
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "state"))
     rec = _Rec()
     with mock.patch.object(deferral_retry.subprocess, "Popen", rec):
         deferral_retry.spawn_detached(tmp_path, python=sys.executable)

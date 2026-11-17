@@ -841,7 +841,10 @@ class DriverHardeningTests(unittest.TestCase):
                 folder, condition_ids=[KG_CID],
                 backend_probe=lambda f, k: True, runner=runner,
             )
-        self.assertEqual([r.status for r in results], [deferral_retry.SKIPPED])
+        # v0.2.107: QUEUED — the work stays in the machine queue and no
+        # attempt is consumed (an already-running pre-0.2.107 driver is
+        # harmless: the worker waits for it instead of running beside it).
+        self.assertEqual([r.status for r in results], [deferral_retry.QUEUED])
         self.assertIn("already running", results[0].detail)
         self.assertEqual(runner.calls, [], "nothing may be spawned")
 
@@ -974,11 +977,14 @@ class SessionStartTriggerTests(unittest.TestCase):
                 captured["kwargs"] = kwargs
 
         with TemporaryDirectory() as td:
-            with mock.patch("subprocess.Popen", _FakePopen):
+            with mock.patch("subprocess.Popen", _FakePopen), \
+                 mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(Path(td) / "state")}):
                 ok = deferral_retry.spawn_detached(Path(td), python="/py")
         self.assertTrue(ok)
+        # v0.2.107: the session start queues the project and starts the
+        # machine's ONE owed-work worker — never a per-project driver.
         self.assertEqual(
-            captured["argv"][:4], ["/py", "-m", "vco_lib.deferral_retry", "--folder"],
+            captured["argv"][:4], ["/py", "-m", "vco_lib.owed_work", "worker"],
         )
         if os.name == "posix":
             self.assertTrue(captured["kwargs"]["start_new_session"])

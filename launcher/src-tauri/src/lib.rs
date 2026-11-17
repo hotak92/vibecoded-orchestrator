@@ -3608,6 +3608,8 @@ pub fn run() {
             commands::local_summary_model::get_local_summary_model_status,
             commands::local_summary_model::remove_local_summary_model,
             commands::local_summary_model::download_local_summary_model,
+            // v0.2.107 (A-003): Preferences → Services owed-work queue line.
+            commands::owed_work::get_owed_work_status,
             commands::kg_summary::retry_kg_summary,
             // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
             // (Preferences → KG Summaries) — shells to
