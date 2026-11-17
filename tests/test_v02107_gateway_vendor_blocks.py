@@ -504,6 +504,58 @@ class AnthropicRouteAllowListTests(unittest.TestCase):
                 _assert_only_text_notes(self, result["messages"][0]["content"])
 
 
+class ConvertedBlockDeltaTests(unittest.TestCase):
+    """G-3: a block converted whole at its start must not leak its own deltas."""
+
+    def _stream(self) -> bytes:
+        return b"".join([
+            _sse("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "weird_vendor_thing", "stuff": "x"},
+            }),
+            _sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "weird_delta", "stuff": "y"},
+            }),
+            _sse("content_block_delta", {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "not-a-text-block"},
+            }),
+            _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _sse("content_block_start", {
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            }),
+            _sse("content_block_delta", {
+                "type": "content_block_delta", "index": 1,
+                "delta": {"type": "text_delta", "text": "after"},
+            }),
+            _sse("content_block_stop", {"type": "content_block_stop", "index": 1}),
+        ])
+
+    def test_deltas_of_a_converted_block_are_suppressed(self) -> None:
+        for chunk_size in (3, 7, 1 << 20):
+            with self.subTest(chunk_size=chunk_size):
+                raw, stats = _rewind(self._stream(), chunk_size)
+                self.assertEqual(stats.blocks_converted, 1)
+                events = [
+                    json.loads(line[6:])
+                    for line in raw.decode().splitlines()
+                    if line.startswith("data: ")
+                ]
+                deltas = [e for e in events if e["type"] == "content_block_delta"]
+                self.assertNotIn("weird_delta", raw.decode())
+                self.assertNotIn("not-a-text-block", raw.decode())
+                self.assertEqual(
+                    [(d["index"], d["delta"]["type"]) for d in deltas],
+                    [(0, "text_delta"), (1, "text_delta")],
+                )
+                self.assertIn("[weird_vendor_thing block from vendor:", _stream_text(raw))
+                self.assertEqual(deltas[1]["delta"]["text"], "after")
+                stops = [e["index"] for e in events if e["type"] == "content_block_stop"]
+                self.assertEqual(stops, [0, 1])
+
+
 class ToolInputIsolationTests(unittest.TestCase):
     def test_id_restore_and_unmark_never_enter_tool_inputs_tools_or_system(self) -> None:
         mapped = "srvtoolu_vct_call_fixture"
