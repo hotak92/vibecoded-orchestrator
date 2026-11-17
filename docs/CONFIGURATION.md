@@ -1091,10 +1091,13 @@ or a node-format schema change).
 
 ## `vco` CLI — verify commands
 
-The `vco` console-script is registered on PATH automatically when
+The `vco` console-script is installed into the orchestrator's venv when
 `install.py` runs (it does `pip install -e .` against the orchestrator's
 `pyproject.toml` after creating `.venv/`, so `vco` lands at
-`.venv/bin/vco` on Unix and `.venv\Scripts\vco.exe` on Windows). For
+`.venv/bin/vco` on Unix and `.venv\Scripts\vco.exe` on Windows). That
+folder is not on your shell's PATH unless the venv is activated: from the
+install root run `.venv/bin/vco doctor` (Windows: `.venv\Scripts\vco doctor`)
+wherever these docs write `vco doctor`. For
 manual / out-of-band installs, run `pip install -e .` from the repo root
 into any venv. Fall back to `python -m vco_lib.cli <subcommand>` if for any
 reason the entry point isn't on PATH. Two acceptance verifiers ship:
