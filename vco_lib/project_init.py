@@ -7305,7 +7305,8 @@ def _autodrop_empty_codegraph_candidates(
       * ``case_only`` is False (a case-only variant refers to the SAME logical
         collection — dropping it would destroy live data; BUG-1 invariant), AND
       * a RE-PROBE via ``_http_count_objects`` IMMEDIATELY before the drop still
-        returns exactly 0 (guards a row that filled in between detect and drop).
+        returns exactly 0 (guards a row that filled in between detect and drop),
+        and :func:`_legacy_codegraph_drop_revalidated` passes at run time.
     After a successful ``_delete_class`` a POST-DROP re-probe confirms the class
     is gone (count is None/0 → absent). Any deviation (count>0, count unknown
     None, re-probe mismatch, delete error, post-probe still populated) ⇒ the
@@ -7342,6 +7343,11 @@ def _autodrop_empty_codegraph_candidates(
                    else f"it holds {live_count} object(s) now")
                 + " - class left alone, kept in deferral"
             )
+            remaining.append(cand)
+            continue
+        if not _legacy_codegraph_drop_revalidated(class_name, str(folder)):  # S-3
+            _log_auto(f"codegraph auto-drop of {class_name} refused by the run-time "
+                      "re-validation (prefix bound, or bindings unreadable) - kept in deferral")
             remaining.append(cand)
             continue
         # Drop, then POST-DROP re-probe to confirm absence.

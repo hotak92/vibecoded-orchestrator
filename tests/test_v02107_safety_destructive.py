@@ -168,10 +168,14 @@ def test_every_entry_point_still_reads_a_real_count(monkeypatch):
 # ── auto-drop of "empty" legacy code-graph classes ─────────────────────────
 
 
-def _autodrop(monkeypatch, tmp_path, reply):
+def _autodrop(monkeypatch, tmp_path, reply, *, revalidated=True):
     _patch_transport(monkeypatch, reply)
     dropped: list = []
     logs: list = []
+    checked: list = []
+    monkeypatch.setattr(
+        pi, "_legacy_codegraph_drop_revalidated",
+        lambda n, f=None: checked.append((n, f)) or revalidated)
     monkeypatch.setattr(pi, "_delete_class", lambda n, weaviate_url=None: dropped.append(n))
     monkeypatch.setattr(pi, "_log_auto", logs.append)
     from vco_lib import deferral_emit as de
@@ -202,6 +206,16 @@ def test_autodrop_still_drops_a_class_that_answers_zero(monkeypatch, tmp_path):
     got, remaining, dropped, _ = _autodrop(
         monkeypatch, tmp_path, lambda m, u, b: (200, _count_body(0)))
     assert dropped == [CLS] and got == [CLS] and remaining == []
+
+
+def test_autodrop_keeps_an_empty_class_the_run_time_revalidation_refuses(monkeypatch, tmp_path):
+    """S-3: an empty class whose prefix is (now) bound, or whose keep-set
+    cannot be resolved, is left alone — the same guard the emitted drop
+    command runs."""
+    got, remaining, dropped, logs = _autodrop(
+        monkeypatch, tmp_path, lambda m, u, b: (200, _count_body(0)), revalidated=False)
+    assert dropped == [] and got == [] and [c["class_name"] for c in remaining] == [CLS]
+    assert any("re-validation" in line and CLS in line for line in logs)
 
 
 # ── staging recovery ───────────────────────────────────────────────────────
