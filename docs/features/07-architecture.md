@@ -221,14 +221,14 @@ The uninstall path removes only orchestrator-managed files. User project code is
 |---|---|
 | `BOOTSTRAP.md` | First-run install playbook — Path A (Launcher) vs Path B (clone) |
 | `CLAUDE.md` | Claude Code project instructions — KG-first policy, hooks reference, workflow discipline |
-| `docs/ARCHITECTURE.md` | High-level system architecture |
+| `docs/features/INDEX.md` | Feature-area index; this page (`docs/features/07-architecture.md`) is the high-level system architecture (a separate `docs/ARCHITECTURE.md` does not exist) |
 | `docs/CONFIGURATION.md` | Configuration philosophy, per-project vs global env vars |
 | `docs/CLAUDE_CODE_COMPATIBILITY.md` | Surface matrix (hooks/agents/MCP by surface) |
 | `docs/TROUBLESHOOTING.md` | Common failure modes with causes and fixes |
 | `docs/DEPENDENCY_LICENSES.md` | Transitive dependency license audit |
 | `docs/VCT_SECRETS_PRIMITIVE.md` | vct-secrets design |
 | `docs/TELEMETRY.md` | Opt-in telemetry model |
-| `docs/ADMIN_LICENSE.md` | Admin tier architecture — both Path A (Vault-token) and Path B (LS variant) with operational runbooks |
+| `docs/ADMIN_LICENSE.md` (maintainers only — not in this repository) | Admin tier architecture — both Path A (Vault-token) and Path B (LS variant) with operational runbooks; public summary in `docs/features/06-license-and-commercial.md` |
 | `SECURITY.md` | Security posture, hardening notes, disclosure process |
 | `CLA.md` | Contributor License Agreement |
 | `CODE_OF_CONDUCT.md` | Contributor Covenant v2.1 |

@@ -280,7 +280,7 @@ The launcher edits `~/.claude.json` and the project's `.claude/settings.json` to
 `deregister_mcp` drops only the named `mcpServers.<id>` key; sibling servers are untouched.
 
 ### MCP Dashboard (`/mcp`)
-`McpDashboard.svelte` lists all registered MCP servers (built-in + custom), shows enabled/disabled toggle. Built-in servers (`weaviate-kg`, `ollama`, `search`, `code-embed`) cannot be removed — only toggled.
+`McpDashboard.svelte` lists all registered MCP servers (built-in + custom), shows enabled/disabled toggle. Built-in servers cannot be removed — only toggled. "Built-in" is every name in `vco_lib/mcp_scan_rules.toml` `[bundled].all_names`; the two that a current install registers are `weaviate-kg` and `playwright` (`[entries].default_names`) — the other names (`ollama`, `search`, `code-embedding`, `mermaid`, `excalidraw`, `vct-coordination`) are retired or module-provided entries the launcher still recognises as VCO's.
 
 ### Custom MCP Server Addition
 "+ Add custom MCP server" form writes to three locations: `~/.vct/orchestrator.json` (launcher config), `~/.claude.json` (Claude Code reads this), `.claude/settings.json` env block (orchestrator subprocess). Documented in `launcher/docs/MCP_INTEGRATION.md`.

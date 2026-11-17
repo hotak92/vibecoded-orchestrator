@@ -114,7 +114,7 @@ The ref row still carries an `is_set` column in the DB. It is a snapshot the ref
 
 #### Gotchas / failure modes
 
-- **The badge is stale after you set a value elsewhere.** The probe runs when the tab loads. Switch tabs and back (or reload) to re-probe. (Before v0.3.0 this column rendered the ref row's stored `is_set` flag, which was written once at registration and NEVER recomputed — no amount of rescanning refreshed it. If you remember this tab claiming "set" for a key you had deleted, that was why.)
+- **The badge is stale after you set a value elsewhere.** The probe runs when the tab loads. Switch tabs and back (or reload) to re-probe. (Before v0.2.92 this column rendered the ref row's stored `is_set` flag, which was written once at registration and NEVER recomputed — no amount of rescanning refreshed it. If you remember this tab claiming "set" for a key you had deleted, that was why.)
 - **"keyring entry for vct.… : platform error"** on Linux usually means there is no running Secret Service. Ensure `gnome-keyring-daemon` (or KWallet) is running and the login keyring is unlocked.
 - **Headless / SSH sessions on Linux**: libsecret requires a D-Bus session and an unlocked keyring. Either run the launcher inside a desktop session, or use `resolution: file` with `~/.vct-secrets/<name>` (chmod 600) instead.
 - **"value does not match validation pattern"** comes from `set_secret_v2` validating against the module manifest's `validation_regex`. Check the module's secrets manifest (e.g. for `GITHUB_TOKEN` the regex usually requires `ghp_…` / `github_pat_…`).

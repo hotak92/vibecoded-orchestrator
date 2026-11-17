@@ -150,7 +150,7 @@ TypeScript shape of one entry in the `vct_admin_tokens` map: `{ token: string; e
 
 Two server-authoritative paths classify a request as admin tier. Both yield the same wire response (`tier="admin"` plus `is_admin`/`unlock_all_modules`/`dev_features_enabled` flags) and unlock the same client-side dev affordances.
 
-The TL;DR of the architecture: an earlier draft used a local `MAINTAINER_TOKEN` + Ed25519 client check. That was dropped because a one-line patch to the AGPL client defeated it. Both Path A and Path B fix this by classifying server-side — patching the client only suppresses the visual ADMIN badge, it doesn't unlock anything the server gates. Authoritative reference: [`docs/ADMIN_LICENSE.md`](../ADMIN_LICENSE.md).
+The TL;DR of the architecture: an earlier draft used a local `MAINTAINER_TOKEN` + Ed25519 client check. That was dropped because a one-line patch to the AGPL client defeated it. Both Path A and Path B fix this by classifying server-side — patching the client only suppresses the visual ADMIN badge, it doesn't unlock anything the server gates. Authoritative reference: `docs/ADMIN_LICENSE.md`, the maintainers' private runbook — it is deliberately not part of this repository (`.gitignore`), so the references to it on this page point at a file you will not find here; this page is the public summary.
 
 ### Two paths to admin tier
 **Path A — Vault-token admin (recommended for maintainer / small-team use).** High-entropy `vct_admin_<URL-safe-base64>` token resolved against the `vct_admin_tokens` Supabase Vault secret. No LS product required. Per-token leak containment via TOFU machine binding + optional expiration. Adding/revoking team members = a single SQL statement.

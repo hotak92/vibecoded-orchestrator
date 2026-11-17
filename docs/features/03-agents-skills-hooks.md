@@ -124,7 +124,7 @@ Auto-start the code embedding service container if it exists and is stopped. Sil
 Display KG resource paths at session start. Optionally launches the RL server if installed (Pro tier; silent no-op when absent).
 
 ### `context-size-check.sh` — SessionStart (startup, blocking)
-Warn if `CONTEXT_STATE.md` exceeds configured thresholds (warn: 300 lines, max: 400 lines). Prompts to run `doc-maintainer` agent to trim.
+Size check for `CONTEXT_STATE.md`: an alert at `CONTEXT_STATE_MAX_LINES` (default 500) and a notice from 60 % of it (300 lines by default), each suggesting the `doc-maintainer` agent; plus a notice when the project's `MEMORY.md` passes `MEMORY_MAX_LINES` (default 200 — Claude Code loads only its first 200 lines). It never truncates anything.
 
 ### `compact-context-reinject.sh` — SessionStart (startup + compact)
 Re-inject `CONTEXT_STATE.md`, recent git commits and the active plan at session start and after context compaction (the pre-compact snapshot section is a compaction artefact and emits only on `compact`). After a compaction (v0.2.104) it does not repeat the git state Claude Code restores itself: the recent commits and the snapshot's git-status block are dropped in favour of the harness's fresh git status; `CONTEXT_STATE.md`, the session state and the plan are still re-injected in full. Before v0.2.102 only the `compact` matcher was registered; v0.2.102 W6-F briefly added `resume` and W6-K withdrew it (owner 2026-10-11: a resumed chat already has CONTEXT_STATE in context) — the bundle update scrubs the resume group from installs that received it.
@@ -329,7 +329,7 @@ Log all settings.json changes to `.claude/logs/config_changes.jsonl` for audit t
 Send a desktop notification (`notify-send`) when Claude finishes a response. Note: Stop hooks do not fire in the VS Code extension (CLI/Desktop only).
 
 ### `stop-failure-notify.sh` — StopFailure (background)
-Send an urgent desktop notification when a turn fails (rate limit, auth error, etc.) and log to `~/.claude/metrics/failures.jsonl`.
+Send an urgent desktop notification when a turn fails (rate limit, auth error, etc.) and log to `failures.jsonl` in the metrics directory (`$VCT_STATE_DIR/metrics`, default `~/.vct/metrics`; moved out of `~/.claude/metrics` in v0.2.92).
 
 Notifications are **coalesced** (v0.2.96): at most one per 5 minutes per `(project, error class)`, and the next one through carries the count it suppressed. Before that the hook notified on every event and parsed the payload with the wrong shape, so one repeating background failure produced 304 identical "unknown: No details" pop-ups in a single night. A payload whose shape it does not recognise is now reported as a truncated copy of the payload itself rather than as "no details". **Every** event — suppressed or not — is still written to the ledger; that ledger is what made the storm diagnosable, so `VCO_STOP_FAILURE_NOTIFY=0` silences only the pop-up and never the record. The `.ps1` sibling behaves identically.
 
