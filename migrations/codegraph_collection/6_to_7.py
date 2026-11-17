@@ -151,8 +151,16 @@ def _purge_transient_rows(coll, path_prop: str) -> "tuple[int, int]":
     except Exception:  # noqa: BLE001 — config probe is best-effort; fall through
         pass
 
+    # v0.2.107 (CG-2): the shared cursor. A class that lists 0 rows while its
+    # count is positive or unreadable raises CursorUndeterminable -> main()
+    # returns 1 -> no EDGE_APPLIED, the version does not advance, the purge is
+    # retried on the next update.
+    from vco_lib.codegraph_cursor import iter_class
+
     to_delete = []
-    for obj in coll.iterator(return_properties=[path_prop]):
+    for obj in iter_class(
+        coll, "migrations.codegraph_collection.6_to_7", return_properties=[path_prop],
+    ):
         val = (obj.properties or {}).get(path_prop) or ""
         # EXACT substring on the raw value — NOT a tokenized Like. A real
         # `.claude/hooks/…` / `.claude/scripts/…` source path does not contain

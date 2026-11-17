@@ -340,8 +340,18 @@ def missing_rows(collection: str, slot: str, *,
             return []
         coll = client.collections.get(collection)
         out: "list[tuple[str, str]]" = []
-        for obj in coll.iterator(include_vector=True,
-                                 return_properties=["file_path", "content"]):
+        from vco_lib.codegraph_cursor import iter_class
+        from vco_lib.kg_vector_slot import collection_vector_slots
+
+        # v0.2.107 (CG-2): the shared cursor, reading only ``slot``'s vector
+        # when the class declares it (it used to read every vector of every
+        # row). A class that could not be listed is "no verdict" (None below).
+        declared = collection_vector_slots(coll)
+        for obj in iter_class(
+            coll, "kg_secondary_backfill.missing_rows",
+            return_properties=["file_path", "content"],
+            include_vector=[slot] if declared and slot in declared else True,
+        ):
             vec = obj.vector if isinstance(obj.vector, dict) else {}
             if vec.get(slot):
                 continue

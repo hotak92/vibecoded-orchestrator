@@ -602,7 +602,12 @@ def _iter_canonical_rows(client, prefix: str, base: str) -> "list | None":
     body_field = _BODY_FIELD[base]
     rows = []
     try:
-        for obj in coll.iterator(return_properties=row_properties(base, declared)):
+        from vco_lib.codegraph_cursor import iter_class  # the ONE class listing
+
+        for obj in iter_class(
+            coll, "generate-code-summary._iter_canonical_rows",
+            return_properties=row_properties(base, declared),
+        ):
             props = dict(getattr(obj, "properties", None) or {})
             chunk_num = props.get("chunk_num")
             if chunk_num not in (None, 0):

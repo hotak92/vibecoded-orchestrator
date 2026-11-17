@@ -891,7 +891,14 @@ def _run_enrichment_loop(
 
     # ── Iterate ─────────────────────────────────────────────────────
     try:
-        iterator = col.iterator(include_vector=True)
+        from vco_lib.codegraph_cursor import iter_class
+
+        # v0.2.107 (CG-2): the shared cursor (whole rows: the enrichment
+        # re-embeds from the stored properties).
+        iterator = iter_class(
+            col, "embedding_enrichment.enrich_collection",
+            return_properties=None, include_vector=True,
+        )
     except Exception as e:
         raise CollectionNotFoundError(
             f"Could not iterate collection {collection_name!r}: {e}"
@@ -1201,8 +1208,13 @@ def count_populated_slots(
     client = None
     try:
         client = factory()
+        from vco_lib.codegraph_cursor import iter_class
+
         col = client.collections.get(collection)
-        for obj in col.iterator(include_vector=True):
+        for obj in iter_class(  # v0.2.107 (CG-2): the shared cursor, no properties
+            col, "embedding_enrichment.slot_population",
+            return_properties=[], include_vector=True,
+        ):
             vec = obj.vector
             if not isinstance(vec, dict):
                 # Legacy single-vector format has no named slots — nothing

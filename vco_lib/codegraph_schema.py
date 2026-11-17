@@ -44,6 +44,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from vco_lib.codegraph_cursor import iter_class
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -361,7 +363,9 @@ def backfill_missing_property(coll: Any, prop: str, value: str) -> Tuple[int, in
         return 0, 1
     updated = failures = 0
     try:
-        for obj in coll.iterator(return_properties=[prop]):
+        for obj in iter_class(
+            coll, "codegraph_schema.backfill_missing_property", return_properties=[prop],
+        ):
             if (getattr(obj, "properties", None) or {}).get(prop) not in (None, ""):
                 continue
             try:

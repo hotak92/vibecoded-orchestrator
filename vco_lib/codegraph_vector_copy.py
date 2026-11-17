@@ -68,6 +68,7 @@ from vco_lib.codegraph_imports import filter_compatible_import_rows
 # ignoring the global VCO_LOG_LEVEL pref. Route it through the ONE shared
 # helper instead.
 from vco_lib.log_setup import configure_logging
+from vco_lib.codegraph_cursor import iter_class as _iter_class
 
 logger = logging.getLogger(__name__)
 
@@ -601,7 +602,9 @@ def _iter_project_rows(coll, base: str, old_identity: str):
         want_props = [p for p in want_props if p in schema_props]
     except Exception:  # noqa: BLE001 — probe is best-effort; keep full list
         pass
-    for obj in coll.iterator(return_properties=want_props):
+    for obj in _iter_class(
+        coll, "codegraph_vector_copy._iter_project_rows", return_properties=want_props,
+    ):
         props = getattr(obj, "properties", None) or {}
         if props.get("project") != old_identity:
             continue
@@ -873,9 +876,14 @@ def _ensure_identity_property(client, prefix: str, base: str, coll, canonical: s
 
 def _distinct_stale_identities(
     client, prefix: str, canonical: str, *, ensure: bool = False,
+    unreadable: Optional[List[str]] = None,
 ) -> List[str]:
     """Discover every ``project`` value ≠ ``canonical`` present in the 5
     ``<prefix>_<base>`` code-graph classes (v0.2.84 D4 — the identity sweep).
+
+    ``unreadable`` (v0.2.107 CG-2): a list the names of the classes that could
+    NOT be listed are appended to. An empty result is "single identity" only
+    when that list stays empty - :func:`sweep_stale_identities` passes it.
 
     SAFE BY CONSTRUCTION: code-graph classes are per-project-prefix, so any
     ``project`` value inside the prefix family that is not the canonical
@@ -930,7 +938,10 @@ def _distinct_stale_identities(
             )
             continue
         try:
-            for obj in coll.iterator(return_properties=["project"]):
+            for obj in _iter_class(
+                coll, "codegraph_vector_copy._distinct_stale_identities",
+                return_properties=["project"],
+            ):
                 props = getattr(obj, "properties", None) or {}
                 value = props.get("project")
                 if isinstance(value, str) and value and value != canonical:
@@ -939,6 +950,8 @@ def _distinct_stale_identities(
             logger.warning(
                 "identity sweep: enumerate %s failed: %s", coll_name, exc
             )
+            if unreadable is not None:
+                unreadable.append(coll_name)
             continue
     return sorted(found)
 
@@ -991,10 +1004,25 @@ def sweep_stale_identities(
 
     summaries: List[MigrationSummary] = []
     try:
+        unreadable: List[str] = []
         stale = _distinct_stale_identities(
-            client, prefix, canonical, ensure=not dry_run,
+            client, prefix, canonical, ensure=not dry_run, unreadable=unreadable,
         )
+        if unreadable:
+            # v0.2.107 (CG-2): a class that could not be listed may hold stale
+            # identities nobody saw - never "already single-identity". One
+            # failure-signal summary, so the caller cannot read all-zero success.
+            logger.warning(
+                "identity sweep: %s NOT confirmed single-identity - %d class(es) "
+                "could not be listed (%s); the sweep stays owed",
+                prefix, len(unreadable), ", ".join(unreadable),
+            )
+            unread = MigrationSummary()
+            unread.failures += len(unreadable)
+            summaries.append(unread)
         if not stale:
+            if unreadable:
+                return summaries
             logger.info(
                 "identity sweep: %s already single-identity (%r) — nothing to "
                 "migrate%s", prefix, canonical, " (dry-run)" if dry_run else "",

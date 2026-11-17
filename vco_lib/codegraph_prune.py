@@ -32,6 +32,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
+from vco_lib.codegraph_cursor import iter_class, undeterminable_classes
+
 logger = logging.getLogger(__name__)
 
 
@@ -204,7 +206,8 @@ def prune_collection(
         return_props.append("project_source")
 
     try:
-        for obj in collection.iterator(
+        for obj in iter_class(
+            collection, "codegraph_prune.prune_collection",
             return_properties=return_props,
         ):
             props = obj.properties or {}
@@ -312,13 +315,17 @@ def prune_collection(
                     f"Failed to prune {obj.uuid} from {collection.name}: {exc}"
                 )
     except Exception as exc:
-        # Iterating a freshly-created collection can fail if it
-        # has no data yet; treat as zero-prune. This is an enumeration
-        # failure (not a per-row delete failure) — we cannot tell how many
-        # rows were owed, so we do NOT count it as a prune failure here;
-        # a walk that produced zero visited UUIDs against a populated
-        # collection is caught by higher-level insert-error accounting.
-        logger.debug(f"Prune enumeration on {collection.name} failed: {exc}")
+        # The class could not be listed whole (v0.2.107 CG-2: the cursor
+        # raises ``CursorUndeterminable`` for a failed page AND for a 0-row
+        # pass over a class that is not confirmed empty; it has logged the
+        # class and this call site, and remembered the class). Nothing more is
+        # deleted on this read. It is not a per-row delete failure, so the
+        # count returned here is unchanged; the run still ends PARTIAL because
+        # :func:`prune_failure_stats` adds every unlisted class to the total.
+        logger.debug(
+            "Prune of %s stopped: the class could not be listed (%s) - "
+            "no further row is judged stale this run", collection.name, exc,
+        )
         # v0.2.103 (defect 7): enumeration failure = uncertainty → the
         # deferred orphan candidates are DROPPED, never deleted.
         orphan_candidates = []
@@ -533,6 +540,39 @@ def record_prune_failures(holder: Any, collection_name: str, failures: int) -> N
     holder._prune_failure_collections = per_coll
 
 
+def reset_prune_ledgers(holder: Any) -> None:
+    """Start-of-run reset of everything :func:`prune_failure_stats` reports:
+    the delete-failure total, its per-collection map, and the process record
+    of classes that could not be listed (``codegraph_cursor``)."""
+    from vco_lib.codegraph_cursor import reset_undeterminable
+
+    holder._prune_failures = 0
+    holder._prune_failure_collections = {}
+    reset_undeterminable()
+
+
+def prune_failure_stats(holder: Any) -> Dict[str, Any]:
+    """The end-of-run stats keys for stale-row work that did NOT complete.
+
+    ``prune_failures`` is the total the build status keys on
+    (``PRUNE_FAILURES=N`` -> success→partial): the failed deletes PLUS one per
+    class that could not be listed this run (v0.2.107 CG-2). A sweep that
+    could not read its class deleted nothing and proved nothing, so the run
+    must not read as a clean success - the stale rows it could not see stay
+    owed. ``prune_failure_collections`` keeps naming only the classes with
+    failed DELETES (the remedy prints a drop command for those and must not
+    for a class that merely could not be listed);
+    ``listing_undeterminable`` maps the unlisted classes to the call site.
+    """
+    unlisted = undeterminable_classes()
+    return {
+        "prune_failures": int(getattr(holder, "_prune_failures", 0)) + len(unlisted),
+        "prune_failure_collections": dict(
+            getattr(holder, "_prune_failure_collections", None) or {}),
+        "listing_undeterminable": unlisted,
+    }
+
+
 #: The default in the remedy's ``${WEAVIATE_URL:-...}`` expansion (mirrors the
 #: pre-v0.2.103 hard-coded line).
 PRUNE_REMEDY_URL_DEFAULT = "http://localhost:8081"
@@ -567,8 +607,18 @@ def format_prune_remedy_lines(
         f"/v1/schema/{n}\"   # then re-run analysis"
         for n in names
     ]
-    unattributed = max(0, int(total_failures) - sum(per_coll.values()))
-    if unattributed or not names:
+    # v0.2.107 (CG-2): a class that could not be LISTED is part of the total
+    # (the run is partial) but gets no drop command - nothing shows its rows
+    # are broken, only that this run could not read them.
+    unlisted = undeterminable_classes()
+    lines += [
+        f"   # {n}: its rows could not be listed this run ({site}) - nothing "
+        "was deleted there; do NOT drop it, re-run the analysis"
+        for n, site in sorted(unlisted.items())
+    ]
+    unattributed = max(
+        0, int(total_failures) - sum(per_coll.values()) - len(unlisted))
+    if unattributed or not (names or unlisted):
         # R12-F6: failures no producer could attribute keep the placeholder
         # (with their count) rather than vanishing from the remedy.
         line = (

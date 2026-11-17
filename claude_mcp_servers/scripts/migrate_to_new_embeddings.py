@@ -60,6 +60,10 @@ from vco_lib.log_setup import configure_logging
 # `vco_lib.log_setup` import above is bare for the reason stated there, so
 # vco_lib is already a hard requirement of this script.
 from vco_lib.weaviate_helpers import weaviate_url_default
+# v0.2.107 (CG-2): every whole-class read goes through the shared cursor. A
+# class that lists nothing while it is not confirmed empty raises - so a
+# migration never drops and recreates a class it could not read.
+from vco_lib.codegraph_cursor import iter_class
 
 configure_logging(format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migrate_embeddings")
@@ -359,7 +363,8 @@ def add_named_vector_to_collection(
     # Read all objects with vectors
     logger.info("Reading all objects from '%s'...", coll_name)
     all_objects = []
-    for obj in coll.iterator(include_vector=True):
+    for obj in iter_class(coll, "migrate_to_new_embeddings.migrate_collection",
+                          return_properties=None, include_vector=True):
         if isinstance(obj.vector, dict):
             vec_dict = obj.vector
         elif obj.vector:
@@ -456,7 +461,8 @@ def backfill_new_embeddings(
 
     if dry_run:
         coll = client.collections.get(coll_name)
-        count = sum(1 for _ in coll.iterator())
+        count = sum(1 for _ in iter_class(
+            coll, "migrate_to_new_embeddings.backfill_dry_run", return_properties=[]))
         logger.info("[DRY RUN] Would backfill %d objects in '%s' with '%s'", count, coll_name, target_vec)
         return {"collection": coll_name, "target": target_vec, "total": count, "dry_run": True}
 
@@ -466,7 +472,8 @@ def backfill_new_embeddings(
     skipped = 0
     errors = 0
 
-    for obj in coll.iterator(include_vector=True):
+    for obj in iter_class(coll, "migrate_to_new_embeddings.backfill_collection",
+                          return_properties=None, include_vector=True):
         total += 1
 
         # Skip if already has the new vector
@@ -584,7 +591,8 @@ def main():
             config = coll.config.get()
             vc = config.vector_config
             vecs = list(vc.keys()) if vc and hasattr(vc, 'keys') else (list(vc) if vc else ["default"])
-            count = sum(1 for _ in coll.iterator())
+            count = sum(1 for _ in iter_class(
+                coll, "migrate_to_new_embeddings.status", return_properties=[]))
             scheme = "code" if is_code_collection(name) else "kg"
             print(f"  {name} ({scheme}): {count} objects, vectors: {vecs}")
         client.close()

@@ -2851,3 +2851,27 @@ def _gateway_vendor_keys_all_resolve():
         yield
     finally:
         _mgd._default_vendor_probe = saved
+
+
+# -- Code-graph class listings (v0.2.107, CG-2) -------------------------------
+# Production code lists a class only through `vco_lib.codegraph_cursor`
+# (`fetch_objects(after=...)` pages + a count cross-check on a 0-row pass).
+# The pre-CG-2 fakes model a collection as `iterator(...)`; this adapter serves
+# the cursor's pages from that method so those suites keep testing what they
+# test (the decision made on the rows). Fakes that speak the cursor protocol
+# (`tests/common/cursor_fakes.CursorClass`, `cursor_native = True`) are never
+# adapted. Rationale and limits: the docstring of `tests/common/cursor_fakes.py`.
+# Saved/restored by hand, NOT through `monkeypatch`: an autouse fixture that
+# requests `monkeypatch` would move its teardown after the env-leak guards above.
+@pytest.fixture(autouse=True)
+def _codegraph_cursor_serves_legacy_fakes():
+    try:
+        from tests.common import cursor_fakes as _cursor_fakes
+    except Exception:  # noqa: BLE001 - a suite without vco_lib lists no class
+        yield
+        return
+    restore = _cursor_fakes.install_legacy_adapter()
+    try:
+        yield
+    finally:
+        restore()

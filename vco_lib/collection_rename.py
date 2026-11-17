@@ -316,8 +316,17 @@ def default_ops(weaviate_url: Optional[str] = None) -> WeaviateOps:
     def _sample(name: str, limit: int) -> Mapping[str, Any]:
         client = _pi._connect_v4_client(weaviate_url=url)
         try:
+            from vco_lib.codegraph_cursor import iter_class
+
             out: dict[str, Any] = {}
-            for obj in client.collections.get(name).iterator(include_vector=True):
+            # v0.2.107 (CG-2): the shared cursor; a class that lists nothing
+            # while it is not confirmed empty raises (the rename then fails
+            # before anything is dropped) instead of "verifying" an empty sample.
+            for obj in iter_class(
+                client.collections.get(name), "collection_rename._sample",
+                return_properties=[], include_vector=True,
+                page_size=max(1, int(limit)), weaviate_url=url,
+            ):
                 out[str(obj.uuid)] = obj.vector
                 if len(out) >= limit:
                     break

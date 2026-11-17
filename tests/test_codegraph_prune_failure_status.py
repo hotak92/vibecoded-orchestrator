@@ -362,7 +362,9 @@ def test_source_stats_prune_failures_populated_unconditionally() -> None:
     `if prune_stale:` block so orphan-clear/drain failures reach main() on
     ordinary walks."""
     src = _ANALYZER_PATH.read_text(encoding="utf-8")
-    anchor = src.find("stats['prune_failures'] = int(getattr(self, \"_prune_failures\", 0))")
+    # v0.2.107 (CG-2): the three keys come from ONE vco_lib call
+    # (`codegraph_prune.prune_failure_stats`: failed deletes + unlisted classes).
+    anchor = src.find("stats.update(_prune_failure_stats(self))")
     assert anchor > 0, "the unconditional stats assignment is missing"
     # The assignment's enclosing line must be indented at METHOD-body level
     # (8 spaces), not inside the `if prune_stale:` suite (12 spaces).

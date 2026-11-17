@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from vco_lib import codegraph_resync as _cr
+from vco_lib.codegraph_cursor import iter_class as _iter_class
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,10 @@ def prune_orphan_interactions(
             pass
         candidates: list = []
         try:
-            for obj in coll.iterator(return_properties=read_props):
+            for obj in _iter_class(
+                coll, "codegraph_source_purge.prune_orphan_interactions",
+                return_properties=read_props,
+            ):
                 props = getattr(obj, "properties", None) or {}
                 if _cr.is_provable_codegraph_orphan(
                     coll, str(obj.uuid), props,
@@ -244,7 +248,8 @@ def count_rows_for_project_source(
                 # same one every delete here follows).
                 try:
                     n = sum(
-                        1 for obj in coll.iterator(
+                        1 for obj in _iter_class(
+                            coll, "codegraph_source_purge.count_rows_for_project_source",
                             return_properties=["project_source"])
                         if str((getattr(obj, "properties", None) or {})
                                .get("project_source") or "").strip() == src
