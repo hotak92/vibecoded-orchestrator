@@ -64,7 +64,7 @@ git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-
 
 `first-install.{sh,command,bat}` is a thin OS shim that (1) finds a usable Python 3.11+ (offering to install one via Homebrew / apt / dnf / pacman / zypper / apk / winget if missing), (2) runs a read-only system-detection prepass that writes a diagnostic report to `state/logs/bootstrap-prepass.json` — no side effects, and a failure there never blocks the install — then (3) runs `install.py` for the canonical install. On success the launcher GUI auto-starts (pass `--no-auto-launch` to skip). Root install and per-project bundle install share one engine — the orchestrator's own `.claude/` goes through the same code path the launcher uses for your projects. Full detail: [`docs/INSTALL_ARCHITECTURE_v2.md`](docs/INSTALL_ARCHITECTURE_v2.md) and [`docs/INSTALL_PARITY.md`](docs/INSTALL_PARITY.md).
 
-The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 14, and Windows on every push to main and on installer-touching PRs; a red run blocks release tags.
+The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 15, and Windows on every push to main and on installer-touching PRs; a red run blocks release tags.
 
 Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
 
@@ -86,7 +86,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Code graph (AST/tree-sitter, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
 | Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
 | User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (51 hooks, 7 skills, 11 agents)** |
-| Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
+| Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
 **Reading the table**: Cursor, Copilot, Augment, and Devin are closed all-in-ones — they ship the editor, the AI, the context layer, and the cloud, bundled. Aider, Cline, and Codex CLI are open-source / BYOL but lack persistent memory and (in most cases) a structural code graph. VCO is the combination that doesn't otherwise exist: open-source, local, BYO-Claude-subscription, *and* it has both persistent memory and a code graph. The trade you're making for that is product polish — VCO is alpha, the others are stable v1+.
@@ -128,7 +128,7 @@ When you click **Add project** in the launcher GUI, the project is usable the mo
 
 1. **Code graph build** — structural analysis over the project root, populating the `CodeModule` / `CodeClass` / `CodeFunction` / `CodeAPI` / `CodeInteraction` collections.
 2. **KG sync** — walks `knowledge/**/*.md` and `docs/**/*.md` and embeds them into the per-project Weaviate collections.
-3. **KG summaries** — LLM-written node summaries consumed by `hybrid_search`'s `summary` tier (backend fallback: `claude` CLI → local Ollama → `ANTHROPIC_API_KEY` → skip; summaries backfill later as you edit nodes if no backend is available).
+3. **KG summaries** — LLM-written node summaries consumed by `hybrid_search`'s `summary` tier (backend ladder: `claude` CLI → a z.ai / QwenCloud key if you added one → local Ollama → OpenAI (consent-gated) → `ANTHROPIC_API_KEY` → skip; summaries backfill later as you edit nodes if no backend is available — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)).
 
 Each task gets a status banner on the project page (`pending` / `running` / `failed`, with `Show details` and `Retry`); runs interrupted by a crash are marked failed and retryable, and retries are cheap no-ops for already-indexed content. Full walkthrough: [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md#background-tasks-the-launcher-fans-out-on-add-project).
 
@@ -144,15 +144,13 @@ Each task gets a status banner on the project page (`pending` / `running` / `fai
 
 ## Downloads (Launcher GUI)
 
-The launcher GUI ships as a per-OS standalone artifact on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
+Each release on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases) carries one `.zip` per OS (plus its `.sha256`). The archive is the whole orchestrator with the prebuilt launcher, hub and updater binaries inside (`launcher/dist/<os>-<arch>/`) — there is no separate launcher installer (no `.exe` setup, AppImage, `.deb` or `.dmg`). Extract it and run the `first-install` entry point for your OS; a `git clone` gets the same binaries from the repository.
 
 | OS                                  | Artifact                                              | Notes |
 |-------------------------------------|-------------------------------------------------------|-------|
-| **Windows 10/11 (x64)**             | `vct-launcher-windows-x64.exe`                        | Portable, no installer. Unsigned — SmartScreen → "More info" → "Run anyway" on first run. Code signing on backlog. |
-| **Linux (x64)**                     | `*.AppImage` (portable) or `*.deb`                    | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
-| **macOS (Apple Silicon)**           | `vct-launcher-macos-arm64.zip` (dist binary at `launcher/dist/macos-arm64/vct-launcher`) | Tier-2. Ad-hoc codesigned, not notarized — Gatekeeper warns once. See [docs/macos-install.md](docs/macos-install.md). |
-
-No GUI yet? The CLI install path (above) covers all three OSes.
+| **Windows 10/11 (x64)**             | `vibecoded-orchestrator-<version>-windows-x64.zip`    | Unsigned — SmartScreen → "More info" → "Run anyway" on first run. Code signing on backlog. |
+| **Linux (x64)**                     | `vibecoded-orchestrator-<version>-linux-x64.zip`      | |
+| **macOS (Apple Silicon)**           | `vibecoded-orchestrator-<version>-macos-arm64.zip`    | Tier-2. Ad-hoc codesigned, not notarized — Gatekeeper warns once. See [docs/macos-install.md](docs/macos-install.md). |
 
 ## Requirements
 
@@ -209,10 +207,10 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 | GPU, VRAM ≥ 4.9 GB                      | Ollama           | `qwen3.5:4b`       | Small-card rung (~3.2 GB).                                         |
 | No GPU; CPU, RAM ≥ 12 GB & 6+ cores     | Ollama           | `gemma4:e4b`       | Pure-CPU fallback.                                                 |
 | Any other machine                       | Ollama           | `qwen3.5:0.8b`     | Always-pulled floor.                                               |
+| Local model switched off (`VCT_LOCAL_SUMMARY_MODEL=off`) and no other backend | _none_ | _none_ | Summaries skipped; raw KG content still embedded + searchable.     |
+| OpenAI API (opt-in, requires consent)   | OpenAI           | `gpt-4o-mini`      | Off by default; toggle via Preferences → KG Summaries. Cost warning surfaced on enable. |
 
 The GPU thresholds are not chosen by hand: a GPU rung is picked only when the card can hold the free-VRAM floor the summary runtime checks before loading the model (its on-disk size plus a max(1 GB, 40 %) KV-cache margin, plus ~0.5 GB an idle desktop already uses), so the table never assigns a model the runtime would refuse to load.
-| Anything below those tiers              | _none_           | _none_             | Summaries skipped; raw KG content still embedded + searchable.     |
-| OpenAI API (opt-in, requires consent)   | OpenAI           | `gpt-4o-mini`      | Off by default; toggle via Preferences → KG Summaries. Cost warning surfaced on enable. |
 
 ¹ CPU core thresholds count **physical cores** (not logical/SMT threads), and the 24 GB RAM / 8 GB VRAM cutoffs are strict `>` boundaries — this avoids performance cliffs on hardware sitting exactly at a boundary.
 
