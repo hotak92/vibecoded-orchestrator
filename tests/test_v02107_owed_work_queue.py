@@ -496,7 +496,7 @@ def test_just_below_the_threshold_the_retry_stays_narrow(tmp_path):
         dr.dispatch(folder, condition_ids=[FAIL_CID], backend_probe=lambda f, k: True,
                     runner=runner, single_instance=False)
     assert "--all" not in runner.calls[0]
-    assert len(runner.calls[0]) == 2 + 200
+    assert len(runner.calls[0]) == 2 + dr.MAX_NARROW_SYNC_PATHS
 
 
 def test_above_the_path_count_the_retry_falls_back_to_the_whole_tree(tmp_path):
