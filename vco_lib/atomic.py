@@ -906,8 +906,10 @@ def machine_slot(
     open file description, it is also released when the holder process exits
     or crashes.
 
-    Best-effort exactly like :func:`exclusive_file_lock`: where ``flock`` does
-    not exist (Windows, or a filesystem without it) the first slot "succeeds"
+    Best-effort exactly like :func:`exclusive_file_lock`: POSIX locks with
+    ``flock`` and Windows with ``msvcrt.locking`` (since v0.2.103), so the slot
+    count holds on both. Only where NEITHER works (a filesystem without
+    ``flock``, a platform with neither module) the first slot "succeeds"
     without exclusion, so the block runs unbounded, as it did before. The
     yielded value is always a slot index (``Optional`` only for callers typed
     against the pre-W6-U contract, which yielded ``None`` on expiry).
