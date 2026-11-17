@@ -5,7 +5,8 @@ services:
     # (weaviate-client 4.21) was released against. A 1.28.4 data folder opens
     # in place (verified: objects, vectors and search results unchanged).
     image: cr.weaviate.io/semitechnologies/weaviate:1.37.18
-    # v0.2.105: the container memory limit, sized from the host by install
+    # v0.2.105: the container memory limit, 40 % of the smaller of the host's
+    # and the container engine's memory, set by install
     # (vco_lib.weaviate_memory -> VCT_WEAVIATE_MEM_LIMIT in infrastructure/.env;
     # an exported VCT_WEAVIATE_MEM_LIMIT wins, "0" = no limit). With a limit,
     # LIMIT_RESOURCES below sets Go's soft limit to 80% of it, and Weaviate

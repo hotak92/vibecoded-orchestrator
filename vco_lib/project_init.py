@@ -541,8 +541,9 @@ def detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool,
         only on absent core slots that would break basic search.
       - inverted_index_config.index_null_state == True
 
-    Both invariants CANNOT be retro-added on Weaviate ≤1.30 — the only
-    fix is drop + re-ingest (or copy-with-vectors per PR 3).
+    A missing slot is added in place (``add_slots``); a missing
+    index_null_state is only fixed by recreating the class (``copy``: the
+    vectors are carried over, nothing is re-embedded).
 
     Failure-soft: if Weaviate is unreachable or the collection doesn't
     exist, returns (False, []).
@@ -750,15 +751,14 @@ _rebuild_collections = rebuild_collections
 
 
 # ---------------------------------------------------------------------------
-# Smart schema migration (PR 3) — copy-with-vectors instead of drop+re-embed.
+# Smart schema migration (PR 3) — in place or copied, not drop+re-embed.
 #
-# Verified against Weaviate 1.28.4 (see
-# .claude/context/weaviate-schema-port-research-2026-05-01.md):
-#   - vectorConfig slots:     PUT 422 "vector config is immutable"   → rebuild
-#   - indexNullState:         PUT 422 "cannot be changed"            → rebuild
+# What Weaviate accepts on a live class:
+#   - vectorConfig slots:     added in place (one schema PUT)        → add_slots
 #   - properties:             POST /v1/schema/<class>/properties 200 → patch
+#   - indexNullState and vectorIndexType: PUT 422, cannot be changed → copy
 #
-# Solution: copy collection with iterator(include_vector=True) +
+# The copy path: iterator(include_vector=True) +
 # batch.add_object(vector=<dict>, uuid=<orig>). Vectors round-trip
 # byte-for-byte, no Ollama re-runs.
 #
@@ -1558,7 +1558,7 @@ def migrate_collections(
     schema_fetcher: Optional[Callable[[str], Optional[dict]]] = None,
 ) -> dict:
     """Smart per-collection schema migration. Replaces `rebuild_collections`'s
-    drop-and-re-embed with: noop / patch_props / copy-with-vectors / rebuild.
+    drop-and-re-embed with: noop / patch_props / add_slots / copy / rebuild.
 
     Caller contract: `args` must expose at minimum `force_rebuild` (bool).
     install.py callers pass the argparse Namespace; CLI callers construct

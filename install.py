@@ -6169,7 +6169,7 @@ def main() -> int:
         _rebuild_was_performed = False
 
         if _maybe_prompt_rebuild_collections(args, deferral_report=_deferral_report):
-            # PR 3: smart per-collection dispatch (copy-with-vectors etc.)
+            # PR 3: smart per-collection dispatch (noop / patch_props / add_slots / copy / rebuild)
             # replaces the old drop-and-re-embed default. --force-rebuild
             # is the escape hatch back to today's behaviour.
             if getattr(args, "force_rebuild", False):
