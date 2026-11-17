@@ -147,6 +147,47 @@ def test_rebind_deferrals_do_not_propagate_to_seed_errors(monkeypatch, tmp_path)
     )
 
 
+def test_first_boot_rebind_notes_are_not_printed_as_failures(monkeypatch, tmp_path, capsys):
+    """A root the launcher has not registered yet (a fresh install, before
+    its first start) is the expected state. The two notes that describe it
+    must not carry the `!` failure marker; a real failure still does."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    monkeypatch.setattr(install, "_is_orchestrator_root_install", lambda: True)
+    monkeypatch.setattr(
+        install,
+        "_rebind_orchestrator_root_to_canonical",
+        lambda canonical: [
+            "launcher.db: no orchestrator-root project row found (skipped)",
+            "config_projection: orchestrator-root project_id not resolvable; "
+            "env files will be reconciled on next launcher boot",
+            "launcher.db UPDATE failed: simulated",
+        ],
+    )
+    monkeypatch.setattr(install, "_write_app_state_key", lambda *a, **k: None)
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", lambda *a, **k: 0)
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+
+    class _Args:
+        update = False
+
+    install._seed_weaviate_shared_kg_only(
+        args=_Args(),
+        venv_py=tmp_path / "py",
+        sync_kg=tmp_path / "sync",
+        weaviate_url="http://x",
+        current_shared_kg="MyKG",
+        current_kg_collection="MyKG",
+    )
+    out = capsys.readouterr().out
+    failures = [ln for ln in out.splitlines() if "! rebind:" in ln]
+    assert failures == ["    ! rebind: launcher.db UPDATE failed: simulated"], failures
+    notes = [ln for ln in out.splitlines() if "rebind:" in ln and "! rebind:" not in ln]
+    assert len(notes) == 2, notes
+    assert all("first start" in ln for ln in notes), notes
+
+
 def test_orphan_collection_notice_fires(monkeypatch, tmp_path, capsys):
     """Fix 3: notice prints when canonical differs AND primary has rows."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

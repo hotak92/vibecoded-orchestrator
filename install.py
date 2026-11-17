@@ -13217,7 +13217,13 @@ def _seed_weaviate_shared_kg_only(
         rebind_errors = _rebind_orchestrator_root_to_canonical(canonical)
         if rebind_errors:
             for e in rebind_errors:
-                print(f"    ! rebind: {e}")
+                # A root the launcher has not registered yet (a fresh install,
+                # before its first start) is the expected state, not a fault.
+                if "(skipped)" in e or "reconciled on next launcher boot" in e:
+                    print(f"    · rebind: {e} — expected before the launcher's "
+                          "first start, which registers the root and its bindings")
+                else:
+                    print(f"    ! rebind: {e}")
             # v0.2.44 fix-now-2: propagate the "definitely broken" tier so
             # the audit-log "warn" entry fires on real DB write failures or
             # import errors. Two error classes stay non-propagated and
