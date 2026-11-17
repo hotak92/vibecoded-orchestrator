@@ -24,12 +24,13 @@ Installed by default in every project. ONE definition per agent: the dispatcher 
 
 Delivered ONLY when the model gateway is configured on the machine (tri-state module gate); they pin `claude-gw/*` model ids in frontmatter and are dispatched by name with no model override. The z.ai lane: `glm-implementer`, `glm-implementer-high` (effort-high sibling), `glm-reviewer`, `glm-planner`, `glm-flash-researcher`. The qwen-vendor lane: `deepseek-implementer`, `qwen-implementer`, `qwen-implementer-high` (effort high, run by QwenCloud at xhigh), `deepseek-researcher`, `qwen-flash-sweeper`. There is deliberately no dedicated reviewer or planner definition on the qwen vendor (`qwen-implementer-high` can still be dispatched for a review round). Both research lanes (`deepseek-researcher`, `glm-flash-researcher`) also take bounded code reviews and fix-delta verifications, following the role file `specializations/roles/bounded-review.md`. The kimi-vendor lane (Kimi K3.1 Pro): `kimi-implementer`, `kimi-reviewer`. Each lane is delivered only when its vendor's key resolves at bundle time; a lane whose key is missing is held back (an earlier copy is kept, never deleted).
 
-## Default skills — `skills/` (6 skills)
+## Default skills — `skills/` (7 skills)
 
 Short-form guidance invoked via `/skill-name` or auto-loaded by description match:
 
 | Skill | Role |
 |---|---|
+| `api-review` | One bounded headless Claude Code task (typically a final review) billed to the Claude Console API key, with a cost summary |
 | `context-compress` | /compact pipeline guidance + CONTEXT_STATE.md inspection/maintenance |
 | `fix-issue` | Structured GitHub-issue/bug investigation → fix + regression test |
 | `orchestrator-installer` | Diagnose partially-failed VCO installs; install.py flag advice |
@@ -125,7 +126,7 @@ Keep placeholders in templates — do NOT hard-code paths, ports or URLs.
 ## Install flags
 
 ```bash
-python install.py                      # 11 default agents + 6 default skills (+ 8 gateway agents when the model gateway is configured)
+python install.py                      # 11 default agents + 7 default skills (+ the gateway agents whose vendor key resolves, when the model gateway is configured)
 python install.py --no-agents          # skip agent installation
 python install.py --no-skills          # skip skill installation
 ```

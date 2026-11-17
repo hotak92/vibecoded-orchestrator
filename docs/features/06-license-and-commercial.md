@@ -312,7 +312,7 @@ Enforced by the collection layer; the queue schema stores only what the `collect
 Scans staged files (or full tracked tree with `--all`) for blocklisted token patterns. Exits non-zero with instructions. Wire as a pre-commit hook via `ln -sf ../../scripts/check-no-secrets.sh .git/hooks/pre-commit`.
 
 ### Env scrubbing in hooks
-All 31 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
+Every project hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
 
 ### Supabase key rotation runbook
 Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).

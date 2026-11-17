@@ -139,7 +139,7 @@ Each task gets a status banner on the project page (`pending` / `running` / `fai
 - **51 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 45 are event-registered in `settings.json`; 4 more (`post-edit-outcome`, `post-bash-context-record`, `kg-summary-generator`, `post-git-commit-kg-sync`) are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually (v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records — each sub-hook stays individually switchable from the launcher's Hooks tab; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update); and 2 ship unwired — `code-graph-incremental` (its per-edit scheduling now lives in `stop-codegraph-drain`) and `kg-sync-on-edit` (an opt-in single-purpose hook superseded by `post-file-edit`'s auto-sync). Every hook ships as `.sh` (Linux/macOS) with a native `.ps1` sibling (Windows). The `vct-hub` background service resolves per-project config for hooks, MCPs, and scripts.
 - **MCP servers (default install)** — 2 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) is **enabled by default per project**; `playwright` is **enabled by default**, invoked via `npx -y @playwright/mcp@<pin> --browser chromium` (exact version pinned in `vco_lib/bundled_mcp_versions.toml`; the pinned package and the Chromium revision it needs are pre-cached at install/update, and `vco doctor` reports a missing browser; opt out with `VCT_SKIP_PLAYWRIGHT=1`). That entry needs `npx` resolvable on PATH: without Node.js installed it cannot spawn at all, and Claude Code reports only "Failed to connect". `vco doctor` (and the launcher's MCP registration badge) names that case explicitly. The per-project toggle in the launcher's Permissions tab writes `~/.claude.json` `projects[<project>].disabledMcpServers`, so disabling a server for one project actually reaches Claude Code. (v0.2.101 removed the `search` paper MCP; v0.2.102 removed the `mermaid`/`excalidraw` diagram wrapper MCPs entirely — a leftover entry from an older install is scrubbed automatically by the ordinary install/update, with one notice line.) All local, no per-tool API keys. Ollama (Weaviate vectorizer + embedding fallback) and the code-embedding FastAPI service on port 11440 are backend infrastructure, not MCPs.
 - **Secrets primitive** — OS-keychain storage (launcher-managed) plus a chmod-600 file store under `~/.vct-secrets/`, resolved through the `vct` CLI and the `vct-hub` service. Agents inject credentials into child processes by key name (`vct exec --secret KEY=ENV_VAR -- cmd`) instead of printing them; a hook blocks env-grepping for tokens. See [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
-- **11 default agents + 8 machine-gated gateway agents + 7 skills, plus 11 opt-in packs** — shipped via `install.py` templates. The default agents handle planning, coding, testing, review, doc maintenance, KG maintenance and web/code exploration; the gateway agents cover the vendor models you have keys for; the packs carry the topical specialists (security, k8s, consulting, science, design — install only the ones you want). Skills cover context compression, issue fixing, task breakdown, and the installer / bootstrapper flows.
+- **11 default agents + 12 machine-gated gateway agents + 7 skills, plus 11 opt-in packs** — shipped via `install.py` templates. The default agents handle planning, coding, testing, review, doc maintenance, KG maintenance and web/code exploration; the gateway agents cover the vendor models you have keys for; the packs carry the topical specialists (security, k8s, consulting, science, design — install only the ones you want). Skills cover context compression, issue fixing, task breakdown, and the installer / bootstrapper flows.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
 ## Downloads (Launcher GUI)
@@ -229,7 +229,7 @@ Non-interactive / CI: `python install.py --quiet --no-containers`
 ```
 vibecoded-orchestrator/
 ├── .claude/
-│   ├── hooks/                 # 49 automation hooks (.sh + .ps1 per hook)
+│   ├── hooks/                 # Automation hooks (.sh + .ps1 per hook)
 │   ├── scripts/               # CLI tools for KG and code graph
 │   └── settings.json          # Claude Code configuration
 ├── claude_mcp_servers/
@@ -239,8 +239,8 @@ vibecoded-orchestrator/
 │   # (paper search) MCP was removed in v0.2.101 and the mermaid/excalidraw
 │   # diagram wrapper MCPs in v0.2.102.
 ├── templates/
-│   ├── agents/free/           # 11 default agents (+ machine-gated gateway agents)
-│   ├── skills/                # 6 default skills (+ opt-in pack skills)
+│   ├── agents/free/           # Default agents (+ machine-gated gateway agents)
+│   ├── skills/                # Default skills (+ opt-in pack skills)
 │   └── hooks/                 # Hook sources rendered into .claude/hooks/ at install
 ├── infrastructure/
 │   ├── docker-compose.yml     # Weaviate + Ollama
