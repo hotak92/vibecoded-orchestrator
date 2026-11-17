@@ -398,3 +398,81 @@ def test_nudge_silent_without_transcript(tmp_path: Path) -> None:
         cwd=str(rig["cwd"]), env=rig["env"],
     )
     assert r.returncode == 0, r.stderr
+
+
+# --- 9. one content block per transcript line (audit 2026-11-17) --------------
+#
+# Claude Code writes each content block of ONE API response as its own JSONL
+# line, all carrying the same requestId: a text/thinking line first, the
+# tool_use lines after it. Crediting tool_use only on the FIRST line of a
+# request dropped almost every edit body and every Read / Bash / Agent result
+# from the work units (measured on four real transcripts: 25-40% of the
+# documented formula was never counted). tool_use is deduped by its own id.
+
+
+def _block_entry(req: str, out_tokens: int, block: dict) -> str:
+    return json.dumps({
+        "requestId": req,
+        "message": {
+            "role": "assistant",
+            "usage": {"output_tokens": out_tokens},
+            "content": [block],
+        },
+    }) + "\n"
+
+
+def _tool_result(tool_use_id: str, text: str) -> str:
+    return json.dumps({
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id,
+                         "content": text}],
+        },
+    }) + "\n"
+
+
+def test_tool_use_on_a_later_line_of_its_request_is_credited(tmp_path: Path) -> None:
+    ctc = _load_counter()
+    t = tmp_path / "t.jsonl"
+    body = "y" * 1000
+    read_result = "z" * 2000
+    _write_transcript(t, [
+        _block_entry("r1", 10, {"type": "text", "text": "plan"}),
+        _block_entry("r1", 10, {"type": "tool_use", "id": "tu_w", "name": "Write",
+                                "input": {"file_path": "a.py", "content": body}}),
+        _block_entry("r1", 10, {"type": "tool_use", "id": "tu_r", "name": "Read",
+                                "input": {"file_path": "b.py"}}),
+        _tool_result("tu_w", "ok"),
+        _tool_result("tu_r", read_result),
+    ])
+    res = ctc.TranscriptScanner().scan(t)
+    expected = 10 + int(1000 * ctc.CHARS_TO_TOKENS) + int(2000 * ctc.CHARS_TO_TOKENS)
+    assert res.output_tokens_total == 10, "usage stays deduped by requestId"
+    assert res.work_units_total == expected, (
+        f"edit body + read result on later lines of the request must count: "
+        f"got {res.work_units_total}, want {expected}")
+
+
+def test_a_tool_use_block_repeated_across_lines_is_credited_once(tmp_path: Path) -> None:
+    """Older builds repeated the cumulative content on every streaming line:
+    the same tool_use id must still count once (the B12 double-count)."""
+    ctc = _load_counter()
+    t = tmp_path / "t.jsonl"
+    block = {"type": "tool_use", "id": "tu_w", "name": "Write",
+             "input": {"file_path": "a.py", "content": "y" * 1000}}
+    _write_transcript(t, [_block_entry("r1", 10, block)] * 3)
+    res = ctc.TranscriptScanner().scan(t)
+    assert res.work_units_total == 10 + int(1000 * ctc.CHARS_TO_TOKENS)
+
+
+def test_resume_does_not_recredit_a_tool_use_seen_before_the_offset(tmp_path: Path) -> None:
+    ctc = _load_counter()
+    t = tmp_path / "t.jsonl"
+    block = {"type": "tool_use", "id": "tu_w", "name": "Write",
+             "input": {"file_path": "a.py", "content": "y" * 1000}}
+    _write_transcript(t, [_block_entry("r1", 10, block)])
+    first = ctc.TranscriptScanner().scan(t)
+    with open(t, "a", encoding="utf-8") as fh:
+        fh.write(_block_entry("r1", 10, block))  # the repeat lands after the offset
+    second = ctc.TranscriptScanner().scan(t, start_offset=first.end_offset)
+    assert second.work_units_total == 0
