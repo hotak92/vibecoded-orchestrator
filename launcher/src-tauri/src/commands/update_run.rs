@@ -88,6 +88,24 @@ pub enum UpdateKind {
 /// The command argument's type name in the contract.
 pub type UpdateKindDto = UpdateKind;
 
+/// PURE (v0.2.107 U-2): does this kind START an update — refused while index
+/// work runs — or carry on with one already under way (never refused for
+/// it)? `Resume` continues a halted update; `ApplyOnly` re-applies
+/// `install.py --update` to a tree the update already moved. Both must stay
+/// reachable while code-graph / KG jobs run, or a half-applied update has no
+/// way forward.
+pub(crate) fn orchestrator_claim_for(
+    kind: UpdateKind,
+) -> crate::commands::single_flight::OrchestratorClaim {
+    use crate::commands::single_flight::OrchestratorClaim;
+    match kind {
+        UpdateKind::PullFf | UpdateKind::Merge | UpdateKind::Rebase | UpdateKind::ResetHard => {
+            OrchestratorClaim::Start
+        }
+        UpdateKind::Resume | UpdateKind::ApplyOnly => OrchestratorClaim::Continue,
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // The phase ledger
@@ -413,7 +431,7 @@ pub(crate) fn decide_binary_refresh(
 pub(crate) trait UpdateOps {
     // phase 1-2
     fn resolve_root(&mut self) -> Result<PathBuf, UpdateSurfaceError>;
-    fn claim(&mut self, root: &Path) -> Result<(), UpdateSurfaceError>;
+    fn claim(&mut self, root: &Path, kind: UpdateKind) -> Result<(), UpdateSurfaceError>;
     // phase 3 (read-only probes, then the remote pin)
     fn git_available(&mut self) -> impl Future<Output = bool> + Send;
     fn python_for_install(
@@ -543,7 +561,7 @@ async fn drive_phases<O: UpdateOps + Send>(
     let log_path = update_failure::install_log_path(&root);
 
     // ── 2. claim (in-process + cross-process) ─────────────────────────────
-    if let Err(e) = ops.claim(&root) {
+    if let Err(e) = ops.claim(&root, kind) {
         ledger.fail(Phase::Claim, e.message());
         return Err(e);
     }
@@ -1020,10 +1038,12 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         Ok(resolved.path)
     }
 
-    fn claim(&mut self, _root: &Path) -> Result<(), UpdateSurfaceError> {
+    fn claim(&mut self, _root: &Path, kind: UpdateKind) -> Result<(), UpdateSurfaceError> {
         if self.flight.is_none() {
-            let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
-                .map_err(|reason| UpdateSurfaceError::Refused {
+            let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                orchestrator_claim_for(kind),
+            )
+            .map_err(|reason| UpdateSurfaceError::Refused {
                     code: "already_running",
                     reason,
                 })?;
@@ -2306,6 +2326,34 @@ pub(crate) fn require_gui_path_is_resolved_root(
 pub(crate) mod tests {
     use super::*;
 
+    /// U-2: only the kinds that START an update are refused for index work;
+    /// a resume and an apply-only carry on with an update already under way.
+    /// Exhaustive over `UpdateKind` (a new kind must be classified here).
+    #[test]
+    fn only_starting_kinds_are_refused_for_index_work() {
+        use crate::commands::single_flight::OrchestratorClaim;
+        for kind in [
+            UpdateKind::PullFf,
+            UpdateKind::Merge,
+            UpdateKind::Rebase,
+            UpdateKind::ResetHard,
+            UpdateKind::Resume,
+            UpdateKind::ApplyOnly,
+        ] {
+            let expected = match kind {
+                UpdateKind::PullFf
+                | UpdateKind::Merge
+                | UpdateKind::Rebase
+                | UpdateKind::ResetHard => OrchestratorClaim::Start,
+                UpdateKind::Resume | UpdateKind::ApplyOnly => OrchestratorClaim::Continue,
+            };
+            assert_eq!(orchestrator_claim_for(kind), expected, "{kind:?}");
+        }
+        assert_eq!(orchestrator_claim_for(UpdateKind::Resume), OrchestratorClaim::Continue);
+        assert_eq!(orchestrator_claim_for(UpdateKind::ApplyOnly), OrchestratorClaim::Continue);
+        assert_eq!(orchestrator_claim_for(UpdateKind::PullFf), OrchestratorClaim::Start);
+    }
+
     /// A recording fake: every op appends its name; outcomes are scripted.
     struct FakeOps {
         calls: Vec<String>,
@@ -2399,7 +2447,7 @@ pub(crate) mod tests {
             self.rec("resolve_root");
             self.root.clone()
         }
-        fn claim(&mut self, _root: &Path) -> Result<(), UpdateSurfaceError> {
+        fn claim(&mut self, _root: &Path, _kind: UpdateKind) -> Result<(), UpdateSurfaceError> {
             self.rec("claim");
             Ok(())
         }

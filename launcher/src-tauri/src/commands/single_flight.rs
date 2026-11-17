@@ -50,7 +50,10 @@
 //! mechanism with its own wording: the orchestrator update stops the hub that
 //! "Update all" and its index jobs need, so `embed_admission`'s index-work
 //! exclusion refuses the one while the other runs (see
-//! [`begin_orchestrator_update_or_refuse`]). (v0.2.100, owner Q1: a
+//! [`begin_orchestrator_update_or_refuse`]). Only STARTING an update is
+//! refused for index work ([`OrchestratorClaim::Start`]); continuing,
+//! resuming, aborting or re-applying one already under way never is
+//! ([`OrchestratorClaim::Continue`]). (v0.2.100, owner Q1: a
 //! third key, for the per-clone file-copy command, was retired with that
 //! command.)
 //!
@@ -202,6 +205,23 @@ pub fn begin_or_refuse(key: &str) -> Result<SingleFlightGuard, String> {
 #[cfg(test)]
 pub(crate) static ORCHESTRATOR_CLAIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// What a caller of [`begin_orchestrator_update_or_refuse`] is doing — the
+/// one input that decides whether index work may refuse it (v0.2.107, U-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrchestratorClaim {
+    /// Starts a NEW orchestrator update (pull / merge / rebase / reset) or a
+    /// hardware reconfiguration (`install.py` re-run). Refused while
+    /// "Update all" runs or an index job is queued or running — nothing has
+    /// been changed yet, so waiting is free.
+    Start,
+    /// Continues, resumes, aborts or re-applies an update ALREADY under way
+    /// (the conflict resolvers, Abort, `Resume`, `ApplyOnly`). Never refused
+    /// for index work: the update is half-applied, and a refusal here had no
+    /// exit — a restart re-queues the jobs at boot. Jobs that have not
+    /// started yet wait for it; running ones continue (as in v0.2.106).
+    Continue,
+}
+
 /// Claim the orchestrator-clone update, or fail with the refusal.
 ///
 /// The ONE entry point for [`OP_UPDATE_ORCHESTRATOR_CLONE`], and it exists
@@ -215,13 +235,19 @@ pub(crate) static ORCHESTRATOR_CLAIM_TEST_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// v0.2.107 (UPDATER-07): being the ONE entry point is also why the
 /// index-work exclusion lives here — every update surface takes it with the
-/// claim, and the update is refused (before anything is changed) while
-/// "Update all" runs or a code-graph / KG job is queued or running.
-pub fn begin_orchestrator_update_or_refuse() -> Result<SingleFlightGuard, String> {
+/// claim. A [`OrchestratorClaim::Start`] is refused (before anything is
+/// changed) while "Update all" runs or a code-graph / KG job is queued or
+/// running; a [`OrchestratorClaim::Continue`] (U-2) takes the exclusion
+/// without that check, so a halted update can always be continued or
+/// aborted. Both refuse a second concurrent holder of the key.
+pub fn begin_orchestrator_update_or_refuse(
+    purpose: OrchestratorClaim,
+) -> Result<SingleFlightGuard, String> {
     let mut claim = begin_or_refuse(OP_UPDATE_ORCHESTRATOR_CLONE)?;
     // On refusal `claim` drops here, releasing the key again.
-    claim._index_exclusion =
-        Some(crate::commands::embed_admission::begin_orchestrator_update_exclusion()?);
+    claim._index_exclusion = Some(crate::commands::embed_admission::begin_orchestrator_update_exclusion(
+        purpose == OrchestratorClaim::Start,
+    )?);
     Ok(claim)
 }
 
@@ -504,9 +530,12 @@ mod tests {
 
         // ACT arm: the first caller proceeds, the second is refused — a
         // Preferences update while the MenuBar update is mid-`install.py`.
-        let first = begin_orchestrator_update_or_refuse().expect("first update must proceed");
-        let refused = begin_orchestrator_update_or_refuse()
+        let first = begin_orchestrator_update_or_refuse(OrchestratorClaim::Start)
+            .expect("first update must proceed");
+        let refused = begin_orchestrator_update_or_refuse(OrchestratorClaim::Start)
             .expect_err("a second concurrent orchestrator update must be refused");
+        // …and a Continue does not bypass the KEY: only the index-work check.
+        assert!(begin_orchestrator_update_or_refuse(OrchestratorClaim::Continue).is_err());
         assert!(
             refused.contains(OP_UPDATE_ORCHESTRATOR_CLONE),
             "the refusal must name what is already running: {refused}"
@@ -517,9 +546,43 @@ mod tests {
         // process's life after the first successful update — worse than the
         // race it prevents.
         drop(first);
-        let second = begin_orchestrator_update_or_refuse()
+        let second = begin_orchestrator_update_or_refuse(OrchestratorClaim::Start)
             .expect("a sequential re-run must be allowed once the first finished");
         drop(second);
+    }
+
+    /// U-2: with an index job live, a START is refused (and says what runs
+    /// and that it can start afterwards) while a CONTINUE — the conflict
+    /// resolvers, Abort, Resume, ApplyOnly — takes the claim, and jobs that
+    /// have not entered yet wait for it. Act + leave-alone on one state.
+    #[tokio::test]
+    async fn index_work_refuses_a_start_but_never_a_continue() {
+        let _serial = ORCHESTRATOR_CLAIM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let job = crate::commands::embed_admission::enter_index_job().await;
+
+        let refused = begin_orchestrator_update_or_refuse(OrchestratorClaim::Start)
+            .expect_err("a new update must wait for the index job");
+        assert!(refused.contains("code-graph / knowledge-graph job(s)"), "{refused}");
+        assert!(refused.contains("when they finish"), "{refused}");
+        assert!(!is_in_flight(OP_UPDATE_ORCHESTRATOR_CLONE), "a refusal releases the key");
+
+        let cont = begin_orchestrator_update_or_refuse(OrchestratorClaim::Continue)
+            .expect("continuing / aborting a halted update is never refused for index work");
+        let waiting = tokio::spawn(crate::commands::embed_admission::enter_index_job());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a job that has not entered waits for the update");
+        drop(job);
+        drop(cont);
+        let late = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("the waiting job proceeds after the update")
+            .expect("join");
+        drop(late);
+        let after = begin_orchestrator_update_or_refuse(OrchestratorClaim::Start)
+            .expect("a start is free once the jobs are done");
+        drop(after);
     }
 
     /// The orchestrator claim must not collide with the update-all key, or a

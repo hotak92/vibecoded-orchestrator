@@ -385,7 +385,8 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
             set(),
             "these #[command]s write the orchestrator clone but take no "
             f"single-flight claim: {sorted(unexplained)}. Add "
-            f"`{ENTRY}()` at the top of each (or, if one genuinely acts on a "
+            f"`{ENTRY}(OrchestratorClaim::Start or ::Continue)` at the top of each "
+            "(or, if one genuinely acts on a "
             "DIFFERENT tree, record it in EXEMPT with the reason). Prior "
             "review §4.8: an unclaimed surface and a claimed one can be "
             "offered to the user at the same moment, and only one of them "
@@ -599,6 +600,75 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
 # manifest writer (`manifest::refresh_install_manifest`) and the variant went
 # with those commands — install.py is the only writer of
 # `state/install-manifest.json` (see `manifest.rs`, "Bug G … RETIRED").
+
+
+#: v0.2.107 (U-2): which claim each surface takes. Only a surface that STARTS
+#: an update is refused while code-graph / KG jobs run; every surface that
+#: continues, resumes, aborts or re-applies an update already under way takes
+#: `OrchestratorClaim::Continue`, so a halted update always has a way out.
+START = "OrchestratorClaim::Start"
+CONTINUE = "OrchestratorClaim::Continue"
+CLAIM_PURPOSE = {
+    # Starts an install.py re-run on the clone: nothing changed yet.
+    "apply_hardware_reconfig": START,
+    # Recovery from a halted update: never refused for index work.
+    "abort_orchestrator_merge_or_rebase": CONTINUE,
+    "keep_local_and_continue_update": CONTINUE,
+    "accept_upstream_and_continue_update": CONTINUE,
+    "resolve_autostash_pop_and_retry": CONTINUE,
+}
+#: The hand-down helper's claim (`resolve_untracked_collision_and_retry`).
+HAND_DOWN_PURPOSE = {"claim_then_resolve_collision_files": CONTINUE}
+
+
+class OrchestratorClaimPurposeWiring(unittest.TestCase):
+    """v0.2.107 U-2 — the seven claim sites, each with the purpose it must
+    pass. CLOSED WORLD over the commands that call the entry point: a new
+    claiming command fails here until it is classified."""
+
+    def _commands(self) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for path in (INSTALLER, SELF_UPDATE, UPDATE_RUN):
+            merged.update(discover_commands(code_only_lines(path)))
+        return merged
+
+    def _assert_purpose(self, name: str, body: str, purpose: str) -> None:
+        other = CONTINUE if purpose == START else START
+        self.assertIn(ENTRY, body, f"{name} no longer claims")
+        self.assertIn(purpose, body, f"{name} must claim with {purpose}")
+        self.assertNotIn(other, body, f"{name} must not claim with {other}")
+
+    def test_every_claiming_command_passes_its_purpose(self) -> None:
+        commands = self._commands()
+        claiming = {n for n, b in commands.items() if ENTRY in b}
+        self.assertEqual(
+            claiming,
+            set(CLAIM_PURPOSE),
+            "the set of #[command]s that take the orchestrator claim changed; "
+            "classify each new one as a START (refused while index work runs) "
+            "or a CONTINUE (never refused for it) in CLAIM_PURPOSE",
+        )
+        for name, purpose in CLAIM_PURPOSE.items():
+            self._assert_purpose(name, commands[name], purpose)
+
+    def test_the_hand_down_helper_claims_as_a_continue(self) -> None:
+        lines = code_only_lines(INSTALLER)
+        for helper, purpose in HAND_DOWN_PURPOSE.items():
+            body = "\n".join(function_body(lines, f"pub(crate) async fn {helper}("))
+            self.assertTrue(body, f"{helper} not found")
+            self._assert_purpose(helper, body, purpose)
+
+    def test_the_pipeline_claims_by_update_kind(self) -> None:
+        """`run_orchestrator_update` claims in phase 2 through the kind: the
+        pure `orchestrator_claim_for` (Rust-tested per kind) decides."""
+        lines = code_only_lines(UPDATE_RUN)
+        claim = "\n".join(method_body(lines, LIVE_OPS_IMPL, "    fn claim(&mut self"))
+        self.assertIn(ENTRY, claim)
+        self.assertIn("orchestrator_claim_for(kind)", claim)
+        mapping = "\n".join(
+            function_body(lines, "pub(crate) fn orchestrator_claim_for(")
+        )
+        self.assertRegex(mapping, r"UpdateKind::Resume \| UpdateKind::ApplyOnly => OrchestratorClaim::Continue")
 
 
 class InstallPyRunnerDbGuardWiring(unittest.TestCase):

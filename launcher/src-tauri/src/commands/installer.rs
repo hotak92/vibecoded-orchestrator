@@ -2030,7 +2030,9 @@ pub async fn apply_hardware_reconfig(
     // "Resync now" is one page away, its `git reset --hard` would land under
     // this run exactly as it would under any other. One user-initiated button,
     // no nested callers, so the claim is a plain top-of-command take.
-    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+        crate::commands::single_flight::OrchestratorClaim::Start,
+    )?;
 
     let install_path_str = db
         .app_state_get(APP_STATE_KEY_INSTALL_PATH)?
@@ -5772,7 +5774,9 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     // installer. Taken here, in the `#[command]`, so a caller that already
     // holds the claim can use [`abort_merge_or_rebase_unclaimed`] instead of
     // deadlocking against itself.
-    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+        crate::commands::single_flight::OrchestratorClaim::Continue,
+    )?;
     abort_merge_or_rebase_unclaimed(&PathBuf::from(&path)).await
 }
 
@@ -6880,7 +6884,9 @@ pub async fn keep_local_and_continue_update<R: Runtime>(
     // six, and found by making the wiring gate closed-world: this command
     // runs `git checkout --ours` over every conflicted path and commits, then
     // runs the whole resume tail. That is clone-writing work by any reading.
-    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+        crate::commands::single_flight::OrchestratorClaim::Continue,
+    )?;
     resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::KeepLocal, flight).await
 }
 
@@ -6899,7 +6905,9 @@ pub async fn accept_upstream_and_continue_update<R: Runtime>(
     crate::commands::update_run::require_gui_path_is_resolved_root(app.try_state::<crate::db::Db>().as_deref(), &path)?; // F-W3-14
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3 — the sibling button, same
     // claim. See `keep_local_and_continue_update`.
-    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+        crate::commands::single_flight::OrchestratorClaim::Continue,
+    )?;
     resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::AcceptUpstream, flight)
         .await
 }
@@ -7028,7 +7036,9 @@ pub(crate) async fn claim_then_resolve_collision_files(
     String,
 > {
     // BEFORE the fetch and before any delete.
-    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+        crate::commands::single_flight::OrchestratorClaim::Continue,
+    )?;
 
     // Resolve the branch (for the incoming-blob comparison) and the upstream tip.
     let branch = resolve_pull_branch(install_path).await;
@@ -7359,7 +7369,9 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
     // DOWN to that resume so one claim spans the resolution and the update it
     // unblocks; re-taking it there would refuse against this one, and taking
     // it only there would leave the stash drop (irreversible) unguarded.
-    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
+    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+        crate::commands::single_flight::OrchestratorClaim::Continue,
+    )?;
 
     let install_path = PathBuf::from(&path);
     if !install_path.join(".git").exists() {
@@ -15338,7 +15350,9 @@ MemAvailable:   23456789 kB
             assert!(merge_head.exists(), "fixture must leave a merge in progress");
 
             // ACT: another surface is mid-update.
-            let held = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
+            let held = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                crate::commands::single_flight::OrchestratorClaim::Start,
+            )
                 .expect("the simulated in-flight update takes the claim");
 
             let refused = abort_orchestrator_merge_or_rebase(local.to_str().unwrap().to_string())
@@ -15365,6 +15379,53 @@ MemAvailable:   23456789 kB
             );
         }
 
+        /// v0.2.107 U-2: a code-graph / KG job queued or running never blocks
+        /// the Abort of a halted update (nor the collision resolve that
+        /// continues one) — before, both answered "Update refused … Wait
+        /// until they finish" for as long as the jobs ran, and a restart
+        /// re-queued them. A START is still refused in the same state.
+        #[tokio::test]
+        async fn index_work_never_blocks_abort_or_collision_resolve_of_a_halted_update() {
+            skip_if_no_git!();
+            let _serial = crate::commands::single_flight::ORCHESTRATOR_CLAIM_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let job = crate::commands::embed_admission::enter_index_job().await;
+            assert!(
+                crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                    crate::commands::single_flight::OrchestratorClaim::Start,
+                )
+                .is_err(),
+                "fixture premise: a live index job refuses a new update"
+            );
+
+            let (_tmp_a, _remote_a, stalled) = init_remote_and_clone();
+            let _pull = stall_merge_on_readme(&stalled);
+            let merge_head = stalled.join(".git").join("MERGE_HEAD");
+            assert!(merge_head.exists(), "fixture must leave a merge in progress");
+            abort_orchestrator_merge_or_rebase(stalled.to_str().unwrap().to_string())
+                .await
+                .expect("Abort must never be refused because index work runs");
+            assert!(!merge_head.exists(), "the abort ran");
+
+            // A separate clone: the stalled one's seed is behind its remote.
+            let (tmp, _remote, local) = init_remote_and_clone();
+            let seed = tmp.path().join("seed");
+            let body = "shipped = 1\n";
+            push_upstream_added_file(&seed, &local, "vco_lib/u2.py", body);
+            let f = local.join("vco_lib/u2.py");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+            let backup = local.join(".claude/state/backups-u2");
+            let (flight, _branch, results) =
+                claim_then_resolve_collision_files(&local, &["vco_lib/u2.py".to_string()], &backup)
+                    .await
+                    .expect("continuing a halted update must never be refused for index work");
+            assert_eq!(results.len(), 1);
+            drop(flight);
+            drop(job);
+        }
+
         /// THE re-entrancy property the pipeline's `ResetHard`
         /// (`update_run::reset_hard_git_op`) depends on.
         ///
@@ -15384,7 +15445,9 @@ MemAvailable:   23456789 kB
             let _pull = stall_merge_on_readme(&local);
 
             // Exactly the `ResetHard` git operation's position: claim in hand.
-            let _held = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
+            let _held = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                crate::commands::single_flight::OrchestratorClaim::Start,
+            )
                 .expect("the caller takes the claim first, as the pipeline does");
 
             abort_merge_or_rebase_unclaimed(&local)
@@ -17043,14 +17106,18 @@ severity_max: critical\n\
             // retry run without a window. A guard that released early would let
             // this second claim succeed.
             assert!(
-                crate::commands::single_flight::begin_orchestrator_update_or_refuse().is_err(),
+                crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                crate::commands::single_flight::OrchestratorClaim::Start,
+            ).is_err(),
                 "the returned guard must still HOLD the claim: releasing it here \
                  reopens the window exactly where the tree is least consistent \
                  — files removed, pull not yet started",
             );
             drop(flight);
             // …and it is not a latch: the next resolve/update can run.
-            let after = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
+            let after = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                crate::commands::single_flight::OrchestratorClaim::Start,
+            )
                 .expect("dropping the guard must free the claim");
             drop(after);
         }
@@ -17077,7 +17144,9 @@ severity_max: critical\n\
             std::fs::write(&f, body).unwrap();
 
             // Another surface is mid-update on this same clone.
-            let held = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
+            let held = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                crate::commands::single_flight::OrchestratorClaim::Start,
+            )
                 .expect("fixture: take the claim first");
 
             let backup = local.join(".claude/state/backups-test");

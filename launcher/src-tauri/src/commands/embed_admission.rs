@@ -372,10 +372,13 @@ pub async fn acquire_update_all_admission(db: &Db) -> AdmissionPermit {
 // failure became a deferral and a retry driver.
 //
 // One process-wide state, ONE mutex, three participants:
-//   * the orchestrator update (`single_flight::begin_orchestrator_update_or_refuse`,
-//     the ONE entry point every update surface uses) REFUSES while "Update all"
-//     runs or any index job is queued or running — nothing is changed yet, and
-//     the message names what runs;
+//   * STARTING an orchestrator update (`single_flight::begin_orchestrator_update_or_refuse`
+//     with `OrchestratorClaim::Start`, the ONE entry point every update surface
+//     uses) REFUSES while "Update all" runs or any index job is queued or
+//     running — nothing is changed yet, and the message names what runs. A
+//     CONTINUE (resume, conflict resolvers, abort, apply-only — v0.2.107 U-2)
+//     is never refused for index work: it takes the flag as it stands, new
+//     jobs wait and running ones continue (the v0.2.106 coexistence);
 //   * "Update all" (`update_all_projects`) REFUSES while an orchestrator update
 //     runs;
 //   * an index job (every holder of an admission permit: `run_build_task`,
@@ -444,9 +447,10 @@ pub(crate) fn exclusion_refusal_message(r: &ExclusionRefusal) -> String {
             }
             format!(
                 "Update refused before anything was changed: {}. The orchestrator \
-                 update stops the hub and may restart services under them. Wait \
-                 until they finish (the project pages show their progress), then \
-                 start the update again.",
+                 update stops the hub and may restart services under them, so it \
+                 can start when they finish (the project pages show their \
+                 progress). Quitting the launcher does not clear this: queued \
+                 jobs resume when it starts again.",
                 what.join(" and ")
             )
         }
@@ -501,10 +505,18 @@ impl Drop for IndexJobExclusion {
     }
 }
 
-/// Claim the orchestrator-update side, or refuse with the message.
-pub(crate) fn begin_orchestrator_update_exclusion() -> Result<OrchestratorUpdateExclusion, String> {
+/// Claim the orchestrator-update side. `starts_update` (v0.2.107 U-2):
+/// `true` for a surface that STARTS an update — refused with the message
+/// while index work runs; `false` for one that continues, resumes, aborts or
+/// re-applies an update already under way — never refused here (the key in
+/// `single_flight` still refuses a second concurrent holder).
+pub(crate) fn begin_orchestrator_update_exclusion(
+    starts_update: bool,
+) -> Result<OrchestratorUpdateExclusion, String> {
     with_exclusion(|s| {
-        orchestrator_update_admissible(s).map_err(|r| exclusion_refusal_message(&r))?;
+        if starts_update {
+            orchestrator_update_admissible(s).map_err(|r| exclusion_refusal_message(&r))?;
+        }
         s.orchestrator_update = true;
         Ok(OrchestratorUpdateExclusion(()))
     })
@@ -552,6 +564,8 @@ mod v02107_exclusion_tests {
         let r = orchestrator_update_admissible(&busy).unwrap_err();
         let msg = exclusion_refusal_message(&r);
         assert!(msg.contains("3 code-graph") && msg.contains("before anything was changed"), "{msg}");
+        assert!(msg.contains("can start when they finish"), "{msg}");
+        assert!(msg.contains("Quitting the launcher does not clear this"), "{msg}");
         let all = ExclusionState { update_all: true, ..Default::default() };
         assert!(exclusion_refusal_message(&orchestrator_update_admissible(&all).unwrap_err())
             .contains("Update all"));
@@ -578,9 +592,12 @@ mod v02107_exclusion_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let job = enter_index_job().await;
-        assert!(begin_orchestrator_update_exclusion().is_err(), "a live job blocks the update");
+        assert!(begin_orchestrator_update_exclusion(true).is_err(), "a live job blocks a start");
+        let cont = begin_orchestrator_update_exclusion(false)
+            .expect("a continuing update is never refused for index work");
+        drop(cont);
         drop(job);
-        let upd = begin_orchestrator_update_exclusion().expect("free once the job ends");
+        let upd = begin_orchestrator_update_exclusion(true).expect("free once the job ends");
         assert!(begin_update_all_exclusion().is_err(), "update-all refused during an update");
         let waiting = tokio::spawn(enter_index_job());
         tokio::time::sleep(Duration::from_millis(50)).await;
