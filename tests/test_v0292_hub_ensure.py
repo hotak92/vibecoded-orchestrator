@@ -45,6 +45,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -223,10 +224,18 @@ def test_real_spawn_invokes_start_if_not_running(
     """The spawn's argv is the documented CLI, and it is detached by default."""
     seen: dict = {}
 
+    reaped = threading.Event()
+
     class FakePopen:
+        pid = 4242
+
         def __init__(self, argv, **kwargs):  # type: ignore[no-untyped-def]
             seen["argv"] = argv
             seen["kwargs"] = kwargs
+
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            reaped.set()
+            return 0
 
     monkeypatch.setattr(subprocess, "Popen", FakePopen)
     exe = _write_hub(tmp_path)
@@ -234,6 +243,10 @@ def test_real_spawn_invokes_start_if_not_running(
     res = hub_ensure._spawn(exe, wait=False)
 
     assert res.state is EnsureState.STARTED
+    # The detached starter is reaped from a daemon thread (no zombie in a
+    # long-lived caller) and its pid is recorded.
+    assert reaped.wait(timeout=5)
+    assert hub_ensure._LAST_DETACHED_STARTER_PID == 4242
     assert seen["argv"] == [str(exe), "--start-if-not-running"]
     if sys.platform != "win32":
         assert seen["kwargs"]["start_new_session"] is True
