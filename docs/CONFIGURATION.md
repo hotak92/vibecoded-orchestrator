@@ -563,6 +563,10 @@ Before VCO re-creates a Weaviate container that would move its data from Weaviat
 |---|---|---|
 | `VCT_WEAVIATE_SNAPSHOT_TIMEOUT_S` | `1800` | Seconds the one-off old-version run may take to start and snapshot. Raise it for a very large data folder on a slow disk; on timeout the move is refused and the old container started again. |
 | `VCT_WEAVIATE_UPGRADE_SNAPSHOT_CONFIRMED` | unset | Set to `1` for ONE run only when VCO cannot tell which Weaviate version wrote the data (a stopped container with no version in its image tag, or data with no container) and you have taken the snapshot yourself (`python -m vco_lib.weaviate_raft_guard snapshot --container <name>`) or the data was already served by Weaviate 1.29 or newer. Never consulted when VCO can take the snapshot itself. |
+| `VCO_CONTAINER_UPGRADE` | `on` | What an update does with VCO's OWN Weaviate container when it runs another image than the one VCO pins. `on`: move it (count every class, raft snapshot, copy the data to a backup volume after a free-space check, recreate, verify, roll back on a mismatch). `off`: keep the old container exactly as it is — VCO supports only the pinned Weaviate, so this is a deliberate hold. `dry-run`: print the steps and change nothing. `python -m vco_lib.container_upgrade plan` prints the same line at any time. |
+| `VCO_CONTAINER_UPGRADE_READY_TIMEOUT_S` | `3600` | Seconds the recreated Weaviate may take to answer before the move counts as failed and is rolled back (a large data folder replays its logs at the first start). |
+| `VCO_WEAVIATE_FOREIGN_LIMIT` | `on` | `off` = never apply VCO's memory limit in place (`<runtime> update --memory`) to a Weaviate container VCO did not create. Such a container is never recreated either way; a container that already carries a limit of its own is always left alone. |
+| `VCT_ENGINE_MEMORY_GB` | unset | The container engine's memory in GiB, stated by hand (Docker Desktop / podman machine VM). Unset: VCO asks the engine (`<runtime> info`). Weaviate's limit is 40% of the smaller of host and engine memory. `0` = do not ask; size from the host alone. |
 
 ## MCP Servers
 

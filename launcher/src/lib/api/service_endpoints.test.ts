@@ -13,9 +13,14 @@ import {
   adoptActionFor,
   adoptNeedsKgConfirm,
   buildCandidateReport,
+  containerOf,
+  containerOwnership,
   CORE_SERVICES,
   describeDataMount,
+  formatMemoryLimit,
   modeBadge,
+  ownershipLine,
+  uncappedBanner,
   parseDataMount,
   pendingServices,
   rowUrl,
@@ -82,6 +87,84 @@ describe('the three modes render three badges', () => {
       'https://o.example',
     );
     expect(rowUrl(row('ollama', 'adopted_external', { host: '[::1]', port: 11434 }))).toBe('http://[::1]:11434');
+  });
+});
+
+describe('managed / foreign and the memory limit (v0.2.107)', () => {
+  const GIB = 1024 ** 3;
+  const managed = state('weaviate', row('weaviate', 'vco_managed', { container_name: 'vco_weaviate' }));
+  const foreign = state('weaviate', row('weaviate', 'adopted_container', { container_name: 'their_weaviate' }));
+  const report = (name: string, limit: number | null | undefined): DetectionReport => ({
+    schema: 1,
+    candidates: {
+      weaviate: [
+        { service: 'weaviate', url: 'http://localhost:9999', host: 'localhost', port: 9999, container: { name: 'other' } },
+        {
+          service: 'weaviate',
+          url: 'http://localhost:8081',
+          host: 'localhost',
+          port: 8081,
+          container: { name, memory_limit_bytes: limit },
+        },
+      ],
+    },
+  });
+
+  it('a row is managed, foreign, or neither', () => {
+    expect(containerOwnership(managed)).toBe('managed');
+    expect(containerOwnership(foreign)).toBe('foreign');
+    expect(containerOwnership(state('ollama', row('ollama', 'adopted_external')))).toBeNull();
+    expect(containerOwnership(state('ollama', null))).toBeNull();
+  });
+
+  it('finds the container the row names, not another candidate’s', () => {
+    expect(containerOf(report('vco_weaviate', 5), managed)?.memory_limit_bytes).toBe(5);
+    expect(containerOf(report('someone_else', 5), managed)).toBeNull();
+    expect(containerOf(null, managed)).toBeNull();
+    expect(containerOf({ error: 'no runtime' }, managed)).toBeNull();
+  });
+
+  it('shows the limit, and says so when there is none', () => {
+    expect(ownershipLine(managed, { name: 'vco_weaviate', memory_limit_bytes: 24 * GIB })).toMatchObject({
+      text: 'managed · memory limit 24.0 GiB',
+      tone: 'ok',
+    });
+    expect(ownershipLine(foreign, { name: 'their_weaviate', memory_limit_bytes: 0 })).toMatchObject({
+      text: 'foreign · no memory limit',
+      tone: 'warn',
+    });
+    expect(formatMemoryLimit(2816 * 1024 ** 2)).toBe('2.8 GiB');
+    expect(formatMemoryLimit(512 * 1024 ** 2)).toBe('512 MiB');
+  });
+
+  it('a limit that was not read is never shown as "no limit"', () => {
+    expect(ownershipLine(managed, null)?.text).toBe('managed');
+    expect(ownershipLine(managed, { name: 'vco_weaviate', memory_limit_bytes: null })?.text).toBe('managed');
+    expect(ownershipLine(managed, { name: 'vco_weaviate' })?.text).toBe('managed');
+  });
+
+  it('only Weaviate carries a limit line; a URL endpoint has no ownership line', () => {
+    const ollama = state('ollama', row('ollama', 'vco_managed', { container_name: 'vco_ollama' }));
+    expect(ownershipLine(ollama, { name: 'vco_ollama', memory_limit_bytes: 0 })?.text).toBe('managed');
+    expect(ownershipLine(state('weaviate', row('weaviate', 'adopted_external')), null)).toBeNull();
+  });
+
+  it('the banner appears only for an uncapped Weaviate container and says what VCO does', () => {
+    const snap = (s: ServiceRuntimeState) => ({
+      services: [s],
+      runtime: 'podman',
+      needs_podman_machine_start: false,
+      endpoints_missing: false,
+    });
+    expect(uncappedBanner(snap(managed), report('vco_weaviate', 0))).toContain('next orchestrator update recreates it');
+    const text = uncappedBanner(snap(foreign), report('their_weaviate', 0));
+    expect(text).toContain('never recreated');
+    expect(text).toContain('VCO_WEAVIATE_FOREIGN_LIMIT=off');
+    // leave-alone: capped, unread, no report, no snapshot.
+    expect(uncappedBanner(snap(managed), report('vco_weaviate', 6 * GIB))).toBeNull();
+    expect(uncappedBanner(snap(managed), report('vco_weaviate', null))).toBeNull();
+    expect(uncappedBanner(snap(managed), null)).toBeNull();
+    expect(uncappedBanner(null, report('vco_weaviate', 0))).toBeNull();
   });
 });
 

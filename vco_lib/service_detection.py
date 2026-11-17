@@ -244,10 +244,18 @@ class ContainerInfo:
     host_ports: Mapping[int, int] = field(default_factory=dict)
     mounts: tuple[Mount, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
+    #: ``HostConfig.Memory`` in bytes (0 = no limit); ``None`` = not reported.
+    memory_limit: Optional[int] = None
 
     @property
     def running(self) -> bool:
         return self.state.lower() == "running"
+
+    @property
+    def compose_working_dir(self) -> str:
+        """The directory the compose run that created it worked in (its
+        label), or ``""`` when the container carries none."""
+        return (self.labels.get(_containers.COMPOSE_WORKING_DIR_LABEL, "") or "").strip()
 
     @property
     def compose_project(self) -> str:
@@ -269,6 +277,8 @@ class ContainerInfo:
             "compose_project": self.compose_project or None,
             "host_ports": {str(k): v for k, v in sorted(self.host_ports.items())},
             "mounts": [m.to_row() for m in self.mounts],
+            # v0.2.107: the Services page shows the limit (0 = none).
+            "memory_limit_bytes": self.memory_limit,
         }
 
 
@@ -313,8 +323,12 @@ def parse_inspect(obj: Mapping[str, Any]) -> Optional[ContainerInfo]:
         if isinstance(item, str) and "=" in item:
             k, _, v = item.partition("=")
             env[k] = v
+    memory = host_config.get("Memory") if isinstance(host_config, Mapping) else None
+    memory_limit = max(0, memory) if isinstance(memory, int) and not isinstance(memory, bool) \
+        else None
     return ContainerInfo(name=name, image=image, state=str(status), labels=labels,
-                         host_ports=host_ports, mounts=mounts, env=env)
+                         host_ports=host_ports, mounts=mounts, env=env,
+                         memory_limit=memory_limit)
 
 
 def list_containers(runtime: Optional[str], *, run: Optional[RunFn] = None,
@@ -398,6 +412,38 @@ def container_ownership(c: ContainerInfo, service: str, installer_project: str) 
     if any(f"/{d}/" in f"{home}/" or home.endswith(f"/{d}") for d in _LEGACY_VCO_COMPOSE_DIRS):
         return "legacy_vco"
     return "third_party"
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """Two directory paths naming one directory (symlinks, case and
+    separators resolved the way the OS does)."""
+    import os  # noqa: PLC0415
+
+    if not a or not b:
+        return False
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except (OSError, ValueError):
+        return False
+
+
+def is_own_compose_container(c: ContainerInfo, service: str, installer_project: str,
+                             infra_dir: Any) -> bool:
+    """Did THIS install's compose create *c*? All of: its compose project is
+    the installer's, its compose working directory is this install's
+    ``infrastructure/`` (a second VCO clone on the machine shares the project
+    name ``infrastructure`` — the directory tells them apart), and it runs
+    under the name VCO's compose gives the service. A container without the
+    working-directory label is not provably this install's: ``False``.
+
+    The data mount is the third leg of "VCO's own" and is compared by the
+    caller (:func:`vco_lib.service_reconcile.reclassify_own`), which knows
+    what the installer's compose mounts."""
+    if not installer_project or c.compose_project != installer_project:
+        return False
+    if c.name != _containers.canonical_name(service):
+        return False
+    return _same_dir(c.compose_working_dir, str(infra_dir) if infra_dir else "")
 
 
 # ─── HTTP fingerprints ──────────────────────────────────────────────────

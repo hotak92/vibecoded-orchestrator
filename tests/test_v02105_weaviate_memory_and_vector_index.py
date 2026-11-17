@@ -31,6 +31,17 @@ CI_SMOKE = REPO / ".github" / "workflows" / "installer-smoke.yml"
 CAP = wvi.policy().cache_max_objects
 
 
+@pytest.fixture(autouse=True)
+def _no_engine_probe(monkeypatch):
+    """v0.2.107: the limit is sized from min(host, container-engine memory)
+    and the engine is asked by default. These tests state a HOST figure and
+    pin the value it gives, so the engine is "not readable" here (a CI runner
+    whose docker has less memory than the stated host would change them);
+    tests/test_v02107_container_upgrade.py covers the engine leg."""
+    monkeypatch.setattr(weaviate_memory, "_probed_engine_memory_gb", lambda: None)
+
+
+
 # ── memory limit formula ───────────────────────────────────────────────────
 
 @pytest.mark.parametrize("ram_gb, want", [
