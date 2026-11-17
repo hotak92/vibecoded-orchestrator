@@ -877,6 +877,26 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["dry_run"])
         self.assertIsNone(payload["backup"])
 
+    def test_the_summary_counts_stripped_thinking_blocks(self) -> None:
+        """A pass that only strips vendor ``thinking`` blocks used to print
+        "entries touched: 1" over three zero counts — the one edit it made
+        had no line. Both output shapes must name it."""
+        path = self.root / "s.jsonl"
+        path.write_text(
+            json.dumps(_entry(
+                "assistant",
+                [{"type": "thinking", "thinking": "t", "signature": "vct_"}],
+                "a1",
+            )) + "\n",
+            encoding="utf-8",
+        )
+        out = StringIO()
+        ft.run(path, dry_run=True, out=out)
+        self.assertIn("thinking stripped  : 1", out.getvalue())
+        out = StringIO()
+        ft.run(path, dry_run=True, as_json=True, out=out)
+        self.assertEqual(json.loads(out.getvalue())["thinking_stripped"], 1)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

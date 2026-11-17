@@ -47,6 +47,7 @@ def _as_json(result: FileRepairResult) -> str:
             "ids_rewritten": result.stats.ids_rewritten,
             "blocks_stripped": result.stats.blocks_stripped,
             "results_stripped": result.stats.results_stripped,
+            "thinking_stripped": result.stats.thinking_blocks_stripped,
             "stripped_names": sorted(result.stats.stripped_names),
             "unparseable_lines": result.unparseable_lines,
             "backup": str(result.backup_path) if result.backup_path else None,

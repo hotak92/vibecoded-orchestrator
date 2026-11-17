@@ -1044,6 +1044,7 @@ class FileRepairResult:
             f"  ids rewritten      : {self.stats.ids_rewritten}",
             f"  blocks stripped    : {self.stats.blocks_stripped}",
             f"  results stripped   : {self.stats.results_stripped}",
+            f"  thinking stripped  : {self.stats.thinking_blocks_stripped}",
         ]
         if self.stats.stripped_names:
             lines.append(
