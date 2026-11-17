@@ -8,8 +8,9 @@
 // DORMANT in v0.2.60.
 // ============================================================================
 // This stub is COMPILED + unit-tested but is NOT wired as the update
-// entrypoint. The LIVE update path in v0.2.60 is the launcher's
-// `update_orchestrator` (installer.rs) — unchanged (Pieces 1-5). The stub is
+// entrypoint. The LIVE update path is the launcher's one pipeline,
+// `update_run::run_update` (`commands/update_run.rs`; until v0.2.100 it was
+// the `update_orchestrator` command in installer.rs). The stub is
 // the v0.3.0 inverted entrypoint: it does the LEAST POSSIBLE work, then hands
 // off to the (separate-process) engine which owns pull/install/migrate/swap.
 //
@@ -49,7 +50,7 @@
 // the verify+plan+spawn-decision core so it can be unit-tested dormant.
 
 // DORMANT in v0.2.60: the stub is not wired as the update entrypoint
-// (update_orchestrator stays live). dead_code is intentional until v0.3.0.
+// (`update_run::run_update` stays live). dead_code is intentional until v0.3.0.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

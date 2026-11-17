@@ -14,7 +14,7 @@ license = "AGPL-3.0"
 # ----------
 # Windows mandatory file locking prevents the running `vct-launcher.exe`
 # (and `vct-hub.exe`) from being overwritten during `git pull`. The
-# pre-pull rename pattern in `installer.rs::pre_pull_rename_running_binary`
+# pre-pull rename pattern in `services/binary_freshness.rs::pre_pull_rename_running_binary`
 # helps for the LAUNCHER itself, but the dist binary at
 # `launcher/dist/windows-x64/vct-launcher.exe` is still the .metadata.json's
 # advertised version. When the running launcher (v0.2.50) sees v0.2.51 in

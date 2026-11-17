@@ -3,8 +3,8 @@
 // See `Cargo.toml` for the design rationale. TL;DR: this binary exists
 // to perform the Windows binary swap during orchestrator update, after
 // the running launcher has exited and released its mandatory file
-// locks. On POSIX systems the swap pattern in `installer.rs` already
-// works (advisory locks); this binary is a no-op there.
+// locks. On POSIX systems `git pull` overwrites the running binary in
+// place (advisory locks; see `swap.rs`); this binary is a no-op there.
 //
 // Invocation contract
 // -------------------
@@ -36,7 +36,8 @@
 // Soft-fail throughout: every step writes its outcome to
 // `<vct_root>/update.log` (next to the lock file) for forensic recovery.
 // On any unrecoverable error, exit non-zero — the new launcher's
-// boot-time recovery (see `lib.rs::poll_update_lock_on_boot`) will
+// boot-time recovery (`commands/update_handoff.rs::poll_update_lock_on_boot`,
+// called from the launcher's `setup` in lib.rs) will
 // surface a toast.
 
 use std::env;
