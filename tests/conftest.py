@@ -48,6 +48,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import shutil
 import sys
 import tempfile
 import warnings
@@ -965,6 +966,18 @@ def child_env() -> dict:
     from tests.common.child_env import child_env as _child_env
 
     return _child_env()
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_endpoint_down_marker():
+    """v0.2.107 (A-063): the hook router skips every leg for 30 s after any
+    client on the machine found Weaviate unreachable — a marker under
+    ``$VCT_STATE_DIR/hook_endpoint_down/``. Every test shares the redirected
+    state dir and the unroutable ``WEAVIATE_URL`` sentinel, so one test's
+    refused connection would silence the router in the tests after it. Each
+    test starts without a marker; a test that wants one writes it."""
+    shutil.rmtree(_VCO_STATE_REDIRECT / "hook_endpoint_down", ignore_errors=True)
+    yield
 
 
 @pytest.fixture(autouse=True)

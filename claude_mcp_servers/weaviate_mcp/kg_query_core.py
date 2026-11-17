@@ -1703,7 +1703,8 @@ def _fetch_adjacent_chunks(coll, title: str, hit_num: int, total: int,
     return neighbours
 
 
-def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str) -> list[dict]:
+def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str,
+                                 *, min_score: float | None = None) -> list[dict]:
     """
     For each chunked result in *results*, fetch adjacent chunks (N-1, N+1)
     and merge them into the list, de-duplicated by the per-NODE chunk
@@ -1725,6 +1726,9 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
         coll: Weaviate collection handle
         results: List of formatted result dicts (from _format_obj)
         collection_name: Collection name for formatting
+        min_score: Optional hook-only override. MCP callers omit it and keep
+            the established single_chunk floor; hook injection passes its
+            profile's full-render (strong) threshold.
 
     Returns:
         Combined list: original results + neighbour chunks, deduplicated.
@@ -1741,8 +1745,11 @@ def _enrich_with_adjacent_chunks(coll, results: list[dict], collection_name: str
     # KG-2: the gate below which neighbour-fetch is pure waste. Use the KG
     # gate's single_chunk threshold as the conservative floor (three_chunks
     # is the first tier that renders neighbours; single_chunk gives a
-    # one-tier rerank margin).
-    _neighbour_floor = _TIER_THRESHOLDS["single_chunk"]
+    # one-tier rerank margin). That is the MCP path, unchanged. v0.2.107
+    # (A-036): a hook profile passes its full-render (strong) threshold, so a
+    # hit rendered as a title costs no neighbour read.
+    _neighbour_floor = (_TIER_THRESHOLDS["single_chunk"] if min_score is None
+                        else float(min_score))
 
     def _score_of(r: dict) -> float | None:
         # score_cosine (1.0 - distance) is what results carry at enrich time

@@ -532,6 +532,12 @@ class TestW3R10RouterSuppressesStagedCitations:
         sid = "sess-w3r10"
 
         _router_run(proj, "pa", stub, sid)  # seen-store now knows the block
+        # v0.2.107 (A-008): the router's query cache is no longer keyed on
+        # prompt_id, so run B would be served run A's cached block without
+        # running its legs. Drop the cache (as its TTL would) so run B's
+        # producer runs and stages — the premise this test is about.
+        for entry in (proj / ".claude" / "state" / "query_cache").iterdir():
+            entry.unlink()
         out_b = _router_run(proj, "pb", stub, sid,
                             extra_env={"VCO_STUB_WRITE_SIBLING": "1"})
         assert "KG: Stub Node" not in out_b, "run B's own block is suppressed"

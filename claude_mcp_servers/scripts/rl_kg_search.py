@@ -449,7 +449,13 @@ async def main():
                                 r["emb"] = node_emb
                         except Exception:
                             pass
-                coll_formatted = _enrich_with_adjacent_chunks(coll, coll_formatted, coll_name)
+                if gate is not None:
+                    coll_formatted = _enrich_with_adjacent_chunks(
+                        coll, coll_formatted, coll_name,
+                        min_score=gate.strong_threshold)
+                else:
+                    coll_formatted = _enrich_with_adjacent_chunks(
+                        coll, coll_formatted, coll_name)
                 out.extend(coll_formatted)
             return out
 

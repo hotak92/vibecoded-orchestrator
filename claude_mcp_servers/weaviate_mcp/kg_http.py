@@ -41,6 +41,11 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
+# v0.2.107 (A-063): the machine-wide "endpoint down" marker this client sets
+# on a refused/unreachable connection and clears on a ready probe; its one
+# home is vco_lib.endpoint_down (the hook router checks it there).
+from vco_lib.endpoint_down import clear_endpoint_down, mark_endpoint_down
+
 
 class WeaviateUnreachable(Exception):
     """Raised when Weaviate is not reachable (HTTP refused / gRPC down).
@@ -469,15 +474,18 @@ class HttpWeaviateClient:
                                         timeout=init_timeout) as resp:
                 status = resp.status
         except (urllib.error.URLError, OSError, ValueError) as exc:
+            mark_endpoint_down(self.base_url)
             raise WeaviateUnreachable(
                 f"Connection to Weaviate failed. Details: {exc}",
                 f"Is Weaviate running and reachable at {self.base_url}?",
             ) from exc
         if status != 200:
+            mark_endpoint_down(self.base_url)
             raise WeaviateUnreachable(
                 f"Weaviate at {self.base_url} is not ready (HTTP {status})",
                 f"Weaviate at {self.base_url} answered but is not ready yet; retry shortly.",
             )
+        clear_endpoint_down(self.base_url)
 
     def _request(self, path: str, body: "Optional[dict]" = None) -> dict:
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -491,6 +499,14 @@ class HttpWeaviateClient:
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as exc:
             raise WeaviateHttpQueryError(f"HTTP {exc.code} on {path}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            # A refused/unreachable connection marks the endpoint down for
+            # every hook (A-063); a slow query (timeout) does not — the
+            # server is up. The original exception propagates unchanged.
+            reason = getattr(exc, "reason", exc)
+            if not isinstance(reason, TimeoutError):
+                mark_endpoint_down(self.base_url)
+            raise
 
     def _get_json(self, path: str) -> dict:
         return self._request(path)

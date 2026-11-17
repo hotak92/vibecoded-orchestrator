@@ -163,7 +163,7 @@ class _ThreadRoutedStdout:
         return getattr(self._fallback, "errors", None)
 
 
-def _run_leg(proxy: _ThreadRoutedStdout, fn) -> str:
+def _run_leg(proxy: _ThreadRoutedStdout, fn, status_out=None, name: str = "") -> str:
     """Run ``fn()`` in the CURRENT thread with its stdout captured; return it.
 
     Soft-fail per leg: any exception (including ``SystemExit`` — the code-graph
@@ -171,15 +171,24 @@ def _run_leg(proxy: _ThreadRoutedStdout, fn) -> str:
     returns whatever was printed before the failure, never propagates. stderr is
     left alone: the shell caller already redirects it to /dev/null, and silently
     swallowing it here would hide diagnostics from a manual run.
+
+    ``status_out`` records ``finished`` versus ``error`` for the router's cache:
+    only a finished leg may be remembered as an answered-empty retrieval.
     """
     buf = io.StringIO()
     proxy.register(buf)
     try:
         fn()
     except SystemExit:
-        pass
+        if status_out is not None:
+            status_out[name] = "error"
     except BaseException as exc:  # noqa: BLE001 — a leg must never kill the hook
+        if status_out is not None:
+            status_out[name] = "error"
         print(f"[hook_dual_search] leg failed: {exc!r}", file=sys.stderr)
+    else:
+        if status_out is not None:
+            status_out[name] = "finished"
     return buf.getvalue()
 
 
@@ -258,6 +267,14 @@ def legs_abandoned() -> bool:
     return _LEGS_ABANDONED
 
 
+class LegResults(dict):
+    """Captured leg stdout plus its completion state (mapping API unchanged)."""
+
+    def __init__(self, values, *, status):
+        super().__init__(values)
+        self.status = status
+
+
 def run_legs(
     legs: "Dict[str, Callable[[], None]]",
     leg_timeout_s: "float | None" = None,
@@ -284,9 +301,10 @@ def run_legs(
     real_stdout = sys.stdout
     proxy = _ThreadRoutedStdout(real_stdout)
     results: "dict[str, str]" = {name: "" for name in legs}
+    status: "dict[str, str]" = {name: "pending" for name in legs}
 
     def _worker(name: str, fn) -> None:
-        results[name] = _run_leg(proxy, fn)
+        results[name] = _run_leg(proxy, fn, status, name)
 
     threads = [
         threading.Thread(target=_worker, args=(name, fn), name=f"vco-{name}", daemon=True)
@@ -309,6 +327,11 @@ def run_legs(
                 t.join(max(0.0, remaining))
     finally:
         abandoned = [t for t in threads if t.is_alive()]
+        for t in abandoned:
+            # A leg that missed the join is never an answered-empty result.
+            for name, candidate in zip(legs, threads):
+                if candidate is t:
+                    status[name] = "timed_out"
         if abandoned:
             _LEGS_ABANDONED = True
             # SF-1 fence: keep a guarded stream installed so late writes from
@@ -317,7 +340,7 @@ def run_legs(
             sys.stdout = _PostLegStdout(real_stdout, abandoned)
         else:
             sys.stdout = real_stdout
-    return results
+    return LegResults(results, status=status)
 
 
 def _load_cg_module(cg_script: Path):
