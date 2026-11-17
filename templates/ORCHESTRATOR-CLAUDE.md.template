@@ -724,7 +724,7 @@ Run these once to confirm the install landed correctly:
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓ Connected, search ✓ Connected (Ollama runs as infrastructure, not as an MCP)
+# Expected: weaviate-kg ✓ Connected, playwright ✓ Connected (Ollama runs as infrastructure, not as an MCP)
 
 curl -s {{WEAVIATE_URL}}/v1/.well-known/ready    # Weaviate ready
 curl -s {{OLLAMA_URL}}/api/tags               # Ollama models
