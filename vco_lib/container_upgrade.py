@@ -272,6 +272,22 @@ def previous_failure(service: str, move: ImageMove, path: Optional[Path] = None)
     return None
 
 
+def write_image_override(image: str) -> Path:
+    """The one-line compose file naming the image that ran on the data
+    before the move — appended LAST to the ``-f`` chain by the rollback, and
+    by ``hand-to-vco``'s take-over, which keeps the version the container
+    runs so that only the protected move changes it. Kept outside the
+    checkout, under the VCT state directory."""
+    from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
+
+    path = state_path().parent / "container-upgrade-rollback-weaviate.yml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, "# Written by vco_lib.container_upgrade: the image that ran on "
+                            "this data before the move.\n"
+                            f"services:\n  weaviate:\n    image: {json.dumps(image)}\n")
+    return path
+
+
 # ─── the engine ─────────────────────────────────────────────────────────
 
 
@@ -439,16 +455,7 @@ class ContainerEngine:
             + f" (cd {infra} && {shlex.join(argv)})"
 
     def write_image_override(self, image: str) -> Path:
-        """The one-line compose file the rollback appends (kept outside the
-        checkout, under the VCT state directory)."""
-        from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
-
-        path = state_path().parent / "container-upgrade-rollback-weaviate.yml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(path, "# Written by vco_lib.container_upgrade (rollback): the image "
-                                "that ran on this data before the move.\n"
-                                f"services:\n  weaviate:\n    image: {json.dumps(image)}\n")
-        return path
+        return write_image_override(image)
 
     # -- Weaviate over HTTP ---------------------------------------------
     def wait_ready(self, url: str, timeout_s: float) -> bool:
@@ -632,31 +639,8 @@ def protect_weaviate_move(
         return out
     mount_obj = container.mount_at(_DATA_DEST)
     mount = mount_obj.to_row() if mount_obj is not None else None
-    if move.direction == "downgrade":
-        out.status, out.reason = REFUSED, (
-            f"{name} runs {move.live}, NEWER than the {move.pinned} VCO pins; Weaviate does "
-            "not downgrade, so VCO leaves it as it is")
-        out.say(f"  [weaviate] {out.reason}.")
+    if held_back(out, name, move, mount, environ=environ, state_file=state_file):
         return out
-    mode = upgrade_mode(environ)
-    if mode == "dry-run":
-        out.status, out.reason = DRY_RUN, f"{MODE_ENV}=dry-run"
-        out.say(f"  [weaviate] {MODE_ENV}=dry-run — nothing is changed. It would do this:")
-        out.say(plan_line(name, move, mount))
-        return out
-    if mode == "off":
-        out.status, out.reason = OPTED_OUT, f"{MODE_ENV}=off"
-        out.say(f"  [weaviate] {MODE_ENV}=off — {name} stays on {move.live} "
-                f"(VCO supports {move.pinned}); nothing is recreated.")
-        return out
-
-    retry_cmd = f"{_CLI} retry --service weaviate\npython install.py --update"
-    earlier = previous_failure("weaviate", move, state_file)
-    if earlier is not None:
-        return _refuse(out, name, move, (
-            f"an earlier attempt failed ({earlier.get('reason') or 'no reason recorded'}) and a "
-            "failed move is not repeated by itself"),
-            "# Ask for another attempt:\n" + retry_cmd)
     if mount is None:
         return _refuse(out, name, move, f"{name} mounts nothing at {_DATA_DEST}",
                        "python install.py --update")
@@ -752,6 +736,43 @@ def protect_weaviate_move(
         say(f"  [weaviate] the failed attempt could not be recorded ({exc})")
     out.entries.append(_rolled_back_entry(name, move, problem, backup, restored, manual))
     return out
+
+
+def held_back(out: MoveOutcome, name: str, move: ImageMove, mount: Optional[Mapping[str, str]],
+              *, environ: Optional[Mapping[str, str]] = None,
+              state_file: Optional[Path] = None) -> bool:
+    """The decisions made before anything is asked of the engine: a
+    downgrade (Weaviate does not downgrade), ``VCO_CONTAINER_UPGRADE=dry-run``
+    / ``off``, and an earlier failed attempt (not repeated by itself). Fills
+    *out* and returns ``True`` when the move is held back. Also asked by
+    ``hand-to-vco`` BEFORE it takes a container over, so a hand-over never
+    leaves a container VCO's own on a version it then cannot move."""
+    if move.direction == "downgrade":
+        out.status, out.reason = REFUSED, (
+            f"{name} runs {move.live}, NEWER than the {move.pinned} VCO pins; Weaviate does "
+            "not downgrade, so VCO leaves it as it is")
+        out.say(f"  [weaviate] {out.reason}.")
+        return True
+    mode = upgrade_mode(environ)
+    if mode == "dry-run":
+        out.status, out.reason = DRY_RUN, f"{MODE_ENV}=dry-run"
+        out.say(f"  [weaviate] {MODE_ENV}=dry-run — nothing is changed. It would do this:")
+        out.say(plan_line(name, move, mount))
+        return True
+    if mode == "off":
+        out.status, out.reason = OPTED_OUT, f"{MODE_ENV}=off"
+        out.say(f"  [weaviate] {MODE_ENV}=off — {name} stays on {move.live} "
+                f"(VCO supports {move.pinned}); nothing is recreated.")
+        return True
+    earlier = previous_failure("weaviate", move, state_file)
+    if earlier is not None:
+        _refuse(out, name, move, (
+            f"an earlier attempt failed ({earlier.get('reason') or 'no reason recorded'}) and a "
+            "failed move is not repeated by itself"),
+            f"# Ask for another attempt:\n{_CLI} retry --service weaviate\n"
+            "python install.py --update")
+        return True
+    return False
 
 
 def _refuse(out: MoveOutcome, name: str, move: ImageMove, reason: str, command: str) -> MoveOutcome:

@@ -238,10 +238,14 @@ def test_hand_to_vco_never_takes_over_a_canonically_named_stale_container(tmp_pa
     assert se.load_rows(db)["weaviate"].container_name == "their_weaviate"
 
 
-def test_hand_to_vco_passes_the_rows_container_to_the_adoption(tmp_path):
+def test_hand_to_vco_passes_the_rows_container_to_the_adoption(tmp_path, monkeypatch):
     db = _seed(tmp_path, [se.EndpointRow("weaviate", "adopted_container", 8081, "migrated:legacy_compose",
                                          grpc_port=50052, container_name="vco_weaviate")])
     machine = _Formatted([dict(_VCO_WEAVIATE_STALE, state="running")])
+    # v0.2.107: a Weaviate hand-over first reads the image the container runs
+    # (a version change goes through the protected move; no compose here pins one).
+    monkeypatch.setattr(det, "list_containers_or_none", lambda *_a, **_kw: [det.ContainerInfo(
+        name="vco_weaviate", image=_VCO_WEAVIATE_STALE["image"], state="running")])
     spy = _AdoptSpy()
     rc, _lines = _hand(tmp_path, db, machine, spy)
     assert rc == 0

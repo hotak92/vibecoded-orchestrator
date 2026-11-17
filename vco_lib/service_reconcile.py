@@ -2605,6 +2605,8 @@ AdoptFn = Callable[..., Any]
 def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str] = None,
                 db_path: Optional[Path] = None, run: Optional[RunFn] = None,
                 adopt: Optional[AdoptFn] = None,
+                mover: Optional[Callable[..., Any]] = None,
+                environ: Optional[Mapping[str, str]] = None,
                 out: LogFn = _console_print) -> int:  # type: ignore[assignment]
     """``hand-to-vco --service S`` — the opt-in ownership transfer (owner
     ruling Q2): VCO's compose takes over THE container the row names (an
@@ -2615,7 +2617,18 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
     (:func:`vco_lib.service_adoption.adopt_services`). Refused, with nothing
     touched, when there is no such row, the row names no container, the
     container is gone, or it is not under the name VCO's compose creates
-    (:func:`can_hand_to_vco`)."""
+    (:func:`can_hand_to_vco`).
+
+    v0.2.107: a Weaviate on another version than the one VCO's compose pins
+    is handed over in TWO steps and never by a plain recreate across
+    versions: the take-over keeps the image it runs
+    (``adopt_services(hold_weaviate_image=…)``), then the version is changed
+    by THE protected move (:func:`vco_lib.container_upgrade.protect_weaviate_move`
+    — counts, copy, verify, rollback). The hand-over is the user's consent to
+    the move; a move that would be held back (a downgrade,
+    ``VCO_CONTAINER_UPGRADE=off|dry-run``, an earlier failed attempt) holds
+    the hand-over back too, before anything is touched. *mover* / *environ*
+    are test seams."""
     row = _se.load_rows(db_path).get(service)
     refusal = hand_to_vco_refusal(service, row)
     if refusal is not None and refusal != "not_canonical":
@@ -2635,9 +2648,15 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
             "second, differently named container on the same data, so VCO leaves it as it is. "
             "It stays yours: VCO starts and stops it by name.")
         return 1
+    move = None
+    if service == "weaviate":
+        move, held = _weaviate_hand_over_move(Path(orchestrator_root), rt, name, run, environ, out)
+        if held is not None:
+            return held
+    kwargs: dict[str, Any] = {"hold_weaviate_image": move.live} if move is not None else {}
     result = (adopt or _service_adoption.adopt_services)(
         Path(orchestrator_root), services=(service,), runtime=rt, db_path=db_path,
-        container_refs={service: name})
+        container_refs={service: name}, **kwargs)
     for line in result.lines:
         out(line)
     entries = getattr(result, "entries", None)
@@ -2648,7 +2667,74 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
         from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
 
         emit_entries(Path(orchestrator_root), entries)
-    return 0 if service in result.adopted else 1
+    if service not in result.adopted:
+        return 1
+    if move is None:
+        return 0
+    return _move_after_hand_over(Path(orchestrator_root), rt, name, db_path=db_path, run=run,
+                                 environ=environ, mover=mover, out=out)
+
+
+def _weaviate_hand_over_move(root: Path, runtime: str, name: str, run: Optional[RunFn],
+                             environ: Optional[Mapping[str, str]], out: LogFn
+                             ) -> tuple[Any, Optional[int]]:
+    """``(the version move a take-over of *name* entails or None, an exit
+    code when the hand-over is held back before anything is touched)``."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+    listed = _det.list_containers_or_none(runtime, run=run, names={name})
+    c = next((x for x in listed or [] if x.name == name), None)
+    if c is None:
+        out(f"weaviate: {name} could not be inspected — nothing handed over.")
+        return None, 1
+    move = _cu.image_move(c.image, _service_adoption.pinned_image("weaviate", root))
+    if move is None:
+        return None, None
+    mount = c.mount_at(DATA_MOUNT_TARGETS["weaviate"])
+    probe = _cu.MoveOutcome("weaviate", log=out)
+    if _cu.held_back(probe, name, move, mount.to_row() if mount is not None else None,
+                     environ=environ):
+        out(f"weaviate: {name} is not handed over — taking it over moves it from {move.live} "
+            f"to {move.pinned}, and that move is held back ({probe.reason}).")
+        return move, 0 if probe.status == _cu.DRY_RUN else 1
+    out(f"weaviate: {name} runs {move.live}; it is taken over on that version, then moved to "
+        f"{move.pinned} by the protected move (counts, a copy of the data, verify, rollback).")
+    return move, None
+
+
+def _move_after_hand_over(root: Path, runtime: str, name: str, *, db_path: Optional[Path],
+                          run: Optional[RunFn], environ: Optional[Mapping[str, str]],
+                          mover: Optional[Callable[..., Any]], out: LogFn) -> int:
+    """Step two of a Weaviate hand-over: THE protected move of the container
+    VCO now owns. The outcome's ledger rows are written; ``0`` only when it
+    now runs the pinned image."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+    row = _se.load_rows(db_path).get("weaviate")
+    engine = _cu.ContainerEngine(runtime, root, run=run, db_path=db_path, log=out)
+    container = engine.inspect(name)
+    if row is None or container is None:
+        out(f"weaviate: {name} is VCO's now, but it could not be read back, so it was not moved "
+            "— `python install.py --update` makes the move.")
+        return 1
+    if mover is not None:
+        outcome = mover(root=root, runtime=runtime, row=row, container=container,
+                        environ=environ)
+        for line in outcome.lines:
+            out(line)
+    else:
+        outcome = _cu.protect_weaviate_move(root=root, runtime=runtime, row=row,
+                                            container=container, engine=engine,
+                                            environ=environ, log=out)
+    if outcome.entries:
+        from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
+
+        emit_entries(root, list(outcome.entries))
+    if outcome.status in (_cu.MOVED, _cu.NOT_NEEDED):
+        return 0
+    out(f"weaviate: {name} is VCO's now and stays on its version ({outcome.reason}); "
+        "UPDATE_DEFERRED.md says what to do.")
+    return 1
 
 
 def cli(verb: str, args: argparse.Namespace) -> int:

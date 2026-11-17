@@ -1050,6 +1050,15 @@ def wv_world(tmp_path):
     return infra, db, data, live
 
 
+@pytest.fixture(autouse=True)
+def _snapshot_stub(monkeypatch):
+    """The raft snapshot (stop, one-off run, poll) is tests/test_v02106's
+    subject: here it is answered at once, so a recreate that is NOT refused
+    by the version gate goes on to its rm / compose (what the red run shows)."""
+    monkeypatch.setattr(rg, "snapshot_with_container_image",
+                        lambda *_a, **_kw: rg.UpgradeVerdict(rg.PREPARED, "snapshot (stub)"))
+
+
 def _composed(box):
     return [a for a in box.argv if "up" in a and a[-1] != "config"]
 
@@ -1125,13 +1134,109 @@ def test_the_launchers_volume_migration_check_refuses_a_version_change(wv_world)
 
 
 @pytest.mark.real_raft_guard
-def test_only_the_protected_move_passes_the_version_gate(wv_world, monkeypatch):
+def test_only_the_protected_move_passes_the_version_gate(wv_world):
     infra, db, data, live = wv_world
-    monkeypatch.setattr(rg, "snapshot_with_container_image",
-                        lambda *_a, **_kw: rg.UpgradeVerdict(rg.PREPARED, "snapshot taken"))
     box = Runtime(live_mount=live, image=OLD)
     box.compose_source = str(data)
     res = sl.up_services(["weaviate"], compose_dir=infra, compose_argv=["podman", "compose"],
                          runtime="podman", guard_only=True, protected_move=True, db_path=db,
                          run=box.run, out=lambda _l: None)
     assert res.cleared == ["weaviate"] and res.refused == []
+
+
+# ─── hand-to-vco: the take-over keeps the version; the protected move changes it
+
+
+class _HandWorld:
+    """A foreign Weaviate under VCO's container name, recorded as adopted."""
+
+    def __init__(self, tmp_path, monkeypatch, image=OLD):
+        self.root = tmp_path / "orch"
+        (self.root / "infrastructure").mkdir(parents=True)
+        (self.root / "infrastructure" / "docker-compose.yml").write_text(
+            f"services:\n  weaviate:\n    image: {PINNED}\n", encoding="utf-8")
+        self.db = make_launcher_db(tmp_path / "launcher.db")
+        se.write_rows([se.EndpointRow("weaviate", "adopted_container", 8081, "user_cli",
+                                      grpc_port=50052, container_name=NAME)], db_path=self.db)
+        self.image = image
+        self.adopt_calls: list[dict] = []
+        self.moves: list[dict] = []
+        self.move_status = cu.MOVED
+        self.lines: list[str] = []
+        monkeypatch.setattr(sr, "_container_exists", lambda *_a: True)
+        monkeypatch.setattr(det, "list_containers_or_none",
+                            lambda *_a, **_kw: [_container(image=self.image)])
+
+    def adopt(self, root, **kw):
+        self.adopt_calls.append(kw)
+        return sr._service_adoption.AdoptionResult(adopted=list(kw["services"]))
+
+    def mover(self, **kw):
+        self.moves.append(kw)
+        return cu.MoveOutcome("weaviate", status=self.move_status,
+                              lines=[f"  [weaviate] {self.move_status}"])
+
+    def hand(self, environ=None):
+        return sr.hand_to_vco("weaviate", orchestrator_root=self.root, runtime="podman",
+                              db_path=self.db, adopt=self.adopt, mover=self.mover,
+                              environ=environ if environ is not None else {},
+                              out=self.lines.append)
+
+
+def test_a_hand_over_across_versions_keeps_the_version_then_makes_the_protected_move(
+        tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch)
+    assert w.hand() == 0
+    assert len(w.adopt_calls) == 1 and w.adopt_calls[0]["hold_weaviate_image"] == OLD
+    assert len(w.moves) == 1 and w.moves[0]["container"].name == NAME   # then THE move
+
+
+def test_a_hand_over_whose_move_fails_reports_it(tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch)
+    w.move_status = cu.ROLLED_BACK
+    assert w.hand() == 1 and len(w.moves) == 1
+    assert any("stays on its version" in line for line in w.lines)
+
+
+def test_a_hand_over_on_the_pinned_version_is_a_plain_take_over(tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch, image=PINNED)
+    assert w.hand() == 0
+    assert "hold_weaviate_image" not in w.adopt_calls[0] and w.moves == []
+
+
+@pytest.mark.parametrize("image, environ, rc", [
+    ("cr.weaviate.io/semitechnologies/weaviate:1.40.0", {}, 1),  # Weaviate does not downgrade
+    (OLD, {cu.MODE_ENV: "off"}, 1),
+    (OLD, {cu.MODE_ENV: "dry-run"}, 0),
+])
+def test_a_held_back_move_holds_the_hand_over_back_before_anything_is_touched(
+        tmp_path, monkeypatch, image, environ, rc):
+    w = _HandWorld(tmp_path, monkeypatch, image=image)
+    assert w.hand(environ) == rc
+    assert w.adopt_calls == [] and w.moves == []
+    assert any("not handed over" in line for line in w.lines)
+
+
+def test_the_take_over_composes_the_held_image_and_checks_against_it(tmp_path, monkeypatch):
+    from tests import test_v0296_service_adoption as t296
+
+    monkeypatch.setattr(cu, "state_path", lambda: tmp_path / "state" / "container-upgrade.json")
+    seen = []
+    monkeypatch.setattr(rg, "upgrade_check",
+                        lambda **kw: seen.append(kw) or rg.UpgradeVerdict(rg.NOT_NEEDED))
+    world = t296.World(tmp_path)
+    result, _lines = world.adopt(services=("weaviate",), hold_weaviate_image=OLD)
+    assert result.adopted == ["weaviate"]
+    assert seen[0]["target_image"] == OLD                 # judged against the KEPT version
+    ups = [a for a in result.argv_log if "up" in a and a[-1] == "weaviate"]
+    files = [a[i + 1] for a in ups for i, x in enumerate(a) if x == "-f"]
+    assert files[-1].endswith("container-upgrade-rollback-weaviate.yml")
+    import yaml
+
+    assert yaml.safe_load(Path(files[-1]).read_text())["services"]["weaviate"]["image"] == OLD
+
+
+def test_a_container_whose_image_cannot_be_read_is_not_handed_over(tmp_path, monkeypatch):
+    w = _HandWorld(tmp_path, monkeypatch)
+    monkeypatch.setattr(det, "list_containers_or_none", lambda *_a, **_kw: None)
+    assert w.hand() == 1 and w.adopt_calls == []
