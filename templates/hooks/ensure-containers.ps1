@@ -738,6 +738,17 @@ if ($script:ComposeList.Count -gt 0) {
 }
 $recovered = $script:recovered
 
+# v0.2.107: a Weaviate container VCO did not create keeps its own compose, so
+# VCO cannot write a memory limit at create time. ONE Python verb
+# (vco_lib.weaviate_memory, the limit's one home) applies it IN PLACE --
+# `<runtime> update --memory`, never a recreate, never a restart -- and it runs
+# at every ensure because an in-place limit does not survive a restart on
+# podman 4.9. It does nothing for VCO's own container (its compose carries the
+# limit), for a container that already has a limit, or when the user switched
+# it off (VCO_WEAVIATE_FOREIGN_LIMIT=off). It prints one line only when it
+# changed something or could not.
+& $RunPy -m vco_lib.weaviate_memory ensure-foreign-limit 2>$null | ForEach-Object { Write-Output $_ }
+
 if ($started -gt 0) { Write-Output "Started $started container(s) via $Runtime" }
 if ($recovered -gt 0) { Write-Output "Recovered $recovered zombie container(s) via $Runtime" }
 exit 0

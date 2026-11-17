@@ -95,19 +95,23 @@
   import {
     ACTION_LABELS,
     buildCandidateReport,
+    containerOf,
     describeDataMount,
     getEndpointCandidates,
     getServicesStatus,
     isCoreService,
     modeBadge,
+    ownershipLine,
     parseDataMount,
     pendingFromSnapshot,
     rowsFromSnapshot,
     runEndpointAction,
     serviceActions,
     serviceLabel,
+    uncappedBanner,
     type CandidateReport,
     type CoreServiceName,
+    type DetectionReport,
     type ServiceActionId,
     type ServiceRuntimeState,
     type ServicesRuntimeSnapshot,
@@ -133,6 +137,12 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let progress = $state<LifecycleProgress | null>(null);
+  // v0.2.107: what the detector inspected (each container's memory limit).
+  // Read once when the page opens and after a start/stop/restart — NOT on the
+  // 5 s poll: the detector lists and inspects containers. A failed read shows
+  // nothing rather than "no limit".
+  let containerFacts = $state<DetectionReport | null>(null);
+  let weaviateUncapped = $derived(uncappedBanner(snapshot, containerFacts));
   let pollerHandle: (() => void) | null = null;
   let unlistenProgress: (() => void) | null = null;
 
@@ -469,6 +479,15 @@
     }
   }
 
+  async function refreshContainerFacts() {
+    try {
+      const report = await getEndpointCandidates();
+      containerFacts = report.error ? null : report;
+    } catch {
+      containerFacts = null;
+    }
+  }
+
   async function startAll() {
     loading = true;
     error = null;
@@ -522,6 +541,7 @@
     try {
       await invoke(cmd, { name });
       await refresh();
+      void refreshContainerFacts();
     } catch (e) {
       const msg = String(e);
       error = msg;
@@ -558,6 +578,7 @@
     // system !== null).
     void orchestrator.detectSystem();
     await refresh();
+    void refreshContainerFacts();
     // Model gateway: its own probes, on the same 5 s cadence as the table.
     await refreshGateway();
     await refreshAgentsGate();
@@ -673,6 +694,9 @@
         </button>
       </div>
     {/if}
+    {#if weaviateUncapped}
+      <div class="banner warn" data-testid="weaviate-uncapped">{weaviateUncapped}</div>
+    {/if}
     {#if error}
       <div class="banner error">{error}</div>
     {/if}
@@ -698,6 +722,7 @@
           {@const badge = modeBadge(svc)}
           {@const mount = parseDataMount(svc.endpoint?.data_mount_json)}
           {@const move = moveOffer(svc)}
+          {@const owner = ownershipLine(svc, containerOf(containerFacts, svc))}
           <tr data-testid="service-row-{svc.name}">
             <td><strong>{serviceLabel(svc.name)}</strong></td>
             <td>
@@ -713,6 +738,12 @@
             </td>
             <td class="mode-cell">
               <span class="mode-badge {badge.tone}" title={badge.title}>{badge.label}</span>
+              {#if owner}
+                <span
+                  class="ownership {owner.tone}"
+                  title={owner.title}
+                  data-testid="ownership-{svc.name}">{owner.text}</span>
+              {/if}
             </td>
             <td>
               {svc.port}
@@ -1617,6 +1648,16 @@
   .mode-badge.pending {
     color: var(--color-pink);
     border-color: rgba(255, 79, 160, 0.4);
+  }
+  /* v0.2.107: managed / foreign and the container's memory limit. */
+  .ownership {
+    display: block;
+    margin-top: 0.2rem;
+    font-size: 0.75rem;
+    color: var(--color-mid);
+  }
+  .ownership.warn {
+    color: var(--color-pink);
   }
   .container-cell .mount {
     display: block;

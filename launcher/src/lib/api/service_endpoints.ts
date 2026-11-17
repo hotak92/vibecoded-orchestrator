@@ -91,6 +91,8 @@ export interface DetectedContainer {
   compose_project?: string | null;
   host_ports?: Record<string, number>;
   mounts?: DataMount[];
+  /** `HostConfig.Memory` in bytes; 0 = no limit; null/absent = not reported. */
+  memory_limit_bytes?: number | null;
 }
 
 /**
@@ -262,6 +264,94 @@ export function modeBadge(s: ServiceRuntimeState): { label: string; tone: BadgeT
         title: 'VCO only connects to this endpoint; starting and stopping it is up to you.',
       };
   }
+}
+
+/**
+ * v0.2.107 — whose container a row names. `managed`: VCO's own compose
+ * created it, so an update recreates it (pinned image, memory limit).
+ * `foreign`: VCO did not create it — it is started and stopped by name, never
+ * recreated; Weaviate's memory limit is applied to it in place. `null` for an
+ * endpoint used by URL and for a service with no row yet.
+ */
+export type ContainerOwnership = 'managed' | 'foreign';
+
+export function containerOwnership(s: ServiceRuntimeState): ContainerOwnership | null {
+  switch (s.endpoint?.mode) {
+    case 'vco_managed':
+      return 'managed';
+    case 'adopted_container':
+      return 'foreign';
+    default:
+      return null;
+  }
+}
+
+/** The inspected container a Services row names, from the detector's reply. */
+export function containerOf(
+  report: DetectionReport | null | undefined,
+  s: ServiceRuntimeState,
+): DetectedContainer | null {
+  if (!s.container_name || !isCoreService(s.name)) return null;
+  for (const c of report?.candidates?.[s.name] ?? []) {
+    if (c.container && c.container.name === s.container_name) return c.container;
+  }
+  return null;
+}
+
+export function formatMemoryLimit(bytes: number): string {
+  const gib = bytes / 1024 ** 3;
+  return gib >= 1 ? `${gib.toFixed(1)} GiB` : `${Math.round(bytes / 1024 ** 2)} MiB`;
+}
+
+export interface OwnershipLine {
+  /** e.g. "managed · memory limit 24.0 GiB", "foreign · no memory limit". */
+  text: string;
+  tone: 'ok' | 'warn';
+  title: string;
+}
+
+/**
+ * The line under a row's mode badge: managed / foreign, plus — for Weaviate,
+ * the one service VCO sizes a limit for — the container's memory limit when
+ * the detector read it. A limit that was not read is not shown as "none".
+ */
+export function ownershipLine(
+  s: ServiceRuntimeState,
+  container: DetectedContainer | null,
+): OwnershipLine | null {
+  const ownership = containerOwnership(s);
+  if (ownership === null) return null;
+  const title =
+    ownership === 'managed'
+      ? 'VCO’s own container: an orchestrator update recreates it with the pinned image and settings.'
+      : 'Not created by VCO: never recreated. VCO applies Weaviate’s memory limit to it in place.';
+  const limit = s.name === 'weaviate' ? container?.memory_limit_bytes : undefined;
+  if (typeof limit !== 'number') return { text: ownership, tone: 'ok', title };
+  if (limit <= 0) return { text: `${ownership} · no memory limit`, tone: 'warn', title };
+  return { text: `${ownership} · memory limit ${formatMemoryLimit(limit)}`, tone: 'ok', title };
+}
+
+/**
+ * The page banner for a Weaviate container that runs without a memory limit
+ * (`null` when it has one, or when the limit was not read). Says what VCO
+ * does about it, per ownership.
+ */
+export function uncappedBanner(
+  snapshot: ServicesRuntimeSnapshot | null,
+  report: DetectionReport | null | undefined,
+): string | null {
+  const s = snapshot?.services.find((x) => x.name === 'weaviate');
+  if (!s) return null;
+  const ownership = containerOwnership(s);
+  const limit = containerOf(report, s)?.memory_limit_bytes;
+  if (ownership === null || typeof limit !== 'number' || limit > 0) return null;
+  const name = s.container_name ?? 'Weaviate';
+  return ownership === 'managed'
+    ? `${name} runs without a memory limit. It is VCO’s own container: the next orchestrator ` +
+        'update recreates it with a limit sized for this machine.'
+    : `${name} runs without a memory limit. VCO did not create it, so it is never recreated: ` +
+        'VCO applies its limit in place at the next session start (and again after each restart), ' +
+        'unless you switched that off with VCO_WEAVIATE_FOREIGN_LIMIT=off.';
 }
 
 export type ServiceActionId = 'start' | 'stop' | 'restart' | 'recover' | 'change' | 'hand_to_vco';

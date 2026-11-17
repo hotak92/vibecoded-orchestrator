@@ -366,7 +366,7 @@ owner = "vco_lib.service_reconcile"
 clear_probe = "probe:py:adopted_service_config_drift_persists"
 emit_surfaces = ["ledger"]
 dismiss_key = ["service", "drift_keys"]
-notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). v0.2.104: or on an image OLDER than the one VCO's compose pins (key `image`; e.g. an Ollama too old for the summary-tier models). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2). The probe inspects only the adopted rows' own containers, so an unrelated container vanishing mid-probe no longer leaves it undetermined."""
+notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). v0.2.104: or on an image OLDER than the one VCO's compose pins (key `image`; e.g. an Ollama too old for the summary-tier models). v0.2.107: only a FOREIGN container can carry this now — a container this install's own compose created, on the installer's data mount, is recorded as VCO-managed on the next update (service_reconcile.reclassify_own) and moved to the pinned image (vco_lib.container_upgrade). True of the machine while it lasts; VCO never recreates a container it did not create. The one setting VCO applies to such a container in place is Weaviate's memory limit (weaviate_memory.ensure_foreign_limit, at every ensure-containers). The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2). The probe inspects only the adopted rows' own containers, so an unrelated container vanishing mid-probe no longer leaves it undetermined."""
 
 [conditions.service_adopted_without_prompt]
 class = "informational_record"
@@ -1011,12 +1011,35 @@ dismiss_key = ["classes"]
 notes = """v0.2.106. Classes are in the Weaviate schema but their index is gone ("non-existing index") — the footprint of the 1.37 orphan drop. The repair (snapshot first, then drop + bootstrap-collections + kg-sync) is destructive and ordered, so it is printed, never run. Clears once every class has its index."""
 
 [conditions.weaviate_container_uncapped]
-class = "action_required"
+class = "environmental"
 owner = "vco_lib.doctor (probe + entry in vco_lib.weaviate_raft_guard)"
 clear_probe = "probe:py:weaviate_container_still_uncapped"
 emit_surfaces = ["ledger"]
 dismiss_key = ["container"]
-notes = """v0.2.106 (an OOM on a maintainer machine: an adopted Weaviate with no memory limit reached 30 GB RSS). VCO sizes VCT_WEAVIATE_MEM_LIMIT only for the containers it creates; an adopted one keeps its own limit. The remedy caps it in place (`<runtime> update --memory`), never by an automatic recreate. Clears once the container has a limit."""
+notes = """v0.2.106 (an OOM on a maintainer machine: an adopted Weaviate with no memory limit reached 30 GB RSS). v0.2.107 (owner rulings 2026-11-13 / 2026-11-17): VCO's own container gets the limit from its compose (VCT_WEAVIATE_MEM_LIMIT, sized from min(host, container-engine memory)); a container VCO did not create gets the same limit IN PLACE (`<runtime> update --memory`, never a recreate) at every update and every ensure-containers, because an in-place limit does not survive a restart on podman 4.9. So this entry is now a description of the machine, not a to-do: it is listed only while the container still runs uncapped — the user switched the in-place limit off (VCO_WEAVIATE_FOREIGN_LIMIT=off, or VCT_WEAVIATE_MEM_LIMIT=0), the engine refused the update, or no limit has been sized yet. Clears once the container has a limit."""
+
+[conditions.container_upgrade_refused]
+class = "action_required"
+owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "container"]
+notes = """v0.2.107 (owner ruling "recreate it to get latest"; only the pinned Weaviate is supported). VCO's own Weaviate container runs an image other than the pinned one and the protected move was NOT made: a class count or the free space could not be read, the copy of the data does not fit (the entry names the data size and the free space), the raft snapshot was refused, or an earlier attempt failed and is not repeated by itself. Nothing was removed; the old container runs as before and step 5 leaves it alone. Re-detected by every update that still cannot move it; the run that moves it drops the entry."""
+
+[conditions.container_upgrade_rolled_back]
+class = "action_required"
+owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "container"]
+notes = """v0.2.107. The move of VCO's own Weaviate to the pinned image failed its check after the recreate (compose failed, the new version did not become ready, wrong image or mount, a class without its index, or an object count that differs). The new container was removed, the data volume restored from the copy taken before the first start of the new version, and the old image started on it again (severity critical when that restore did not finish). The failed attempt is recorded in <vct_root>/state/container-upgrade.json, so later updates raise container_upgrade_refused instead of trying again, until `python -m vco_lib.container_upgrade retry --service weaviate`. One-shot here: the run that rolled back emits it."""
+
+[conditions.container_upgrade_backup_kept]
+class = "informational_record"
+owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.107. One-shot record of a verified move of VCO's own Weaviate to the pinned image: names the backup volume holding the data as it was before the move and the command that frees it. VCO never deletes that copy itself."""
 
 [conditions.code_embed_image_stale]
 class = "action_required"
