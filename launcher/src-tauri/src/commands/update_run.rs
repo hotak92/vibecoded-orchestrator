@@ -100,7 +100,7 @@ pub(crate) fn orchestrator_claim_for(
     use crate::commands::single_flight::OrchestratorClaim;
     match kind {
         UpdateKind::PullFf | UpdateKind::Merge | UpdateKind::Rebase | UpdateKind::ResetHard => {
-            OrchestratorClaim::Start
+            OrchestratorClaim::StartUpdate
         }
         UpdateKind::Resume | UpdateKind::ApplyOnly => OrchestratorClaim::Continue,
     }
@@ -2344,14 +2344,14 @@ pub(crate) mod tests {
                 UpdateKind::PullFf
                 | UpdateKind::Merge
                 | UpdateKind::Rebase
-                | UpdateKind::ResetHard => OrchestratorClaim::Start,
+                | UpdateKind::ResetHard => OrchestratorClaim::StartUpdate,
                 UpdateKind::Resume | UpdateKind::ApplyOnly => OrchestratorClaim::Continue,
             };
             assert_eq!(orchestrator_claim_for(kind), expected, "{kind:?}");
         }
         assert_eq!(orchestrator_claim_for(UpdateKind::Resume), OrchestratorClaim::Continue);
         assert_eq!(orchestrator_claim_for(UpdateKind::ApplyOnly), OrchestratorClaim::Continue);
-        assert_eq!(orchestrator_claim_for(UpdateKind::PullFf), OrchestratorClaim::Start);
+        assert_eq!(orchestrator_claim_for(UpdateKind::PullFf), OrchestratorClaim::StartUpdate);
     }
 
     /// A recording fake: every op appends its name; outcomes are scripted.

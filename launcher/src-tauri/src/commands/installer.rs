@@ -2031,7 +2031,7 @@ pub async fn apply_hardware_reconfig(
     // this run exactly as it would under any other. One user-initiated button,
     // no nested callers, so the claim is a plain top-of-command take.
     let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-        crate::commands::single_flight::OrchestratorClaim::Start,
+        crate::commands::single_flight::OrchestratorClaim::StartHardwareReconfig,
     )?;
 
     let install_path_str = db
@@ -15351,7 +15351,7 @@ MemAvailable:   23456789 kB
 
             // ACT: another surface is mid-update.
             let held = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-                crate::commands::single_flight::OrchestratorClaim::Start,
+                crate::commands::single_flight::OrchestratorClaim::StartUpdate,
             )
                 .expect("the simulated in-flight update takes the claim");
 
@@ -15393,7 +15393,7 @@ MemAvailable:   23456789 kB
             let job = crate::commands::embed_admission::enter_index_job().await;
             assert!(
                 crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-                    crate::commands::single_flight::OrchestratorClaim::Start,
+                    crate::commands::single_flight::OrchestratorClaim::StartUpdate,
                 )
                 .is_err(),
                 "fixture premise: a live index job refuses a new update"
@@ -15446,7 +15446,7 @@ MemAvailable:   23456789 kB
 
             // Exactly the `ResetHard` git operation's position: claim in hand.
             let _held = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-                crate::commands::single_flight::OrchestratorClaim::Start,
+                crate::commands::single_flight::OrchestratorClaim::StartUpdate,
             )
                 .expect("the caller takes the claim first, as the pipeline does");
 
@@ -17107,7 +17107,7 @@ severity_max: critical\n\
             // this second claim succeed.
             assert!(
                 crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-                crate::commands::single_flight::OrchestratorClaim::Start,
+                crate::commands::single_flight::OrchestratorClaim::StartUpdate,
             ).is_err(),
                 "the returned guard must still HOLD the claim: releasing it here \
                  reopens the window exactly where the tree is least consistent \
@@ -17116,7 +17116,7 @@ severity_max: critical\n\
             drop(flight);
             // …and it is not a latch: the next resolve/update can run.
             let after = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-                crate::commands::single_flight::OrchestratorClaim::Start,
+                crate::commands::single_flight::OrchestratorClaim::StartUpdate,
             )
                 .expect("dropping the guard must free the claim");
             drop(after);
@@ -17145,7 +17145,7 @@ severity_max: critical\n\
 
             // Another surface is mid-update on this same clone.
             let held = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
-                crate::commands::single_flight::OrchestratorClaim::Start,
+                crate::commands::single_flight::OrchestratorClaim::StartUpdate,
             )
                 .expect("fixture: take the claim first");
 
