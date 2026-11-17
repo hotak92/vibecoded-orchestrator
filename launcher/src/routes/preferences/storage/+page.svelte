@@ -34,10 +34,13 @@
     margin: 0 auto;
   }
 
+  /* `--text-muted`, `--border` and `--text` are defined nowhere in app.css,
+     so these painted their light-theme fallbacks: the current crumb was
+     #1a1a1a on the navy background (contrast 1.1:1). Real tokens now. */
   .crumb {
     margin-bottom: 1rem;
     font-size: 0.9rem;
-    color: var(--text-muted, #666);
+    color: var(--color-mid);
   }
 
   .crumb a {
@@ -51,11 +54,11 @@
 
   .crumb .sep {
     margin: 0 0.4rem;
-    color: var(--border, #d4d4d8);
+    color: var(--color-muted);
   }
 
   .crumb .current {
-    color: var(--text, #1a1a1a);
+    color: var(--color-text);
     font-weight: 500;
   }
 </style>
