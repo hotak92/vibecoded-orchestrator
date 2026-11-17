@@ -152,8 +152,8 @@ Enforces LF line endings on all text files (critical for `.sh` scripts, which ba
 
 Three independent CI jobs (Rust / Python / Frontend), no docs-only skip. The matrix is small but the three together cover the trust-critical surfaces: license validator, telemetry PII scrubbing, and the launcher's TypeScript types. Frontend runtime tests are an acknowledged gap at v0.1.0 — Playwright PRs are explicitly invited.
 
-### Three-job CI matrix (Rust + Python + Frontend)
-`.github/workflows/ci.yml` runs three independent jobs on every push to `main` and every PR. No job is skipped for docs-only PRs.
+### CI matrix (Rust + Python + Frontend, plus gates)
+`.github/workflows/ci.yml` runs the Rust, Python and Frontend jobs described below on every push to `main` and every PR, and beside them `python-typecheck`, `python-lint`, `managed-paths-cross-language`, `launcher-leak-check`, `leak-gates` and `version-pins`. No job is skipped for docs-only PRs. The sections below were written at v0.1.0 (three jobs); the installer and release gates live in their own workflows (`install-smoke-tri-os.yml`, `installer-smoke.yml`, `hook-parity.yml`, `manifest-validate.yml`, `codeql.yml`, `release.yml`).
 
 ### Rust job: cargo test --lib
 Runs `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml` on `ubuntu-latest`. Installs Tauri 2 Linux build deps. Full Tauri bundle builds are gated behind the release workflow.
