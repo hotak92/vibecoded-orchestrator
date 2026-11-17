@@ -150,7 +150,7 @@ TypeScript shape of one entry in the `vct_admin_tokens` map: `{ token: string; e
 
 Two server-authoritative paths classify a request as admin tier. Both yield the same wire response (`tier="admin"` plus `is_admin`/`unlock_all_modules`/`dev_features_enabled` flags) and unlock the same client-side dev affordances.
 
-The TL;DR of the architecture: an earlier draft used a local `MAINTAINER_TOKEN` + Ed25519 client check. That was dropped because a one-line patch to the AGPL client defeated it. Both Path A and Path B fix this by classifying server-side — patching the client only suppresses the visual ADMIN badge, it doesn't unlock anything the server gates. Authoritative reference: [`docs/ADMIN_LICENSE.md`](../ADMIN_LICENSE.md).
+The TL;DR of the architecture: an earlier draft used a local `MAINTAINER_TOKEN` + Ed25519 client check. That was dropped because a one-line patch to the AGPL client defeated it. Both Path A and Path B fix this by classifying server-side — patching the client only suppresses the visual ADMIN badge, it doesn't unlock anything the server gates. Authoritative reference: `docs/ADMIN_LICENSE.md`, the maintainers' private runbook — it is deliberately not part of this repository (`.gitignore`), so the references to it on this page point at a file you will not find here; this page is the public summary.
 
 ### Two paths to admin tier
 **Path A — Vault-token admin (recommended for maintainer / small-team use).** High-entropy `vct_admin_<URL-safe-base64>` token resolved against the `vct_admin_tokens` Supabase Vault secret. No LS product required. Per-token leak containment via TOFU machine binding + optional expiration. Adding/revoking team members = a single SQL statement.
@@ -312,7 +312,7 @@ Enforced by the collection layer; the queue schema stores only what the `collect
 Scans staged files (or full tracked tree with `--all`) for blocklisted token patterns. Exits non-zero with instructions. Wire as a pre-commit hook via `ln -sf ../../scripts/check-no-secrets.sh .git/hooks/pre-commit`.
 
 ### Env scrubbing in hooks
-All 31 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
+Every project hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
 
 ### Supabase key rotation runbook
 Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).

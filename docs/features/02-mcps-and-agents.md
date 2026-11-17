@@ -46,7 +46,7 @@ Params: `query` (natural language), `limit` (default 5), `node_type` (filter: pr
 
 The `detail` param controls token cost. `"auto"` picks a verbosity tier per result from its relevance score (higher-scoring results render richer detail — summary → single chunk → three chunks → full node); the explicit values apply one tier uniformly to every result. Summaries are pre-generated and stored in `knowledge/.node_formats.json`, so summary-tier renders are fast and cheap.
 
-Collections searched: `KG_COLLECTION` + `SHARED_KG_COLLECTION` + `DEVELOPMENT_COLLECTION` (all resolved from env, set per-project in `.claude/settings.json` `env` — the canonical channel; `.vscode/settings.json` `claude-code.env` does not propagate to MCP subprocesses on Linux and is not used). Results are deduplicated across collections. RL reranking applies transparently when `RL_SERVER_URL` is reachable (Pro tier only).
+Collections searched: `KG_COLLECTION` + `SHARED_KG_COLLECTION` + `DEVELOPMENT_COLLECTION` (all resolved from env, set per-project in `.claude/settings.json` `env` — the canonical channel; `.vscode/settings.json` `claude-code.env` does not propagate to MCP subprocesses on Linux and is not used). Results are deduplicated across collections. RL reranking applies transparently when `RL_SERVER_URL` is reachable (no licence needed since v0.2.106 — see "RL Reranking" below).
 
 </details>
 

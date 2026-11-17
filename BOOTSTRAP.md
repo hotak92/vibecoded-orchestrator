@@ -5,9 +5,9 @@
 You're looking at **VibeCoded Orchestrator**, an AI-coding orchestrator that sits on top of Claude Code. It adds:
 - A **Knowledge Graph** with semantic search across your project
 - A **Code Graph** that knows your repo structurally — modules, classes, functions, APIs, cross-service calls
-- **36 automation hooks** (KG sync on file edits, secret scans, context injection, post-commit reviews)
-- **2 MCP servers** enabled by default per project — weaviate-kg (KG + code graph), search (academic papers). Ollama + code-embedding run as infrastructure services.
-- **44 agents and 54 skills** for Claude Code — architects, code reviewers, debuggers, planners
+- **Automation hooks** (KG sync on file edits, secret scans, context injection, post-commit reviews)
+- **2 MCP servers** enabled by default per project — weaviate-kg (KG + code graph) and playwright (browser automation). Ollama + code-embedding run as infrastructure services.
+- **Default agents and skills** for Claude Code — planner, coder, tester, reviewer, doc and KG maintainers — plus opt-in packs of topical specialists (see [templates/README.md](templates/README.md))
 
 The next steps depend on how you got here.
 
@@ -20,9 +20,9 @@ The next steps depend on how you got here.
 Download the latest archive for your OS from
 [Releases](https://github.com/hotak92/vibecoded-orchestrator/releases):
 
-- Linux x64: `vibecoded-orchestrator-0.2.0-linux-x64.tar.gz`
-- macOS arm64: `vibecoded-orchestrator-0.2.0-macos-arm64.tar.gz`
-- Windows x64: `vibecoded-orchestrator-0.2.0-windows-x64.zip`
+- Linux x64: `vibecoded-orchestrator-<version>-linux-x64.zip`
+- macOS arm64: `vibecoded-orchestrator-<version>-macos-arm64.zip`
+- Windows x64: `vibecoded-orchestrator-<version>-windows-x64.zip`
 
 Extract, then double-click `first-install.{sh,command,desktop,bat}` for
 your platform. The installer will:
@@ -30,7 +30,7 @@ your platform. The installer will:
 - Detect or prompt for Podman/Docker
 - Set up the venv and pull container images on first run
 
-System requirements: Python 3.11+, Podman or Docker, ~2GB free disk.
+System requirements: Python 3.11+, Podman or Docker (with a compose provider), and room for the first-run downloads (~5 GB of container images and models; ~2.5 GB more in GPU mode).
 The first-install script handles the Python auto-install via your
 platform's package manager (apt/dnf/pacman/brew on Linux/macOS;
 winget on Windows). It does NOT install Podman/Docker — you'll be
@@ -74,7 +74,7 @@ You can run the orchestrator without the launcher; you just miss some integratio
 | **Multi-project tracking** | Launcher tracks every project's agents/skills/hooks/permissions/secrets/KG/codegraph in a local DB | You manage each project independently; nothing tracks the cross-project state |
 | **Easy install/update flow** | One-click install, version upgrades handled | You re-run `install.py` manually; pulling new versions = `git pull` + re-install |
 | **Service lifecycle** | Launcher starts/stops Weaviate/Ollama on demand | You run `podman-compose up -d` manually |
-| **License-gated paid modules** | Launcher fetches + verifies (RL retrieval, Coordination, etc.) | You can't use paid modules without the launcher |
+| **License-gated paid modules** | Launcher fetches + verifies them (e.g. Coordination). The RL retrieval reranker is not one of them: it is part of this repository and needs no licence | You can't use paid modules without the launcher |
 | **MCP discovery** | New MCP servers appear in Claude Code automatically | You edit `~/.claude.json` by hand |
 
 What you keep without the launcher:
@@ -129,7 +129,7 @@ mkdir -p ~/.vct-secrets/{shared,projects}
 chmod 700 ~/.vct-secrets
 cp tools/vct-secrets/vct ~/.vct-secrets/vct
 chmod 755 ~/.vct-secrets/vct
-echo "ghp_yourtokenhere" | ~/.vct-secrets/vct set --project SHARED --key github_pat
+printf %s "ghp_yourtokenhere" | ~/.vct-secrets/vct set --shared --key github_pat
 
 # Sanity check the orchestrator
 .claude/scripts/kg-search list           # should print empty list (no KG nodes yet)
@@ -148,7 +148,7 @@ The orchestrator uses three local services — **Weaviate**, **Ollama**, and an 
 Verify what's running:
 ```bash
 podman ps   # or `docker ps`
-# Should show one weaviate, one ollama, optionally one vct_code_embed.
+# Should show vco_weaviate, vco_ollama and, on a CodeSage (GPU) install, vco_code_embed.
 ```
 
 **Advanced**: set `VCT_FORCE_SEPARATE_CONTAINERS=1` and override `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to give an install its own containers. Useful for hard isolation between (e.g.) work and personal setups, but it costs extra disk and RAM per install.

@@ -70,9 +70,10 @@ Out of scope:
 The project ships a few defence-in-depth layers. If you find a way
 around any of them, that's a valid report:
 
-- **Credential scrubbing** — hooks that scan written files for
-  high-entropy strings and known token formats before letting an edit
-  through.
+- **Credential scanning** — a hook scans the text each edit introduced
+  for known token formats and credential-shaped strings and raises an
+  alert in the session naming path, line and shape (never the value).
+  It runs after the write and does not block it.
 - **Env scrubbing** — hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`,
   `OPENAI_API_KEY`, AWS credentials, etc. before spawning subprocesses.
 - **Bash injection guards** — pre-tool-use hook blocks shell-injection

@@ -12,8 +12,9 @@ flagging for early adopters and the next iteration.
       flow's macOS-specific runtime path is still verified-by-CI-only.
       Linux remains the recommended platform. (needs verification post-v0.2.50)
 
-- [ ] **Launcher binaries remain unsigned on Windows + macOS** —
-      SmartScreen and Gatekeeper warnings persist; Apple notarization
+- [ ] **Launcher binaries are unsigned on Windows and only ad-hoc signed on macOS** —
+      SmartScreen and Gatekeeper warnings persist (the macOS binaries are ad-hoc
+      codesigned in CI, not notarized); Apple notarization
       enrollment is still pending. Workarounds in
       [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
 

@@ -398,7 +398,7 @@ WARNING naming the failure — a read failure is not an absence. `$OPENAI_API_KE
 project's `.env` is not a source for either name (tier 3 is excluded for
 them).
 
-### What the launcher's Secrets panel shows (v0.3.0)
+### What the launcher's Secrets panel shows (v0.2.92)
 
 The panel reads BOTH launcher-managed stores and labels each key with the
 one that actually answers:
@@ -412,7 +412,7 @@ one that actually answers:
 | `not set` | neither store has it |
 
 The per-project **Secret refs** tab renders the same five badges from the
-same probe (`get_secret_status_v2` → `badgeOf`). Before v0.3.0 it rendered
+same probe (`get_secret_status_v2` → `badgeOf`). Before v0.2.92 it rendered
 the `project_secret_refs.is_set` COLUMN instead — a snapshot written once
 at registration and never revised — so it reported "set" for deleted keys
 and "missing" for keys that resolve from the file store. One probe, two
@@ -430,7 +430,7 @@ DIFFERENT values. That second one is the fork this document's stores are
 designed to avoid — the keychain copy wins at runtime and the file copy
 becomes dead weight that misleads the next reader.
 
-Before v0.3.0 the badge came from a keychain-only probe, so a key that
+Before v0.2.92 the badge came from a keychain-only probe, so a key that
 lived only in the file store displayed as **not set** while every consumer
 resolved it. The panel was, in effect, inviting the user to re-type a
 working key into the *other* store and create the fork.

@@ -122,10 +122,10 @@ Installs `requirements-dev.txt` in addition to `requirements.txt` inside the ven
 Re-installs deps and restarts services, but skips `.env` and `settings.json` creation (preserves user edits).
 
 ### `--with-agents` / `--no-agents`
-Default-on. Copies bundled agent templates from `templates/agents/free/` into `~/.claude/agents/`. Already-present files are skipped (idempotent).
+Default-on. Delivers the bundled agent templates from `templates/agents/free/` into the install root's own `.claude/agents/` through the bundle engine (the same hash-compare / adopt-with-backup rules as a project's bundle update); `--no-agents` skips the `agents` kind. Nothing is written to `~/.claude/agents/`.
 
 ### `--with-skills` / `--no-skills`
-Default-on. Copies skill directories from `templates/skills/` into `~/.claude/skills/`. `.md` files get placeholder substitution; other files are copied raw.
+Default-on. Delivers the skill directories from `templates/skills/` into the install root's own `.claude/skills/` through the bundle engine; `--no-skills` skips the `skills` kind. `.md` files get placeholder substitution; other files are copied raw. Nothing is written to `~/.claude/skills/`.
 
 ### `--no-compile`
 Skips Step 11b (bytecode pre-compile of orchestrator Python modules). Default is to run `python -m compileall` against `VCThelpers/`, `claude_mcp_servers/`, `tools/`, `vco_lib/`, and `.claude/scripts/` so first-import is ~50-200ms faster per cold module. Best-effort: per-directory failures warn but never abort. Cross-OS via stdlib `compileall`. Skip in dev/CI runs where the speedup doesn't matter.
@@ -234,7 +234,7 @@ Suppresses the volume cleanup step ([2]) entirely: the container volumes — KG 
 Both the installer and uninstaller explicitly state this. User's GitHub PAT, Supabase keys, etc. survive uninstall.
 
 ### Selective MCP entry removal
-The uninstaller removes exactly: `weaviate-kg`, `ollama`, `search`, `code-embedding`, and VCO-registered Pro-tier MCPs from `~/.claude.json`, leaving any user-added servers intact.
+The uninstaller removes exactly the names in `vco_lib/mcp_scan_rules.toml` `[bundled].uninstall_scrub_names` from `~/.claude.json` — `weaviate-kg`, `playwright`, `vct-coordination` and the retired `ollama`, `search`, `code-embedding`, `mermaid`, `excalidraw` — leaving any user-added servers intact. `playwright`, `mermaid` and `excalidraw` are also common third-party MCP names, so those three are removed only when the entry is VCO-shaped (`uninstall_scrub_shape_gated`).
 
 ---
 

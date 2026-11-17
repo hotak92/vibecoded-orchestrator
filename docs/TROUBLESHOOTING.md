@@ -359,7 +359,7 @@ If you upgrade VCO in place (e.g. `python install.py --update` on top of an exis
 Workaround:
 
 1. From the install root, locate both binaries: `find . -name 'vct-launcher*' -o -name 'vct-hub*'` (expect 2-4 hits).
-2. The canonical paths are `launcher/dist/<os>-<arch>/vct-launcher{,.exe}` and `vct-hub/dist/<os>-<arch>/vct-hub{,.exe}`. Any binaries at non-canonical paths are stale.
+2. The canonical paths are `launcher/dist/<os>-<arch>/vct-launcher{,.exe}` and `launcher/dist/<os>-<arch>/vct-hub{,.exe}` (both binaries live in the same folder). Any binaries at non-canonical paths are stale.
 3. Delete the stale copies (NOT the canonical ones).
 4. Quit + relaunch the launcher. The next boot picks up the canonical binary; if it doesn't, run `python install.py --update --force` to re-stamp the launcher's recorded binary path back to the canonical one.
 
@@ -553,9 +553,9 @@ vct-hub --status
 #   not-running         (exit 1) — no hub started
 #   stale pid=12345     (exit 2) — pid file present but owner is dead
 
-curl -s http://127.0.0.1:7700/health
-# Expected: HTTP 200 with a JSON body. /health is the ONLY route that
-# doesn't require the bearer token.
+curl -s http://127.0.0.1:7700/api/v1/health
+# Expected: HTTP 200 with a JSON body. /api/v1/health is the ONLY route
+# that doesn't require the bearer token (a bare /health answers 401).
 ```
 
 If `--status` says `stale`, run `vct-hub --start-if-not-running` — it cleans up the dead lockfile and spawns a fresh detached instance (idempotent; safe to run any time).
@@ -628,7 +628,7 @@ Resolver clients (`vco_lib/project_config.py`, the bash/PowerShell helpers under
 
 Symptom: a script or wrapper calling `http://127.0.0.1:7700/api/v1/...` gets `401 Unauthorized` with `{"error":{"code":"unauthorized",...}}`.
 
-Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <token>` where the token lives in `<vct_root_dir>/hub.token`. The token is **regenerated on every hub startup** — so any client that cached an old token will 401 after a `vct-hub --stop` + restart.
+Every `/api/v1/*` route (except `/api/v1/health`) requires `Authorization: Bearer <token>` where the token lives in `<vct_root_dir>/hub.token`. The token is **regenerated on every hub startup** — so any client that cached an old token will 401 after a `vct-hub --stop` + restart.
 
 - **Python clients** (`vco_lib.project_config`): auto-recover. The internal `_get_with_401_retry` wrapper catches a single 401, invalidates the 5-second discovery cache, re-reads `hub.token` + `hub.port` from disk, and re-issues the request. Subsequent 401s after the retry are surfaced as `HubUnreachable`. You don't need to do anything in calling code.
 - **In-tree wrappers** (the `vct-cli` launcher CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
@@ -690,7 +690,7 @@ If `LastTaskResult` is non-zero, the boot shim (`vct-hub-boot.cmd` next to the b
 
 ### Cutover sentinel stuck after a failed install
 
-When `install.py` upgrades a v0.2.20 install to v0.2.21, it writes a sentinel at `<vct_root_dir>/v0.2.21-cutover.flag` **before** starting `vct-hub`. The v0.2.21 launcher reads this sentinel on startup and **skips** spawning its embedded `services::watcher` — the assumption is that `vct-hub` will take over supervision. `install.py` deletes the sentinel after `vct-hub` responds to `/health`.
+When `install.py` upgrades a v0.2.20 install to v0.2.21, it writes a sentinel at `<vct_root_dir>/v0.2.21-cutover.flag` **before** starting `vct-hub`. The v0.2.21 launcher reads this sentinel on startup and **skips** spawning its embedded `services::watcher` — the assumption is that `vct-hub` will take over supervision. `install.py` deletes the sentinel after `vct-hub` responds to `/api/v1/health`.
 
 If `install.py` is killed mid-cutover (Ctrl-C, OOM, power loss), the sentinel persists and the v0.2.21 launcher refuses to start its services watcher indefinitely — symptom: Weaviate/Ollama not auto-restarting when they crash.
 
@@ -987,7 +987,7 @@ chmod +x .claude/scripts/*
 
 (On Windows, use the `.ps1` variants — they're shipped alongside shell scripts.)
 
-**Venv not found**: the scripts auto-detect `.venv` at the repo root. If you installed elsewhere, export `VCO_VENV` to point at your venv's root.
+**Venv not found**: the scripts resolve the orchestrator's venv through one ladder (`.claude/scripts/vct_venv_ladder.sh` / `.ps1`): `$VCT_VENV`, then the install root (`VCT_INSTALL_ROOT` / `VCT_ORCHESTRATOR_ROOT`), then the orchestrator clone's own `.venv`. If your venv lives elsewhere, export `VCT_VENV` pointing at the venv's root (or at its interpreter).
 
 ## Post-install, Claude doesn't read the knowledge graph
 

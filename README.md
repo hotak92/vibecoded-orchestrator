@@ -64,7 +64,7 @@ git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-
 
 `first-install.{sh,command,bat}` is a thin OS shim that (1) finds a usable Python 3.11+ (offering to install one via Homebrew / apt / dnf / pacman / zypper / apk / winget if missing), (2) runs a read-only system-detection prepass that writes a diagnostic report to `state/logs/bootstrap-prepass.json` — no side effects, and a failure there never blocks the install — then (3) runs `install.py` for the canonical install. On success the launcher GUI auto-starts (pass `--no-auto-launch` to skip). Root install and per-project bundle install share one engine — the orchestrator's own `.claude/` goes through the same code path the launcher uses for your projects. Full detail: [`docs/INSTALL_ARCHITECTURE_v2.md`](docs/INSTALL_ARCHITECTURE_v2.md) and [`docs/INSTALL_PARITY.md`](docs/INSTALL_PARITY.md).
 
-The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 14, and Windows on every push to main and on installer-touching PRs; a red run blocks release tags.
+The entry points run end-to-end in CI on Ubuntu 22.04/24.04, Fedora 40, macOS 15, and Windows on every push to main and on installer-touching PRs; a red run blocks release tags.
 
 Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
 
@@ -86,7 +86,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Code graph (AST/tree-sitter, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
 | Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
 | User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (51 hooks, 7 skills, 11 agents)** |
-| Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
+| Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
 **Reading the table**: Cursor, Copilot, Augment, and Devin are closed all-in-ones — they ship the editor, the AI, the context layer, and the cloud, bundled. Aider, Cline, and Codex CLI are open-source / BYOL but lack persistent memory and (in most cases) a structural code graph. VCO is the combination that doesn't otherwise exist: open-source, local, BYO-Claude-subscription, *and* it has both persistent memory and a code graph. The trade you're making for that is product polish — VCO is alpha, the others are stable v1+.
@@ -128,7 +128,7 @@ When you click **Add project** in the launcher GUI, the project is usable the mo
 
 1. **Code graph build** — structural analysis over the project root, populating the `CodeModule` / `CodeClass` / `CodeFunction` / `CodeAPI` / `CodeInteraction` collections.
 2. **KG sync** — walks `knowledge/**/*.md` and `docs/**/*.md` and embeds them into the per-project Weaviate collections.
-3. **KG summaries** — LLM-written node summaries consumed by `hybrid_search`'s `summary` tier (backend fallback: `claude` CLI → local Ollama → `ANTHROPIC_API_KEY` → skip; summaries backfill later as you edit nodes if no backend is available).
+3. **KG summaries** — LLM-written node summaries consumed by `hybrid_search`'s `summary` tier (backend ladder: `claude` CLI → a z.ai / QwenCloud key if you added one → local Ollama → OpenAI (consent-gated) → `ANTHROPIC_API_KEY` → skip; summaries backfill later as you edit nodes if no backend is available — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)).
 
 Each task gets a status banner on the project page (`pending` / `running` / `failed`, with `Show details` and `Retry`); runs interrupted by a crash are marked failed and retryable, and retries are cheap no-ops for already-indexed content. Full walkthrough: [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md#background-tasks-the-launcher-fans-out-on-add-project).
 
@@ -139,20 +139,18 @@ Each task gets a status banner on the project page (`pending` / `running` / `fai
 - **51 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 45 are event-registered in `settings.json`; 4 more (`post-edit-outcome`, `post-bash-context-record`, `kg-summary-generator`, `post-git-commit-kg-sync`) are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually (v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records — each sub-hook stays individually switchable from the launcher's Hooks tab; v0.2.102 retired the diagram-indexer pair `pre-diagram-path-validation` and `post-file-delete` with the diagrams integration, and existing installs lose their registrations at the next bundle update); and 2 ship unwired — `code-graph-incremental` (its per-edit scheduling now lives in `stop-codegraph-drain`) and `kg-sync-on-edit` (an opt-in single-purpose hook superseded by `post-file-edit`'s auto-sync). Every hook ships as `.sh` (Linux/macOS) with a native `.ps1` sibling (Windows). The `vct-hub` background service resolves per-project config for hooks, MCPs, and scripts.
 - **MCP servers (default install)** — 2 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) is **enabled by default per project**; `playwright` is **enabled by default**, invoked via `npx -y @playwright/mcp@<pin> --browser chromium` (exact version pinned in `vco_lib/bundled_mcp_versions.toml`; the pinned package and the Chromium revision it needs are pre-cached at install/update, and `vco doctor` reports a missing browser; opt out with `VCT_SKIP_PLAYWRIGHT=1`). That entry needs `npx` resolvable on PATH: without Node.js installed it cannot spawn at all, and Claude Code reports only "Failed to connect". `vco doctor` (and the launcher's MCP registration badge) names that case explicitly. The per-project toggle in the launcher's Permissions tab writes `~/.claude.json` `projects[<project>].disabledMcpServers`, so disabling a server for one project actually reaches Claude Code. (v0.2.101 removed the `search` paper MCP; v0.2.102 removed the `mermaid`/`excalidraw` diagram wrapper MCPs entirely — a leftover entry from an older install is scrubbed automatically by the ordinary install/update, with one notice line.) All local, no per-tool API keys. Ollama (Weaviate vectorizer + embedding fallback) and the code-embedding FastAPI service on port 11440 are backend infrastructure, not MCPs.
 - **Secrets primitive** — OS-keychain storage (launcher-managed) plus a chmod-600 file store under `~/.vct-secrets/`, resolved through the `vct` CLI and the `vct-hub` service. Agents inject credentials into child processes by key name (`vct exec --secret KEY=ENV_VAR -- cmd`) instead of printing them; a hook blocks env-grepping for tokens. See [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
-- **11 default agents + 8 machine-gated gateway agents + 7 skills, plus 11 opt-in packs** — shipped via `install.py` templates. The default agents handle planning, coding, testing, review, doc maintenance, KG maintenance and web/code exploration; the gateway agents cover the vendor models you have keys for; the packs carry the topical specialists (security, k8s, consulting, science, design — install only the ones you want). Skills cover context compression, issue fixing, task breakdown, and the installer / bootstrapper flows.
+- **11 default agents + 12 machine-gated gateway agents + 7 skills, plus 11 opt-in packs** — shipped via `install.py` templates. The default agents handle planning, coding, testing, review, doc maintenance, KG maintenance and web/code exploration; the gateway agents cover the vendor models you have keys for; the packs carry the topical specialists (security, k8s, consulting, science, design — install only the ones you want). Skills cover context compression, issue fixing, task breakdown, and the installer / bootstrapper flows.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
 ## Downloads (Launcher GUI)
 
-The launcher GUI ships as a per-OS standalone artifact on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
+Each release on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases) carries one `.zip` per OS (plus its `.sha256`). The archive is the whole orchestrator with the prebuilt launcher, hub and updater binaries inside (`launcher/dist/<os>-<arch>/`) — there is no separate launcher installer (no `.exe` setup, AppImage, `.deb` or `.dmg`). Extract it and run the `first-install` entry point for your OS; a `git clone` gets the same binaries from the repository.
 
 | OS                                  | Artifact                                              | Notes |
 |-------------------------------------|-------------------------------------------------------|-------|
-| **Windows 10/11 (x64)**             | `vct-launcher-windows-x64.exe`                        | Portable, no installer. Unsigned — SmartScreen → "More info" → "Run anyway" on first run. Code signing on backlog. |
-| **Linux (x64)**                     | `*.AppImage` (portable) or `*.deb`                    | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
-| **macOS (Apple Silicon)**           | `vct-launcher-macos-arm64.zip` (dist binary at `launcher/dist/macos-arm64/vct-launcher`) | Tier-2. Ad-hoc codesigned, not notarized — Gatekeeper warns once. See [docs/macos-install.md](docs/macos-install.md). |
-
-No GUI yet? The CLI install path (above) covers all three OSes.
+| **Windows 10/11 (x64)**             | `vibecoded-orchestrator-<version>-windows-x64.zip`    | Unsigned — SmartScreen → "More info" → "Run anyway" on first run. Code signing on backlog. |
+| **Linux (x64)**                     | `vibecoded-orchestrator-<version>-linux-x64.zip`      | |
+| **macOS (Apple Silicon)**           | `vibecoded-orchestrator-<version>-macos-arm64.zip`    | Tier-2. Ad-hoc codesigned, not notarized — Gatekeeper warns once. See [docs/macos-install.md](docs/macos-install.md). |
 
 ## Requirements
 
@@ -209,10 +207,10 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 | GPU, VRAM ≥ 4.9 GB                      | Ollama           | `qwen3.5:4b`       | Small-card rung (~3.2 GB).                                         |
 | No GPU; CPU, RAM ≥ 12 GB & 6+ cores     | Ollama           | `gemma4:e4b`       | Pure-CPU fallback.                                                 |
 | Any other machine                       | Ollama           | `qwen3.5:0.8b`     | Always-pulled floor.                                               |
+| Local model switched off (`VCT_LOCAL_SUMMARY_MODEL=off`) and no other backend | _none_ | _none_ | Summaries skipped; raw KG content still embedded + searchable.     |
+| OpenAI API (opt-in, requires consent)   | OpenAI           | `gpt-4o-mini`      | Off by default; toggle via Preferences → KG Summaries. Cost warning surfaced on enable. |
 
 The GPU thresholds are not chosen by hand: a GPU rung is picked only when the card can hold the free-VRAM floor the summary runtime checks before loading the model (its on-disk size plus a max(1 GB, 40 %) KV-cache margin, plus ~0.5 GB an idle desktop already uses), so the table never assigns a model the runtime would refuse to load.
-| Anything below those tiers              | _none_           | _none_             | Summaries skipped; raw KG content still embedded + searchable.     |
-| OpenAI API (opt-in, requires consent)   | OpenAI           | `gpt-4o-mini`      | Off by default; toggle via Preferences → KG Summaries. Cost warning surfaced on enable. |
 
 ¹ CPU core thresholds count **physical cores** (not logical/SMT threads), and the 24 GB RAM / 8 GB VRAM cutoffs are strict `>` boundaries — this avoids performance cliffs on hardware sitting exactly at a boundary.
 
@@ -229,7 +227,7 @@ Non-interactive / CI: `python install.py --quiet --no-containers`
 ```
 vibecoded-orchestrator/
 ├── .claude/
-│   ├── hooks/                 # 49 automation hooks (.sh + .ps1 per hook)
+│   ├── hooks/                 # Automation hooks (.sh + .ps1 per hook)
 │   ├── scripts/               # CLI tools for KG and code graph
 │   └── settings.json          # Claude Code configuration
 ├── claude_mcp_servers/
@@ -239,8 +237,8 @@ vibecoded-orchestrator/
 │   # (paper search) MCP was removed in v0.2.101 and the mermaid/excalidraw
 │   # diagram wrapper MCPs in v0.2.102.
 ├── templates/
-│   ├── agents/free/           # 11 default agents (+ machine-gated gateway agents)
-│   ├── skills/                # 6 default skills (+ opt-in pack skills)
+│   ├── agents/free/           # Default agents (+ machine-gated gateway agents)
+│   ├── skills/                # Default skills (+ opt-in pack skills)
 │   └── hooks/                 # Hook sources rendered into .claude/hooks/ at install
 ├── infrastructure/
 │   ├── docker-compose.yml     # Weaviate + Ollama
