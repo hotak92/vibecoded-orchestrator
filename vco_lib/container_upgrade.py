@@ -186,17 +186,32 @@ def class_counts(url: str, *, http: Optional[HttpFn] = None
 
 
 def count_mismatches(before: Mapping[str, int], after: Optional[Mapping[str, int]]) -> list[str]:
-    """Human lines for every class whose count is not what it was (a class
-    that disappeared or appeared included). An unreadable *after* is one
-    line, never an empty list."""
+    """Human lines for every class that LOST objects or disappeared — the
+    failures of a move. An unreadable *after* is one line, never an empty
+    list. More objects than before (or a new class) is not a loss: the
+    counts are read while sessions can still write, before the container is
+    stopped (audit C-4) — :func:`count_gains` reports those."""
     if after is None:
         return ["the counts after the move could not be read"]
     lines = []
-    for name in sorted(set(before) | set(after)):
-        b, a = before.get(name), after.get(name)
-        if b != a:
-            lines.append(f"{name}: {b if b is not None else 'absent'} before, "
-                         f"{a if a is not None else 'absent'} after")
+    for name in sorted(before):
+        b, a = before[name], after.get(name)
+        if a is None or a < b:
+            lines.append(f"{name}: {b} before, {a if a is not None else 'absent'} after")
+    return lines
+
+
+def count_gains(before: Mapping[str, int], after: Optional[Mapping[str, int]]) -> list[str]:
+    """Human lines for every class that holds MORE objects than before, or
+    that appeared — written between the count and the stop; reported in the
+    success line, never a failure."""
+    if after is None:
+        return []
+    lines = []
+    for name in sorted(after):
+        b, a = before.get(name), after[name]
+        if b is None or a > b:
+            lines.append(f"{name}: {b if b is not None else 'absent'} before, {a} after")
     return lines
 
 
@@ -602,8 +617,8 @@ def _backup_kept_entry(name: str, move: ImageMove, backup: str, runtime: str,
     return DeferralEntry(
         condition_id=CID_BACKUP_KEPT,
         title="Weaviate now runs the supported version; the pre-move copy is kept",
-        detected=(f"Container {name} moved {move.live} -> {move.pinned}; every class holds the "
-                  f"object count it had. The data as it was before the move is in volume "
+        detected=(f"Container {name} moved {move.live} -> {move.pinned}; no class lost an "
+                  f"object. The data as it was before the move is in volume "
                   f"{backup}.{extra}"),
         why_deferred="Recorded for your information; VCO never deletes that copy itself.",
         command_to_apply=("# Once you are satisfied with the new version, free the space:\n"
@@ -701,7 +716,7 @@ def protect_weaviate_move(
     out.backup = backup
 
     # ── from here the old container is replaced; every failure rolls back ──
-    problem = ""
+    problem, gains = "", []
     if not eng.remove_container(name):
         return back_to_old(f"the old container {name} could not be removed (the copy is in "
                            f"volume {backup}; remove it with `{runtime} volume rm {backup}`)")
@@ -711,12 +726,13 @@ def protect_weaviate_move(
     elif not eng.wait_ready(url, ready_timeout_s(environ)):
         problem = f"{move.pinned} did not become ready at {url}"
     else:
-        problem = _verify(eng, name, url, move, mount, before, _di)
+        problem, gains = _verify(eng, name, url, move, mount, before, _di)
     if not problem:
         after_empty = sorted(c for c, n in before.items() if n == 0)
         out.status, out.empty_classes = MOVED, after_empty
         say(f"  [weaviate] verified: {move.pinned}, same data mount, every index present, "
-            f"all {len(before)} class counts equal")
+            f"no class lost an object (of {len(before)} counted)"
+            + (f"; written during the move: {'; '.join(gains[:10])}" if gains else ""))
         say(f"  [weaviate] the pre-move copy is kept in volume {backup}")
         out.entries.append(_backup_kept_entry(name, move, backup, runtime, after_empty))
         return out
@@ -783,29 +799,33 @@ def _refuse(out: MoveOutcome, name: str, move: ImageMove, reason: str, command: 
 
 
 def _verify(eng: ContainerEngine, name: str, url: str, move: ImageMove,
-            mount: Mapping[str, str], before: Mapping[str, int], _di: Any) -> str:
-    """``""`` when the recreated container is the pinned image on the same
-    data with every class intact, else the first thing that is not."""
+            mount: Mapping[str, str], before: Mapping[str, int], _di: Any
+            ) -> tuple[str, list[str]]:
+    """``("", gains)`` when the recreated container is the pinned image on
+    the same data with every class intact (*gains*: :func:`count_gains`),
+    else ``(the first thing that is not, [])``."""
     live = eng.inspect(name)
     if live is None:
-        return f"the new container {name} could not be inspected"
+        return f"the new container {name} could not be inspected", []
     if image_move(live.image, move.pinned) is not None:
-        return f"the new container runs {live.image}, not {move.pinned}"
+        return f"the new container runs {live.image}, not {move.pinned}", []
     new_mount = live.mount_at(_DATA_DEST)
     if new_mount is None or _di.mount_key(new_mount.to_row()) != _di.mount_key(dict(mount)):
         got = f"{new_mount.kind} {new_mount.source}" if new_mount is not None else "nothing"
         return (f"the new container mounts {got} at {_DATA_DEST}, not "
-                f"{mount.get('kind')} {mount.get('source')}")
+                f"{mount.get('kind')} {mount.get('source')}"), []
     missing = eng.indexes_missing(url, sorted(before))
     if missing is None:
-        return "whether every class still has its index could not be checked"
+        return "whether every class still has its index could not be checked", []
     if missing:
-        return "classes without their index: " + ", ".join(missing[:10])
+        return "classes without their index: " + ", ".join(missing[:10]), []
     after, why = eng.counts(url)
     if after is None:
-        return why
+        return why, []
     bad = count_mismatches(before, after)
-    return ("object counts differ — " + "; ".join(bad[:10])) if bad else ""
+    if bad:
+        return "object counts differ — " + "; ".join(bad[:10]), []
+    return "", count_gains(before, after)
 
 
 def _rollback(eng: ContainerEngine, name: str, url: str, move: ImageMove, source: str,

@@ -224,6 +224,26 @@ def test_unreadable_counts_after_the_move_are_a_mismatch_not_equality():
     assert cu.count_mismatches({"A": 0}, None)            # 0 == None must never pass
     assert cu.count_mismatches({"A": 0}, {"A": 0}) == []
     assert cu.count_mismatches({"A": 5, "B": 1}, {"A": 5}) == ["B: 1 before, absent after"]
+    assert cu.count_mismatches({"A": 5}, {"A": 4}) == ["A: 5 before, 4 after"]
+
+
+def test_objects_written_between_the_count_and_the_stop_are_not_a_loss():
+    # C-4: counts are read while sessions still write; more objects (or a new
+    # class) after the move is reported, never a failure.
+    assert cu.count_mismatches({"A": 5}, {"A": 7, "New": 1}) == []
+    assert cu.count_gains({"A": 5}, {"A": 7, "New": 1}) == [
+        "A: 5 before, 7 after", "New: absent before, 1 after"]
+    assert cu.count_gains({"A": 5}, {"A": 5}) == [] and cu.count_gains({"A": 5}, None) == []
+
+
+def test_a_row_written_during_the_move_does_not_roll_a_good_move_back(root, tmp_path):
+    eng = FakeEngine()
+    eng.on_new_start = lambda e: e.data.update(Alpha_KnowledgeGraph=121, Alpha_New=3)
+    out = _move(root, eng, tmp_path)
+    assert out.status == cu.MOVED and "restore" not in eng.calls
+    text = "\n".join(out.lines)
+    assert "Alpha_KnowledgeGraph: 120 before, 121 after" in text
+    assert "Alpha_New: absent before, 3 after" in text
 
 
 def test_every_class_is_counted_and_one_unreadable_class_fails_the_whole_read():
