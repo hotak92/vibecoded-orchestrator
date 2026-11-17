@@ -76,7 +76,7 @@ Other paid features are NOT shipped in this repo. Paid-module code is hosted sep
 
 Known paid modules, handled outside this repo:
 
-- **RL retrieval reranking** — per-project reranker trained over KG/codegraph retrieval. Paid add-on.
+- *(RL retrieval reranking was listed here until v0.2.106. It is now part of this repository — `claude_mcp_servers/rl_reranker` — and needs no licence.)*
 
 The VCT Launcher is the gate: it validates the license, fetches the module from a private distribution server, and installs into `.claude/` or `claude_mcp_servers/`. The free repo only documents these modules' existence for discoverability, never their source.
 
