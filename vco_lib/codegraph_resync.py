@@ -4258,19 +4258,14 @@ def spawn_code_summary_after_walk(
 #: never starts the N−2 queued walks at once when the period expires. The slot
 #: is released on exit or crash (flock semantics); see
 #: ``vco_lib.atomic.machine_slot`` (and its known narrow overlap window).
-#:   VCO_RESYNC_DRIVER_SLOTS   — slots (default 2; minimum 1)
+#: v0.2.107: the pool is the ONE bulk-writer pool the owed-work worker also
+#: counts against — same directory (``atomic.bulk_slot_dir``) and same size
+#: (``atomic.machine_slot_count``: from the RAM, 1 below 12 GiB, 4 from 64 GiB).
+#:   VCO_RESYNC_DRIVER_SLOTS   — slots (overrides the RAM-sized count; minimum 1)
 #:   VCO_RESYNC_DRIVER_WAIT_S  — wait period in seconds before a dead holder's
 #:                               slot may be taken over (default 21600 = 6 h)
-_DRIVER_SLOTS_ENV = "VCO_RESYNC_DRIVER_SLOTS"
 _DRIVER_WAIT_ENV = "VCO_RESYNC_DRIVER_WAIT_S"
-_DRIVER_SLOTS_DEFAULT = 2
 _DRIVER_WAIT_DEFAULT_S = 6 * 3600.0
-
-
-def _driver_slot_dir() -> Path:
-    from vco_lib.paths import vct_root_dir
-
-    return vct_root_dir() / "state" / "resync-driver-slots"
 
 
 def _driver_claim_lock_path(project_name: str) -> Path:
@@ -4289,7 +4284,9 @@ def _driver_claim_lock_path(project_name: str) -> Path:
     """
     from vco_lib.codegraph_walk import claim_key
 
-    return _driver_slot_dir().parent / "resync-driver-claims" / f"{claim_key(project_name)}.lock"
+    from vco_lib.atomic import bulk_slot_dir
+
+    return bulk_slot_dir().parent / "resync-driver-claims" / f"{claim_key(project_name)}.lock"
 
 
 def run_resync_and_verify(
@@ -4319,7 +4316,14 @@ def run_resync_and_verify(
     (``flock``) and Windows (``msvcrt``, v0.2.103); only a platform with
     neither degrades to no exclusion.
     """
-    from vco_lib.atomic import LockTimeout, exclusive_file_lock, machine_slot
+    from vco_lib.atomic import (
+        BULK_SLOTS_ENV,
+        LockTimeout,
+        bulk_slot_dir,
+        exclusive_file_lock,
+        machine_slot,
+        machine_slot_count,
+    )
 
     claim = exclusive_file_lock(_driver_claim_lock_path(project_name), timeout_s=0)
     try:
@@ -4344,13 +4348,13 @@ def run_resync_and_verify(
         )
         return 0
     try:
-        slots = int(max(1, env_float(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT)))
+        slots = machine_slot_count()
         wait_s = max(0, env_float(_DRIVER_WAIT_ENV, _DRIVER_WAIT_DEFAULT_S))
 
         def _on_wait(waited: float) -> None:
             if waited < 1.0:
                 msg = (f"all {slots} resync-driver slot(s) are busy — queued "
-                       f"({_DRIVER_SLOTS_ENV} raises the cap)")
+                       f"({BULK_SLOTS_ENV} raises the cap)")
             else:
                 msg = (f"still queued after {waited / 3600:.1f} h — every slot "
                        f"holder is alive, so this driver keeps waiting (never "
@@ -4362,7 +4366,7 @@ def run_resync_and_verify(
             print(f"[resync-driver] {project_name}: slot {slot_i}'s holder "
                   f"(pid {pid}) is gone — taking the slot over", flush=True)
 
-        with machine_slot(_driver_slot_dir(), slots=slots, wait_s=wait_s,
+        with machine_slot(bulk_slot_dir(), slots=slots, wait_s=wait_s,
                           on_wait=_on_wait, on_takeover=_on_takeover):
             return _run_resync_and_verify_slotted(
                 project_name, repo_root, analyzer_path,
