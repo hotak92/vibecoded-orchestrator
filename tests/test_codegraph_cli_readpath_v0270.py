@@ -282,9 +282,9 @@ def test_callers_branch_requests_and_reads_references() -> None:
        never be found — fixing (1) alone still answers 0 in practice.
     """
     src = CLI_SRC.read_text(encoding="utf-8")
-    assert 'return_references=QueryReference(link_on="calls")' in src, (
-        "callers fetch does not request the `calls` link — obj.references will "
-        "be None on every row and the branch answers 0 forever"
+    assert 'return_references=_structure_reference("calls")' in src, (
+        "callers fetch does not request the bounded `calls` link — "
+        "obj.references will be None on every row and the branch answers 0 forever"
     )
     assert '_caller_match_terms(target)' in src, (
         "callers fetch is not filtered on call_names via the shared "

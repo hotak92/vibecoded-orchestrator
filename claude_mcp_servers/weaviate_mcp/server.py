@@ -51,6 +51,7 @@ import sys
 import json
 import logging
 import re
+import time
 import asyncio
 import functools
 import uuid
@@ -6298,6 +6299,7 @@ async def search_code_graph(
                         sib_filter = sib_filter & Filter.by_property("project").equal(effective_project)
                     sib_rows = _wem.fetch_matching_rows(
                         coll_obj, sib_filter, _sib_accept, max_matches=64,
+                        return_properties=list(_bounded_read.SIBLING_PROPERTIES),
                     )
                     for obj in sib_rows:
                         sp = obj.properties or {}
@@ -6310,7 +6312,9 @@ async def search_code_graph(
                             sl_int = 0
                         collected.append((sl_int, c_name, sp))
                 except Exception as exc:
-                    logger.debug("search_code_graph: sibling fetch %s failed: %s", c_name, exc)
+                    if not _code_resource_exhausted(
+                            exc, coll_obj, "search_code_graph.file_siblings"):
+                        logger.debug("search_code_graph: sibling fetch %s failed: %s", c_name, exc)
             if not collected:
                 return []
             collected.sort(key=lambda t: abs(t[0] - hit_start_line))
@@ -6364,6 +6368,7 @@ async def search_code_graph(
             for base in ("CodeFunction", "CodeClass"):
                 try:
                     coll_obj = client.collections.get(_project_collection(base))
+                    entity_props = _bounded_read.chunk_properties(base)
                     rows = confirmed_entity_rows(
                         coll_obj,
                         filter_cls=Filter,
@@ -6371,6 +6376,7 @@ async def search_code_graph(
                         full_name=full_name,
                         file_path=file_path,
                         max_matches=max(total, max_chunks) + 4,
+                        return_properties=entity_props,
                     )
                     for obj in rows:
                         cp = obj.properties or {}
@@ -6380,7 +6386,9 @@ async def search_code_graph(
                         except (TypeError, ValueError):
                             collected.append((0, cp))
                 except Exception as exc:
-                    logger.debug("search_code_graph: code chunk fetch %s failed: %s", base, exc)
+                    if not _code_resource_exhausted(
+                            exc, coll_obj, "search_code_graph.code_chunks"):
+                        logger.debug("search_code_graph: code chunk fetch %s failed: %s", base, exc)
             if not collected:
                 return []
             # Centre a window of max_chunks around the hit chunk, ordered by chunk_num.
@@ -6522,9 +6530,14 @@ async def search_code_graph(
                                     )
                                 if ix_fn_obj is not None:
                                     src_uuid = str(ix_fn_obj.uuid)
-                                    ix_resp = ix_coll.query.fetch_objects(
+                                    ix_resp = _code_fetch_objects(
+                                        ix_coll, "search_code_graph.expand_hops.function_interactions",
                                         filters=Filter.by_ref("source_function").by_id().equal(src_uuid),
                                         limit=20,
+                                        return_properties=[
+                                            "interaction_type", "direction", "protocol",
+                                            "endpoint", "file_path",
+                                        ],
                                     )
                                     for ix_obj in ix_resp.objects:
                                         if len(expanded_results) >= CODE_EXPANSION_LIMIT:
@@ -6560,12 +6573,18 @@ async def search_code_graph(
                                 mod_rows = _code_identity_rows(
                                     mod_coll, "path", identifier, "",
                                     tolerant_limit=1,
+                                    return_properties=["path", "project"],
                                 )
                                 if mod_rows:
                                     src_uuid = str(mod_rows[0].uuid)
-                                    ix_resp = ix_coll.query.fetch_objects(
+                                    ix_resp = _code_fetch_objects(
+                                        ix_coll, "search_code_graph.expand_hops.module_interactions",
                                         filters=Filter.by_ref("source_module").by_id().equal(src_uuid),
                                         limit=20,
+                                        return_properties=[
+                                            "interaction_type", "direction", "protocol",
+                                            "endpoint", "file_path",
+                                        ],
                                     )
                                     for ix_obj in ix_resp.objects:
                                         if len(expanded_results) >= CODE_EXPANSION_LIMIT:
@@ -6708,6 +6727,8 @@ def _caller_match_terms(target: str) -> list[str]:
 # evidence of absence (see the CLI's callers branch).
 _CALLER_TARGET_ROWS = 8       # callee rows fetched to learn its root(s)
 _CALLER_SCOPE_SCAN_MULT = 10  # candidate over-fetch when a root scope applies
+_CODE_PATH_NODE_BUDGET = 500
+_CODE_PATH_TIME_BUDGET_SECONDS = 10.0
 # Path-spelling differences (a symlinked root, a `..`/`//` spelling, a
 # Windows drive-letter case) must not fork the scope, so stored stamps are
 # compared through their comparison FORMS — raw + realpath-resolved POSIX
@@ -6871,6 +6892,17 @@ def _caller_scan_limit(base_limit: int, escalate: bool) -> int:
     return base_limit * (_CALLER_SCOPE_SCAN_MULT if escalate else 1)
 
 
+def _caller_scan_rows(coll, flt, scan_limit: int, call_site: str):
+    """One callers candidate page with the caller fields only (v0.2.107 CG-1)."""
+    return _code_fetch_objects(
+        coll, call_site, filters=flt, limit=scan_limit,
+        return_properties=[
+            "full_name", "signature", "file_path", "chunk_num",
+            "project", "project_source",
+        ],
+    )
+
+
 def _callers_answer_truncated(in_scope_rows, raw_object_count: int,
                               scan_limit: int, answer_cap: int) -> bool:
     """ONE truncation rule for BOTH caller surfaces (v0.2.105 fix round,
@@ -6912,6 +6944,26 @@ def _pick_canonical_chunk(objects: list):
     return pick_canonical_chunk(objects)
 
 
+def _code_resource_exhausted(exc: Exception, coll, call_site: str) -> bool:
+    """v0.2.107 CG-1: one log line for an oversized reply (shared home
+    ``vco_lib.codegraph_bounded_read``, used by the CLI too)."""
+    from vco_lib.codegraph_bounded_read import report_resource_exhausted
+
+    return report_resource_exhausted(exc, coll, call_site)
+
+
+def _code_fetch_objects(coll, call_site: str, **kwargs):
+    from vco_lib.codegraph_bounded_read import fetch_objects
+
+    return fetch_objects(coll, call_site, **kwargs)
+
+
+def _code_fetch_object_by_id(coll, uuid, call_site: str, **kwargs):
+    from vco_lib.codegraph_bounded_read import fetch_object_by_id
+
+    return fetch_object_by_id(coll, uuid, call_site, **kwargs)
+
+
 def _code_identity_rows(
     coll, prop: str, target: str, effective_project, *,
     tolerant_limit: int, **fetch_kwargs,
@@ -6928,9 +6980,12 @@ def _code_identity_rows(
     """
     from vco_lib.codegraph_lookup import code_identity_rows
 
-    return code_identity_rows(
-        coll, prop, target, effective_project or "",
-        filter_cls=Filter, tolerant_limit=tolerant_limit, **fetch_kwargs,
+    from vco_lib.codegraph_bounded_read import rows_or_empty
+
+    return rows_or_empty(
+        code_identity_rows, coll, f"identity.{prop}", prop, target,
+        effective_project or "", filter_cls=Filter,
+        tolerant_limit=tolerant_limit, **fetch_kwargs,
     )
 
 
@@ -6955,14 +7010,24 @@ def _resolve_code_function(func_coll, full_name: str, effective_project, *,
     """
     refs = _code_return_references("calls")
     if uuid:
-        obj = func_coll.query.fetch_object_by_id(uuid, return_references=refs)
+        obj = _code_fetch_object_by_id(
+            func_coll, uuid, "resolve_code_function.by_id",
+            return_properties=[
+                "full_name", "signature", "file_path", "chunk_num", "project",
+            ],
+            return_references=refs,
+        )
         if obj is not None:
             return obj
     if not full_name:
         return None
     return _pick_canonical_chunk(_code_identity_rows(
         func_coll, "full_name", full_name, effective_project,
-        tolerant_limit=1, return_references=refs,
+        tolerant_limit=1,
+        return_properties=[
+            "full_name", "signature", "file_path", "chunk_num", "project",
+        ],
+        return_references=refs,
     ))
 
 
@@ -7040,8 +7105,14 @@ def _code_return_references(link_on: str) -> list:
 
     weaviate v4 requires `_QueryReference` instances here; a bare property
     name (str) is rejected by client-side validation before any network call.
+    v0.2.107 CG-1: the link carries the bounded field list of
+    ``vco_lib.codegraph_bounded_read.REFERENCE_PROPERTIES`` (shared with the
+    CLI) — never whole referenced rows, never an empty list its readers need.
     """
-    return [QueryReference(link_on=link_on)]
+    from vco_lib.codegraph_bounded_read import REFERENCE_PROPERTIES
+
+    return [QueryReference(
+        link_on=link_on, return_properties=list(REFERENCE_PROPERTIES[link_on]))]
 
 
 # One home (CLAUDE.md § "search before you add, extract before you duplicate"):
@@ -7058,6 +7129,7 @@ def _code_return_references(link_on: str) -> list:
 # import configure_logging` in the import block at the top): a failing import
 # means a BROKEN install and must surface loudly, never degrade to an inline
 # copy.
+from vco_lib import codegraph_bounded_read as _bounded_read  # noqa: E402 — v0.2.107 CG-1, shared with the CLI
 from vco_lib.codegraph_references import (  # noqa: E402 — kept beside its explainer
     dedup_ref_targets as _dedup_ref_targets,
     read_cross_reference as _read_cross_reference,
@@ -7170,6 +7242,7 @@ def _callgraph_target_language(
                 # v0.2.101 pull-in: exact entity first, tolerant fallback.
                 rows = _code_identity_rows(
                     coll, prop, probe_name, effective_project, tolerant_limit=1,
+                    return_properties=[prop, "language", "project"],
                 )
                 if rows:
                     lang = (rows[0].properties or {}).get("language")
@@ -7278,6 +7351,7 @@ def query_code_structure(
                 module_rows = _code_identity_rows(
                     coll, "path", target, effective_project,
                     tolerant_limit=1,
+                    return_properties=["path", "language", "project"],
                     return_references=_code_return_references("imports"),
                 )
 
@@ -7360,16 +7434,23 @@ def query_code_structure(
                         _seen_importers.add(key)
                     return True
 
-                confirmed = _wem.fetch_matching_rows(
-                    coll,
-                    with_project(
-                        Filter.by_ref("imports").by_property("path").equal(target)
-                    ),
-                    _confirmed_importer,
-                    accept_object=True,
-                    max_matches=IMPORTS_LIMIT + 1,
-                    return_references=_code_return_references("imports"),
-                )
+                try:
+                    confirmed = _wem.fetch_matching_rows(
+                        coll,
+                        with_project(
+                            Filter.by_ref("imports").by_property("path").equal(target)
+                        ),
+                        _confirmed_importer,
+                        accept_object=True,
+                        max_matches=IMPORTS_LIMIT + 1,
+                        return_properties=["path", "language", "project"],
+                        return_references=_code_return_references("imports"),
+                    )
+                except Exception as exc:
+                    if not _code_resource_exhausted(
+                            exc, coll, "query_code_structure.imports"):
+                        raise
+                    confirmed = []
                 importers = _dedup_ref_targets(confirmed, ("path",))[:IMPORTS_LIMIT]
                 results = [{"path": obj.properties.get("path"), "file_path": obj.properties.get("path", "")} for obj in importers]
                 _truncation_meta = {
@@ -7388,6 +7469,9 @@ def query_code_structure(
             # fallback on a miss.
             canonical = _pick_canonical_chunk(_code_identity_rows(
                 coll, "full_name", target, effective_project, tolerant_limit=8,
+                return_properties=[
+                    "full_name", "file_path", "methods", "chunk_num", "project",
+                ],
             ))
             if canonical is None:
                 return json.dumps({"success": False, "error": f"Class '{target}' not found" + _code_structure_not_found_hint(query_type, target, effective_project)}, indent=2)
@@ -7403,6 +7487,7 @@ def query_code_structure(
             # `extends` references).
             canonical = _pick_canonical_chunk(_code_identity_rows(
                 coll, "full_name", target, effective_project, tolerant_limit=8,
+                return_properties=["full_name", "file_path", "chunk_num", "project"],
                 return_references=_code_return_references("extends"),
             ))
             if canonical is None:
@@ -7437,15 +7522,17 @@ def query_code_structure(
             # WS-4 Finding 1: call_names holds BARE leaf names; match the
             # full_name target AND its bare leaf so dotted / `::`-qualified
             # inputs (the documented form) actually resolve.
-            response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
-                limit=scan_limit
+            response = _caller_scan_rows(
+                coll,
+                with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
+                scan_limit, "query_code_structure.callers",
             )
             if _caller_page_proves_mixed(response.objects, caller_roots, CALLERS_LIMIT):
                 scan_limit = _caller_scan_limit(CALLERS_LIMIT, True)
-                response = coll.query.fetch_objects(
-                    filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
-                    limit=scan_limit
+                response = _caller_scan_rows(
+                    coll,
+                    with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
+                    scan_limit, "query_code_structure.callers.mixed",
                 )
             # F6: `call_names` is replicated on every chunk row of a chunked
             # caller — collapse to one row per full_name (canonical chunk),
@@ -7490,17 +7577,24 @@ def query_code_structure(
             # filter matches.
             canonical_func = _pick_canonical_chunk(_code_identity_rows(
                 func_coll, "full_name", target, effective_project, tolerant_limit=8,
+                return_properties=["full_name", "chunk_num", "project"],
             ))
             if canonical_func is not None:
                 source_uuid = str(canonical_func.uuid)
-                ix_resp = interactions_coll.query.fetch_objects(
+                ix_resp = _code_fetch_objects(
+                    interactions_coll, "query_code_structure.interactions.function",
                     filters=Filter.by_ref("source_function").by_id().equal(source_uuid),
-                    limit=INTERACTIONS_LIMIT
+                    limit=INTERACTIONS_LIMIT,
+                    return_properties=[
+                        "interaction_type", "direction", "protocol", "endpoint",
+                        "confidence", "raw_target", "source_project", "description",
+                    ],
                 )
             else:
                 mod_coll = client.collections.get(_proj_coll("CodeModule"))
                 mod_rows = _code_identity_rows(
                     mod_coll, "path", target, effective_project, tolerant_limit=1,
+                    return_properties=["path", "project"],
                 )
                 if not mod_rows:
                     return json.dumps({
@@ -7509,9 +7603,14 @@ def query_code_structure(
                         + _code_structure_not_found_hint(query_type, target, effective_project)
                     }, indent=2)
                 source_uuid = str(mod_rows[0].uuid)
-                ix_resp = interactions_coll.query.fetch_objects(
+                ix_resp = _code_fetch_objects(
+                    interactions_coll, "query_code_structure.interactions.module",
                     filters=Filter.by_ref("source_module").by_id().equal(source_uuid),
-                    limit=INTERACTIONS_LIMIT
+                    limit=INTERACTIONS_LIMIT,
+                    return_properties=[
+                        "interaction_type", "direction", "protocol", "endpoint",
+                        "confidence", "raw_target", "source_project", "description",
+                    ],
                 )
 
             results = []
@@ -7533,7 +7632,7 @@ def query_code_structure(
             }
 
         elif query_type == "path":
-            # BFS path-finding through CodeFunction.calls (text-array property)
+            # Bounded BFS path-finding through CodeFunction.calls references.
             # target format: "source_full_name->dest_full_name"
             if "->" not in target:
                 return json.dumps({
@@ -7546,6 +7645,7 @@ def query_code_structure(
             dest_name = dest_name.strip()
 
             func_coll = client.collections.get(_proj_coll("CodeFunction"))
+            path_started = time.monotonic()
 
             # BFS state: queue of (current_full_name, current_uuid, path_so_far)
             from collections import deque
@@ -7586,6 +7686,24 @@ def query_code_structure(
             max_depth = 6
 
             while bfs_queue and found_path is None:
+                if time.monotonic() - path_started >= _CODE_PATH_TIME_BUDGET_SECONDS:
+                    _truncation_meta = {
+                        "truncated": True, "limit": _CODE_PATH_TIME_BUDGET_SECONDS,
+                    }
+                    _extra_payload.update({
+                        "truncation_reason": "time_budget",
+                        "nodes_visited": len(visited),
+                    })
+                    break
+                if len(visited) >= _CODE_PATH_NODE_BUDGET:
+                    _truncation_meta = {
+                        "truncated": True, "limit": _CODE_PATH_NODE_BUDGET,
+                    }
+                    _extra_payload.update({
+                        "truncation_reason": "node_budget",
+                        "nodes_visited": len(visited),
+                    })
+                    break
                 current_name, current_uuid, current_path = bfs_queue.popleft()
                 current_hop = len(current_path) - 1
 
@@ -7634,14 +7752,18 @@ def query_code_structure(
                 _emit_code_structure_telemetry(
                     query_type=query_type, target=target, results=[],
                 )
-                return json.dumps({
+                payload = {
                     "success": True,
                     "query_type": "path",
                     "target": target,
                     "path_found": False,
                     "count": 0,
                     "results": [],
-                }, indent=2)
+                }
+                if _truncation_meta is not None:
+                    payload.update(_truncation_meta)
+                payload.update(_extra_payload)
+                return json.dumps(payload, indent=2)
 
             results = found_path
 
@@ -7652,6 +7774,7 @@ def query_code_structure(
             # among exact rows the canonical chunk answers.
             composes_obj = _pick_canonical_chunk(_code_identity_rows(
                 coll, "full_name", target, effective_project, tolerant_limit=1,
+                return_properties=["full_name", "composes", "chunk_num", "project"],
             ))
 
             if composes_obj is None:
@@ -7665,9 +7788,11 @@ def query_code_structure(
             # v0.2.46 V46-D: emit truncation signal.
             COMPOSED_BY_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeClass"))
-            response = coll.query.fetch_objects(
+            response = _code_fetch_objects(
+                coll, "query_code_structure.composed_by",
                 filters=with_project(Filter.by_property("composes").contains_any([target])),
-                limit=COMPOSED_BY_LIMIT
+                limit=COMPOSED_BY_LIMIT,
+                return_properties=["full_name", "file_path", "chunk_num", "project"],
             )
             # F6: one row per full_name — `composes` is replicated per chunk.
             results = [
@@ -7687,9 +7812,13 @@ def query_code_structure(
             # v0.2.46 V46-D: emit truncation signal.
             TYPE_USERS_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeFunction"))
-            response = coll.query.fetch_objects(
+            response = _code_fetch_objects(
+                coll, "query_code_structure.type_users",
                 filters=with_project(Filter.by_property("type_uses").contains_any([target])),
-                limit=TYPE_USERS_LIMIT
+                limit=TYPE_USERS_LIMIT,
+                return_properties=[
+                    "full_name", "signature", "file_path", "chunk_num", "project",
+                ],
             )
             # F6: one row per full_name — `type_uses` is replicated per chunk.
             results = [

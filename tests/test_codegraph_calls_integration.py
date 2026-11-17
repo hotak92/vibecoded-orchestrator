@@ -56,7 +56,7 @@ class _FakeQuery:
     def __init__(self, rows: Dict[str, Dict[str, Any]]) -> None:
         self._rows = rows
 
-    def fetch_object_by_id(self, uuid: str) -> Optional[_FakeObj]:
+    def fetch_object_by_id(self, uuid: str, return_properties=None) -> Optional[_FakeObj]:
         props = self._rows.get(str(uuid))
         return _FakeObj(props) if props is not None else None
 

@@ -1152,28 +1152,19 @@ def _count_stale_in_collection(
     (``project_source`` outside ``primary_sources``) classify ``"not_owed"``
     and converge on their own root's walk.
 
-    Bounded cost: the cheap filtered aggregate is ALWAYS the first gate. When
-    it returns 0, we return 0 IMMEDIATELY — no per-row scan (the converged
-    steady-state cost is one aggregate). The slow per-row classify scan is
-    paid ONLY when the aggregate says "stale > 0" (there is genuine work to
-    classify). Without a ``reachable_fn`` the aggregate count is returned
-    as-is (pre-R3 behaviour: all stale rows, orphans included — conservative
-    over-count, never a wrong "converged").
+    Bounded cost: a one-row, property-free filtered read answers the converged
+    case without an Aggregate. A positive or failed probe falls through to the
+    classified scan, which returns the exact count.
 
     Tiers:
-      1. Filtered aggregate ``embed_revision != rev OR embed_revision IS
-         NULL`` — cheap. The IsNull leg is load-bearing: Weaviate comparisons
-         ignore NULLs and pre-migration rows are exactly the NULL ones (a
-         ``min()``/``not_equal``-only probe reports "converged" over a
-         half-migrated collection — C-3 warning).
-      2. Full scan classified client-side (NULL-safe) — covers collections
-         created without ``index_null_state=True`` where the IsNull filter
-         errors, AND is where the shared classifier is applied.
+      1. ``fetch_objects(limit=1, return_properties=[])`` with the NULL-safe
+         stale filter — a property-free existence probe.
+      2. Full scan classified client-side — covers old null-index schemas and
+         returns the exact owed count.
 
     Returns ``None`` when neither tier could run (undeterminable — the caller
     must NOT treat that as zero).
     """
-    agg_total: Optional[int] = None
     try:
         from weaviate.classes.query import Filter
 
@@ -1181,23 +1172,13 @@ def _count_stale_in_collection(
             Filter.by_property("embed_revision").not_equal(int(current_revision))
             | Filter.by_property("embed_revision").is_none(True)
         )
-        agg = coll.aggregate.over_all(filters=flt, total_count=True)
-        total = getattr(agg, "total_count", None)
-        if total is not None:
-            agg_total = int(total)
-    except Exception:  # noqa: BLE001 — fall to the NULL-safe scan
-        agg_total = None
-
-    if agg_total is not None:
-        # Aggregate is authoritative for "is there ANY stale row?". Zero → done,
-        # NO per-row scan (the R3 bound: cheap converged steady state).
-        if agg_total == 0:
+        probe = coll.query.fetch_objects(
+            filters=flt, limit=1, return_properties=[],
+        )
+        if not getattr(probe, "objects", None):
             return 0
-        if reachable_fn is None:
-            # Pre-R3: return the aggregate (all stale rows, orphans included).
-            return agg_total
-        # R3: aggregate > 0 → pay the per-row scan to count only reachable
-        # stale rows (fall through to the scan below).
+    except Exception:  # noqa: BLE001 — fall to the NULL-safe scan
+        pass
 
     # Full NULL-safe scan. Reads embed_revision (+ the path property when R3
     # reachability filtering is on, + project_source when source-scoping is on
@@ -1394,7 +1375,7 @@ def has_rows_at_current_revision(
       correct content hashes are the ones every gate skips forever.
 
     Probes the same three file-anchored bases as :func:`count_stale_rows`
-    (``_RESYNC_PROBE_BASES``) with the cheap filtered aggregate; short-
+    (``_RESYNC_PROBE_BASES``) with a one-row, property-free read; short-
     circuits on the first positive.  Never raises.
     """
     if not project_name:
@@ -1422,9 +1403,10 @@ def has_rows_at_current_revision(
                 if status == _COLL_ERROR:
                     return None
                 try:
-                    agg = coll.aggregate.over_all(filters=flt, total_count=True)
-                    total = getattr(agg, "total_count", None)
-                    if total is not None and int(total) > 0:
+                    probe = coll.query.fetch_objects(
+                        filters=flt, limit=1, return_properties=[],
+                    )
+                    if getattr(probe, "objects", None):
                         return True
                 except Exception as exc:  # noqa: BLE001 — undeterminable, never False
                     logger.warning(
@@ -4904,14 +4886,16 @@ _IDENTITY_UNMIGRATABLE_BASES = frozenset({"CodeInteraction"})
 def _probe_stale_identity_count(
     client, prefix: str, canonical: str,
 ) -> Optional[int]:
-    """Cheap gate for :func:`identity_sweep_if_stale`: total count of rows whose
-    ``project`` ≠ ``canonical`` across the 5 ``<prefix>_<base>`` classes, via a
-    filtered aggregate (the cheapest read — no per-row scan). ``None`` when the
-    probe is undeterminable on EVERY class (Weaviate down / prefix unresolvable
-    / aggregate shape unsupported) so the caller never treats "can't tell" as
-    "converged". ``0`` means every class positively reported zero stale rows.
+    """Cheap gate for :func:`identity_sweep_if_stale`: how many of the 5
+    ``<prefix>_<base>`` classes hold a row whose ``project`` ≠ ``canonical``.
+    v0.2.107 CG-1: each class is asked with a one-row, property-free filtered
+    read (an existence check — the caller only distinguishes zero from
+    non-zero), never a filtered Aggregate. ``None`` when the probe is
+    undeterminable on EVERY class (Weaviate down / prefix unresolvable) so the
+    caller never treats "can't tell" as "converged". ``0`` means every class
+    positively reported no stale row.
 
-    Soft-fail per class: an aggregate error on one class does not poison the
+    Soft-fail per class: a read error on one class does not poison the
     others (it contributes ``undeterminable``, not ``0``) — EXCEPT when that
     class positively lacks the ``project`` property (v0.2.102 S16-4): then the
     probe returns ``None`` so the caller runs the sweep, which adds it.
@@ -4955,15 +4939,16 @@ def _probe_stale_identity_count(
                 pass
             continue
         try:
-            flt = Filter.by_property("project").not_equal(canonical)
-            agg = coll.aggregate.over_all(filters=flt, total_count=True)
-            count = getattr(agg, "total_count", None)
-            if count is not None:
-                any_determinable = True
-                total += int(count)
+            probe = coll.query.fetch_objects(
+                filters=Filter.by_property("project").not_equal(canonical),
+                limit=1, return_properties=[],
+            )
+            any_determinable = True
+            if getattr(probe, "objects", None):
+                total += 1
         except Exception as exc:  # noqa: BLE001 — one class undeterminable
             logger.debug(
-                "identity sweep probe: aggregate %s failed: %s", coll_name, exc
+                "identity sweep probe: read %s failed: %s", coll_name, exc
             )
             try:
                 if "project" not in {p.name for p in coll.config.get().properties}:

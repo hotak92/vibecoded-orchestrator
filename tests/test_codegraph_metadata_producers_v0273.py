@@ -370,7 +370,7 @@ class _XRefFunctions:
             reference_add=lambda **kw: self.refs.append(kw),
         )
 
-    def _fetch(self, uuid):
+    def _fetch(self, uuid, return_properties=None):
         self.fetched.append(uuid)
         if uuid not in self._bodies:
             return None

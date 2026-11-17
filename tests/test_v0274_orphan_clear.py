@@ -107,6 +107,14 @@ class _FakeColl:
         self.aggregate = types.SimpleNamespace(
             over_all=lambda **kw: types.SimpleNamespace(total_count=agg_count)
         )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if False or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return types.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = types.SimpleNamespace(fetch_objects=_probe)
 
     def iterator(self, return_properties=None):
         self.iter_calls += 1
@@ -749,6 +757,14 @@ class _R3Coll:
         self.aggregate = types.SimpleNamespace(
             over_all=lambda **kw: types.SimpleNamespace(total_count=agg_count)
         )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if False or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return types.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = types.SimpleNamespace(fetch_objects=_probe)
         _names = prop_names if prop_names is not None else (
             "embed_revision", "file_path", "path", "project_source",
         )
@@ -937,17 +953,20 @@ def test_r3_module_uses_path_property(monkeypatch, tmp_path):
 
 
 def test_r3_no_repo_root_counts_all_stale(monkeypatch, tmp_path):
-    """Without repo_root (R3 disabled) the aggregate count is returned as-is —
-    orphans included (pre-R3 behaviour, conservative)."""
+    """Without repo_root (R3 disabled) every stale row counts — orphans
+    included (pre-R3 behaviour, conservative). v0.2.107 CG-1: the count comes
+    from the one exact scan a positive existence probe pays, not from a
+    filtered Aggregate."""
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
     module = _R3Coll(agg_count=0)
     klass = _R3Coll(agg_count=0)
-    func = _R3Coll(agg_count=5)  # aggregate says 5 stale
+    func = _R3Coll(agg_count=5, rows=[
+        {"embed_revision": 0, "file_path": f"gone{i}.py"} for i in range(5)])
     client = _r3_client("Proj", module, klass, func)
 
     counts = cr.count_stale_rows("Proj", current_revision=1, client=client)
     assert counts["Proj_CodeFunction"] == 5
-    assert func.iter_calls == 0, "no repo_root → trust the aggregate, no scan"
+    assert func.iter_calls == 1, "a positive probe pays exactly one scan"
 
 
 def test_r3_escape_path_excluded_from_reachable(monkeypatch, tmp_path):
