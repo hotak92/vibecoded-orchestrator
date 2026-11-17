@@ -987,7 +987,7 @@ chmod +x .claude/scripts/*
 
 (On Windows, use the `.ps1` variants — they're shipped alongside shell scripts.)
 
-**Venv not found**: the scripts auto-detect `.venv` at the repo root. If you installed elsewhere, export `VCO_VENV` to point at your venv's root.
+**Venv not found**: the scripts resolve the orchestrator's venv through one ladder (`.claude/scripts/vct_venv_ladder.sh` / `.ps1`): `$VCT_VENV`, then the install root (`VCT_INSTALL_ROOT` / `VCT_ORCHESTRATOR_ROOT`), then the orchestrator clone's own `.venv`. If your venv lives elsewhere, export `VCT_VENV` pointing at the venv's root (or at its interpreter).
 
 ## Post-install, Claude doesn't read the knowledge graph
 
