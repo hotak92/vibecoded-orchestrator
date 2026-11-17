@@ -105,7 +105,7 @@ python3 install.py --bootstrap                            # human-readable summa
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so that opening the folder in VS Code runs the same `session-start-ensure-hub` hook Claude Code runs on `SessionStart` — which ensures `vct-hub`, the model gateway (when one is registered) and the launcher GUI (when session-autostart is on)
 6. Copies 44 agent templates into `.claude/agents/` and 54 skill templates into `.claude/skills/`; renders 51 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
 7. Registers two MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) is **enabled by default per project**, and `playwright` (browser automation) is **enabled by default** and invoked separately via `npx -y @playwright/mcp@<pin> --browser chromium` (pinned in `vco_lib/bundled_mcp_versions.toml`); install.py pre-caches the pinned package and the Chromium revision it requests at `_install_playwright_browsers`, deferring `playwright_browser_missing` if the browser is still absent. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. Being registered as a bare `npx` command, it is only spawnable when `npx` resolves on PATH — the doctor phase at the end of every install/update checks exactly that and defers `npx_missing_mcp_unspawnable` when it does not. Disable either server for a single project in the launcher's Permissions tab: it writes `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers. (v0.2.101 removed the `search` paper MCP; v0.2.102 removed the `mermaid`/`excalidraw` diagram wrapper MCPs entirely — a leftover entry from an older install is scrubbed automatically by the ordinary install/update, with one notice line.) The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama.
-8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
+8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/api/v1/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Code-embedding backend by host
 
@@ -236,7 +236,7 @@ After install, open the `vibecoded-orchestrator` directory in one of the three s
 On session start, the following hooks fire automatically (`SessionStart` matcher: `startup`):
 
 1. `ensure-containers.sh` — checks that Weaviate, Ollama, and the code-embedding service are running; starts them if not
-2. `session-start-ensure-hub.sh` — also registered for `resume|clear|compact` (v0.2.104), so a chat restored after a reboot brings the services back too — three idempotent legs, each a call into its own `vco_lib.*_ensure` module: **hub** (`vco_lib.hub_ensure` — probes `vct-hub /health`, starts it if not running; the hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver), **model gateway** (`vco_lib.gateway_ensure`, v0.2.95 — only when one is registered for this project) and **launcher GUI** (`vco_lib.launcher_ensure`, v0.2.95 — only when session-autostart is enabled, started hidden so it never steals focus). A leg that can do nothing reports and moves on; none of them can block the session
+2. `session-start-ensure-hub.sh` — also registered for `resume|clear|compact` (v0.2.104), so a chat restored after a reboot brings the services back too — three idempotent legs, each a call into its own `vco_lib.*_ensure` module: **hub** (`vco_lib.hub_ensure` — probes `vct-hub /api/v1/health`, starts it if not running; the hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver), **model gateway** (`vco_lib.gateway_ensure`, v0.2.95 — only when one is registered for this project) and **launcher GUI** (`vco_lib.launcher_ensure`, v0.2.95 — only when session-autostart is enabled, started hidden so it never steals focus). A leg that can do nothing reports and moves on; none of them can block the session
 3. `session-start-kg-loader.sh` — displays KG resource paths
 4. `context-size-check.sh` — warns if `.claude/CONTEXT_STATE.md` is over 500 lines
 5. `embedding-failures-surface.sh` — if `.claude/context/EMBEDDING_FAILURES.md` exists (written by `vco_lib.embedding_service` when a backend was unreachable), surfaces a Claude-readable hint on the next chat start. Auto-clears on the next successful embed
@@ -263,7 +263,7 @@ Verify the hub is up:
 
 ```bash
 vct-hub --status                                # CLI helper
-curl -s http://127.0.0.1:7700/health            # raw probe (no auth required on /health)
+curl -s http://127.0.0.1:7700/api/v1/health     # raw probe (the one route that needs no token; a bare /health answers 401)
 ```
 
 ## Set up a project
@@ -430,7 +430,7 @@ Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
 
 | Surface | URL / file | Notes |
 |---|---|---|
-| HTTP listener | `http://127.0.0.1:7700` (default; `VCT_HUB_PORT` to override; falls back to `<vct_root>/hub.port`) | All `/api/v1/*` routes require `Authorization: Bearer <token>`, except `/health` |
+| HTTP listener | `http://127.0.0.1:7700` (default; `VCT_HUB_PORT` to override; falls back to `<vct_root>/hub.port`) | All `/api/v1/*` routes require `Authorization: Bearer <token>`, except `/api/v1/health` |
 | Token | `<vct_root>/hub.token` (mode `0o600`) | Regenerated on every hub startup. Read by every resolver client |
 | Lockfile | `<vct_root>/hub.pid` | Single-instance per user |
 | CLI | `vct-hub --start-if-not-running` / `--status` / `--stop` / `--foreground` | Also `--register-boot` / `--unregister-boot` / `--boot-status` for the OS auto-start (systemd-user / launchd / Windows Scheduled Task; **default off**, user opts in via launcher Preferences) |
