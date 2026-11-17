@@ -2154,14 +2154,6 @@ pub(crate) enum CodegraphPass {
     Run { mode: BuildMode, reason: String },
 }
 
-impl CodegraphPass {
-    pub(crate) fn reason(&self) -> &str {
-        match self {
-            CodegraphPass::Nothing { reason } | CodegraphPass::Run { reason, .. } => reason,
-        }
-    }
-}
-
 fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
@@ -3803,20 +3795,23 @@ mod v02107_post_bundle_pass_tests {
     #[test]
     fn head_equal_to_the_recorded_commit_runs_nothing() {
         let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(Some(HEAD), None));
-        assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
-        assert!(p.reason().contains("unchanged"), "{p:?}");
+        assert!(
+            matches!(&p, CodegraphPass::Nothing { reason } if reason.contains("unchanged")),
+            "{p:?}"
+        );
     }
 
     /// A-016 act: HEAD moved, recorded commit is an ancestor → incremental since it.
     #[test]
     fn head_moved_runs_an_incremental_pass_since_the_recorded_commit() {
         let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(OLD), git(Some(HEAD), Some(true)));
-        assert_eq!(
-            p,
-            CodegraphPass::Run {
-                mode: BuildMode::Incremental { since_commit: OLD.to_string() },
-                reason: p.reason().to_string(),
-            }
+        assert!(
+            matches!(
+                &p,
+                CodegraphPass::Run { mode: BuildMode::Incremental { since_commit }, .. }
+                    if since_commit == OLD
+            ),
+            "{p:?}"
         );
     }
 
