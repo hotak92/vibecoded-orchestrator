@@ -218,3 +218,50 @@ def test_warmer_holds_a_slot_for_a_bounded_time(tmp_path: Path) -> None:
     assert run.returncode == 0, run.stderr
     assert elapsed < 12, f"the warmer held its slot for {elapsed:.1f}s past the bound"
     assert cached == {"kg": None, "cg_0": None}
+
+
+# --- HR-1 residual: the structure path no longer swallows a failed query ------
+
+
+def _qcg_main_with_failing_query(monkeypatch, argv):
+    """Drive the REAL query_code_graph.main with a Weaviate that is reachable
+    but whose collection lookup raises (shard not ready)."""
+    scripts = str(REPO_ROOT / "templates" / "scripts")
+    for p in (scripts, str(REPO_ROOT / "claude_mcp_servers"), str(REPO_ROOT)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import importlib
+    qcg = importlib.import_module("query_code_graph")
+
+    class _Colls:
+        def get(self, _name):
+            raise RuntimeError("UNAVAILABLE: shard not ready")
+
+    class _Client:
+        collections = _Colls()
+
+        def close(self):
+            pass
+
+    def _connect(self):
+        self.client = _Client()
+        return True
+
+    monkeypatch.setattr(qcg.CodeGraphQuery, "connect", _connect)
+    monkeypatch.setenv("CODE_GRAPH_PROJECT", "Fixture")
+    return qcg.main(argv)
+
+
+def test_structure_query_failure_in_hook_format_is_an_error(
+        monkeypatch, capsys) -> None:
+    rc = _qcg_main_with_failing_query(
+        monkeypatch, ["structure", "callers", "X", "--hook-format"])
+    assert rc == 1, "a failed hook-format structure query returned 0 (cached as empty)"
+    assert "shard not ready" in capsys.readouterr().err
+
+
+def test_structure_query_failure_in_cli_mode_still_prints_and_returns_0(
+        monkeypatch, capsys) -> None:
+    rc = _qcg_main_with_failing_query(monkeypatch, ["structure", "callers", "X"])
+    assert rc == 0
+    assert "Structure query error: UNAVAILABLE" in capsys.readouterr().err

@@ -1232,6 +1232,8 @@ class CodeGraphQuery:
 
         except Exception as e:
             print(f"❌ Search error: {e}", file=sys.stderr)
+            if hook_format:
+                raise  # HR-1: an errored lookup is not an empty answer
 
     @staticmethod
     def _print_code_result(rendered: dict, rank: int, hook_format: bool,
@@ -2188,6 +2190,10 @@ class CodeGraphQuery:
 
         except Exception as e:
             print(f"❌ Structure query error: {e}", file=sys.stderr)
+            if hook_format:
+                # HR-1: a failed lookup must reach main() as an error so the
+                # injection router never caches it as "no callers".
+                raise
 
     def close(self):
         """Close Weaviate connection."""
