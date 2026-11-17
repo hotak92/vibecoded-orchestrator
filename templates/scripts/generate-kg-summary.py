@@ -679,8 +679,8 @@ def _process_node_bulk(
     """Process one node in ``--all`` mode. Returns a status string.
 
     Status values: ``"skipped"``, ``"generated"``, ``"dry_run"``,
-    ``"archived"``, ``"archived_dropped"``, ``"refused:<msg>"``,
-    ``"nonanswer:<msg>"``, ``"error:<msg>"`` (the first four keep the
+    ``"archived"``, ``"archived_dropped"``, ``"untitled"``,
+    ``"refused:<msg>"``, ``"nonanswer:<msg>"``, ``"error:<msg>"`` (the first four keep the
     retired bulk generator's contract, so the progress/tally lines callers
     parse are unchanged). Every LLM call goes through the shared ladder.
 
@@ -697,7 +697,11 @@ def _process_node_bulk(
     """
     title, full_text, body = read_node(file_path)
     if not title:
-        return "error:no title (neither frontmatter title nor H1) — skipped"
+        # A property of the user's FILE, not a failure of this run (v0.2.107):
+        # as an ``error:`` it made every ``--all`` exit 1, so kg-sync re-raised
+        # ``kg_node_formats_refresh_failed`` after every sync and no retry
+        # could ever clear it. A named skip, like the single-file mode's.
+        return "untitled"
     rel_path = _sidecar_key(file_path)
 
     # Archived nodes skip the summarization entirely (owner decision
@@ -790,8 +794,10 @@ def _run_bulk(args: argparse.Namespace) -> int:
     * ``0`` — the pass COMPLETED. Nodes may have been skipped (unchanged,
       archived), refused (``refused:`` — flagged in the sidecar, retried by
       the next ordinary sync; owner ruling 2026-10-18) or unanswered
-      (``nonanswer:`` — nothing cached): those ARE success; the tally line
-      names the counts so nothing is invisible.
+      (``nonanswer:`` — nothing cached), or have no title (``untitled`` —
+      nothing to summarize under; each is named, and listed again after the
+      tally): those ARE success; the tally line names the counts so nothing
+      is invisible.
     * ``1`` — a node errored for a non-refusal reason (a tier's transport
       failed, a parse broke). Potentially transient → the bulk callers
       (kg-sync's post-sync refresh, the schema-migration regeneration)
@@ -849,6 +855,7 @@ def _run_bulk(args: argparse.Namespace) -> int:
     total = len(files)
     skipped = generated = errors = dry_count = archived_count = 0
     nonanswers = refused = 0
+    untitled: list = []
     started = time.time()
     for i, file_path in enumerate(files, 1):
         node_start = time.time()
@@ -865,6 +872,12 @@ def _run_bulk(args: argparse.Namespace) -> int:
             # The marker substring is load-bearing (ARCHIVED_SKIP_MARKER —
             # the launcher's ARCHIVED_MARKER matches it).
             print(f"[{i}/{total}] SKIP  {rel} (archived, skipping)")
+        elif status == "untitled":
+            untitled.append(rel)
+            print(
+                f"[{i}/{total}] SKIP  {rel} (no title: neither a frontmatter "
+                f"title nor an H1 — add one to get a summary)"
+            )
         elif status == "dry_run":
             dry_count += 1
             print(f"[{i}/{total}] DRY   {rel}")
@@ -911,7 +924,13 @@ def _run_bulk(args: argparse.Namespace) -> int:
         f"refused: {refused}, "
         f"non-answer: {nonanswers}, "
         f"dry-run: {dry_count}, errors: {errors}, archived: {archived_count}"
+        + (f", no title: {len(untitled)}" if untitled else "")
     )
+    if untitled:
+        print(
+            f"Skipped {len(untitled)} node(s) without a title (not an error; "
+            f"add a frontmatter `title:` or an H1): " + ", ".join(untitled)
+        )
     if not args.dry_run and (generated or archived_count or refused):
         print(f"Sidecar saved incrementally to {FORMATS_PATH}")
     return 1 if errors else 0

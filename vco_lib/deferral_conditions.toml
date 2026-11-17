@@ -1906,7 +1906,15 @@ re-emits and the old stamps no longer match. v0.2.106: the update STARTS both \
 halves itself — `vco_lib.chunker_revision.kg_rechunk_owed` makes the launcher's \
 `kg-sync --check-drift` probe (`rechunk_owed`) and install.py's root seed run \
 the KG pass, and the extractor-generation rung re-walks the code graph — and \
-the printed code-graph remedy is the non-destructive `--force-rewalk`."""
+the printed code-graph remedy is the non-destructive `--force-rewalk`. \
+v0.2.107: the code-graph half is recorded in the WALKED project (the analyzer \
+passed the ledger root, which is `$VCT_ORCHESTRATOR_ROOT` in every \
+session-spawned walk, so no project but the root could ever clear); a project \
+whose forced walk had already completed is healed without a new walk — the \
+probe accepts `chunker_revision.completed_walk_evidence` for that half, and \
+`chunker_revision.heal_stuck_resync` records it and resolves the row at \
+session start. The KG sync's per-node gate stops once the KG half is recorded \
+(`chunker_revision.kg_half_recorded`), whether or not the row is still there."""
 
 [conditions.project_bundles_stale]
 class = "action_required"
