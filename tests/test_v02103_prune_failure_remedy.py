@@ -173,8 +173,8 @@ def _make_analyzer(analyzer_mod):
     inst.project_name = "Acme"
     inst.visited_uuids = set()
     inst._track_visited = True
-    inst._prune_discovered_paths = set()
-    inst._prune_walked_paths = set()
+    inst._prune_discovered_paths = {"src/walked.py"}  # v0.2.107: a walk that
+    inst._prune_walked_paths = {"src/walked.py"}      # found nothing prunes nothing
     inst._prune_language = ""
     inst._refused_extra_sources = None
     inst._strict_source = False

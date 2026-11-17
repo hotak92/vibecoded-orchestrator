@@ -459,7 +459,7 @@ try:
     # is a thin shim over it.
     from vco_lib.codegraph_prune import (  # v0.2.103: + failure ledger + remedy lines
         prune_collection as _prune_collection_impl, expand_preserve_entries as _expand_preserve,
-        record_prune_failures as _record_prune_failures,
+        record_prune_failures as _record_prune_failures, prune_walk_guard as _prune_walk_guard,
         format_prune_remedy_lines as _format_prune_remedy_lines)
     from vco_lib import codegraph_source_scope as _src_scope  # W6-CGD: stamp + ownership + preserve keys
     from vco_lib.codegraph_extra_overlap import classify as _extra_overlap  # W6-CGD D-4
@@ -3975,11 +3975,16 @@ class CodeGraphAnalyzer:
         success→partial and the remedy can name the REAL classes.
         """
         if not self._track_visited:
-            # Defensive: should never happen (caller gates on
-            # prune_stale=True which sets _track_visited=True), but
-            # guard against a future code path that forgets. Do NOT touch
+            # Defensive (a caller that forgot prune_stale=True). Do NOT touch
             # the accumulator — earlier producers' failures must survive.
             print("⚠️  _prune_stale_objects called without _track_visited — skipping")
+            return 0
+        # v0.2.107 (DESTRUCTIVE-03): what is this walk evidence of? ONE home:
+        # vco_lib.codegraph_prune.prune_walk_guard (no-file / missing-root /
+        # scoped walk -> delete nothing; half-written files -> preserved).
+        _guard = self._prune_guard = _prune_walk_guard(self)
+        if _guard.refusal:
+            print(f"🛡️  --prune-stale deleted nothing: {_guard.refusal}", file=sys.stderr)
             return 0
 
         total_pruned = 0
@@ -3987,27 +3992,19 @@ class CodeGraphAnalyzer:
         for coll_name, uid in self.visited_uuids:
             per_collection_visited.setdefault(coll_name, set()).add(uid)
 
-        # v0.2.82 — preserve set: files discovered on disk whose module row was
-        # not re-written (unchanged-skip / parse-failure) are ALIVE; deleting
-        # them is the 2026-07-15 whole-graph-wipe incident (a minified skip's
-        # rows were already pruned by the S16-3 end-of-walk policy prune).
-        _skipped = getattr(self, "_prune_discovered_paths", set()) - getattr(self, "_prune_walked_paths", set())
+        # v0.2.82 — preserve set: files discovered on disk whose rows were not
+        # (completely) re-written are ALIVE; deleting them is the 2026-07-15
+        # whole-graph-wipe incident.
+        _skipped = _guard.skipped
         preserve_paths = _expand_preserve(  # W6-CGD (D-3): (source, rel) keys
             _skipped, primary_root=getattr(self, "_analyze_repo_root_raw", "") or "",
             strict=bool(getattr(self, "_strict_source", False)))
-        if _skipped:
-            print(
-                f"🛡️  Prune-preserve: {len(_skipped)} skipped-but-present "
-                f"file(s) — their rows are exempt from stale pruning"
-            )
+        if _skipped or _guard.silent_roots:
+            print(f"🛡️  Prune-preserve: {len(_skipped)} skipped-but-present file(s) ({len(_guard.incomplete)} not fully "
+                  f"written), {len(_guard.silent_roots)} root(s) with no file found — their rows are exempt from stale pruning")
 
-        collections = [
-            self.modules_collection,
-            self.classes_collection,
-            self.functions_collection,
-            self.apis_collection,
-            self.interactions_collection,
-        ]
+        collections = [self.modules_collection, self.classes_collection, self.functions_collection,
+                       self.apis_collection, self.interactions_collection]
 
         scope_lang = getattr(self, "_prune_language", "") or ""
         if scope_lang:
@@ -4052,7 +4049,7 @@ class CodeGraphAnalyzer:
             pruned, failures = self._prune_collection(
                 coll, visited, language_scope=scope_lang,
                 preserve_paths=preserve_paths,
-                preserve_sources=getattr(self, "_refused_extra_sources", None),
+                preserve_sources=_guard.preserve_sources,
                 reap_orphans=_reap_orphans if coll.name.endswith("_CodeInteraction") else False,
                 source_scope=_prune_scope,
             )

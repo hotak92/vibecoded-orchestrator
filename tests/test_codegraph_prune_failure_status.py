@@ -168,8 +168,12 @@ def test_prune_stale_objects_aggregates_failures_into_attr(analyzer_mod) -> None
     analyzer.functions_collection = func_coll
     analyzer.apis_collection = None
     analyzer.interactions_collection = None
-    # Nothing visited this run → every row is a prune candidate.
+    # Nothing visited this run → every row is a prune candidate. (v0.2.107:
+    # the walk DID discover and fully walk a file — a walk that found nothing
+    # authorises no delete.)
     analyzer.visited_uuids = set()
+    analyzer._prune_discovered_paths = {"src/walked.py"}
+    analyzer._prune_walked_paths = {"src/walked.py"}
 
     total_pruned = analyzer._prune_stale_objects()
 
@@ -268,6 +272,8 @@ def test_prune_stale_objects_accumulates_onto_prior_failures(analyzer_mod) -> No
     analyzer.apis_collection = None
     analyzer.interactions_collection = None
     analyzer.visited_uuids = set()
+    analyzer._prune_discovered_paths = {"src/walked.py"}  # v0.2.107: a real walk
+    analyzer._prune_walked_paths = {"src/walked.py"}
 
     analyzer._prune_stale_objects()
     assert analyzer._prune_failures == 4, (

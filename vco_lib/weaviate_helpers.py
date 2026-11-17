@@ -741,98 +741,100 @@ def describe_connect_failure(exc: BaseException, weaviate_url: Optional[str] = N
     )
 
 
-def count_objects_v4(name: str, weaviate_url: Optional[str] = None) -> int:
-    """Count objects in a collection via the v4 iterator (metadata-only, no
-    vectors). Returns ``0`` on connection failure OR missing collection.
+def parse_aggregate_count(status: int, body: bytes, class_name: str) -> Optional[int]:
+    """The count carried by one ``{ Aggregate { <class> { meta { count } } } }``
+    reply, or ``None`` when the reply does not carry one.
 
-    SEMANTICS — 0-on-failure: this variant collapses "unreachable" and
-    "empty" into 0. Never gate a drop on it: 0 reads as "empty", and an empty
-    class is exactly what destructive branches are allowed to drop. Where an
-    unreadable count must stop the action, use :func:`count_objects_v4_or_none`
-    (same iterator, None on failure) or :func:`http_count_objects`. See
-    ``knowledge/concepts/silent-zero-fallback-antipattern.md``.
+    Pure (no I/O) so every transport shares ONE reading of the reply. Only an
+    integer ``meta.count`` in a reply WITHOUT a GraphQL ``errors`` array is a
+    count. Everything else is "could not read", never 0:
+
+    * a non-200 status;
+    * a body that is not JSON, or not an object;
+    * HTTP 200 with a non-empty ``errors`` array - the shape a resolver error
+      produces (shard not ready, memory pressure, a timeout inside the server,
+      a class that does not exist), usually with the class field ``null``;
+    * the class field absent, ``null``, or an empty list;
+    * a ``meta.count`` that is not a non-negative integer.
+
+    v0.2.107 (DESTRUCTIVE-02): four copies of this parse returned 0 for a null
+    or empty class field, and 0 is exactly what the destructive callers take as
+    the licence to drop.
     """
-    try:
-        client = connect_v4(weaviate_url=weaviate_url)
-    except Exception:
-        # Connection failure → can't classify; treat as 0 (caller decides the
-        # conservative action from there).
-        return 0
-    try:
-        col = client.collections.get(name)
-        n = 0
-        for _ in col.iterator(include_vector=False):
-            n += 1
-        return n
-    except Exception:
-        # Collection might not exist yet, or the v4 client raises on a missing
-        # class; missing → 0.
-        return 0
-    finally:
-        client.close()
-
-
-def count_objects_v4_or_none(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:
-    """:func:`count_objects_v4` with None-on-failure: a connection failure or
-    any iterator error (a missing class included) returns ``None``, never 0.
-    Callers check the class exists first, so None means "could not count" and
-    must be handled as "may hold objects" — never as empty."""
-    try:
-        client = connect_v4(weaviate_url=weaviate_url)
-    except Exception:
-        return None
-    try:
-        return sum(1 for _ in client.collections.get(name).iterator(include_vector=False))
-    except Exception:
-        return None
-    finally:
-        client.close()
-
-
-def http_count_objects(
-    class_name: str, weaviate_url: Optional[str] = None
-) -> Optional[int]:
-    """Count objects in ``class_name`` via the Weaviate GraphQL Aggregate
-    endpoint.
-
-    SEMANTICS — None-on-failure (the counterpart to
-    :func:`count_objects_v4`'s 0-on-failure):
-
-        int   — object count when the request succeeds (0 for a genuinely
-                empty / missing class per Aggregate's empty-list contract).
-        None  — Weaviate unreachable, non-200, or malformed response. The
-                caller treats None as "unknown" (NOT zero) so it never claims
-                a collection is empty when the server was simply unreachable.
-
-    Soft-fails throughout: never raises into the caller.
-    """
-    base = (weaviate_url or weaviate_url_default()).rstrip("/")
-    query = "{ Aggregate { " f"{class_name} {{ meta {{ count }} }}" " } }"
-    try:
-        status, body = http_request(
-            "POST", f"{base}/v1/graphql", body={"query": query}, timeout=10.0,
-        )
-    except Exception:
-        return None
     if status != 200:
         return None
     try:
-        payload = json.loads(body.decode("utf-8"))
+        payload = json.loads(body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body)
     except Exception:
         return None
+    if not isinstance(payload, dict) or payload.get("errors"):
+        return None
+    data = payload.get("data")
+    agg = data.get("Aggregate") if isinstance(data, dict) else None
+    rows = agg.get(class_name) if isinstance(agg, dict) else None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    meta = rows[0].get("meta")
+    count = meta.get("count") if isinstance(meta, dict) else None
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
+def http_count_objects(
+    class_name: str,
+    weaviate_url: Optional[str] = None,
+    *,
+    absent_is_zero: bool = False,
+    timeout: float = 10.0,
+    request: Optional[Callable[..., "tuple[int, bytes]"]] = None,
+) -> Optional[int]:
+    """THE object count of a Weaviate class - the one home every VCO count
+    goes through (v0.2.107, DESTRUCTIVE-02). One unfiltered GraphQL Aggregate;
+    never a listing.
+
+    Returns:
+        int   - the server answered with an integer ``meta.count`` (0 = the
+                class exists and is empty).
+        None  - the count could NOT be read: Weaviate unreachable, a timeout,
+                any exception, a non-200, an ``errors`` array on a 200, a null
+                or empty class field, a malformed body, a class name that is
+                not ``[A-Za-z0-9_]+``. See :func:`parse_aggregate_count`.
+
+    CONTRACT FOR CALLERS: ``None`` is "unknown", never "empty". A caller that
+    deletes, drops, verifies a copy, recovers a staging class or stamps a
+    version on the strength of a count MUST leave the data alone on ``None``
+    (and say so in a log line). Write ``if n is None: refuse`` - never
+    ``if not n`` and never ``n or 0`` on a path that gates a delete.
+
+    A class that does not exist also reads ``None`` (the server answers a
+    missing class with an ``errors`` array). A caller that must tell "absent"
+    from "unreadable" passes ``absent_is_zero=True``: when the Aggregate gave
+    no count, ``GET /v1/schema/<class>`` is asked and exactly HTTP 404 - the
+    server positively saying the class is not there - returns 0. Any other
+    outcome of that probe stays ``None``.
+
+    ``request`` is the transport, ``(method, url, *, body, timeout) ->
+    (status, body_bytes)``; default :func:`http_request`. Modules that keep a
+    module-local transport for their tests pass it. Never raises.
+    """
+    if not class_name or not class_name.replace("_", "").isalnum():
+        return None
+    send = request or http_request
     try:
-        agg = payload.get("data", {}).get("Aggregate", {}) or {}
-        rows = agg.get(class_name) or []
-        if not rows:
-            # Aggregate returns an empty list for a missing class.
-            return 0
-        meta = rows[0].get("meta") or {}
-        count = meta.get("count")
-        if isinstance(count, int):
-            return count
+        base = (weaviate_url or weaviate_url_default()).rstrip("/")
+        query = "{ Aggregate { " f"{class_name} {{ meta {{ count }} }}" " } }"
+        status, body = send("POST", f"{base}/v1/graphql", body={"query": query}, timeout=timeout)
+        count = parse_aggregate_count(status, body, class_name)
     except Exception:
         return None
-    return None
+    if count is not None or not absent_is_zero:
+        return count
+    try:
+        status, _ = send("GET", f"{base}/v1/schema/{class_name}", timeout=timeout)
+    except Exception:
+        return None
+    return 0 if status == 404 else None
 
 
 class WeaviateGraphQLError(Exception):

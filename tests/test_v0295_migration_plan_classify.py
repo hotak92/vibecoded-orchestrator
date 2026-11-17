@@ -204,7 +204,10 @@ class TheActionVocabularyIsFullyClassified(unittest.TestCase):
     def test_the_sets_did_not_widen(self) -> None:
         """`rebuild` is the one thing consent exists for. A change here is a
         change to what gets applied to a user's data unattended."""
-        self.assertEqual(mpc.ADDITIVE_ACTIONS, frozenset({"copy", "patch_props"}))
+        # v0.2.107: `add_slots` joins - a named vector added IN PLACE (one
+        # schema PUT; no drop, no copy). It replaced `copy` for that delta.
+        self.assertEqual(mpc.ADDITIVE_ACTIONS,
+                         frozenset({"add_slots", "copy", "patch_props"}))
         self.assertEqual(mpc.LOSSY_ACTIONS, frozenset({"rebuild"}))
         self.assertEqual(mpc.ADDITIVE_ACTIONS & mpc.LOSSY_ACTIONS, frozenset())
 

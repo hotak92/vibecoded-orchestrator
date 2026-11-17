@@ -56,7 +56,6 @@ import json
 import re
 import sqlite3
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -114,75 +113,27 @@ def _is_fixture_shaped(class_name: str) -> bool:
 def _count_weaviate_class_objects(
     weaviate_url: str, class_name: str,
 ) -> Optional[int]:
-    """Count objects in ``class_name`` via Weaviate's GraphQL Aggregate.
+    """Object count of ``class_name``, or ``None`` when it could not be read.
+
+    A thin delegate to the ONE count helper,
+    :func:`vco_lib.weaviate_helpers.http_count_objects` (v0.2.107: this was one
+    of four copies that read an error-shaped Aggregate reply as 0).
 
     Returns:
-        int  — object count when the request succeeds (0 for empty class).
-        None — Weaviate unreachable, malformed response, or HTTP error.
+        int  - the server answered an integer count (0 = an empty class).
+        None - Weaviate unreachable, an HTTP error, a GraphQL ``errors``
+               array, a null class field, a malformed reply, a missing class.
                Callers MUST treat ``None`` as "unknown" (not zero) so a
-               transient network blip cannot cause a populated collection
-               to look empty and miss adoption.
+               transient failure cannot make a populated collection look
+               empty and miss adoption.
 
-    Soft-fails throughout: never raises into the caller.
-
-    A falsy ``weaviate_url`` falls back to
-    :func:`vco_lib.weaviate_helpers.weaviate_url_default` — the ONE home for
-    that resolution — rather than to a bare ``http://localhost:8081``. The
-    literal ignored ``WEAVIATE_URL`` *and* ``WEAVIATE_PORT``, so a caller
-    that passed nothing counted objects in whatever Weaviate happened to be
-    on the canonical port — possibly a different install's — and fed that
-    count to an adoption decision.
+    A falsy ``weaviate_url`` resolves through
+    :func:`vco_lib.weaviate_helpers.weaviate_url_default` (inside the helper),
+    never a bare ``http://localhost:8081``. Never raises.
     """
-    from vco_lib.weaviate_helpers import weaviate_url_default
+    from vco_lib.weaviate_helpers import http_count_objects
 
-    base = (weaviate_url or weaviate_url_default()).rstrip("/")
-    # GraphQL injection guard: class_name comes from Weaviate's own schema
-    # endpoint (we filter from existing_classes), so it's already safe. But
-    # validate the shape anyway to fail-closed if a future caller passes
-    # user input.
-    if not class_name or not class_name.replace("_", "").isalnum():
-        return None
-    query = (
-        "{ Aggregate { "
-        f"{class_name} {{ meta {{ count }} }}"
-        " } }"
-    )
-    try:
-        data = json.dumps({"query": query}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{base}/v1/graphql",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
-            req, timeout=10,
-        )
-    except Exception:
-        return None
-    try:
-        status = resp.getcode()
-    except Exception:
-        status = 0
-    if status != 200:
-        return None
-    try:
-        payload = json.loads(resp.read())
-    except Exception:
-        return None
-    try:
-        agg = payload.get("data", {}).get("Aggregate", {}) or {}
-        rows = agg.get(class_name) or []
-        if not rows:
-            # Aggregate returns empty list for missing class.
-            return 0
-        meta = rows[0].get("meta") or {}
-        count = meta.get("count")
-        if isinstance(count, int):
-            return count
-    except Exception:
-        return None
-    return None
+    return http_count_objects(class_name, weaviate_url)
 
 
 def _rebind_collection_names_to_on_disk_casing(

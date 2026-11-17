@@ -569,7 +569,7 @@ def detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool,
     # extras handled by the migrate-collections idempotent helper and
     # are not blockers for basic KG operation. This keeps drift-
     # triggered destructive rebuilds rare; the explicit migrate path
-    # adds the new slots additively via copy-with-vectors.
+    # adds the new slots in place (one schema PUT, nothing dropped or copied).
     vec_config = schema.get("vectorConfig") or {}
     core_expected_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
     actual_slots = set(vec_config.keys())
@@ -780,8 +780,10 @@ class SchemaDelta:
 
     Attributes drive the migrate dispatch:
       legacy_single_vector → action=rebuild (no named vectors to copy)
-      missing_vec_slots / indexNullState_needed → action=copy
+      indexNullState_needed → action=copy (immutable on a live class)
       vector_index_type_change → action=copy  (v0.2.73 FIX-D4, hnsw→hfresh)
+      missing_vec_slots (without the two above) → action=add_slots
+        (v0.2.107: added in place, nothing dropped or copied)
       missing_props (only) → action=patch_props
       not_present → action=create
       none of the above → action=noop
@@ -1045,8 +1047,10 @@ def _delete_class(name: str, weaviate_url: Optional[str] = None) -> None:
 def _count_objects(name: str, weaviate_url: Optional[str] = None) -> Optional[int]:
     """Object count for the staging-recovery classifier; None = could not count
     (never 0 — an unreadable count must not read as "empty, safe to drop").
-    Module-level so tests can ``mock.patch.object(project_init, "_count_objects")``."""
-    return _wh.count_objects_v4_or_none(name, weaviate_url=weaviate_url)
+    Module-level so tests can ``mock.patch.object(project_init, "_count_objects")``.
+    v0.2.107: the server's Aggregate through the ONE count helper, no longer a
+    listing (one that ends early without raising counted a populated class 0)."""
+    return _wh.http_count_objects(name, weaviate_url, request=_http_request)
 
 
 def _recover_or_drop_orphan_staging(
@@ -1240,25 +1244,10 @@ def _snapshot_collection_for_rebuild(
     except Exception:
         pass
 
-    # Object count via GraphQL Aggregate.
-    try:
-        gql = {"query": "{ Aggregate { %s { meta { count } } } }" % name}
-        status, body = _http_request(
-            "POST", f"{base}/v1/graphql", body=gql, timeout=10,
-        )
-        if status == 200:
-            payload = json.loads(body.decode("utf-8"))
-            agg = (
-                payload.get("data", {})
-                .get("Aggregate", {})
-                .get(name, [])
-            )
-            if agg and isinstance(agg, list):
-                count = agg[0].get("meta", {}).get("count")
-                if isinstance(count, int):
-                    snapshot["object_count"] = count
-    except Exception:
-        pass
+    # Object count through the ONE count helper: None unless a count came back.
+    count = _wh.http_count_objects(name, base, timeout=10, request=_http_request)
+    if count is not None:
+        snapshot["object_count"] = count
 
     return snapshot
 
@@ -1381,10 +1370,26 @@ def _copy_collection_with_vectors(
         client.close()
 
 
+def _swap_through_staging(
+    name: str, target: dict, *, weaviate_url: Optional[str] = None,
+) -> int:
+    """The count-gated staging swap (``copy`` action) - body, ordering and
+    rationale in :func:`vco_lib.staging_swap.swap_through_staging`."""
+    from vco_lib.staging_swap import swap_through_staging
+
+    return swap_through_staging(name, target, weaviate_url=weaviate_url)
+
+
 def _classify_action(delta: SchemaDelta) -> str:
-    """Translate a SchemaDelta into one of: noop / create / rebuild / copy / patch_props.
+    """Translate a SchemaDelta into one of: noop / create / rebuild / copy /
+    add_slots / patch_props.
 
     Order matters — same as the algorithm in the research report.
+
+    v0.2.107 (DESTRUCTIVE-01): a missing named-vector slot is ``add_slots`` -
+    one schema PUT on the live class, no staging, no drop, no copy. ``copy``
+    (the staging swap) remains ONLY for the two settings Weaviate cannot
+    change on a live class: ``indexNullState`` and ``vectorIndexType``.
     """
     if delta.not_present:
         return "create"
@@ -1393,16 +1398,15 @@ def _classify_action(delta: SchemaDelta) -> str:
     if delta.legacy_single_vector:
         return "rebuild"
     # v0.2.73 FIX-D4: a vectorIndexType change (hnsw→hfresh) routes to the
-    # SAME copy path as missing_vec_slots — the copy action recreates the
-    # collection with the TARGET schema (born hfresh) + re-imports client
-    # vectors (no re-embed). Ordered before patch_props: an index-type change
-    # is structural (must recreate), a prop add is additive.
-    if (
-        delta.missing_vec_slots
-        or delta.indexNullState_needed
-        or delta.vector_index_type_change is not None
-    ):
+    # copy path — the copy action recreates the collection with the TARGET
+    # schema (born hfresh) + re-imports client vectors (no re-embed). Ordered
+    # before add_slots / patch_props: an index-type or indexNullState change is
+    # structural (must recreate) and the recreate carries any missing slot and
+    # property with it; a slot or prop add alone is in place.
+    if delta.indexNullState_needed or delta.vector_index_type_change is not None:
         return "copy"
+    if delta.missing_vec_slots:
+        return "add_slots"
     if delta.missing_props:
         return "patch_props"
     return "rebuild"  # unhandled — escape to drop+re-embed
@@ -1444,7 +1448,9 @@ def _build_plan(
             delta = _schema_delta(actual, target)
         action = _classify_action(delta)
         # Force-rebuild override: skip smart path entirely.
-        if getattr(args, "force_rebuild", False) and action in ("copy", "patch_props", "noop"):
+        if getattr(args, "force_rebuild", False) and action in (
+            "copy", "add_slots", "patch_props", "noop",
+        ):
             action = "rebuild"
         plan.append({
             "env_key": env_key,
@@ -1494,7 +1500,7 @@ def _build_plan(
                 delta = _schema_delta(actual, target)
                 action = _classify_action(delta)
                 if getattr(args, "force_rebuild", False) and action in (
-                    "copy", "patch_props", "noop",
+                    "copy", "add_slots", "patch_props", "noop",
                 ):
                     action = "rebuild"
                 plan.append({
@@ -1902,6 +1908,20 @@ def migrate_collections(
                 for prop in delta.missing_props:
                     _post_property(name, prop, weaviate_url=weaviate_url)
 
+            elif action == "add_slots":
+                # v0.2.107: added IN PLACE (one schema PUT; no staging, drop
+                # or copy). A server that cannot raises "update Weaviate".
+                from vco_lib.weaviate_schema import add_vector_configs_in_place
+
+                target_vc = target.get("vectorConfig") or {}
+                add_vector_configs_in_place(
+                    name,
+                    {n: target_vc[n] for n in delta.missing_vec_slots if n in target_vc},
+                    weaviate_url=weaviate_url,
+                )
+                for prop in delta.missing_props:
+                    _post_property(name, prop, weaviate_url=weaviate_url)
+
             elif action == "copy":
                 # v0.2.73 FIX-D4: HFresh × distance pre-flight guard. HFresh
                 # supports ONLY cosine + l2-squared (doc-verified 1.37). If
@@ -1919,31 +1939,10 @@ def migrate_collections(
                             "l2-squared. Keep this collection on hnsw "
                             "(documented fallback); do not force the swap."
                         )
-                staging = f"{name}{_STAGING_SUFFIX}"
-                staging_def = dict(target)
-                staging_def["class"] = staging
-                # 1. create staging w/target schema
-                _create_class(staging_def, weaviate_url=weaviate_url)
-                # 2. copy old → staging
-                copied_a = _copy_collection_with_vectors(
-                    name, staging, weaviate_url=weaviate_url,
+                # v0.2.107: count-gated (see _swap_through_staging).
+                objects_copied = _swap_through_staging(
+                    name, target, weaviate_url=weaviate_url,
                 )
-                # 3. drop old
-                _delete_class(name, weaviate_url=weaviate_url)
-                # 4. recreate name w/target schema
-                _create_class(target, weaviate_url=weaviate_url)
-                # 5. copy staging → name
-                copied_b = _copy_collection_with_vectors(
-                    staging, name, weaviate_url=weaviate_url,
-                )
-                if copied_a != copied_b:
-                    raise RuntimeError(
-                        f"copy round-trip mismatch: old→staging={copied_a}, "
-                        f"staging→new={copied_b}"
-                    )
-                # 6. drop staging
-                _delete_class(staging, weaviate_url=weaviate_url)
-                objects_copied = copied_b
 
             elif action == "rebuild":
                 # Drop + recreate with the target schema. v0.2.54 Track D
@@ -2024,9 +2023,18 @@ def migrate_collections(
                         _create_class(
                             recovery_def, weaviate_url=weaviate_url,
                         )
+                        staging_n = _count_objects(staging, weaviate_url=weaviate_url)
                         recovered = _copy_collection_with_vectors(
                             staging, name, weaviate_url=weaviate_url,
                         )
+                        if staging_n is None or recovered != staging_n:
+                            # v0.2.107: the tally must match a count read first.
+                            raise RuntimeError(
+                                f"recovery copy wrote {recovered} object(s) but "
+                                f"{staging} counts "
+                                f"{'unreadable' if staging_n is None else staging_n}; "
+                                f"{staging} RETAINED"
+                            )
                         _delete_class(staging, weaviate_url=weaviate_url)
                         _log(
                             "7b.copy.rollback",
@@ -6192,49 +6200,11 @@ def _levenshtein(a: str, b: str) -> int:
 
 
 def _http_count_objects(class_name: str, weaviate_url: str) -> Optional[int]:
-    """Count objects in `class_name` via the Weaviate GraphQL Aggregate
-    endpoint.
-
-    Returns:
-        int   — object count when the request succeeds.
-        None  — Weaviate unreachable, malformed response, or class missing.
-                Caller treats `None` as "unknown" (not zero) — we don't want
-                to claim a legacy collection is empty when we couldn't reach
-                the server.
-
-    Soft-fails throughout: never raises into the caller.
-    """
-    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
-    query = (
-        "{ Aggregate { "
-        f"{class_name} {{ meta {{ count }} }}"
-        " } }"
-    )
-    try:
-        status, body = _http_request(
-            "POST", f"{base}/v1/graphql", body={"query": query}, timeout=10.0,
-        )
-    except Exception:
-        return None
-    if status != 200:
-        return None
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except Exception:
-        return None
-    try:
-        agg = payload.get("data", {}).get("Aggregate", {}) or {}
-        rows = agg.get(class_name) or []
-        if not rows:
-            # Aggregate returns empty list for missing class.
-            return 0
-        meta = rows[0].get("meta") or {}
-        count = meta.get("count")
-        if isinstance(count, int):
-            return count
-    except Exception:
-        return None
-    return None
+    """Object count of ``class_name``; ``None`` = could not be read, never
+    "empty". A thin delegate to the ONE count helper
+    (:func:`vco_lib.weaviate_helpers.http_count_objects`, v0.2.107), kept
+    module-local so patching ``project_init._http_request`` steers it."""
+    return _wh.http_count_objects(class_name, weaviate_url, request=_http_request)
 
 
 def _embedding_dim_from_schema(class_def: dict) -> Optional[int]:
@@ -7328,8 +7298,8 @@ def _autodrop_empty_codegraph_candidates(
     None, re-probe mismatch, delete error, post-probe still populated) ⇒ the
     candidate STAYS in the deferred remainder (conservative: defer to human).
 
-    Weaviate unreachable ⇒ re-probe returns None ⇒ nothing dropped (existing
-    soft-fail). Never raises.
+    A count that could not be read is ``None``, NEVER 0 (the ONE count helper):
+    unreachable / error-shaped reply ⇒ nothing dropped, one log line. Never raises.
 
     Returns ``(dropped_class_names, remaining_candidates)``.
     """
@@ -7352,6 +7322,13 @@ def _autodrop_empty_codegraph_candidates(
             live_count = None
         if live_count != 0:
             # Filled in since detect, or unknown (None) → do NOT drop.
+            _log_auto(
+                f"codegraph auto-drop of {class_name} refused: "
+                + ("its object count could not be read"
+                   if live_count is None
+                   else f"it holds {live_count} object(s) now")
+                + " - class left alone, kept in deferral"
+            )
             remaining.append(cand)
             continue
         # Drop, then POST-DROP re-probe to confirm absence.
@@ -13756,10 +13733,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "migrate-collections",
         help=(
             "Smart per-collection schema migration: noop / patch_props / "
-            "copy-with-vectors / rebuild. Replaces drop-and-re-embed. "
-            "v0.2.18: also adds new named-vector slots (arctic2_embed, "
+            "add_slots / copy-with-vectors / rebuild. Replaces drop-and-re-embed. "
+            "Also adds new named-vector slots (arctic2_embed, "
             "openai_text_embed, jina_embed, etc.) to existing KG + code "
-            "collections via additive copy-with-vectors."
+            "collections in place (nothing is dropped or copied; needs the "
+            "Weaviate version VCO ships)."
         ),
     )
     p_migrate.add_argument(

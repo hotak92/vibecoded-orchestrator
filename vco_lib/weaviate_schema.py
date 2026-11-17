@@ -21,19 +21,22 @@ The design constraint: **schema changes are additive**. Adding a new slot to
 an existing collection must preserve all data already in the existing slots.
 
 Background — why this module exists:
-  * Weaviate ≤1.30 marks `vectorConfig` immutable. PUT/PATCH to add a
-    named-vector slot returns HTTP 422 "vector config is immutable", so the
-    only way to widen a collection's slot set there is to recreate it with
-    the new target schema and round-trip every object (UUID + vectors)
-    through a staging class. VCO shipped 1.28.4 until v0.2.105 and ships
-    1.37.18 since; 1.31+ can add a named vector in place, but this module
-    still uses the round-trip on every version (an adopted Weaviate may be
-    older), so both behave the same.
-  * `project_init.migrate_collections` already implements that round-trip
-    safely (`_copy_collection_with_vectors` + `__staging` double-copy +
-    crash recovery). What's missing pre-v0.2.18 is: (a) a single catalog
+  * A named-vector slot is added IN PLACE (v0.2.107): one
+    `PUT /v1/schema/<class>` carrying the class with its `vectorConfig`
+    extended, the request the Weaviate client's `config.add_vector` sends.
+    Nothing is dropped, copied or re-embedded. Weaviate supports this from
+    1.31; VCO ships and supports the pinned 1.37.x only.
+  * Weaviate <=1.30 marks `vectorConfig` immutable and answers that PUT
+    with HTTP 422. Until v0.2.106 this module widened a slot set on EVERY
+    version by recreating the collection and round-tripping every object
+    through a `<name>__staging` class - a drop of the live class on the
+    strength of the copier's own row count, which emptied a populated class
+    when the listing ended early (DESTRUCTIVE-01). That path is RETIRED:
+    on a server that cannot add the slot in place the add is REFUSED with a
+    message that says to update Weaviate, and the class is left as it was.
+  * What this module adds over raw schema calls: (a) a single catalog
     that names every slot the orchestrator wants to support, (b) a
-    code-graph leg (the existing path only walks KG + Dev collections).
+    code-graph leg (the plan path only walks KG + Dev collections).
   * `claude_mcp_servers/scripts/migrate_to_new_embeddings.py` has been
     doing the manual "delete + recreate + reinsert" for ad-hoc additions;
     this module wraps the same pattern behind a clean API so the GUI
@@ -76,7 +79,7 @@ deliberately retained in the v0.2.18 target. Rationale: v0.2.17 installs
 have data in these slots and rebuilding a collection drops it. Carrying
 them forward as part of the target makes `_schema_delta` see the existing
 slots as "already present" (only the new ones become `missing_vec_slots`)
-and lets the copy-with-vectors round-trip preserve every vector.
+and the in-place add leaves every stored vector where it is.
 
 A future "purge legacy slots" command is explicitly OUT OF SCOPE for
 v0.2.18.
@@ -256,9 +259,8 @@ class NamedVectorSlot:
 # Order matters only for stable iteration / migration reports — Weaviate
 # treats vectorConfig as an unordered map.
 #
-# Legacy slots (`ollama_embed`, `openai_embed`) are RETAINED so v0.2.17 ->
-# v0.2.18 upgrades preserve data round-tripped through the migration's
-# copy-with-vectors path.
+# Legacy slots (`ollama_embed`, `openai_embed`) are RETAINED so the vectors a
+# v0.2.17 install stored in them stay declared and readable.
 KG_NAMED_VECTORS: list[NamedVectorSlot] = [
     # Active primary (v0.2.17 default; v0.2.18 keeps as one valid choice).
     NamedVectorSlot("qwen3_embed", 1024),
@@ -267,7 +269,7 @@ KG_NAMED_VECTORS: list[NamedVectorSlot] = [
     NamedVectorSlot("ollama_embed", 1024),
     NamedVectorSlot("openai_embed", 1536),
     # NEW in v0.2.18 — added to existing collections via
-    # `migrate_collection_to_target` (copy-with-vectors round-trip).
+    # `migrate_collection_to_target` (in-place slot add).
     NamedVectorSlot("arctic2_embed", 1024),
     NamedVectorSlot("openai_text_embed", 1536),
 ]
@@ -359,9 +361,8 @@ class AddSlotResult(enum.Enum):
 
     Created
         The slot was absent on the target collection and has been added
-        (via collection recreate + data round-trip — Weaviate ≤1.30 does
-        not support live PATCH-add of named vectors, and VCO uses the same
-        round-trip on every version).
+        IN PLACE (one schema PUT; no drop, no copy, no re-embed). A server
+        that cannot do that raises :class:`SlotAddUnsupported` instead.
     Skipped
         The slot already exists on the target collection (and, if a dim
         probe was possible, the existing stored vector dim matches the
@@ -391,9 +392,9 @@ class MigrationReport:
             ``{"slot": str, "reason": str}``. Populated by DimMismatch
             and transport failures. Non-empty `errors` means the
             collection didn't reach the target schema.
-        objects_copied: Total objects round-tripped during the migration.
-            Zero if the collection was already at target (no recreate
-            needed) OR if the collection had no data.
+        objects_copied: Always 0 since v0.2.107 - a slot is added in place
+            and no object is copied. Kept because the CLI's JSON and table
+            output carry the column.
     """
     collection: str
     added_slots: list[str] = field(default_factory=list)
@@ -588,20 +589,152 @@ def diff_collection_vs_target(
     return [s for s in target_slots if s.name not in actual_names]
 
 
+#: First Weaviate release that can add a named vector to an existing class.
+MIN_INPLACE_SLOT_ADD_VERSION = (1, 31, 0)
+
+
+class SlotAddUnsupported(RuntimeError):
+    """The server did not add the named-vector slot in place. The class is
+    exactly as it was: VCO never falls back to a drop + recreate + copy."""
+
+
+def _server_version_text(weaviate_url: Optional[str] = None) -> str:
+    """``/v1/meta``'s ``version``, or ``""`` when it cannot be read."""
+    import json
+
+    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
+    try:
+        status, body = _http_request("GET", f"{base}/v1/meta", timeout=15.0)
+        if status != 200:
+            return ""
+        return str((json.loads(body.decode("utf-8")) or {}).get("version") or "")
+    except Exception:
+        return ""
+
+
+def _slot_add_refusal(
+    collection: str, names: list[str], status: int, body: bytes,
+    weaviate_url: Optional[str],
+) -> SlotAddUnsupported:
+    """The one refusal text for a slot add the server did not perform."""
+    from vco_lib.version_compare import VersionParseError, parse_version
+
+    version = _server_version_text(weaviate_url)
+    too_old = False
+    try:
+        too_old = bool(version) and (
+            parse_version(version.split("-", 1)[0]) < MIN_INPLACE_SLOT_ADD_VERSION
+        )
+    except VersionParseError:
+        too_old = False
+    detail = body[:300].decode("utf-8", "replace") if body else ""
+    if too_old:
+        return SlotAddUnsupported(
+            f"Weaviate {version} cannot add the named vector(s) "
+            f"{', '.join(names)} to the existing collection {collection!r} "
+            f"(HTTP {status}). Update Weaviate to the version VCO ships (run "
+            "the VCO update, which moves VCO's own container to the pinned "
+            "image), then run this again. Nothing was dropped and nothing was "
+            "changed.")
+    return SlotAddUnsupported(
+        f"Weaviate{' ' + version if version else ''} refused to add the named "
+        f"vector(s) {', '.join(names)} to {collection!r}: HTTP {status} "
+        f"{detail}. If this Weaviate is older than the version VCO ships, "
+        "update it. Nothing was dropped and nothing was changed.")
+
+
+def add_vector_slots_in_place(
+    collection: str,
+    slots: list[NamedVectorSlot],
+    *,
+    weaviate_url: Optional[str] = None,
+) -> list[str]:
+    """:func:`add_vector_configs_in_place` for catalog slots: each slot's
+    config is built with the class's vector-index policy (cache cap)."""
+    from vco_lib.weaviate_vector_index import create_index_config
+
+    index_config = create_index_config(collection)
+    return add_vector_configs_in_place(
+        collection,
+        {s.name: s.to_weaviate_config(index_config=index_config) for s in slots},
+        weaviate_url=weaviate_url,
+    )
+
+
+def add_vector_configs_in_place(
+    collection: str,
+    configs: "dict[str, dict]",
+    *,
+    weaviate_url: Optional[str] = None,
+) -> list[str]:
+    """Add the named vectors ``{slot name: vectorConfig entry}`` to the
+    EXISTING class ``collection`` in place and return the names actually
+    added (slots the class already declares are skipped, never rewritten).
+
+    One ``GET /v1/schema/<class>``, one ``PUT /v1/schema/<class>`` with
+    ``vectorConfig`` extended by the new slots (existing entries are sent
+    back verbatim), then a second ``GET`` that must show every new slot.
+    No object is read, copied, re-embedded or deleted, and no class is
+    created or dropped - on ANY outcome.
+
+    Raises:
+        RuntimeError: the class does not exist, or a transport failure.
+        SlotAddUnsupported: the server did not add the slot(s) - a Weaviate
+            older than 1.31 (the message says to update Weaviate), a class
+            created without named vectors, or any other refusal. The class
+            is unchanged.
+    """
+    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
+    schema = _fetch_schema(collection, weaviate_url=base)
+    if schema is None:
+        raise RuntimeError(
+            f"collection {collection!r} not found — cannot add slot")
+    current_vc = schema.get("vectorConfig") or {}
+    names = [n for n in configs if n not in current_vc]
+    if not names:
+        return []
+    if not current_vc:
+        # A legacy single-vector class has no vectorConfig; a named vector
+        # cannot be added beside an unnamed one. That needs the consented
+        # rebuild, never an unattended one from here.
+        raise SlotAddUnsupported(
+            f"{collection!r} was created without named vectors, so the named "
+            f"vector(s) {', '.join(names)} cannot be added to it in place. "
+            "It needs the consented rebuild (`python -m vco_lib.project_init "
+            "migrate-collections`). Nothing was dropped and nothing was "
+            "changed.")
+    body = dict(schema)
+    body["vectorConfig"] = dict(current_vc)
+    for n in names:
+        body["vectorConfig"][n] = configs[n]
+    status, resp = _http_request(
+        "PUT", f"{base}/v1/schema/{collection}", body=body, timeout=600.0)
+    if status != 200:
+        raise _slot_add_refusal(collection, names, status, resp, base)
+    after = _fetch_schema(collection, weaviate_url=base) or {}
+    absent = [n for n in names if n not in (after.get("vectorConfig") or {})]
+    if absent:
+        raise _slot_add_refusal(
+            collection, absent, status,
+            b"the update was accepted but the schema does not show the slot", base)
+    return names
+
+
 def add_named_vector_slot(
     collection: str,
     slot: NamedVectorSlot,
     *,
     weaviate_url: Optional[str] = None,
     schema_fetcher: Any = None,
-    collection_rebuilder: Any = None,
+    slot_adder: Any = None,
 ) -> AddSlotResult:
     """Idempotently ensure `slot` exists on `collection`.
 
     Behaviour:
-      * Slot absent on collection -> recreate collection with target
-        schema (existing slots preserved + new slot added) via
-        `collection_rebuilder`. Returns `AddSlotResult.Created`.
+      * Slot absent on collection -> added IN PLACE via ``slot_adder``
+        (:func:`add_vector_slots_in_place`: one schema PUT). Returns
+        `AddSlotResult.Created`. This never drops, recreates or copies the
+        collection; a server that cannot add the slot raises (see Raises).
       * Slot present, stored vectors have matching dim -> no-op. Returns
         `AddSlotResult.Skipped`.
       * Slot present, stored vectors have DIFFERENT dim -> no
@@ -616,33 +749,33 @@ def add_named_vector_slot(
         weaviate_url: Override default URL.
         schema_fetcher: Test injection — callable returning schema dict
             for a class name.
-        collection_rebuilder: Callable used to perform the recreate +
-            data round-trip when a new slot must be added. Signature::
+        slot_adder: Callable that adds slots to an existing class in
+            place. Signature::
 
-                collection_rebuilder(
+                slot_adder(
                     collection: str,
-                    target_slots: list[NamedVectorSlot],
-                    weaviate_url: Optional[str],
-                ) -> int  # objects copied
+                    new_slots: list[NamedVectorSlot],
+                    *, weaviate_url: Optional[str],
+                ) -> list[str]  # slot names added
 
-            Defaults to `_default_collection_rebuilder` (which delegates
-            to `project_init._copy_collection_with_vectors` via a
-            staging double-copy). Tests inject a fake for offline runs.
+            Defaults to :func:`add_vector_slots_in_place`. Tests inject a
+            fake for offline runs.
+
+    Raises:
+        RuntimeError: the collection does not exist, or the add failed. The
+            message of a refused add (:class:`SlotAddUnsupported`) says to
+            update Weaviate; the collection is unchanged.
 
     Notes for callers:
       * "Idempotent" means: running this twice in a row produces
-        Created+Skipped (or Skipped+Skipped). It does NOT mean
-        "idempotent across concurrent runs" — the data round-trip is not
-        crash-safe on its own. Use `migrate_collection_to_target` (or
-        `project_init.migrate_collections`) which wraps this in the
-        full staging-double-copy + crash-recovery harness.
+        Created+Skipped (or Skipped+Skipped).
       * This function does NOT compute embeddings for the new slot.
         Adding a slot makes Weaviate accept writes to it; backfilling
         existing objects with vectors for the new slot is the
-        consumer's job (see `embedding_enrichment.py` in Commit 9).
+        consumer's job (see `embedding_enrichment.py`).
     """
-    if collection_rebuilder is None:
-        collection_rebuilder = _default_collection_rebuilder
+    if slot_adder is None:
+        slot_adder = add_vector_slots_in_place
 
     fetch = schema_fetcher or (
         lambda c: _fetch_schema(c, weaviate_url=weaviate_url)
@@ -663,26 +796,14 @@ def add_named_vector_slot(
             return AddSlotResult.DimMismatchError
         return AddSlotResult.Skipped
 
-    # Slot absent — compute union of existing slots + new slot and
-    # recreate. The collection_rebuilder handles staging, copy, and
-    # post-recreate property restore.
-    existing_slots = _decode_existing_slots(actual_vc)
-    new_target = list(existing_slots) + [slot]
+    # Slot absent — add it in place. No staging, no drop, no copy.
     try:
-        copied = collection_rebuilder(
-            collection, new_target, weaviate_url=weaviate_url,
-        )
+        slot_adder(collection, [slot], weaviate_url=weaviate_url)
     except Exception as e:
         raise RuntimeError(
-            f"failed to rebuild {collection!r} for slot "
-            f"{slot.name!r}: {type(e).__name__}: {e}"
+            f"failed to add slot {slot.name!r} to {collection!r}: "
+            f"{type(e).__name__}: {e}"
         ) from e
-
-    # Sanity: the rebuilder should have round-tripped objects without
-    # data loss. Surface a soft warning if zero objects copied AND the
-    # collection had data before; for now we trust the rebuilder
-    # (the project_init version raises on mismatch already).
-    _ = copied
     return AddSlotResult.Created
 
 
@@ -692,18 +813,17 @@ def migrate_collection_to_target(
     *,
     weaviate_url: Optional[str] = None,
     schema_fetcher: Any = None,
-    collection_rebuilder: Any = None,
+    slot_adder: Any = None,
 ) -> MigrationReport:
     """Add all missing slots from `target_slots` to `collection`.
 
     Idempotent — running twice produces 0 new additions on the second
     pass (every slot already in actual schema -> all `Skipped`).
 
-    Implementation: this is a thin wrapper around `add_named_vector_slot`
-    that batches the schema rebuild. Each missing slot triggers a single
-    recreate-with-target-schema cycle; subsequent slots in the same call
-    re-read the fresh schema and skip (because the first rebuild already
-    added them as part of the union).
+    Implementation: a thin wrapper around `add_named_vector_slot`. Each
+    missing slot is added IN PLACE (one schema PUT per slot); nothing is
+    dropped, recreated or copied. A slot the server refuses to add lands in
+    `report.errors` with a reason that says to update Weaviate.
 
     Returns:
         A `MigrationReport` listing added / skipped slots and per-slot
@@ -715,20 +835,14 @@ def migrate_collection_to_target(
     on all objects. A backfill step (Commit 9's enrichment migration)
     runs separately to populate vectors for the new slots.
     """
-    if collection_rebuilder is None:
-        collection_rebuilder = _default_collection_rebuilder
-
     fetch = schema_fetcher or (
         lambda c: _fetch_schema(c, weaviate_url=weaviate_url)
     )
 
     report = MigrationReport(collection=collection)
 
-    # Re-read the schema between slot adds — each successful add
-    # triggers a collection rebuild that ALSO incorporates other
-    # missing slots from the union (see `add_named_vector_slot` -> the
-    # rebuild's `new_target` includes every existing slot, plus the
-    # newly-required one). After the first add, the others are no-ops.
+    # The schema is re-read for every slot, so each add sees the slots the
+    # previous one put there.
     for slot in target_slots:
         try:
             outcome = add_named_vector_slot(
@@ -736,7 +850,7 @@ def migrate_collection_to_target(
                 slot,
                 weaviate_url=weaviate_url,
                 schema_fetcher=fetch,
-                collection_rebuilder=collection_rebuilder,
+                slot_adder=slot_adder,
             )
         except Exception as e:
             report.errors.append({
@@ -768,151 +882,6 @@ def migrate_collection_to_target(
 # ---------------------------------------------------------------------------
 # Helpers (internal)
 # ---------------------------------------------------------------------------
-
-
-def _decode_existing_slots(vector_config: dict) -> list[NamedVectorSlot]:
-    """Read a Weaviate `vectorConfig` dict and produce a slot list.
-
-    Weaviate's schema doesn't carry dim, so the returned slots get
-    `dim=0` (we don't probe stored vectors here — that's a heavier path
-    used only by `add_named_vector_slot`'s dim-mismatch check). The
-    `dim` is purely informational on these reconstructed slots; what
-    matters for the rebuild is the slot NAMES and their vectorizer
-    config, which we copy from the existing schema.
-    """
-    slots: list[NamedVectorSlot] = []
-    for name, cfg in vector_config.items():
-        vectorizer = "none"
-        # vectorizer shape: {"none": {}} OR {"text2vec-openai": {...}} etc.
-        if isinstance(cfg, dict) and "vectorizer" in cfg:
-            vc = cfg["vectorizer"]
-            if isinstance(vc, dict) and vc:
-                vectorizer = next(iter(vc.keys()))
-        slots.append(NamedVectorSlot(name=name, dim=0, vectorizer=vectorizer))
-    return slots
-
-
-def _default_collection_rebuilder(
-    collection: str,
-    target_slots: list[NamedVectorSlot],
-    *,
-    weaviate_url: Optional[str] = None,
-) -> int:
-    """Default implementation of the `collection_rebuilder` callable.
-
-    Recreates `collection` with `target_slots` as the new `vectorConfig`,
-    preserving all existing data (properties + named vectors + UUIDs)
-    via a staging double-copy. Delegates to
-    `vco_lib.project_init._copy_collection_with_vectors` for the data
-    round-trip and `_create_class` / `_delete_class` for the schema
-    surgery.
-
-    Returns:
-        Total objects copied (final staging -> name round-trip count).
-
-    Implementation notes:
-      * Uses the SAME staging pattern as `project_init.migrate_collections`
-        (`<name>__staging` class with target schema, then 5-step
-        double-copy). This means crash recovery via
-        `_recover_or_drop_orphan_staging` works against rebuilds done
-        through this helper too.
-      * Properties are read from the existing schema and re-applied to
-        both staging and the recreated `<name>`. Targets that need
-        different properties (e.g. adding a new field) must use
-        `project_init.migrate_collections` directly, which handles the
-        property delta path.
-      * Inverted-index config is preserved verbatim from the source
-        (`indexNullState` etc.) so the KG MCP's stale-filter keeps
-        working post-rebuild.
-    """
-    # Late import so this module can be imported without dragging in
-    # urllib + weaviate-client. Also breaks the would-be import cycle
-    # if project_init ever needs to import weaviate_schema.
-    from vco_lib import project_init as _pi
-
-    base_url = weaviate_url or _weaviate_url_default()
-
-    # 0. Read the existing schema; we need its properties + inverted
-    #    index config to recreate the collection faithfully.
-    schema = _fetch_schema(collection, weaviate_url=base_url)
-    # v0.2.105: the recreated class carries the vector-index policy (cache
-    # cap) like every other create path; RQ-8 comes from the server default.
-    from vco_lib.weaviate_vector_index import create_index_config
-
-    index_config = create_index_config(collection)
-    if schema is None:
-        # Collection doesn't exist — create it fresh with target slots
-        # and minimal property surface.
-        target_def = {
-            "class": collection,
-            "vectorConfig": {
-                s.name: s.to_weaviate_config(index_config=index_config)
-                for s in target_slots
-            },
-            "invertedIndexConfig": {"indexNullState": True},
-            "properties": [],
-        }
-        _pi._create_class(target_def, weaviate_url=base_url)
-        return 0
-
-    # 1. Build the staging class def. Vector slots = union of target
-    #    slots; properties + inverted index inherited from source.
-    staging_name = f"{collection}{_pi._STAGING_SUFFIX}"
-    target_vc = {s.name: s.to_weaviate_config(index_config=index_config)
-                 for s in target_slots}
-    target_def = {
-        "class": staging_name,
-        "vectorConfig": target_vc,
-        "invertedIndexConfig": schema.get("invertedIndexConfig") or {
-            "indexNullState": True
-        },
-        "properties": schema.get("properties", []),
-    }
-
-    # Defensive cleanup: if a prior crashed run left a `__staging` from
-    # this very name, drop it before we recreate (safe — if any data is
-    # in it we'd lose it, but that scenario is already handled by
-    # `project_init._recover_or_drop_orphan_staging` upstream; here we
-    # assume the caller has flushed orphans).
-    existing_staging = _fetch_schema(staging_name, weaviate_url=base_url)
-    if existing_staging is not None:
-        _pi._delete_class(staging_name, weaviate_url=base_url)
-
-    # 2. Create staging with the target schema.
-    _pi._create_class(target_def, weaviate_url=base_url)
-
-    # 3. Copy source -> staging (preserves vectors that already exist;
-    #    new slots arrive empty).
-    copied_a = _pi._copy_collection_with_vectors(
-        collection, staging_name, weaviate_url=base_url,
-    )
-
-    # 4. Drop source.
-    _pi._delete_class(collection, weaviate_url=base_url)
-
-    # 5. Recreate source with the target schema (same vc as staging,
-    #    inherits the same properties).
-    recreated_def = dict(target_def)
-    recreated_def["class"] = collection
-    _pi._create_class(recreated_def, weaviate_url=base_url)
-
-    # 6. Copy staging -> source.
-    copied_b = _pi._copy_collection_with_vectors(
-        staging_name, collection, weaviate_url=base_url,
-    )
-
-    if copied_a != copied_b:
-        # Don't auto-drop staging on mismatch — leave it for forensic
-        # inspection. Same policy as project_init.migrate_collections.
-        raise RuntimeError(
-            f"copy round-trip mismatch on {collection}: "
-            f"source->staging={copied_a}, staging->source={copied_b}; "
-            f"staging {staging_name} RETAINED for manual review"
-        )
-
-    # 7. Drop staging.
-    _pi._delete_class(staging_name, weaviate_url=base_url)
-    return copied_b
 
 
 # ---------------------------------------------------------------------------
@@ -1077,7 +1046,7 @@ def migrate_collections_to_v0218_schema(
     project_name: Optional[str] = None,
     weaviate_url: Optional[str] = None,
     schema_fetcher: Any = None,
-    collection_rebuilder: Any = None,
+    slot_adder: Any = None,
 ) -> list[MigrationReport]:
     """Walk every KG + Code collection and apply the v0.2.18 target slots.
 
@@ -1095,8 +1064,7 @@ def migrate_collections_to_v0218_schema(
             KG-shaped and Code-shaped class on the server.
         weaviate_url: Override default Weaviate URL.
         schema_fetcher: Test injection — same as `add_named_vector_slot`.
-        collection_rebuilder: Test injection — same as
-            `add_named_vector_slot`.
+        slot_adder: Test injection — same as `add_named_vector_slot`.
 
     Returns:
         One `MigrationReport` per collection visited. The caller
@@ -1121,7 +1089,7 @@ def migrate_collections_to_v0218_schema(
             coll, KG_NAMED_VECTORS,
             weaviate_url=weaviate_url,
             schema_fetcher=schema_fetcher,
-            collection_rebuilder=collection_rebuilder,
+            slot_adder=slot_adder,
         ))
 
     for coll in enumerate_code_collections(
@@ -1131,7 +1099,7 @@ def migrate_collections_to_v0218_schema(
             coll, CODE_NAMED_VECTORS,
             weaviate_url=weaviate_url,
             schema_fetcher=schema_fetcher,
-            collection_rebuilder=collection_rebuilder,
+            slot_adder=slot_adder,
         ))
 
     return reports
@@ -1178,6 +1146,9 @@ __all__ = [
     "AddSlotResult",
     "MigrationReport",
     "add_named_vector_slot",
+    "add_vector_slots_in_place",
+    "add_vector_configs_in_place",
+    "SlotAddUnsupported",
     "diff_collection_vs_target",
     "migrate_collection_to_target",
     "migrate_collections_to_v0218_schema",
