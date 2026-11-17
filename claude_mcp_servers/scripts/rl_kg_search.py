@@ -380,6 +380,24 @@ async def main():
         # collection recorded in the project KG's model (the steady state).
         _per_slot: dict = {}
 
+        # v0.2.107 HR-1: collections whose query FAILED (not "returned
+        # nothing"). The router caches an empty answer for 300 s only when
+        # the lookup FINISHED; a search that failed on a collection which
+        # could have contributed is an ERROR, never "nothing above the floor".
+        # A collection Weaviate positively reports as absent (a peer that was
+        # never indexed) is not a failure: it can contribute nothing.
+        failed_collections: set[str] = set()
+
+        def _note_query_failure(coll_name: str) -> None:
+            exists = getattr(client.collections, "exists", None)
+            if exists is not None:
+                try:
+                    if exists(coll_name) is False:
+                        return
+                except Exception:  # noqa: BLE001 — unconfirmed → a failure
+                    pass
+            failed_collections.add(coll_name)
+
         async def _vector_for(coll_name: str, q_text: str, q_vector):
             if EMBEDDING_SOURCE == "weaviate" or q_vector is None:
                 return q_vector, query_target
@@ -399,7 +417,9 @@ async def main():
                 try:
                     coll = client.collections.get(coll_name)
                 except Exception:
-                    # Collection may not exist (peer never indexed yet) — skip.
+                    # Collection may not exist (peer never indexed yet) — skip;
+                    # anything else is a failed query (HR-1).
+                    _note_query_failure(coll_name)
                     continue
                 c_vector, c_target = await _vector_for(coll_name, q_text, q_vector)
                 try:
@@ -422,6 +442,7 @@ async def main():
                             nv_kwargs["target_vector"] = q_target
                         primary = coll.query.near_vector(**nv_kwargs)
                 except Exception:
+                    _note_query_failure(coll_name)
                     continue
                 # v0.2.102 W4-G: per-node `cross_project_access` — a row
                 # from a NON-SELF collection (shared / peer) restricted to
@@ -488,6 +509,15 @@ async def main():
             )
         else:
             all_formatted = await _retrieve_for_vector(effective_query, vector, fetch_limit)
+
+        if not all_formatted and args.injection_profile and failed_collections:
+            # HR-1: empty because a query FAILED — an error, not an answer.
+            # A non-zero exit makes the router record the leg as errored:
+            # nothing is cached and the warmer may re-run it. (The `finally`
+            # still closes the client and hands off any events.)
+            print(f"[rl_kg_search] query failed on {sorted(failed_collections)}",
+                  file=sys.stderr)
+            raise SystemExit(1)
 
         if not all_formatted:
             # v0.2.21 audit fix: under --hook-format, emit a single short
@@ -780,6 +810,15 @@ async def main():
         # be injected noise (the survey's precision complaint).
         if printed_count == 0 and args.hook_format and gate is None:
             print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
+        if args.injection_profile and failed_collections:
+            # HR-1 partial failure: what the answering collections returned is
+            # printed above and shown, but a failed collection could have
+            # contributed a better row — so this is not the COMPLETE answer.
+            # Exit non-zero: the router shows the text, caches nothing and
+            # lets the warmer re-run the whole lookup.
+            print(f"[rl_kg_search] query failed on {sorted(failed_collections)}",
+                  file=sys.stderr)
+            raise SystemExit(1)
     finally:
         client.close()
         # W5R-07: the results are out; NOW send the training events, off the

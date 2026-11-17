@@ -954,6 +954,24 @@ HOOK_QUERY_SLOTS = 2
 HOOK_QUERY_SLOT_WAIT_S = 5.0
 
 
+def _run_producer_main(mod) -> None:
+    """Run a producer's ``main()`` the way every leg must (v0.2.107 HR-1).
+
+    ``rl_kg_search.main`` is async; the ``VCO_ROUTER_KG_SCRIPT`` /
+    ``VCO_CG_SCRIPT`` seams may point at a SYNC stub — accept both (the
+    producer contract is "a main() whose argv is pinned"). A non-zero int
+    return (``query_code_graph.main`` returns 1 on a connect failure or an
+    exception) is an ERROR, raised as ``SystemExit`` so
+    ``hook_dual_search._run_leg`` records the leg as ``error``: never cached
+    as a finished-empty answer, and eligible for the warmer.
+    """
+    result = mod.main()
+    if inspect.iscoroutine(result):
+        result = asyncio.run(result)
+    if isinstance(result, int) and not isinstance(result, bool) and result != 0:
+        raise SystemExit(result)
+
+
 @contextlib.contextmanager
 def _query_slot(wait_s: Optional[float] = None):
     """Hold one of ``HOOK_QUERY_SLOTS`` machine-wide query slots (A-008).
@@ -1115,13 +1133,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                 def _kg_leg(script=kg_script, kg_argv=tuple(argv)) -> None:
                     mod = _hds._load_cg_module(script)
                     _hds._pin_argv(mod, list(kg_argv))
-                    # rl_kg_search.main is async; the VCO_ROUTER_KG_SCRIPT
-                    # test seam may point at a SYNC stub producer — accept
-                    # both (the documented producer contract is "a main()
-                    # whose argv is pinned", not "an async main").
-                    result = mod.main()
-                    if inspect.iscoroutine(result):
-                        asyncio.run(result)
+                    _run_producer_main(mod)
 
                 legs["kg"] = _kg_leg
             except BaseException as exc:  # noqa: BLE001 — never block the tool
@@ -1147,7 +1159,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
                             if cg_module is None:
                                 cg_module = _hds._load_cg_module(script)
                             _hds._pin_argv(cg_module, [str(a) for a in cg_argv])
-                            cg_module.main()
+                            _run_producer_main(cg_module)
 
                     legs[f"cg_{index}"] = _cg_leg
             except BaseException as exc:  # noqa: BLE001
@@ -1421,7 +1433,8 @@ def _warm_legs_main() -> int:
     cache entry instead (:func:`_install_warm_hold_interceptor`): until an
     interactive run shows that entry, nobody has seen the retrieval, so it
     is not a training label (v0.2.105). A finished empty output is cached for
-    300 s and holds no ctx; a timeout/error remains uncached (v0.2.107)."""
+    300 s and holds no ctx; a timeout/error — partial output included —
+    remains uncached (v0.2.107)."""
     held: List[Dict] = []
     _install_warm_hold_interceptor(held)
     try:
@@ -1451,9 +1464,7 @@ def _warm_legs_main() -> int:
         _hds._pin_argv(mod, [str(a) for a in argv])
 
         def _run(mod=mod) -> None:
-            result = mod.main()
-            if inspect.iscoroutine(result):
-                asyncio.run(result)
+            _run_producer_main(mod)
 
         held.clear()
         with _query_slot() as acquired:
@@ -1463,13 +1474,18 @@ def _warm_legs_main() -> int:
         out = (leg_results or {}).get(str(name)) or ""
         status = getattr(leg_results, "status", {}).get(str(name), "error")
         out = out.strip()
+        if status != "finished":
+            # HR-1: an errored leg (a non-zero producer exit, a raise, or a
+            # KG search that failed on a collection) is never cached — not as
+            # empty, and not its partial output as the complete answer.
+            continue
         if out:
             cache_leg_output(project_root, key, out + "\n")
             if cache_get(project_root, key) is not None:
                 _write_warm_held(project_root, key, list(held))
-        elif status == "finished" and cache_get(project_root, key) is None:
-            # A warmer runs to completion without an interactive join deadline;
-            # an ordinary empty return is therefore a finished-empty answer.
+        elif cache_get(project_root, key) is None:
+            # A warmer's leg that FINISHED with nothing is a finished-empty
+            # answer.
             cache_finished_empty(project_root, key)
     return 0
 

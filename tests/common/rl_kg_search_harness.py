@@ -54,15 +54,25 @@ class FakeObj:
 
 
 class FakeClient:
-    """Records every collection a near_vector query was issued against."""
+    """Records every collection a near_vector query was issued against.
 
-    def __init__(self, queried: list) -> None:
+    ``behaviour`` (v0.2.107 HR-1) maps a collection name to ``"fail"`` (its
+    query raises, the collection exists), ``"missing"`` (its query raises and
+    ``collections.exists`` answers False) or ``"empty"`` (it answers with no
+    rows); any other collection answers with two rows.
+    """
+
+    def __init__(self, queried: list, behaviour: "dict | None" = None) -> None:
         self.queried = queried
+        self.behaviour = dict(behaviour or {})
         client = self
 
         class _Colls:
             def get(self, name):
                 return _Coll(name, client)
+
+            def exists(self, name):
+                return client.behaviour.get(name) != "missing"
 
         self.collections = _Colls()
 
@@ -78,6 +88,11 @@ class _Coll:
         class _Q:
             def near_vector(self, **kw):
                 client.queried.append(coll.name)
+                mode = client.behaviour.get(coll.name)
+                if mode in ("fail", "missing"):
+                    raise RuntimeError(f"fake query failure on {coll.name}")
+                if mode == "empty":
+                    return SimpleNamespace(objects=[])
                 return SimpleNamespace(
                     objects=[
                         FakeObj(f"{coll.name}-node-a", coll.name, 0.10),
@@ -159,7 +174,8 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
         # (kg_search / hook_injection / …); the fake accepts and ignores it.
         return list(ACTIVE_VEC), ACTIVE_SLOT
 
-    patch(srv, "get_weaviate_client", lambda *a, **k: FakeClient(queried))
+    behaviour = dict(cfg.get("collection_behaviour") or {})
+    patch(srv, "get_weaviate_client", lambda *a, **k: FakeClient(queried, behaviour))
     patch(srv, "_get_search_vector", _search_vector)
     patch(
         srv,
