@@ -120,7 +120,13 @@ export async function startWindowActivity(): Promise<void> {
   if (started || typeof document === 'undefined') return;
   started = true;
   const root = document.documentElement;
-  watchUserIdle(root, window);
+  // The idle watch only rests decorative motion. It must never keep the
+  // visibility / minimise wiring below from being installed.
+  try {
+    watchUserIdle(root, window);
+  } catch (e) {
+    console.warn('[window-activity] user-idle watch unavailable:', e);
+  }
   activity.subscribe((active) => applyInactiveAttr(root, active));
   const readHidden = () => setWindowState({ hidden: document.visibilityState === 'hidden' });
   document.addEventListener('visibilitychange', readHidden);
@@ -153,6 +159,25 @@ export const USER_IDLE_MS = 60_000;
 
 const USER_INPUT_EVENTS = ['pointermove', 'pointerdown', 'keydown', 'wheel', 'touchstart'] as const;
 
+type IdleTimerHandle = ReturnType<typeof setTimeout>;
+
+/** The two timer calls {@link watchUserIdle} makes. */
+export interface IdleTimers {
+  set: (fn: () => void, ms: number) => IdleTimerHandle;
+  clear: (handle: IdleTimerHandle) => void;
+}
+
+/**
+ * The real timers, each called as a BARE global. Never store `setTimeout` /
+ * `clearTimeout` themselves in an object and call them through it: a browser
+ * checks the receiver and throws — WebKit "Can only call Window.setTimeout on
+ * instances of Window", Chromium "Illegal invocation" (the v0.2.97 class).
+ */
+const GLOBAL_IDLE_TIMERS: IdleTimers = {
+  set: (fn, ms) => setTimeout(fn, ms),
+  clear: (handle) => clearTimeout(handle),
+};
+
 /**
  * Mark `root` idle after `idleMs` without input; clear it on the next input.
  * Returns a stop function. Timers are injectable for tests.
@@ -161,9 +186,9 @@ export function watchUserIdle(
   root: Element,
   target: Pick<EventTarget, 'addEventListener' | 'removeEventListener'>,
   idleMs: number = USER_IDLE_MS,
-  timers: { set: typeof setTimeout; clear: typeof clearTimeout } = { set: setTimeout, clear: clearTimeout },
+  timers: IdleTimers = GLOBAL_IDLE_TIMERS,
 ): () => void {
-  let handle: ReturnType<typeof setTimeout> | undefined;
+  let handle: IdleTimerHandle | undefined;
   const arm = () => {
     if (handle !== undefined) timers.clear(handle);
     handle = timers.set(() => root.setAttribute(USER_IDLE_ATTR, ''), idleMs);
