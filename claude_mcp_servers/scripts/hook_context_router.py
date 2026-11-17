@@ -51,7 +51,10 @@ Mechanism (one interpreter, one home):
   retirement of ``_lib/query-cache.{sh,ps1}`` — the ``kgi``/``cgi``
   namespace split is the guard that must hold, so profile-gated blocks can
   never be served to the legacy
-  surfaces' keys (and vice-versa). Empty results are NEVER cached (§9).
+  surfaces' keys (and vice-versa). An empty result is cached (300 s) only
+  when the lookup FINISHED with nothing above its floor; a timeout or an
+  error (a raise, a non-zero producer exit, a KG query that failed on a
+  collection) is never cached as empty (v0.2.107; §9 before it).
 
 Kill switch: ``VCO_INJECT_PROFILE=off`` → exit 0 silently (checked first,
 beside the wrappers' own check). Per-surface: ``VCO_PROMPT_INJECT=off``
