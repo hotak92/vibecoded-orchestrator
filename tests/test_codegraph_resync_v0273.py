@@ -439,6 +439,7 @@ def test_count_cleanup_owed_ignores_extra_path_deleted_rows(monkeypatch, tmp_pat
     """B1: an extra-path deleted row (project_source outside the primary root)
     is NEVER counted — it converges on its own root's walk."""
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    (tmp_path / "README.md").write_text("x\n")  # the root holds entries
     func = _ConfigPathColl(agg_count=0, rows=[
         {"embed_revision": 1, "file_path": "gone.py",
          "project_source": "/some/other/root"},   # extra-path deleted → skip
@@ -448,6 +449,18 @@ def test_count_cleanup_owed_ignores_extra_path_deleted_rows(monkeypatch, tmp_pat
     client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
     n = cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client)
     assert n == 1
+
+
+def test_count_cleanup_owed_is_zero_under_an_empty_root(monkeypatch, tmp_path):
+    """v0.2.107 DESTRUCTIVE-03a: an empty root (unmounted drive) owes no
+    cleanup, so the gate never spawns a walk that could only sweep it."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    func = _ConfigPathColl(agg_count=0, rows=[
+        {"embed_revision": 1, "file_path": "gone2.py",
+         "project_source": tmp_path.as_posix()},
+    ])
+    client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
+    assert cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client) == 0
 
 
 def test_count_cleanup_owed_none_on_scan_failure(monkeypatch, tmp_path):

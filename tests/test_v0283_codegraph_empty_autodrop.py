@@ -38,6 +38,14 @@ from vco_lib import project_init  # noqa: E402
 URL = "http://localhost:8081"
 
 
+@pytest.fixture(autouse=True)
+def _revalidation_allows(monkeypatch):
+    """v0.2.107 S-3: the run-time re-validation (launcher.db keep-set) is
+    covered in test_v02107_safety_destructive; here it allows the drop."""
+    monkeypatch.setattr(
+        project_init, "_legacy_codegraph_drop_revalidated", lambda n, f=None: True)
+
+
 def _cand(name: str, *, count, case_only: bool = False) -> dict:
     return {
         "class_name": name,

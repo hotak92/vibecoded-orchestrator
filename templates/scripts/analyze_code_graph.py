@@ -3831,14 +3831,14 @@ class CodeGraphAnalyzer:
         # sweep lives inside `_build_stale_file_set`, which only runs when the
         # LAZY per-file trigger (`_get_existing_module` → `_get_stale_file_set`)
         # fires — i.e. when ≥1 analyzable file dispatches. A whole-repo walk that
-        # dispatches ZERO analyzable files (e.g. every analyzable file was just
-        # deleted from disk) would then NEVER run the sweep: the orphan rows
-        # survive, the resync owed-gate keeps counting cleanup-owed>0, and every
-        # subsequent `--update` re-spawns a whole-repo resync forever. Close it
-        # by force-triggering the stale-set build once at the END of a whole-repo
-        # walk. `_get_stale_file_set` caches on `_stale_file_set_cache` presence
-        # (reset per run above), so this is a no-op when the lazy path already
-        # ran it — the sweep runs EXACTLY ONCE per whole-repo walk. Not done for
+        # dispatches ZERO analyzable files (every analyzable file deleted, while
+        # the root still holds other entries) would never sweep, and the resync
+        # gate would respawn forever; so force the build once at the END of a
+        # whole-repo walk. An EMPTY / missing root deletes nothing here: the
+        # sweep's predicate (`path_reachable_on_disk` → `root_holds_entries`)
+        # answers "kept" (v0.2.107 DESTRUCTIVE-03a). Cached per run (reset
+        # above), so a no-op when the lazy path already ran it — the sweep
+        # runs EXACTLY ONCE per whole-repo walk. Not done for
         # single-file / --only-files-from walks: those must not sweep the whole
         # collection (the sweep is itself gated on `_analyze_whole_repo`, but we
         # also avoid paying the full stale-scan cost on narrow/incremental walks).
@@ -4799,8 +4799,8 @@ class CodeGraphAnalyzer:
             path per row inside the helper, so the decision is made on the value
             the helper itself read back.
           * Reachability is fail-SAFE toward KEEPING (``_path_reachable_on_disk``
-            returns True on any probe error / escape-uncertainty), so a transient
-            filesystem error never authorises a delete.
+            returns True on any probe error and under an empty / missing root),
+            so neither a filesystem error nor an unmounted drive deletes rows.
 
         Returns ``(deleted, failures)``; a per-collection scan failure soft-fails
         to ``(0, 0)`` (an incomplete scan must never authorise deletes).

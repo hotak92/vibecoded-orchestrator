@@ -37,10 +37,11 @@ Background — why this module exists:
   * What this module adds over raw schema calls: (a) a single catalog
     that names every slot the orchestrator wants to support, (b) a
     code-graph leg (the plan path only walks KG + Dev collections).
-  * `claude_mcp_servers/scripts/migrate_to_new_embeddings.py` has been
-    doing the manual "delete + recreate + reinsert" for ad-hoc additions;
-    this module wraps the same pattern behind a clean API so the GUI
-    "change embedding model" flow (Commit 9 of v0.2.18) can drive it.
+  * The manual tools (`claude_mcp_servers/scripts/migrate_to_new_embeddings.py`
+    and the MCP server's `migrate_embeddings`) add slots through this
+    module's in-place add as well (`vco_lib.named_vector_migration`); only a
+    legacy single-vector class is still rebuilt there, count-gated and with
+    every uuid kept.
 
 Layering rule: this module declares slot **catalogs** and a thin
 idempotent-add API. It does NOT compute embeddings or talk to Ollama /

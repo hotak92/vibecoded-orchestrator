@@ -1723,7 +1723,8 @@ def test_driver_entry_takes_a_slot_and_honours_the_env(monkeypatch, tmp_path):
     assert seen["slots"] == 3 and seen["wait_s"] == 42.0
     monkeypatch.setenv("VCO_RESYNC_DRIVER_SLOTS", "junk")
     cr.run_resync_and_verify("Acme", tmp_path, tmp_path / "a.py")
-    assert seen["slots"] == 2, "an unparseable cap falls back to the default"
+    assert seen["slots"] == atomic.machine_slot_count(), (
+        "an unparseable cap falls back to the RAM-sized pool (v0.2.107)")
 
 
 # ── W1-C R5: per-project single-flight — one resync driver per project ──────

@@ -65,6 +65,7 @@ __all__ = [
     "is_deleted_primary_row",
     "path_is_ignored",
     "path_reachable_on_disk",
+    "root_holds_entries",
 ]
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,21 @@ def path_is_ignored(file_path: str, *, index_dot_claude: bool = True) -> bool:
     return any(name.endswith(s) for s in CODEGRAPH_SKIP_SUFFIXES)
 
 
+def root_holds_entries(repo_root: "Path") -> bool:
+    """True only when ``repo_root`` is a directory holding at least one entry.
+
+    The precondition of every "this file was deleted" verdict: an unmounted
+    drive's mount point, a missing folder or an empty checkout makes every
+    path ``ENOENT``, and a walk that found nothing is not evidence that
+    anything was deleted. Any OS error is "cannot tell" → False.
+    """
+    try:
+        with os.scandir(repo_root) as it:
+            return next(it, None) is not None
+    except (OSError, ValueError):
+        return False
+
+
 def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
     """True when ``rel_or_abs_path`` resolves to a real on-disk file INSIDE
     ``repo_root`` (mirrors ``install.py::_path_resolves_on_disk`` safety).
@@ -180,6 +196,14 @@ def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
     ``ENOTDIR`` → ``False``) from "could not determine" (any other ``OSError``:
     ``EACCES``/``ELOOP``/... → ``True``, fail-safe). Version-independent: the
     ``os.stat`` form has these semantics on every supported Python.
+
+    v0.2.107 (DESTRUCTIVE-03a): a "not reachable" verdict also needs
+    :func:`root_holds_entries` — under an empty, missing or non-directory root
+    every path is ``ENOENT``, so the answer is "kept". The root is probed only
+    on the ``ENOENT`` / ``ENOTDIR`` branch (once per absent path, never per
+    live row); a path escaping the root stays ``False`` (a corrupt row). Every deleted-file delete — the analyzer's end-of-walk sweep, the
+    classifier orphan-clear, the resync gates' cleanup-owed counts — consults
+    this one predicate.
     """
     if not rel_or_abs_path:
         return True
@@ -196,7 +220,7 @@ def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
     except (OSError, ValueError):
         return True
     if not inside:
-        return False
+        return False  # a lexical verdict on a corrupt path, not walk evidence
     try:
         os.stat(candidate)
         return True
@@ -209,7 +233,7 @@ def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
         # truly is not there. EVERY other errno (EACCES/ELOOP/ENAMETOOLONG/...)
         # is "could not determine" → fail-safe True (keep the data).
         if exc.errno in (errno.ENOENT, errno.ENOTDIR):
-            return False
+            return not root_holds_entries(root_resolved)
         return True
 
 
@@ -372,8 +396,10 @@ def is_deleted_primary_row(
       own root's walk and this walk cannot judge its files' existence), AND
     * its path does NOT resolve on disk inside the repo root. Reachability is
       fail-SAFE toward KEEPING (:func:`path_reachable_on_disk` returns True on
-      any probe error / escape-uncertainty) — so a transient filesystem error
-      or a missing root never counts a live row as deleted.
+      any probe error / escape-uncertainty, and when the root is missing,
+      not a directory or empty — :func:`root_holds_entries`) — so a transient
+      filesystem error or an unmounted root never counts a live row as
+      deleted.
 
     ``reachable_fn`` optionally injects a memoized reachability predicate (one
     syscall per unique path across a probe run); without it (and without

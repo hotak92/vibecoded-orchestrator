@@ -163,9 +163,10 @@ def _emit_migrate_required_deferral(
         why_deferred=(
             "Schema drift detected. `rebuild` re-embeds every object via Ollama "
             "(vectors are regenerated, not preserved), so it is deferred for "
-            "explicit consent. Additive `copy` migrations preserve all data "
-            "(UUIDs + named vectors + properties round-trip byte-for-byte) and "
-            "are auto-applied without a deferral. The bundle install (hooks, "
+            "explicit consent. Additive migrations (named-vector slots added in "
+            "place, new properties, copies with vectors) preserve all data (a "
+            "copy round-trips UUIDs + named vectors + properties byte-for-byte) "
+            "and are auto-applied without a deferral. The bundle install (hooks, "
             "agents, scripts) still proceeds and is unaffected."
         ),
         command_to_apply=cmd,

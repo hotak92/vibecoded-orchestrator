@@ -1077,7 +1077,7 @@ def _default_live_drift_probe(
     embedding-invalidating change: a missing CORE named-vector slot, a
     missing ``indexNullState``, OR a slot whose live stored-vector dim
     differs from the catalog. A purely-additive optional-slot gap is NOT
-    stale (handled by copy-with-vectors / patch_props, no re-embed). See
+    stale (handled by the in-place ``add_slots`` / ``patch_props``, no re-embed). See
     ``vco_lib.project_init.live_fingerprint_stale`` +
     ``vco_lib.weaviate_schema.embedding_schema_fingerprint``. Failure-soft
     (Weaviate down / class absent → not stale), preserving the §5 NO-OP

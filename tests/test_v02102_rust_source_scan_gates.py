@@ -227,7 +227,8 @@ def migrate_warning_findings(projects_src: str) -> List[str]:
     problems = []
     if "(`rebuild`) requires consent and was NOT auto-applied" not in src:
         problems.append("dry-run warning must scope consent to the rebuild action")
-    if ("additive `copy` migrations are lossless and were applied automatically"
+    if ("additive migrations (named-vector slots added in place, new properties, "
+            "copies with vectors) are lossless and were applied automatically"
             not in src.lower()):
         problems.append("dry-run warning must still carry the additive-copy clause text")
     if "the destructive migration was NOT auto-applied" in src:

@@ -2573,12 +2573,13 @@ pub(crate) async fn run_migrate_dry_run(
                 // must match _emit_migrate_required_deferral why_deferred
                 // (vco_lib/project_init.py) — cross-language mirror. Keep the
                 // framing identical: ONLY lossy `rebuild` is consent-gated here
-                // (it re-embeds every object). The additive-`copy` clause is
+                // (it re-embeds every object). The additive clause is
                 // appended ONLY when additive drift was actually auto-applied
                 // this run (rebuild-only plans have none to apply).
                 let additive_clause = if auto_apply_additive {
-                    " Additive `copy` migrations are lossless and were applied \
-                     automatically."
+                    " Additive migrations (named-vector slots added in place, \
+                     new properties, copies with vectors) are lossless and were \
+                     applied automatically."
                 } else {
                     ""
                 };

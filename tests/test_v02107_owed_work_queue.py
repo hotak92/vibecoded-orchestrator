@@ -797,6 +797,31 @@ def test_the_pool_is_the_resync_drivers_directory(state):
     assert bulk_slot_dir() == state / "state" / "resync-driver-slots"
 
 
+@pytest.mark.parametrize("ram,slots", [(8.0, 1), (128.0, 4)])
+def test_the_resync_driver_sizes_and_places_its_slot_like_the_worker(
+        state, tmp_path, monkeypatch, ram, slots):
+    """Seam (WAVE1-CHECK-A): the resync driver takes its slot from the SAME
+    pool, at the SAME size, as the owed-work worker — on a small machine one
+    bulk writer, not one per pool user."""
+    from vco_lib import atomic
+    from vco_lib import codegraph_resync as cr
+
+    monkeypatch.delenv("VCO_RESYNC_DRIVER_SLOTS", raising=False)
+    monkeypatch.setattr("vco_lib.host_probe.probe_system_ram_gb", lambda: ram)
+    seen: dict = {}
+    real = atomic.machine_slot
+
+    def _spy(slot_dir, **kw):
+        seen.update(kw, dir=slot_dir)
+        return real(tmp_path / "s", slots=kw["slots"], wait_s=0)
+
+    monkeypatch.setattr(atomic, "machine_slot", _spy)
+    monkeypatch.setattr(cr, "_run_resync_and_verify_slotted", lambda *a, **k: 0)
+    assert cr.run_resync_and_verify("Acme", tmp_path, tmp_path / "a.py") == 0
+    assert seen["slots"] == slots == atomic.machine_slot_count()
+    assert seen["dir"] == atomic.bulk_slot_dir()
+
+
 def test_job_log_names_carry_the_project_key_and_the_pid(state, tmp_path, monkeypatch):
     from vco_lib import owed_work
 

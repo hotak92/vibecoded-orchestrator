@@ -7978,18 +7978,19 @@ async def migrate_embeddings(
     If vector_scheme is None, it is auto-detected from the collection name
     (Code* collections -> "code", everything else -> "kg").
 
-    This recreates the collection with named vector configuration, re-inserts all
-    objects with their existing vector mapped to the scheme's primary named vector,
-    and optionally generates 'openai_embed' if VCO's OpenAI slot has a key.
-
-    WARNING: This deletes and recreates the collection. Back up first.
+    v0.2.107 (S-2), one home ``vco_lib.named_vector_migration``: a class that
+    already has named vectors gets the scheme's missing slots IN PLACE (nothing
+    read, dropped or re-inserted; fill them with ``backfill_embeddings``). Only
+    a legacy single-vector class is rebuilt: every object is read, the read is
+    proved whole against the server's count (else refused, nothing dropped),
+    and each object is re-inserted under its original uuid with its vector on
+    the scheme's primary named vector (plus 'openai_embed' when VCO's OpenAI
+    slot has a key).
 
     Args:
         collection_name: Name of the Weaviate collection to migrate
         vector_scheme: "kg" or "code" (auto-detected if None)
     """
-    from weaviate.classes.config import Configure, Property
-
     # Resolve scheme
     scheme = vector_scheme or _scheme_for_collection(collection_name)
     if scheme not in VECTOR_SCHEMES:
@@ -7998,94 +7999,53 @@ async def migrate_embeddings(
     scheme_vectors = VECTOR_SCHEMES[scheme]
     primary_vector_name = _primary_named_vector(scheme)
 
+    from vco_lib import named_vector_migration as _nvm
+    from vco_lib.weaviate_schema import SlotAddUnsupported
+
     client = get_weaviate_client()
 
     if not client.collections.exists(collection_name):
         return json.dumps({"error": f"Collection '{collection_name}' does not exist"})
 
+    try:
+        added = _nvm.add_missing_slots_in_place(
+            collection_name, scheme_vectors, weaviate_url=WEAVIATE_URL)
+    except (_nvm.MigrationRefused, SlotAddUnsupported) as exc:
+        return json.dumps({"error": str(exc)})
+    if added is not None:
+        return json.dumps({
+            "status": "success",
+            "mode": "in_place",
+            "collection": collection_name,
+            "vector_scheme": scheme,
+            "added_vectors": added,
+            "note": "Nothing was dropped or re-inserted; run backfill_embeddings to fill new slots.",
+        }, indent=2)
+
     coll = client.collections.get(collection_name)
-
-    # Read all objects with their vectors
     logger.info("migrate_embeddings: reading all objects from '%s' (scheme=%s)...", collection_name, scheme)
-    all_objects = []
-    # v0.2.107 (CG-2): the shared cursor. A class that lists nothing while it
-    # is not confirmed empty raises here - BEFORE the drop + recreate below.
-    for obj in _iter_class(coll, "server.migrate_embeddings", return_properties=None, include_vector=True):
-        all_objects.append({
-            "properties": dict(obj.properties),
-            "vector": obj.vector.get("default") if isinstance(obj.vector, dict) else obj.vector,
-        })
+    try:
+        rows = _nvm.snapshot_rows(
+            coll, call_site="server.migrate_embeddings",
+            flat_vector_slot=primary_vector_name, weaviate_url=WEAVIATE_URL)
+    except _nvm.MigrationRefused as exc:
+        return json.dumps({"error": str(exc)})
+    total = len(rows)
 
-    total = len(all_objects)
-    logger.info("migrate_embeddings: read %d objects from '%s'", total, collection_name)
-
-    # Get existing collection config to preserve properties
-    config = coll.config.get()
-
-    def _clone_prop(prop_obj) -> Property:
-        """Clone a Property/NestedProperty preserving nested structure."""
-        nested = getattr(prop_obj, "nested_properties", None)
-        kwargs = {
-            "name": prop_obj.name,
-            "data_type": prop_obj.data_type,
-            "description": getattr(prop_obj, "description", None),
-        }
-        if nested:
-            kwargs["nested_properties"] = [_clone_prop(np) for np in nested]
-        return Property(**kwargs)
-
-    existing_props = [_clone_prop(prop) for prop in config.properties]
-
-    # Build named vector config from scheme
-    vectorizer_config = [
-        Configure.NamedVectors.none(name=vec_name)
-        for vec_name in scheme_vectors
-    ]
-
-    # Delete and recreate with named vectors. Preserve the
-    # index_null_state=True invariant (the stale-filter relies on
-    # `valid_until is_none(True)` being filterable; see _stale_filter
-    # docstring). This setting CANNOT be added later via Reconfigure.
-    # v0.2.106: same-name drop + create (safe on replay); recorded for the
-    # case-variant create guard (vco_lib.weaviate_case_history).
-    from vco_lib.fixture_class_guard import record_collection_delete
-    record_collection_delete(client, collection_name)
-    client.collections.create(
-        name=collection_name,
-        properties=existing_props,
-        vectorizer_config=vectorizer_config,
-        inverted_index_config=Configure.inverted_index(index_null_state=True),
-    )
-
-    new_coll = client.collections.get(collection_name)
-
-    # Re-insert objects
-    inserted = 0
+    # The OpenAI vectors are computed BEFORE the drop, so a failing embedder
+    # never leaves a half-rebuilt class.
     openai_generated = 0
-    for obj_data in all_objects:
-        props = obj_data["properties"]
-        vectors = {}
+    if "openai_embed" in scheme_vectors and OPENAI_API_KEY:
+        for row in rows:
+            content = row["properties"].get("content", "")
+            if content:
+                openai_vec = await get_openai_embedding(content[:8000])
+                if openai_vec:
+                    row["vectors"]["openai_embed"] = openai_vec
+                    openai_generated += 1
 
-        # Map existing flat vector to the scheme's primary named vector
-        if obj_data["vector"]:
-            vectors[primary_vector_name] = obj_data["vector"]
-
-        # Generate OpenAI embedding if API key is available and scheme includes it
-        content = props.get("content", "")
-        if "openai_embed" in scheme_vectors and OPENAI_API_KEY and content:
-            openai_vec = await get_openai_embedding(content[:8000])
-            if openai_vec:
-                vectors["openai_embed"] = openai_vec
-                openai_generated += 1
-
-        new_coll.data.insert(
-            properties=props,
-            vector=vectors if vectors else None,
-        )
-        inserted += 1
-
-        if inserted % 50 == 0:
-            logger.info("migrate_embeddings: %d/%d inserted", inserted, total)
+    inserted = _nvm.rebuild_with_named_vectors(
+        client, collection_name, list(scheme_vectors), rows, log=logger.info)
 
     return json.dumps({
         "status": "success",

@@ -5470,9 +5470,9 @@ def main() -> int:
                              "preview which collections will be patched in "
                              "place vs copied vs rebuilt.")
     parser.add_argument("--force-rebuild", action="store_true", default=False,
-                        help="With --rebuild-collections: bypass smart "
-                             "copy-with-vectors path and always drop + "
-                             "re-embed (the OLD behaviour, escape hatch). "
+                        help="With --rebuild-collections: bypass the smart "
+                             "path (in-place add_slots / patch_props / copy) "
+                             "and always drop + re-embed (escape hatch). "
                              "Use when the source has legacy single-vector "
                              "format or you suspect vector corruption.")
     parser.add_argument("--migrate-uuid-scheme", action="store_true", default=False,
@@ -12731,14 +12731,14 @@ def _maybe_prompt_rebuild_collections(
     for feat in missing:
         print(f"  - missing: {feat}")
     print()
-    print("Today's code requires these invariants. Weaviate <=1.30 doesn't")
-    print("allow adding them via Reconfigure -- but most cases can be fixed")
-    print("by COPYING with vectors (no Ollama re-embed). PR 3 smart migrate")
-    print("will pick: noop / patch_props / copy-with-vectors / rebuild per")
-    print("collection.")
+    print("Today's code requires these invariants. A missing named-vector slot")
+    print("is added IN PLACE (add_slots: nothing dropped or copied); a missing")
+    print("indexNullState needs a COPY with vectors (no Ollama re-embed). The")
+    print("smart migrate picks noop / patch_props / add_slots / copy / rebuild")
+    print("per collection.")
     print()
     print("What gets touched:")
-    print("  + Weaviate collections (rebuilt with copy-with-vectors when possible)")
+    print("  + Weaviate collections (slots added in place; copied with vectors only when needed)")
     print("  - Your .md source files in knowledge/ and docs/  (untouched)")
     print("  - .env / .vscode/settings.json / .claude/settings.json (untouched)")
     print("  - The launcher's project bindings (untouched)")

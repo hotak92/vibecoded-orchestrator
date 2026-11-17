@@ -168,10 +168,14 @@ def test_every_entry_point_still_reads_a_real_count(monkeypatch):
 # ── auto-drop of "empty" legacy code-graph classes ─────────────────────────
 
 
-def _autodrop(monkeypatch, tmp_path, reply):
+def _autodrop(monkeypatch, tmp_path, reply, *, revalidated=True):
     _patch_transport(monkeypatch, reply)
     dropped: list = []
     logs: list = []
+    checked: list = []
+    monkeypatch.setattr(
+        pi, "_legacy_codegraph_drop_revalidated",
+        lambda n, f=None: checked.append((n, f)) or revalidated)
     monkeypatch.setattr(pi, "_delete_class", lambda n, weaviate_url=None: dropped.append(n))
     monkeypatch.setattr(pi, "_log_auto", logs.append)
     from vco_lib import deferral_emit as de
@@ -202,6 +206,16 @@ def test_autodrop_still_drops_a_class_that_answers_zero(monkeypatch, tmp_path):
     got, remaining, dropped, _ = _autodrop(
         monkeypatch, tmp_path, lambda m, u, b: (200, _count_body(0)))
     assert dropped == [CLS] and got == [CLS] and remaining == []
+
+
+def test_autodrop_keeps_an_empty_class_the_run_time_revalidation_refuses(monkeypatch, tmp_path):
+    """S-3: an empty class whose prefix is (now) bound, or whose keep-set
+    cannot be resolved, is left alone — the same guard the emitted drop
+    command runs."""
+    got, remaining, dropped, logs = _autodrop(
+        monkeypatch, tmp_path, lambda m, u, b: (200, _count_body(0)), revalidated=False)
+    assert dropped == [] and got == [] and [c["class_name"] for c in remaining] == [CLS]
+    assert any("re-validation" in line and CLS in line for line in logs)
 
 
 # ── staging recovery ───────────────────────────────────────────────────────
@@ -727,3 +741,61 @@ def test_no_file_under_the_primary_root_refuses_the_whole_prune(analyzer_mod, tm
     an._prune_walked_paths = {(e, "lib/x.py")}
     assert an._prune_stale_objects() == 0
     assert _deleted(an) == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DESTRUCTIVE-03(a) — the end-of-walk deleted-file sweep (runs WITHOUT
+# --prune-stale) must not read an empty / missing root as "every file deleted"
+# ═══════════════════════════════════════════════════════════════════════════
+
+from vco_lib import codegraph_row_classify as crc  # noqa: E402
+
+
+def _sweep_rows():
+    return _Coll("Test_CodeFunction", [
+        _row("f-a", "file_path", "src/a.py"),
+        _row("f-b", "file_path", "src/b.py"),
+        _row("f-c", "file_path", "pkg/c.py"),
+    ], ["project", "file_path", "embed_revision"])
+
+
+def _sweep(analyzer_mod, root):
+    inst = analyzer_mod.CodeGraphAnalyzer.__new__(analyzer_mod.CodeGraphAnalyzer)
+    inst.project_name = "TestProject"
+    inst._strict_source = False
+    coll = _sweep_rows()
+    deleted, failures = inst._clear_deleted_primary_rows(coll, "file_path", root, set())
+    return coll, deleted, failures
+
+
+@pytest.mark.parametrize("kind", ["empty", "missing", "file"])
+def test_the_sweep_deletes_nothing_under_an_empty_or_missing_root(analyzer_mod, tmp_path, kind):
+    root = tmp_path / "mountpoint"
+    if kind == "empty":
+        root.mkdir()
+    elif kind == "file":
+        root.write_text("not a directory\n")
+    coll, deleted, failures = _sweep(analyzer_mod, root)
+    assert (deleted, failures, coll.deleted) == (0, 0, [])
+
+
+@pytest.mark.parametrize("kind", ["empty", "missing"])
+def test_the_predicates_keep_every_row_under_an_empty_or_missing_root(tmp_path, kind):
+    root = tmp_path / "mountpoint"
+    if kind == "empty":
+        root.mkdir()
+    assert crc.path_reachable_on_disk("src/a.py", root) is True
+    assert crc.is_deleted_primary_row({"file_path": "src/a.py"}, root) is False
+    assert crc.classify_row(
+        {"file_path": "src/a.py", "embed_revision": 0}, root, path_prop="file_path",
+        current_revision=999) != "purgeable"
+
+
+def test_the_sweep_still_deletes_exactly_the_file_that_is_gone(analyzer_mod, tmp_path):
+    """Leave-alone twin: a real root where one file was deleted."""
+    root = tmp_path / "repo"
+    for rel in ("src/a.py", "pkg/c.py"):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("x = 1\n")
+    coll, deleted, failures = _sweep(analyzer_mod, root)
+    assert (deleted, failures, coll.deleted) == (1, 0, ["f-b"])
