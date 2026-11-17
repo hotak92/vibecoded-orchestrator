@@ -136,6 +136,16 @@ def _now_iso() -> str:
 # fully successful tree sync; a completed ``--force-recreate`` walk), which is
 # the same narrowness the sibling paired clears in both scripts already use.
 #
+# v0.2.107 — two holes in that design, both closed here. (1) The KG sync kept
+# its per-node comparison (and the split-rows re-lay) armed for as long as the
+# ENTRY lived, i.e. until the code-graph half was recorded too, so every
+# `--all` in between re-embedded the same nodes; it now asks
+# :func:`kg_half_recorded`. (2) The analyzer recorded the code-graph half in
+# the ledger root (`$VCT_ORCHESTRATOR_ROOT`) instead of the project it walked,
+# so only the orchestrator root could ever clear; it is recorded in the walked
+# project now, and :func:`completed_walk_evidence` / :func:`heal_stuck_resync`
+# retire the entry of a project whose walk had already completed.
+#
 # A LATER revision crossing re-arms everything for free: :func:`gate` emits
 # again, and stamps recorded under the old revision no longer match, so the
 # probe says "still owed" without anyone having to clear them.
@@ -262,7 +272,9 @@ def resync_still_owed(folder: Path) -> Optional[bool]:
                 (including "no stamp file at all", the state every machine
                 that has not acted is in).
         False — provably over: every half in :data:`RESYNC_HALVES` is
-                recorded at the CURRENT revision.
+                recorded at the CURRENT revision — or only the code-graph
+                half is unrecorded and :func:`completed_walk_evidence` shows
+                the project's forced walk completed under it.
         None  — could not look (the chunker revision is unreadable, or the
                 stamp file exists and is corrupt). Positive evidence only: an
                 unreadable stamp never retires a user-visible record of owed
@@ -274,7 +286,148 @@ def resync_still_owed(folder: Path) -> Optional[bool]:
     stamps = read_resync_stamps(folder)
     if stamps is None:
         return None
-    return not all(stamps.get(half) == current for half in RESYNC_HALVES)
+    missing = [half for half in RESYNC_HALVES if stamps.get(half) != current]
+    if missing == ["codegraph"] and completed_walk_evidence(folder):
+        # v0.2.107: the walk ran, its half was recorded in another tree (see
+        # `completed_walk_evidence`). Read-only here — probes write nothing;
+        # `heal_stuck_resync` is the writer.
+        return False
+    return bool(missing)
+
+
+def kg_half_recorded(folder: Path) -> Optional[bool]:
+    """Is the KG half of the re-sync recorded at the CURRENT revision?
+
+    The ONE reading of "the KG half has run" — :func:`kg_rechunk_owed` (the
+    update's trigger) and ``sync_knowledge_graph.py``'s per-node gate
+    (``_chunker_resync_pending``) both ask it, so "start a pass" and "re-lay
+    this node" cannot disagree. They did until v0.2.107: the gate read only
+    the ledger entry, which stays until the CODE-GRAPH half is recorded too,
+    so every ``--all`` in between re-embedded the same nodes again.
+
+    Returns True / False on a readable state; ``None`` when the revision or
+    the stamp file cannot be read (unknown — each caller keeps its own
+    conservative arm).
+    """
+    current = current_revision()
+    if not current:
+        return None
+    stamps = read_resync_stamps(folder)
+    if stamps is None:
+        return None
+    return stamps.get("kg") == current
+
+
+def _parse_utc(value: object) -> Optional[datetime]:
+    """A ``%Y-%m-%dT%H:%M:%SZ`` stamp as an aware datetime, else ``None``."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def completed_walk_evidence(folder: Path) -> bool:
+    """Positive evidence that ``folder``'s whole-repo forced code-graph walk
+    COMPLETED under the current chunker revision. Read-only, never raises.
+
+    Why it exists (v0.2.107): until this release the analyzer recorded the
+    code-graph half in ``$VCT_ORCHESTRATOR_ROOT`` instead of the project it
+    walked, so on every project except the orchestrator root the walk the
+    update runs finished and the half was never recorded where the probe
+    reads — the entry could not clear. The walk itself left a record in the
+    RIGHT place: ``codegraph_extractor_generation.stamp_after_walk`` writes
+    the project's own generation stamp, and only a clean whole-repo forced
+    walk writes it with a ``force-rewalk completed…`` note.
+
+    True only when ALL of these are read:
+
+    * the generation stamp names the CURRENT extractor generation, was
+      written by that module, and its note starts ``force-rewalk completed``
+      (a stamp set without a walk — ``version_at_or_past_bump``, ``no_graph``
+      — carries another note and proves nothing);
+    * the project's chunker sentinel (:data:`STATE_REL`, written by
+      :func:`gate` when it emitted the entry) names the CURRENT revision;
+    * the walk's ``written_at`` is not earlier than the sentinel's
+      ``updated_at`` — the walk finished after this project crossed to the
+      current revision, so it planned every entity with the current chunker.
+
+    Anything missing, unreadable or out of order is ``False``: the half is
+    then recorded only by a new walk, exactly as before.
+    """
+    try:
+        current = current_revision()
+        if not current:
+            return False
+        from vco_lib import codegraph_extractor_generation as ceg
+
+        walk = ceg.read_stamp_payload(Path(folder))
+        if not isinstance(walk, dict):
+            return False
+        note = walk.get("note")
+        if (
+            walk.get("generation") != ceg.CURRENT_EXTRACTOR_GENERATION
+            or walk.get("written_by") != "vco_lib.codegraph_extractor_generation"
+            or not isinstance(note, str)
+            or not note.startswith("force-rewalk completed")
+        ):
+            return False
+        sentinel = json.loads(state_path(Path(folder)).read_text(encoding="utf-8"))
+        if not isinstance(sentinel, dict) or sentinel.get("revision") != current:
+            return False
+        walked_at = _parse_utc(walk.get("written_at"))
+        crossed_at = _parse_utc(sentinel.get("updated_at"))
+        if walked_at is None or crossed_at is None:
+            return False
+        return walked_at >= crossed_at
+    except Exception:  # noqa: BLE001 — could not look is not evidence
+        return False
+
+
+def heal_stuck_resync(folder: Path) -> bool:
+    """Retire ``folder``'s chunker entry when its remedy has provably run.
+
+    The session-start counterpart of the registry probe (which clears the same
+    entry on every update and bundle update): a project whose forced walk
+    completed while its code-graph half went to another tree (see
+    :func:`completed_walk_evidence`) gets the half recorded HERE, in its own
+    ``chunker-resync.json``, and — once both halves name the current revision
+    — its ledger entry resolved, without a new walk.
+
+    Leaves everything alone unless the ledger carries :data:`RESYNC_CID` and
+    :func:`resync_still_owed` answers a positive ``False``. Returns whether
+    the entry was resolved. Never raises.
+    """
+    try:
+        from vco_lib.deferral_report import DeferralReport
+
+        root = Path(folder)
+        if not DeferralReport.read(root).has_condition(RESYNC_CID):
+            return False
+        current = current_revision()
+        stamps = read_resync_stamps(root)
+        if not current or stamps is None:
+            return False
+        if stamps.get("codegraph") != current and completed_walk_evidence(root):
+            record_resync_half(root, "codegraph", current)
+        if resync_still_owed(root) is not False:
+            return False
+        from vco_lib.deferral_emit import resolve_conditions
+
+        if resolve_conditions(root, (RESYNC_CID,)) <= 0:
+            return False
+        try:
+            from vco_lib.deferral_probes import record_probe_resolution
+
+            record_probe_resolution(root, RESYNC_CID, "chunker_resync_still_owed")
+        except Exception:  # noqa: BLE001 — the audit row is best-effort
+            pass
+        return True
+    except Exception:  # noqa: BLE001 — a heal must never break a session start
+        return False
 
 
 #: The ledger condition the revision gate emits. One name for the readers
@@ -318,10 +471,8 @@ def kg_rechunk_owed(folder: Path) -> Optional[bool]:
         return None
     if not pending:
         return False
-    stamps = read_resync_stamps(folder)
-    if stamps is None:
-        return None
-    return stamps.get("kg") != current
+    recorded = kg_half_recorded(folder)
+    return None if recorded is None else not recorded
 
 
 def resync_commands(folder: Path, tail_comment: str) -> str:

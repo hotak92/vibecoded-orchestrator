@@ -154,7 +154,8 @@ class AnalyzerWiringTests(unittest.TestCase):
         body = body[: body.index("return 0") + len("return 0")]
         self.assertIn(
             '_deferral_op("record_successful_walk", deferral_root, '
-            'args.force_recreate, bool(_stamped))',
+            'args.force_recreate, bool(_stamped), '
+            'None if args.as_extra_path else repo_path)',
             body,
         )
 

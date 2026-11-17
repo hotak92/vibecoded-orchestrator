@@ -850,8 +850,10 @@ _METADATA_REPAIR_FAILED_COUNT = 0
 
 def _chunker_resync_pending() -> bool:
     """True while a chunker-revision crossing is pending repair for THIS
-    project (the deferral ledger carries `chunker_preset_overhaul_pending`),
-    OR this run passed ``--rechunk`` (MAJOR-R5-4).
+    project's KG (the deferral ledger carries `chunker_preset_overhaul_pending`
+    AND the KG half is not yet recorded at the current revision in
+    `.claude/state/chunker-resync.json`), OR this run passed ``--rechunk``
+    (MAJOR-R5-4).
 
     Scoped to the transition by design (brief constraint): an install
     already at the current revision has no such entry — the revision gate
@@ -883,6 +885,20 @@ def _chunker_resync_pending() -> bool:
         )
     except Exception:  # noqa: BLE001 — cannot determine → compare (cheap)
         pending = True
+    if pending:
+        # v0.2.107: the entry stays until the CODE-GRAPH half is recorded too,
+        # but this script's half is over once a clean `--all` stamped it — and
+        # the split-rows heal (`_split_rows_heal_reason`, arm 2) keeps no
+        # per-row record, so without this every later pass re-embedded the
+        # same nodes. Only a positive "recorded at the current revision"
+        # disarms; an unreadable stamp or revision keeps the comparison armed.
+        try:
+            from vco_lib.chunker_revision import kg_half_recorded
+
+            if kg_half_recorded(PROJECT_ROOT) is True:
+                pending = False
+        except Exception:  # noqa: BLE001 — cannot determine → stay armed
+            pass
     _resync_pending_cache = pending
     return pending
 
@@ -2359,6 +2375,18 @@ _KG_NODE_SCALAR_PROPERTIES: dict[str, str] = {
 }
 
 
+def _property_already_exists(exc: BaseException) -> bool:
+    """True when ``exc`` is the server saying the property is already there.
+
+    The additive schema migration asks for the config, then adds what is
+    missing; "already exists" from the add means the server has the property
+    although the read did not show it. That is the state the migration wants,
+    so it is neither printed as a failed schema update nor allowed to stop the
+    additions that follow. Any other error keeps its warning.
+    """
+    return "already exists" in str(exc).lower()
+
+
 def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     """
     Ensure the project's KG_COLLECTION (env-resolved, fallback "KnowledgeGraph")
@@ -2409,13 +2437,24 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                 existing_props = {prop.name for prop in config.properties}
                 existing_refs = {ref.name for ref in (config.references or [])}
 
-                # Add every scalar prop that's missing.
+                # Add every scalar prop that's missing. One prop at a time:
+                # a server that answers "already exists" for a prop the config
+                # read did not list (seen on every `--all` for
+                # `secondary_truncated_slots`) has the prop — the goal state,
+                # not a failure — and must not abort the additions after it
+                # (the remaining scalars, typed_links, linksTo), which the
+                # single try around this whole block used to do.
                 for prop_name, prop_type in _scalar_props.items():
                     if prop_name not in existing_props:
-                        print(f"  Adding property: {prop_name}")
-                        collection.config.add_property(
-                            Property(name=prop_name, data_type=prop_type)
-                        )
+                        try:
+                            collection.config.add_property(
+                                Property(name=prop_name, data_type=prop_type)
+                            )
+                        except Exception as add_err:  # noqa: BLE001
+                            if not _property_already_exists(add_err):
+                                raise
+                        else:
+                            print(f"  Adding property: {prop_name}")
 
                 # Add typed_links property if missing
                 if 'typed_links' not in existing_props:
@@ -5866,6 +5905,15 @@ def _regen_node_formats_after_full_sync() -> None:
                 )
         _t_out.join(5)
         _t_err.join(5)
+        # The child has exited: close our ends of its pipes (they were left to
+        # the garbage collector, which reported an unclosed file on every
+        # `--all`). A pump still draining after the join keeps its stream.
+        for _thread, _stream in ((_t_out, proc.stdout), (_t_err, proc.stderr)):
+            if _stream is not None and not _thread.is_alive():
+                try:
+                    _stream.close()
+                except OSError:
+                    pass
         out = "\n".join(out_tail)
         err = "\n".join(err_tail)
         if proc.returncode == _NODE_FORMATS_EXIT_NO_BACKEND:
