@@ -34,6 +34,13 @@ it, both closed here:
    looks exactly like a dead client: the server is reparented and exits.
    VCO registers the server so Claude Code spawns it directly; do not put an
    exiting wrapper in front of it.
+4. **An exit requested on the loop's thread.** The env-reload SIGHUP handler
+   (``claude_mcp_servers/_lib/sighup_handler.py``) raises ``SystemExit`` while
+   the loop runs. Left to propagate, interpreter shutdown joins the SDK's
+   stdin worker thread (not a daemon), which is blocked reading stdin: the
+   process stayed alive with a dead loop, read every later request and
+   answered none. :func:`run_stdio_server` turns that exit into
+   :func:`_finish`, like the other three.
 
 The reaper in :mod:`vco_lib.mcp_singleton` stays as it was: it handles
 cross-workspace peers at spawn time; this module makes each server end itself.
@@ -339,6 +346,12 @@ def run_stdio_server(
         loop.run_until_complete(_serve_then_drain(serve, grace_s))
     except KeyboardInterrupt:
         reason = "interrupted"
+    except SystemExit as exc:
+        # An exit requested on this thread while the loop ran (the SIGHUP
+        # env-reload handler). Re-raising would hang: interpreter shutdown
+        # joins the stdio reader thread, which is blocked on stdin.
+        reason = "exit requested (env reload)"
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
     except Exception:  # noqa: BLE001 — logged, then a non-zero exit
         logger.exception("%s: the stdio server loop failed", name)
         reason, code = "the stdio server loop failed", 1

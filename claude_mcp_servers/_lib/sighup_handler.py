@@ -106,8 +106,11 @@ def register_sighup_exit_handler(logger: Logger) -> bool:
             "Received SIGHUP — exiting cleanly for env reload (PR-42). "
             "Claude Code will respawn this MCP with fresh env on the next request."
         )
-        # sys.exit raises SystemExit; FastMCP's stdio loop unwinds and
-        # the process terminates with exit code 0.
+        # sys.exit raises SystemExit on the event loop's thread. The serving
+        # wrapper must END the process on it (weaviate-kg:
+        # vco_lib.mcp_stdio_lifetime.run_stdio_server does) — a plain
+        # propagation hangs in interpreter shutdown, which joins the MCP
+        # SDK's stdin reader thread while that thread is blocked on stdin.
         sys.exit(0)
 
     signal.signal(signal.SIGHUP, _exit_for_env_reload)

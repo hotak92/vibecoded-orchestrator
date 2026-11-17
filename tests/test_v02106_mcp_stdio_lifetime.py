@@ -280,3 +280,58 @@ def test_finish_does_not_wait_forever_on_a_blocking_exit_handler(monkeypatch):
     release.set()
     assert exited == [0]
     assert time.monotonic() - t0 < 5
+
+
+# The REAL stdio shape: the MCP SDK reads stdin on an anyio worker thread
+# (non-daemon). The env-reload SIGHUP handler raises SystemExit on the event
+# loop's thread; the server must then END, not sit there with a dead loop.
+_SIGHUP_SERVER = textwrap.dedent(
+    """
+    import logging, sys
+    sys.path.insert(0, {repo!r})
+    sys.path.insert(0, {repo!r} + "/claude_mcp_servers")
+    from mcp.server.fastmcp import FastMCP
+    from _lib.sighup_handler import register_sighup_exit_handler
+    from vco_lib.mcp_stdio_lifetime import run_stdio_server
+
+    assert register_sighup_exit_handler(logging.getLogger("t")) is True
+    run_stdio_server(FastMCP("t").run_stdio_async, name="test-mcp",
+                     grace_s=1.0, watchdog_interval_s=60)
+    """
+)
+
+_INITIALIZE = (
+    b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":'
+    b'"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}\n'
+)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="POSIX signal")
+def test_sighup_env_reload_ends_the_server_process():
+    """The launcher sends SIGHUP to every live MCP when a project's settings
+    env changes; the handler promises a clean exit so the next request starts
+    a fresh server. Measured on v0.2.106: the SystemExit left ``run_stdio_server``
+    uncaught, interpreter shutdown then joined the SDK's stdin worker thread,
+    and the process stayed alive with a dead loop — it read every later
+    request and answered none (the client waited out its 30-minute idle
+    timeout). RED-PROOF: without the ``SystemExit`` arm in ``run_stdio_server``
+    this test times out with the server still running."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _SIGHUP_SERVER.format(repo=str(REPO))],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=child_env(),
+    )
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        proc.stdin.write(_INITIALIZE)
+        proc.stdin.flush()
+        # The answer proves the loop is serving and the stdin worker thread
+        # is back in its blocking read — the state a live server idles in.
+        assert b'"id":1' in proc.stdout.readline()
+        proc.send_signal(signal.SIGHUP)
+        proc.wait(timeout=20)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
