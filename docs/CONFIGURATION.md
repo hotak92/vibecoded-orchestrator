@@ -1084,9 +1084,14 @@ installations:
 - **`migrate_to_new_embeddings.py`** — One-shot migration that adds new named
   vectors (qwen3_embed for KG, codesage_embed for code) to Weaviate
   collections alongside any legacy named vectors (ollama_embed,
-  ollama_code_embed). Preserves all existing data; only adds the new vector
-  slots and backfills them. Run manually after upgrading the embedding
-  models referenced in the MCP configuration.
+  ollama_code_embed), then backfills them. A collection that already has
+  named vectors gets the new slot in place: nothing is dropped, copied or
+  re-inserted. A legacy single-vector collection has to be rebuilt; the
+  script rebuilds it only when the number of objects it read equals the
+  count Weaviate reports (otherwise it stops and drops nothing), and every
+  object keeps its id, properties and existing vector (moved to the legacy
+  named slot). Run manually after upgrading the embedding models referenced
+  in the MCP configuration.
 
 The manual `--all` backfill that regenerates per-node descriptions /
 summaries in `knowledge/.node_formats.json` lives in the ONE sidecar writer,
