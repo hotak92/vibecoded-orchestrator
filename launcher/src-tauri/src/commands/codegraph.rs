@@ -332,10 +332,29 @@ pub fn spawn_initial_build(
     // by default; the wizard's checkbox is the user-controlled path.
     prune_stale: bool,
 ) {
+    spawn_build(
+        app,
+        project_id,
+        project_name,
+        folder_path,
+        BuildMode::Full { prune_stale, force_rewalk: false },
+    );
+}
+
+/// v0.2.107 (UPDATE-ALL): spawn a build of an explicit [`BuildMode`] — the
+/// post-bundle path runs whatever [`decide_post_bundle_codegraph_pass`]
+/// decided (incremental since the recorded commit, or a forced full walk).
+pub(crate) fn spawn_build(
+    app: AppHandle,
+    project_id: String,
+    project_name: String,
+    folder_path: String,
+    mode: BuildMode,
+) {
     // async_runtime::spawn, not tokio::spawn — sync fn, also called from
     // setup()/main thread via the boot-resume sweep (no reactor context).
     tauri::async_runtime::spawn(async move {
-        run_build_task(app, project_id, project_name, folder_path, prune_stale).await;
+        run_build_task(app, project_id, project_name, folder_path, mode).await;
     });
 }
 
@@ -575,12 +594,12 @@ async fn run_build_task(
     project_id: String,
     project_name: String,
     folder_path: String,
-    // W1+W3 wire-up / v0.2.16 (plan 1.4): when true, the analyzer
-    // subprocess is invoked with --prune-stale and will delete any
-    // per-project code-graph object it did NOT visit this run.
-    // Required for re-analyses to clean up rows for deleted source
-    // files; default false for first-time builds.
-    prune_stale: bool,
+    // W1+W3 wire-up / v0.2.16 (plan 1.4): a `Full { prune_stale: true }`
+    // run invokes the analyzer with --prune-stale and deletes any
+    // per-project code-graph object it did NOT visit this run (re-analyses
+    // clean up rows for deleted source files; first builds pass false).
+    // v0.2.107: `Incremental` never prunes by visit — see `build_mode_args`.
+    mode: BuildMode,
 ) {
     let started_at = chrono::Utc::now().timestamp_millis();
 
@@ -713,11 +732,12 @@ async fn run_build_task(
         }
     };
 
-    // 4. Build args. First run uses no `--incremental` flag so the
-    //    analyzer does a full pass. Re-builds also pass through here
-    //    (rebuild_code_graph upserts pending → spawn_initial_build),
-    //    and we keep them as full passes too for now: incremental
-    //    semantics depend on git state we don't necessarily have.
+    // 4. Build args. First runs and user re-builds (rebuild_code_graph →
+    //    spawn_initial_build) are full passes. v0.2.107 (UPDATE-ALL): the
+    //    post-bundle path passes the mode `decide_post_bundle_codegraph_pass`
+    //    chose from the recorded commit and HEAD — an `--incremental
+    //    --since-commit <recorded>` pass when HEAD moved, a forced full walk
+    //    only when one is owed, and no build at all when nothing changed.
     //
     // v0.2.72 (P7): this full pass automatically RESPECTS the code-graph
     // embedding-revision gate. The gate lives in the analyzer's single
@@ -776,9 +796,9 @@ async fn run_build_task(
     // previous analyze). Default is `true` for rebuild_code_graph
     // (user-driven re-analyses); false for first-time create and
     // boot-resume to preserve conservative semantics on those paths.
-    if prune_stale {
-        args.push("--prune-stale".to_string());
-    }
+    // v0.2.107 (UPDATE-ALL): the pass shape (full / forced / incremental)
+    // comes from ONE pure builder, unit-tested for every mode.
+    args.extend(build_mode_args(&mode));
 
     // v0.2.72 (P5): `.claude/` gate. For a user project `.claude/` is
     // orchestrator-GENERATED tooling (bundled agents/skills/hooks/scripts),
@@ -1876,6 +1896,294 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
             }
         }
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.2.107 (UPDATE-ALL, audits A-016 / CGWRITE-03) — what a bundle update owes
+// the code graph, and the ONE launcher-side decision that starts it
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Before: every bundle update queued a full analyzer pass with prune for every
+// non-root project, unconditionally — and, when an extractor generation was
+// owed, the Python bundle step ALSO spawned a detached forced walk, so one
+// release owed every project two whole-repo walks (23–274 min each without a
+// GPU, field report). Owner ruling: the code graph tracks the committed code of
+// the main checkout and is updated when HEAD moves; simple and cheap beats
+// fresh.
+//
+// Now one decision, [`decide_post_bundle_codegraph_pass`], reads:
+//   * what the bundle step said about the Python-decided axes
+//     ([`BundleCodegraphWalk`]: a detached driver is already walking / a forced
+//     walk is owed and handed to us / nothing owed);
+//   * the project's last build row;
+//   * the commit the last build recorded and the checkout's HEAD.
+// and returns at most ONE pass. Pure; the git probe ([`probe_git_facts`]) and
+// the spawn live at the edges.
+
+use crate::commands::projects_v2::BundleCodegraphWalk;
+
+/// The shape of one analyzer run the launcher starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BuildMode {
+    /// Whole-repo walk. `prune_stale` reaps rows of files that no longer exist
+    /// (guarded by the analyzer's discovered-vs-walked preserve set);
+    /// `force_rewalk` bypasses the per-file gate and lets the run write the
+    /// extractor-generation stamp (`stamp_after_walk`).
+    Full { prune_stale: bool, force_rewalk: bool },
+    /// `--incremental --since-commit <since>`: re-walks the files changed in
+    /// `<since>..HEAD` (plus the analyzer's stale-row union) and removes the
+    /// rows of files deleted/renamed in that range. NEVER `--prune-stale`: an
+    /// incremental pass visits only the changed files, so a visit-based prune
+    /// would judge every file it skipped.
+    Incremental { since_commit: String },
+}
+
+/// Analyzer argv fragment for `mode` (appended after `<folder> --project <id>`).
+pub(crate) fn build_mode_args(mode: &BuildMode) -> Vec<String> {
+    match mode {
+        BuildMode::Full { prune_stale, force_rewalk } => {
+            let mut a = Vec::new();
+            if *prune_stale {
+                a.push("--prune-stale".to_string());
+            }
+            if *force_rewalk {
+                a.push("--force-rewalk".to_string());
+            }
+            a
+        }
+        BuildMode::Incremental { since_commit } => vec![
+            "--incremental".to_string(),
+            "--since-commit".to_string(),
+            since_commit.clone(),
+        ],
+    }
+}
+
+/// How the project's `code_graph_builds` row reads for this decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LastBuild {
+    /// No row, or a `skipped` one: nothing has been indexed by a build yet.
+    Absent,
+    /// `success` or `partial` (a completed walk; partial = some rows failed —
+    /// re-walking everything would not fix a row Weaviate keeps refusing).
+    Completed,
+    /// `failed`, an abandoned `running` row, or an unknown status.
+    Failed { status: String },
+    /// A live `pending` / `running` build: something is already walking.
+    InFlight { status: String },
+}
+
+/// Classify the build row. A launcher-run `running` row (pid NULL) is live
+/// only while its heartbeat is fresh — the same read-time guard
+/// `get_code_graph_build_status` applies, through the same
+/// `heartbeat_is_stale`. A detached (pid-bearing) row is judged by the boot
+/// pid sweep, not here, so it reads as in flight.
+pub(crate) fn classify_last_build(
+    row: Option<&CodeGraphBuildRow>,
+    now_ms: i64,
+    stale_secs: u64,
+) -> LastBuild {
+    let Some(r) = row else {
+        return LastBuild::Absent;
+    };
+    match r.status.as_str() {
+        build_status::SUCCESS | build_status::PARTIAL => LastBuild::Completed,
+        build_status::SKIPPED => LastBuild::Absent,
+        build_status::FAILED => LastBuild::Failed { status: r.status.clone() },
+        build_status::PENDING | build_status::RUNNING => {
+            if r.pid.is_none()
+                && r.status == build_status::RUNNING
+                && crate::db::kg_syncs::heartbeat_is_stale(
+                    r.heartbeat_at,
+                    r.started_at,
+                    now_ms,
+                    stale_secs,
+                )
+            {
+                LastBuild::Failed { status: format!("{} (abandoned)", r.status) }
+            } else {
+                LastBuild::InFlight { status: r.status.clone() }
+            }
+        }
+        other => LastBuild::Failed { status: other.to_string() },
+    }
+}
+
+/// What git says about the main checkout. `None` = could not tell.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GitFacts {
+    /// Full SHA of HEAD (`rev-parse --verify HEAD`).
+    pub head: Option<String>,
+    /// Is the recorded commit an ancestor of HEAD? Asked only when the two differ.
+    pub recorded_is_ancestor: Option<bool>,
+}
+
+/// The decision's answer: at most one pass, always with a reason the user sees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CodegraphPass {
+    Nothing { reason: String },
+    Run { mode: BuildMode, reason: String },
+}
+
+impl CodegraphPass {
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            CodegraphPass::Nothing { reason } | CodegraphPass::Run { reason, .. } => reason,
+        }
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+/// THE post-bundle code-graph decision. Pure. Order, and why:
+///
+/// 1. a first create always builds (no prune: nothing can be stale yet);
+/// 2. a detached driver the bundle step started IS this update's walk;
+/// 3. a live build already walks the project — never a second one (an owed
+///    forced walk stays owed: no stamp is written, the next update asks again);
+/// 4. an owed forced walk handed to us → ONE full `--force-rewalk` pass;
+/// 5. no completed build, or a failed one → one full pass;
+/// 6. no git HEAD → nothing (the graph follows commits; Re-analyze is the
+///    user's full pass);
+/// 7. no recorded commit → one full pass (the baseline is re-proven);
+/// 8. HEAD equals the recorded commit → nothing. A dirty tree does not change
+///    that: the analyzer indexes committed content (`<since>..HEAD`), and
+///    uncommitted edits are the per-edit drain's;
+/// 9. HEAD moved and the recorded commit is its ancestor → incremental since
+///    the recorded commit;
+/// 10. otherwise (rewritten history, unknown object) → one full pass.
+pub(crate) fn decide_post_bundle_codegraph_pass(
+    is_initial_create: bool,
+    walk: &BundleCodegraphWalk,
+    walk_reason: Option<&str>,
+    last: &LastBuild,
+    recorded_commit: Option<&str>,
+    git: &GitFacts,
+) -> CodegraphPass {
+    let full = |prune_stale: bool, force_rewalk: bool, reason: String| CodegraphPass::Run {
+        mode: BuildMode::Full { prune_stale, force_rewalk },
+        reason,
+    };
+    if is_initial_create {
+        return full(false, false, "first build of this project".to_string());
+    }
+    if *walk == BundleCodegraphWalk::Background {
+        return CodegraphPass::Nothing {
+            reason: format!(
+                "the bundle update started a background re-index ({}); it is this \
+                 update's one walk",
+                walk_reason.unwrap_or("owed work")
+            ),
+        };
+    }
+    if let LastBuild::InFlight { status } = last {
+        return CodegraphPass::Nothing {
+            reason: format!("a code-graph build is already {}", status),
+        };
+    }
+    if *walk == BundleCodegraphWalk::Forced {
+        return full(
+            true,
+            true,
+            format!(
+                "a full re-walk is owed ({})",
+                walk_reason.unwrap_or("extractor generation changed")
+            ),
+        );
+    }
+    match last {
+        LastBuild::Absent => {
+            return full(true, false, "no completed build is recorded".to_string())
+        }
+        LastBuild::Failed { status } => {
+            return full(true, false, format!("the last build did not complete ({})", status))
+        }
+        LastBuild::Completed | LastBuild::InFlight { .. } => {}
+    }
+    let Some(head) = git.head.as_deref() else {
+        return CodegraphPass::Nothing {
+            reason: "no git HEAD in the project folder — the code graph follows \
+                     commits; use Re-analyze for a full pass"
+                .to_string(),
+        };
+    };
+    let Some(recorded) = recorded_commit.filter(|c| !c.trim().is_empty()) else {
+        return full(true, false, "no analyzed commit is recorded".to_string());
+    };
+    if recorded == head {
+        return CodegraphPass::Nothing {
+            reason: format!("HEAD {} is unchanged since the last build", short_sha(head)),
+        };
+    }
+    if git.recorded_is_ancestor == Some(true) {
+        return CodegraphPass::Run {
+            mode: BuildMode::Incremental { since_commit: recorded.to_string() },
+            reason: format!(
+                "HEAD moved {}..{} — only the changed files are re-walked",
+                short_sha(recorded),
+                short_sha(head)
+            ),
+        };
+    }
+    full(
+        true,
+        false,
+        format!(
+            "the recorded commit {} is not an ancestor of HEAD {}",
+            short_sha(recorded),
+            short_sha(head)
+        ),
+    )
+}
+
+/// The user-facing notice for a decision ("what was queued and why, or that
+/// nothing was needed").
+pub(crate) fn codegraph_pass_notice(pass: &CodegraphPass) -> String {
+    match pass {
+        CodegraphPass::Nothing { reason } => format!("Code graph: nothing queued — {}.", reason),
+        CodegraphPass::Run { mode: BuildMode::Incremental { .. }, reason } => {
+            format!("Code graph: incremental pass queued — {}.", reason)
+        }
+        CodegraphPass::Run { mode: BuildMode::Full { .. }, reason } => {
+            format!("Code graph: full pass queued — {}.", reason)
+        }
+    }
+}
+
+/// The I/O half: HEAD of `folder` and, when it differs from `recorded`,
+/// whether `recorded` is its ancestor. Soft-fail to `None` everywhere.
+pub(crate) async fn probe_git_facts(folder: &std::path::Path, recorded: Option<&str>) -> GitFacts {
+    async fn git(folder: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
+        tokio::process::Command::new("git")
+            .silent()
+            .arg("-C")
+            .arg(folder)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()
+    }
+    let head = git(folder, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .await
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    let recorded_is_ancestor = match (head.as_deref(), recorded) {
+        (Some(h), Some(r)) if !r.trim().is_empty() && r != h => {
+            git(folder, &["merge-base", "--is-ancestor", r, h])
+                .await
+                .and_then(|o| match o.status.code() {
+                    Some(0) => Some(true),
+                    Some(1) => Some(false),
+                    _ => None,
+                })
+        }
+        _ => None,
+    };
+    GitFacts { head, recorded_is_ancestor }
 }
 
 /// Persist code-graph provenance into the project's binding after a successful
@@ -3346,3 +3654,167 @@ mod build_tests {
 
 }
 
+
+#[cfg(test)]
+mod v02107_post_bundle_pass_tests {
+    use super::*;
+
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    const OLD: &str = "0000000000000000000000000000000000000000";
+
+    fn git(head: Option<&str>, ancestor: Option<bool>) -> GitFacts {
+        GitFacts { head: head.map(str::to_string), recorded_is_ancestor: ancestor }
+    }
+
+    fn decide(walk: BundleCodegraphWalk, last: LastBuild, recorded: Option<&str>, g: GitFacts) -> CodegraphPass {
+        decide_post_bundle_codegraph_pass(false, &walk, Some("rung r"), &last, recorded, &g)
+    }
+
+    /// A-016 leave-alone: HEAD equals the recorded commit, nothing owed → no pass.
+    #[test]
+    fn head_equal_to_the_recorded_commit_runs_nothing() {
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(Some(HEAD), None));
+        assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
+        assert!(p.reason().contains("unchanged"), "{p:?}");
+    }
+
+    /// A-016 act: HEAD moved, recorded commit is an ancestor → incremental since it.
+    #[test]
+    fn head_moved_runs_an_incremental_pass_since_the_recorded_commit() {
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(OLD), git(Some(HEAD), Some(true)));
+        assert_eq!(
+            p,
+            CodegraphPass::Run {
+                mode: BuildMode::Incremental { since_commit: OLD.to_string() },
+                reason: p.reason().to_string(),
+            }
+        );
+    }
+
+    /// Owed forced walk handed to the launcher → ONE full pass with --force-rewalk,
+    /// even when HEAD did not move.
+    #[test]
+    fn an_owed_walk_runs_one_forced_full_pass() {
+        let p = decide(BundleCodegraphWalk::Forced, LastBuild::Completed, Some(HEAD), git(Some(HEAD), None));
+        match &p {
+            CodegraphPass::Run { mode: BuildMode::Full { prune_stale: true, force_rewalk: true }, reason } => {
+                assert!(reason.contains("rung r"), "{reason}")
+            }
+            other => panic!("expected a forced full pass, got {other:?}"),
+        }
+    }
+
+    /// CGWRITE-03: a detached driver the bundle step started is the one walk.
+    #[test]
+    fn a_background_driver_means_no_launcher_pass() {
+        for last in [LastBuild::Completed, LastBuild::Absent, LastBuild::Failed { status: "failed".into() }] {
+            let p = decide(BundleCodegraphWalk::Background, last, Some(OLD), git(Some(HEAD), Some(true)));
+            assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_build_is_never_doubled() {
+        let p = decide(
+            BundleCodegraphWalk::Forced,
+            LastBuild::InFlight { status: "running".into() },
+            Some(OLD),
+            git(Some(HEAD), Some(true)),
+        );
+        assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
+    }
+
+    #[test]
+    fn missing_baselines_run_one_full_pass() {
+        for (last, recorded, g) in [
+            (LastBuild::Absent, Some(HEAD), git(Some(HEAD), None)),
+            (LastBuild::Failed { status: "failed".into() }, Some(HEAD), git(Some(HEAD), None)),
+            (LastBuild::Completed, None, git(Some(HEAD), None)),
+            (LastBuild::Completed, Some(OLD), git(Some(HEAD), Some(false))),
+            (LastBuild::Completed, Some(OLD), git(Some(HEAD), None)),
+        ] {
+            let p = decide(BundleCodegraphWalk::NotOwed, last.clone(), recorded, g);
+            assert!(
+                matches!(p, CodegraphPass::Run { mode: BuildMode::Full { prune_stale: true, force_rewalk: false }, .. }),
+                "{last:?} {recorded:?} → {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_git_head_runs_nothing_once_a_build_completed() {
+        let p = decide(BundleCodegraphWalk::NotOwed, LastBuild::Completed, Some(HEAD), git(None, None));
+        assert!(matches!(p, CodegraphPass::Nothing { .. }), "{p:?}");
+    }
+
+    #[test]
+    fn a_first_create_always_builds_without_prune() {
+        let p = decide_post_bundle_codegraph_pass(
+            true,
+            &BundleCodegraphWalk::NotOwed,
+            None,
+            &LastBuild::Absent,
+            None,
+            &GitFacts::default(),
+        );
+        assert!(matches!(p, CodegraphPass::Run { mode: BuildMode::Full { prune_stale: false, force_rewalk: false }, .. }));
+    }
+
+    /// Prune semantics under --incremental: the incremental shape never carries
+    /// --prune-stale (a visit-based prune would judge every unchanged file the
+    /// pass skipped); deletions in the range are removed by --since-commit.
+    #[test]
+    fn incremental_args_never_carry_a_visit_based_prune() {
+        let a = build_mode_args(&BuildMode::Incremental { since_commit: OLD.into() });
+        assert_eq!(a, vec!["--incremental", "--since-commit", OLD]);
+        assert!(!a.iter().any(|x| x == "--prune-stale" || x == "--force-rewalk"));
+        assert_eq!(
+            build_mode_args(&BuildMode::Full { prune_stale: true, force_rewalk: true }),
+            vec!["--prune-stale", "--force-rewalk"]
+        );
+        assert!(build_mode_args(&BuildMode::Full { prune_stale: false, force_rewalk: false }).is_empty());
+    }
+
+    fn row(status: &str, pid: Option<i64>, beat_age_secs: Option<i64>) -> CodeGraphBuildRow {
+        let now = 1_700_000_000_000i64;
+        CodeGraphBuildRow {
+            project_id: "p".into(),
+            status: status.into(),
+            started_at: Some(now - 10_000_000),
+            finished_at: None,
+            duration_ms: None,
+            files_analyzed: 0,
+            languages: None,
+            joern_used: false,
+            error_message: None,
+            log_tail: None,
+            pid,
+            heartbeat_at: beat_age_secs.map(|s| now - s * 1000),
+        }
+    }
+
+    #[test]
+    fn build_rows_classify_for_the_decision() {
+        let now = 1_700_000_000_000i64;
+        assert_eq!(classify_last_build(None, now, 600), LastBuild::Absent);
+        assert_eq!(classify_last_build(Some(&row("success", None, None)), now, 600), LastBuild::Completed);
+        assert_eq!(classify_last_build(Some(&row("partial", None, None)), now, 600), LastBuild::Completed);
+        assert_eq!(classify_last_build(Some(&row("skipped", None, None)), now, 600), LastBuild::Absent);
+        assert!(matches!(classify_last_build(Some(&row("failed", None, None)), now, 600), LastBuild::Failed { .. }));
+        assert!(matches!(classify_last_build(Some(&row("running", None, Some(5))), now, 600), LastBuild::InFlight { .. }));
+        assert!(matches!(classify_last_build(Some(&row("running", None, Some(6000))), now, 600), LastBuild::Failed { .. }));
+        assert!(matches!(classify_last_build(Some(&row("running", Some(42), None)), now, 600), LastBuild::InFlight { .. }));
+        assert!(matches!(classify_last_build(Some(&row("pending", None, None)), now, 600), LastBuild::InFlight { .. }));
+    }
+
+    #[test]
+    fn every_decision_has_a_user_notice() {
+        let n = codegraph_pass_notice(&CodegraphPass::Nothing { reason: "HEAD x is unchanged".into() });
+        assert!(n.contains("nothing queued") && n.contains("unchanged"), "{n}");
+        let n = codegraph_pass_notice(&CodegraphPass::Run {
+            mode: BuildMode::Incremental { since_commit: OLD.into() },
+            reason: "HEAD moved".into(),
+        });
+        assert!(n.contains("incremental pass queued"), "{n}");
+    }
+}

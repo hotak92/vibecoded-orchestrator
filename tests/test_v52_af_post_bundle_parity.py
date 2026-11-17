@@ -136,7 +136,12 @@ def test_apply_post_bundle_steps_exists_with_expected_signature() -> None:
         r"is_initial_create:\s*bool\s*,\s*"
         # v0.2.71 (P5): the kg-sync skip-gate threads whether the bundle
         # changed KG/docs content into the re-embed decision.
-        r"kg_or_docs_content_changed:\s*bool\s*,?\s*"
+        r"kg_or_docs_content_changed:\s*bool\s*,\s*"
+        # v0.2.107 (UPDATE-ALL): the update envelope's facts (code-graph walk,
+        # changed node paths) and the notices channel for "what was queued
+        # and why".
+        r"bundle:\s*Option<&UpdateSummary>\s*,\s*"
+        r"notices:\s*&mut\s+Vec<String>\s*,?\s*"
         r"\)\s*->\s*Vec<String>",
         re.DOTALL,
     )
@@ -151,6 +156,8 @@ def test_apply_post_bundle_steps_exists_with_expected_signature() -> None:
         "      db: &Db,\n"
         "      is_initial_create: bool,\n"
         "      kg_or_docs_content_changed: bool,\n"
+        "      bundle: Option<&UpdateSummary>,\n"
+        "      notices: &mut Vec<String>,\n"
         "  ) -> Vec<String>\n"
         "If you're refactoring this helper, update both call sites "
         "(create_project_v2 + update_project_v2) AND this test."
@@ -397,7 +404,9 @@ def test_apply_post_bundle_steps_contains_all_six_ordered_steps() -> None:
          "step 3: seed project_modules('diagrams') = true (opt-out default)"),
         (4, "upsert_code_graph_build",
          "step 4a: queue PENDING code-graph build row"),
-        (4, "codegraph::spawn_initial_build",
+        # v0.2.107 (UPDATE-ALL): the spawn takes the DECIDED pass
+        # (`decide_post_bundle_codegraph_pass` → `spawn_build(mode)`).
+        (4, "codegraph::spawn_build",
          "step 4b: spawn code-graph build background task (audit AF-6)"),
         (5, "upsert_kg_sync",
          "step 5a: queue PENDING kg-sync row"),

@@ -270,6 +270,8 @@ impl Drop for InFlightGuard {
 pub struct AdmissionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _in_flight: InFlightGuard,
+    /// v0.2.107 (UPDATER-07): this job's place in the update exclusion.
+    _index_job: IndexJobExclusion,
 }
 
 /// The core memory-gate decision, factored out and parameterised on the sampler
@@ -331,6 +333,10 @@ async fn wait_for_memory_gate(sampler: &MemSampler<'_>, footprint_mib: u64, poll
 /// it (it lives for the process lifetime), so the `expect` is unreachable in
 /// practice — surfaced loudly rather than silently dropping the cap.
 pub async fn acquire_update_all_admission(db: &Db) -> AdmissionPermit {
+    // v0.2.107 (UPDATER-07): count in as index work BEFORE queueing on the
+    // semaphore (a queued job blocks an orchestrator update too), waiting
+    // first while one runs.
+    let index_job = enter_index_job().await;
     let permit = admission_semaphore(db)
         .acquire_owned()
         .await
@@ -349,6 +355,244 @@ pub async fn acquire_update_all_admission(db: &Db) -> AdmissionPermit {
     AdmissionPermit {
         _permit: permit,
         _in_flight: in_flight,
+        _index_job: index_job,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.2.107 (UPDATE-ALL, audit UPDATER-07) — an orchestrator update and the
+// index work it would pull the hub out from under exclude each other
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The orchestrator update stops the hub (and install.py restarts services);
+// "Update all" queues one kg-sync and one code-graph build per project, which
+// resolve config and secrets through that hub and write to Weaviate for hours.
+// Nothing made the two exclude each other, so an update started during
+// "Update all" — or during the builds it queued — killed them mid-run, and each
+// failure became a deferral and a retry driver.
+//
+// One process-wide state, ONE mutex, three participants:
+//   * the orchestrator update (`single_flight::begin_orchestrator_update_or_refuse`,
+//     the ONE entry point every update surface uses) REFUSES while "Update all"
+//     runs or any index job is queued or running — nothing is changed yet, and
+//     the message names what runs;
+//   * "Update all" (`update_all_projects`) REFUSES while an orchestrator update
+//     runs;
+//   * an index job (every holder of an admission permit: `run_build_task`,
+//     `run_sync_task`) WAITS while an orchestrator update runs, then counts
+//     itself in for its whole life — queued on the semaphore included, so a
+//     job that has not started yet still blocks an update.
+// Because all three decide under the same lock, no interleaving lets an
+// update and a job both proceed. Scope: this launcher process (the launcher is
+// single-instance). Detached Python walks outside it (install.py's resync, a
+// retry driver) are not counted here — the machine-wide queue of lane QUEUE is
+// their home.
+
+/// Why a request was refused. Rendered by [`exclusion_refusal_message`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExclusionRefusal {
+    /// The orchestrator update was asked for while index work runs.
+    IndexWorkRunning { update_all: bool, index_jobs: usize },
+    /// "Update all" was asked for while an orchestrator update runs.
+    OrchestratorUpdateRunning,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExclusionState {
+    pub orchestrator_update: bool,
+    pub update_all: bool,
+    pub index_jobs: usize,
+}
+
+/// PURE: may an orchestrator update start in `state`?
+pub(crate) fn orchestrator_update_admissible(state: &ExclusionState) -> Result<(), ExclusionRefusal> {
+    if state.update_all || state.index_jobs > 0 {
+        return Err(ExclusionRefusal::IndexWorkRunning {
+            update_all: state.update_all,
+            index_jobs: state.index_jobs,
+        });
+    }
+    Ok(())
+}
+
+/// PURE: may "Update all" start in `state`?
+pub(crate) fn update_all_admissible(state: &ExclusionState) -> Result<(), ExclusionRefusal> {
+    if state.orchestrator_update {
+        return Err(ExclusionRefusal::OrchestratorUpdateRunning);
+    }
+    Ok(())
+}
+
+/// PURE: may an index job start now (else it waits)?
+pub(crate) fn index_job_admissible(state: &ExclusionState) -> bool {
+    !state.orchestrator_update
+}
+
+/// The user-facing refusal text — what runs, why it matters, what to do.
+pub(crate) fn exclusion_refusal_message(r: &ExclusionRefusal) -> String {
+    match r {
+        ExclusionRefusal::IndexWorkRunning { update_all, index_jobs } => {
+            let mut what: Vec<String> = Vec::new();
+            if *update_all {
+                what.push("\"Update all\" is running".to_string());
+            }
+            if *index_jobs > 0 {
+                what.push(format!(
+                    "{} code-graph / knowledge-graph job(s) are queued or running",
+                    index_jobs
+                ));
+            }
+            format!(
+                "Update refused before anything was changed: {}. The orchestrator \
+                 update stops the hub and may restart services under them. Wait \
+                 until they finish (the project pages show their progress), then \
+                 start the update again.",
+                what.join(" and ")
+            )
+        }
+        ExclusionRefusal::OrchestratorUpdateRunning => "\"Update all\" refused: an \
+             orchestrator update is running, and it stops the hub the project updates \
+             and their index jobs rely on. Start \"Update all\" again after the update \
+             has finished."
+            .to_string(),
+    }
+}
+
+static EXCLUSION: std::sync::Mutex<ExclusionState> = std::sync::Mutex::new(ExclusionState {
+    orchestrator_update: false,
+    update_all: false,
+    index_jobs: 0,
+});
+
+fn with_exclusion<T>(f: impl FnOnce(&mut ExclusionState) -> T) -> T {
+    // A poisoned lock still holds a coherent counter (every critical section
+    // is a field write); recovering it beats refusing every update forever.
+    let mut g = EXCLUSION.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut g)
+}
+
+/// Held by the orchestrator update for its whole run (released on drop).
+#[derive(Debug)]
+pub struct OrchestratorUpdateExclusion(());
+
+impl Drop for OrchestratorUpdateExclusion {
+    fn drop(&mut self) {
+        with_exclusion(|s| s.orchestrator_update = false);
+    }
+}
+
+/// Held by "Update all" for its traversal (released on drop).
+#[derive(Debug)]
+pub struct UpdateAllExclusion(());
+
+impl Drop for UpdateAllExclusion {
+    fn drop(&mut self) {
+        with_exclusion(|s| s.update_all = false);
+    }
+}
+
+/// Held by one index job from admission request to completion.
+#[derive(Debug)]
+pub struct IndexJobExclusion(());
+
+impl Drop for IndexJobExclusion {
+    fn drop(&mut self) {
+        with_exclusion(|s| s.index_jobs = s.index_jobs.saturating_sub(1));
+    }
+}
+
+/// Claim the orchestrator-update side, or refuse with the message.
+pub(crate) fn begin_orchestrator_update_exclusion() -> Result<OrchestratorUpdateExclusion, String> {
+    with_exclusion(|s| {
+        orchestrator_update_admissible(s).map_err(|r| exclusion_refusal_message(&r))?;
+        s.orchestrator_update = true;
+        Ok(OrchestratorUpdateExclusion(()))
+    })
+}
+
+/// Claim the "Update all" side, or refuse with the message.
+pub(crate) fn begin_update_all_exclusion() -> Result<UpdateAllExclusion, String> {
+    with_exclusion(|s| {
+        update_all_admissible(s).map_err(|r| exclusion_refusal_message(&r))?;
+        s.update_all = true;
+        Ok(UpdateAllExclusion(()))
+    })
+}
+
+/// Poll interval of an index job waiting out an orchestrator update.
+const UPDATE_WAIT_POLL: Duration = Duration::from_secs(2);
+
+/// Enter as an index job: waits (async) while an orchestrator update runs.
+pub(crate) async fn enter_index_job() -> IndexJobExclusion {
+    loop {
+        let entered = with_exclusion(|s| {
+            if index_job_admissible(s) {
+                s.index_jobs += 1;
+                true
+            } else {
+                false
+            }
+        });
+        if entered {
+            return IndexJobExclusion(());
+        }
+        tokio::time::sleep(UPDATE_WAIT_POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod v02107_exclusion_tests {
+    use super::*;
+
+    #[test]
+    fn an_update_is_refused_while_update_all_or_index_jobs_run() {
+        let idle = ExclusionState::default();
+        assert_eq!(orchestrator_update_admissible(&idle), Ok(()));
+        let busy = ExclusionState { index_jobs: 3, ..Default::default() };
+        let r = orchestrator_update_admissible(&busy).unwrap_err();
+        let msg = exclusion_refusal_message(&r);
+        assert!(msg.contains("3 code-graph") && msg.contains("before anything was changed"), "{msg}");
+        let all = ExclusionState { update_all: true, ..Default::default() };
+        assert!(exclusion_refusal_message(&orchestrator_update_admissible(&all).unwrap_err())
+            .contains("Update all"));
+    }
+
+    #[test]
+    fn update_all_is_refused_and_jobs_wait_while_an_update_runs() {
+        let updating = ExclusionState { orchestrator_update: true, ..Default::default() };
+        assert_eq!(
+            update_all_admissible(&updating),
+            Err(ExclusionRefusal::OrchestratorUpdateRunning)
+        );
+        assert!(!index_job_admissible(&updating));
+        let idle = ExclusionState::default();
+        assert_eq!(update_all_admissible(&idle), Ok(()));
+        assert!(index_job_admissible(&idle));
+    }
+
+    /// The live claims, end to end (serialised with every test that claims
+    /// the orchestrator update — the state is process-global).
+    #[tokio::test]
+    async fn the_live_claims_exclude_each_other_and_release_on_drop() {
+        let _g = crate::commands::single_flight::ORCHESTRATOR_CLAIM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let job = enter_index_job().await;
+        assert!(begin_orchestrator_update_exclusion().is_err(), "a live job blocks the update");
+        drop(job);
+        let upd = begin_orchestrator_update_exclusion().expect("free once the job ends");
+        assert!(begin_update_all_exclusion().is_err(), "update-all refused during an update");
+        let waiting = tokio::spawn(enter_index_job());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "a job waits while the update runs");
+        drop(upd);
+        let job = tokio::time::timeout(UPDATE_WAIT_POLL * 3, waiting)
+            .await
+            .expect("the waiting job proceeds after the update")
+            .unwrap();
+        drop(job);
+        let all = begin_update_all_exclusion().expect("free again");
+        drop(all);
     }
 }
 
@@ -567,6 +811,11 @@ mod tests {
     #[tokio::test]
     async fn admission_never_exceeds_capacity() {
         let _g = GATE_TEST_LOCK.lock().unwrap();
+        // v0.2.107: admission counts as index work in the update exclusion,
+        // so it serialises with every test that claims the orchestrator update.
+        let _claim = crate::commands::single_flight::ORCHESTRATOR_CLAIM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_in_flight();
 
         let db = Db::open_in_memory().expect("in-memory db");

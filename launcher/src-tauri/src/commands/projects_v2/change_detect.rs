@@ -75,6 +75,165 @@ pub(crate) fn envelope_kg_or_docs_content_changed(v: &serde_json::Value) -> bool
     false
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.2.107 (UPDATE-ALL, audit A-015) — the envelope STATES the KG fact
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The path rule above counts ANY changed path under `knowledge/`: a release
+// that edited `knowledge/.node_embeddings.README.txt` (a sidecar the sync never
+// reads) queued `kg-sync --all` in all 11 projects of a machine within 37 s.
+// What the sync ingests is known on the Python side, so `project_init` now
+// writes it into the envelope (`vco_lib/bundle_kg_change.py`, rule A — one
+// home): `kg_content_changed` (bool) + `kg_content_changed_paths`. This side
+// READS that key; the path rule survives only for an envelope without it (an
+// older `project_init`). An older launcher reads only `actions`, so it keeps
+// its path rule against a new envelope — no field it reads changed shape.
+
+/// Envelope key written by `vco_lib.bundle_kg_change.record_kg_content_change`.
+/// MUST MATCH `KG_CONTENT_CHANGED_KEY` there.
+pub(crate) const ENVELOPE_KG_CONTENT_CHANGED_KEY: &str = "kg_content_changed";
+/// Envelope key carrying the changed paths the sync ingests (sorted).
+/// MUST MATCH `KG_CONTENT_CHANGED_PATHS_KEY` in `vco_lib/bundle_kg_change.py`.
+pub(crate) const ENVELOPE_KG_CONTENT_CHANGED_PATHS_KEY: &str = "kg_content_changed_paths";
+
+/// THE kg-content input of the sync gate. Reads the envelope's own statement
+/// when it carries one as a boolean; any other shape (absent key — an older
+/// `project_init` — or a non-boolean value) falls back to the path rule,
+/// [`envelope_kg_or_docs_content_changed`], which is conservative.
+pub(crate) fn envelope_kg_content_changed(v: &serde_json::Value) -> bool {
+    match v.get(ENVELOPE_KG_CONTENT_CHANGED_KEY).and_then(|x| x.as_bool()) {
+        Some(stated) => stated,
+        None => envelope_kg_or_docs_content_changed(v),
+    }
+}
+
+/// The changed node paths the envelope names (empty for an older envelope —
+/// the reason line then falls back to a generic wording).
+pub(crate) fn envelope_kg_content_changed_paths(v: &serde_json::Value) -> Vec<String> {
+    v.get(ENVELOPE_KG_CONTENT_CHANGED_PATHS_KEY)
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.2.107 (UPDATE-ALL, audit CGWRITE-03) — who walks the code graph
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A bundle update used to owe a project TWO whole-repo walks: the Python step
+// spawned a detached driver for an owed extractor generation, and the launcher
+// queued its own full pass unconditionally. The envelope now says which side
+// walks, so the launcher's decision (`codegraph::decide_post_bundle_codegraph_pass`)
+// can start at most one:
+//
+//   * `extractor_reindex.status == "launched"` or `codegraph_audits.status ==
+//     "launched"` → a detached driver is walking: `Background`;
+//   * `extractor_reindex.status == "handed_off"` → a forced walk is owed and
+//     the launcher runs it (`VCT_CODEGRAPH_WALK_OWNER=launcher` was set on the
+//     bundle subprocess): `Forced`;
+//   * anything else → nothing owed on the Python axes: `NotOwed`.
+//
+// An older `project_init` never writes `handed_off` or `codegraph_audits`; its
+// `launched` already existed (v0.2.92), so the new launcher yields to an old
+// driver exactly the same way.
+
+/// What the bundle envelope says about the project's code-graph walk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleCodegraphWalk {
+    /// Nothing owed on the Python-decided axes (generation, audits).
+    #[default]
+    NotOwed,
+    /// The bundle step started a detached driver; it is the one walk.
+    Background,
+    /// A forced walk is owed and handed to the launcher's build.
+    Forced,
+}
+
+/// Read [`BundleCodegraphWalk`] plus the reason text the envelope carries.
+pub(crate) fn envelope_codegraph_walk(v: &serde_json::Value) -> (BundleCodegraphWalk, Option<String>) {
+    let status_of = |key: &str| {
+        v.get(key)
+            .and_then(|o| o.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let reason = v
+        .get("extractor_reindex")
+        .and_then(|o| o.get("reason_text").or_else(|| o.get("reason")))
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let extractor = status_of("extractor_reindex");
+    if extractor == "launched" {
+        return (BundleCodegraphWalk::Background, reason);
+    }
+    if status_of("codegraph_audits") == "launched" {
+        return (
+            BundleCodegraphWalk::Background,
+            Some("one-time code-graph audits are owed".to_string()),
+        );
+    }
+    if extractor == "handed_off" {
+        return (BundleCodegraphWalk::Forced, reason);
+    }
+    (BundleCodegraphWalk::NotOwed, None)
+}
+
+/// The one-line, user-facing account of the kg-sync decision for the
+/// update's notices ("what was queued and why, or that nothing was needed").
+/// `None` when the decision already owes a WARNING (`kg_sync_decision_warning`
+/// says so — one surface per decision, never both).
+pub(crate) fn kg_sync_decision_notice(
+    decision: &KgSyncDecision,
+    changed_paths: &[String],
+) -> Option<String> {
+    let line = match decision {
+        KgSyncDecision::Spawn(KgSyncSpawnReason::ContentChanged) => {
+            if changed_paths.is_empty() {
+                "Knowledge sync queued: the update changed knowledge/docs content.".to_string()
+            } else {
+                let shown: Vec<&str> = changed_paths.iter().take(3).map(String::as_str).collect();
+                let more = changed_paths.len().saturating_sub(shown.len());
+                format!(
+                    "Knowledge sync queued: the update changed {}{}.",
+                    shown.join(", "),
+                    if more > 0 { format!(" and {} more", more) } else { String::new() }
+                )
+            }
+        }
+        KgSyncDecision::Spawn(KgSyncSpawnReason::InitialCreate) => {
+            "Knowledge sync queued: first sync of this project.".to_string()
+        }
+        KgSyncDecision::Spawn(KgSyncSpawnReason::NeverSucceeded { last_status }) => format!(
+            "Knowledge sync queued: no successful sync is recorded (last status: {}).",
+            last_status
+        ),
+        KgSyncDecision::Spawn(KgSyncSpawnReason::DriftDetected { missing, stale, .. }) => format!(
+            "Knowledge sync queued: the store is missing {} and holds {} stale node(s).",
+            missing, stale
+        ),
+        KgSyncDecision::Spawn(KgSyncSpawnReason::MetadataRepairOwed { .. }) => {
+            "Knowledge sync queued: the one-time metadata repair is owed.".to_string()
+        }
+        KgSyncDecision::Spawn(KgSyncSpawnReason::RechunkOwed { .. }) => {
+            "Knowledge sync queued: the chunker changed and this project is owed one re-chunk."
+                .to_string()
+        }
+        KgSyncDecision::SkipConfirmed { .. } | KgSyncDecision::SkipNoContent { .. } => {
+            "Knowledge sync: nothing needed — no knowledge node changed and the store is complete."
+                .to_string()
+        }
+        KgSyncDecision::SkipInFlight { status } => format!(
+            "Knowledge sync: nothing queued — a sync is already {}.",
+            status
+        ),
+        KgSyncDecision::SkipUnverified { .. } => return None,
+    };
+    Some(line)
+}
+
 /// v0.2.71 Piece 5b — pure decision predicate for the kg-sync spawn gate.
 /// Unit-testable without spawning anything.
 ///
@@ -385,6 +544,96 @@ pub(crate) fn kg_sync_needs_drift_probe(
         ),
         KgSyncDecision::SkipUnverified { .. }
     )
+}
+
+#[cfg(test)]
+mod v02107_envelope_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A-015 RED-PROOF: the v0.2.106 shape — only the README sidecar under
+    /// `knowledge/` changed. The NEW envelope states `false` → no sync. The
+    /// old path rule (what an old envelope still gets) said `true`.
+    #[test]
+    fn readme_only_envelope_states_no_kg_change() {
+        let v = json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+            "kg_content_changed": false,
+            "kg_content_changed_paths": [],
+        });
+        assert!(!envelope_kg_content_changed(&v));
+        assert!(envelope_kg_or_docs_content_changed(&v), "the old rule was the defect");
+    }
+
+    #[test]
+    fn real_node_envelope_states_a_change_and_names_it() {
+        let v = json!({
+            "actions": {"create": ["knowledge/concepts/x.md"]},
+            "kg_content_changed": true,
+            "kg_content_changed_paths": ["knowledge/concepts/x.md"],
+        });
+        assert!(envelope_kg_content_changed(&v));
+        assert_eq!(envelope_kg_content_changed_paths(&v), vec!["knowledge/concepts/x.md"]);
+    }
+
+    /// New launcher, OLD envelope (no key): today's path rule, both ways.
+    #[test]
+    fn envelope_without_the_key_keeps_the_path_rule() {
+        let touched = json!({"actions": {"overwrite": ["knowledge/TAG_HIERARCHY.md"]}});
+        assert!(envelope_kg_content_changed(&touched));
+        let untouched = json!({"actions": {"overwrite": [".claude/settings.json"]}});
+        assert!(!envelope_kg_content_changed(&untouched));
+        assert!(envelope_kg_content_changed_paths(&untouched).is_empty());
+        // A malformed statement is not a statement: path rule again.
+        let garbled = json!({"actions": {"create": ["docs/a.md"]}, "kg_content_changed": "no"});
+        assert!(envelope_kg_content_changed(&garbled));
+    }
+
+    #[test]
+    fn codegraph_walk_is_read_from_the_envelope() {
+        let launched = json!({"extractor_reindex": {"status": "launched", "reason_text": "r"}});
+        assert_eq!(
+            envelope_codegraph_walk(&launched),
+            (BundleCodegraphWalk::Background, Some("r".to_string()))
+        );
+        let audits = json!({"extractor_reindex": {"status": "skipped"},
+                            "codegraph_audits": {"status": "launched"}});
+        assert_eq!(envelope_codegraph_walk(&audits).0, BundleCodegraphWalk::Background);
+        let forced = json!({"extractor_reindex": {"status": "handed_off",
+                                                   "reason_text": "new rung"}});
+        assert_eq!(
+            envelope_codegraph_walk(&forced),
+            (BundleCodegraphWalk::Forced, Some("new rung".to_string()))
+        );
+        // Audits declined (not owed) or deferred → nothing on the Python axes.
+        let none = json!({"extractor_reindex": {"status": "stamped"},
+                          "codegraph_audits": {"status": "not_owed"}});
+        assert_eq!(envelope_codegraph_walk(&none).0, BundleCodegraphWalk::NotOwed);
+        // An old envelope with neither key.
+        assert_eq!(envelope_codegraph_walk(&json!({})).0, BundleCodegraphWalk::NotOwed);
+    }
+
+    #[test]
+    fn every_kg_decision_but_the_warned_one_owes_a_notice() {
+        let paths = vec!["knowledge/a.md".to_string()];
+        let queued = kg_sync_decision_notice(
+            &KgSyncDecision::Spawn(KgSyncSpawnReason::ContentChanged),
+            &paths,
+        )
+        .unwrap();
+        assert!(queued.contains("queued") && queued.contains("knowledge/a.md"), "{queued}");
+        let nothing =
+            kg_sync_decision_notice(&KgSyncDecision::SkipConfirmed { scanned: 3 }, &[]).unwrap();
+        assert!(nothing.contains("nothing needed"), "{nothing}");
+        assert_eq!(
+            kg_sync_decision_notice(
+                &KgSyncDecision::SkipUnverified { detail: "down".into() },
+                &[]
+            ),
+            None,
+            "an unverified skip already owes a WARNING; never both"
+        );
+    }
 }
 
 #[cfg(test)]

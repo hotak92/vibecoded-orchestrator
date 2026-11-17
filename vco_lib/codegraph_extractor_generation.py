@@ -412,6 +412,25 @@ EXTRACTOR_GENERATION_RUNG_REASONS: dict[str, str] = {
 #: documented surface; this is its transport.
 FORCE_REWALK_ENV = "VCT_CODEGRAPH_FORCE_REWALK"
 
+#: v0.2.107 (UPDATE-ALL, audit CGWRITE-03): ONE walk per project per update.
+#: The launcher sets this to :data:`WALK_OWNER_LAUNCHER` on the bundle-update
+#: subprocess of every project whose post-bundle code-graph build IT runs (all
+#: but the orchestrator root, whose walk install.py's resync owns). An owed
+#: forced walk is then HANDED OFF — the bundle step starts no detached driver
+#: and reports ``extractor_reindex.status == "handed_off"``; the launcher's
+#: build runs it with ``--force-rewalk`` and the analyzer writes the stamp.
+#: Unset (install.py, a CLI run, an older launcher) → the driver is spawned
+#: here exactly as before, and the launcher (new or old) yields to it.
+WALK_OWNER_ENV = "VCT_CODEGRAPH_WALK_OWNER"
+WALK_OWNER_LAUNCHER = "launcher"
+
+
+def walk_handed_to_launcher(owner: "Optional[str]") -> bool:
+    """PURE: does ``owner`` (the :data:`WALK_OWNER_ENV` value) say the
+    launcher runs this project's post-bundle walk?"""
+    return str(owner or "").strip().lower() == WALK_OWNER_LAUNCHER
+
+
 #: Per-project completion record, relative to the project root. Lives under
 #: ``.claude/state/`` because that tree is explicitly EXCLUDED from code-graph
 #: walks (v0.2.73 read-amplification cleanup), so the stamp can never index
@@ -1169,7 +1188,7 @@ def code_graph_exists(
 class ReindexResult:
     """What :func:`ensure_extractor_generation` did. Never an exception."""
 
-    status: str  # skipped | stamped | launched | deferred | failed
+    status: str  # skipped | stamped | launched | handed_off | deferred | failed
     reason: str = ""
     message: str = ""
     generation: str = CURRENT_EXTRACTOR_GENERATION
@@ -1317,6 +1336,26 @@ def _retarget_deferral(deferral, generation: str):
         return deferral
 
 
+def _audits_owed_for_handoff(
+    folder: Path, project_name: str, index_dot_claude: bool, probe=None,
+) -> bool:
+    """Is a W1-C one-time audit owed (so the driver, not the launcher, must
+    walk)? ``probe(folder, project_name, index_dot_claude) -> bool`` is the
+    test seam. An error reads as "owed" — the conservative side here keeps
+    today's behaviour (the driver), never skips the audits."""
+    try:
+        if probe is not None:
+            return bool(probe(Path(folder), project_name, index_dot_claude))
+        from vco_lib.codegraph_resync import _one_time_audits_owed, _resolve_analyzer
+
+        return bool(_one_time_audits_owed(
+            project_name, _resolve_analyzer(Path(folder)), index_dot_claude,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("audit-owed probe failed (%s) — keeping the driver", exc)
+        return True
+
+
 def ensure_extractor_generation(
     folder: Path,
     *,
@@ -1330,6 +1369,8 @@ def ensure_extractor_generation(
     probe=None,
     spawn=None,
     unknown_graph_is_absent: bool = False,
+    walk_owner: "Optional[str]" = None,
+    audits_owed=None,
 ) -> ReindexResult:
     """Decide, and when owed, launch the background force-rewalk.
 
@@ -1346,6 +1387,15 @@ def ensure_extractor_generation(
     :func:`vco_lib.codegraph_resync.spawn_background_resync` runs.
     ``unknown_graph_is_absent`` is the root-first-install flag — see
     :func:`plan`.
+
+    v0.2.107 (one walk per project): when ``walk_owner`` (default: the
+    :data:`WALK_OWNER_ENV` env value) names the launcher, an owed walk is
+    returned as ``status="handed_off"`` instead of spawned — UNLESS a W1-C
+    one-time audit is also owed (``audits_owed``, default
+    ``codegraph_resync._one_time_audits_owed``): the audits run only inside the
+    driver, so the driver is spawned as before and does the forced walk too;
+    the launcher reads ``launched`` and starts nothing. Either way exactly one
+    process walks the project.
     """
     try:
         verdict = plan(
@@ -1392,6 +1442,23 @@ def ensure_extractor_generation(
     reason_text = describe_rung(verdict.bumps) or (
         f"the graph may predate extractor generation v{verdict.generation}"
     )
+
+    if walk_handed_to_launcher(
+        os.environ.get(WALK_OWNER_ENV) if walk_owner is None else walk_owner
+    ) and not _audits_owed_for_handoff(
+        folder, project_name, index_dot_claude, audits_owed
+    ):
+        return ReindexResult(
+            status="handed_off",
+            reason=verdict.reason,
+            generation=verdict.generation,
+            reason_text=reason_text,
+            message=(
+                f"extractor-generation re-index owed for {project_name}: the "
+                "launcher's post-bundle build runs it (--force-rewalk); no "
+                "background driver started"
+            ),
+        )
 
     if spawn is None:
         try:
@@ -1496,6 +1563,8 @@ __all__ = [
     "EXTRACTOR_GENERATION_BUMPS",
     "EXTRACTOR_GENERATION_RUNG_REASONS",
     "FORCE_REWALK_ENV",
+    "WALK_OWNER_ENV",
+    "WALK_OWNER_LAUNCHER",
     "STAMP_REL",
     "REASON_CROSSES_BUMP",
     "REASON_NO_GRAPH",
@@ -1517,6 +1586,7 @@ __all__ = [
     "stamp_after_walk",
     "stamp_path",
     "walk_certifies_generation",
+    "walk_handed_to_launcher",
     "write_stamp",
 ]
 

@@ -142,6 +142,19 @@ pub struct UpdateSummary {
     /// `kg_docs_content_changed`.
     #[serde(default)]
     pub kg_or_docs_content_changed: bool,
+    /// v0.2.107 (A-015): the changed paths the KG sync ingests, as the
+    /// envelope names them (`kg_content_changed_paths`). Empty for an older
+    /// envelope or when nothing the sync reads changed. Feeds the "why was a
+    /// sync queued" notice.
+    #[serde(default)]
+    pub kg_content_changed_paths: Vec<String>,
+    /// v0.2.107 (CGWRITE-03): which side walks the code graph after this
+    /// update, as the envelope says (`change_detect::envelope_codegraph_walk`).
+    #[serde(default)]
+    pub codegraph_walk: BundleCodegraphWalk,
+    /// Reason text for an owed walk (the rung that owes it), when known.
+    #[serde(default)]
+    pub codegraph_walk_reason: Option<String>,
 }
 
 impl UpdateSummary {
@@ -169,6 +182,7 @@ impl UpdateSummary {
         // nodes, which are the user's data and kept BY DESIGN — not "your edits
         // kept (backup failed)". The engine names them in `knowledge_kept` (the
         // knowledge/code split has one home, Python's `_is_knowledge_dest`).
+        let codegraph_walk = envelope_codegraph_walk(v);
         let knowledge_kept = v
             .get("knowledge_kept")
             .and_then(|x| x.as_array())
@@ -191,7 +205,12 @@ impl UpdateSummary {
                 .unwrap_or(0),
             // v0.2.71 Piece 5b: the inspector is conservative on an
             // unparseable/unexpected `actions` shape (returns true → spawn).
-            kg_or_docs_content_changed: envelope_kg_or_docs_content_changed(v),
+            // v0.2.107 (A-015): the envelope's own statement wins when it
+            // carries one; the path rule is the old-envelope fallback.
+            kg_or_docs_content_changed: envelope_kg_content_changed(v),
+            kg_content_changed_paths: envelope_kg_content_changed_paths(v),
+            codegraph_walk: codegraph_walk.0,
+            codegraph_walk_reason: codegraph_walk.1,
         }
     }
 
@@ -813,6 +832,10 @@ pub(crate) fn create_setup_phases(
                 // always spawns the first-time index). Pass `true` to document
                 // intent — a fresh project's pre-existing KG/docs must be synced.
                 /* kg_or_docs_content_changed */ true,
+                // No update envelope on create; its notices are not shown
+                // (a create reports through the setup banner).
+                None,
+                &mut Vec::new(),
             )
             .await;
             for w in post {
@@ -855,7 +878,8 @@ pub(crate) fn create_setup_phases(
 /// forensic trail from prior race-condition fixes:
 ///   1. populate_project_state_from_filesystem (post-bundle re-walk)
 ///   2. seed_enabled_rows_for_new_project (global modules → this project)
-///   3. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
+///   3. codegraph::spawn_build — needs bundle's analyzer wrapper (v0.2.107:
+///      only the pass `decide_post_bundle_codegraph_pass` decided, if any)
 ///   4. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
 ///   5. kg_summary::spawn_initial_summary — needs bundle's summary script
 ///
@@ -872,9 +896,17 @@ pub(crate) fn create_setup_phases(
 ///
 /// **`is_initial_create`** discriminator: on first create, no
 /// pre-existing per-project code-graph rows can be stale, so the
-/// codegraph spawn passes `prune_stale=false`. On update, prior rows
-/// may reference files the user deleted between create and update, so
-/// the spawn passes `prune_stale=true`.
+/// codegraph spawn is a full pass with `prune_stale=false`. On update
+/// (v0.2.107) the pass is DECIDED, not assumed: nothing when HEAD equals
+/// the recorded commit and nothing is owed; `--incremental --since-commit`
+/// when HEAD moved (deleted files' rows go through the git prune); one
+/// full pass with `--prune-stale` (plus `--force-rewalk` when a forced walk
+/// is owed) otherwise; and nothing when the bundle step's own driver walks.
+///
+/// **`bundle` / `notices`** (v0.2.107): the update envelope's facts
+/// (`UpdateSummary::codegraph_walk`, `kg_content_changed_paths`) and the
+/// channel the "what was queued and why, or that nothing was needed" lines
+/// ride to the toast and the Update-all report. `None` on create.
 ///
 /// **`kg_or_docs_content_changed`** (v0.2.71 Piece 5b): gates step 5
 /// (kg-sync spawn) on UPDATE. On create it is ignored (a fresh project's
@@ -917,6 +949,8 @@ pub(crate) async fn apply_post_bundle_steps(
     db: &Db,
     is_initial_create: bool,
     kg_or_docs_content_changed: bool,
+    bundle: Option<&UpdateSummary>,
+    notices: &mut Vec<String>,
 ) -> Vec<String> {
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
     // launcher.db, instead of `no such table` from the stand-in connection.
@@ -1082,37 +1116,80 @@ pub(crate) async fn apply_post_bundle_steps(
         spawn_root_identity_sweep(app, db, project_id, project_name);
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let prune_stale = !is_initial_create;
+    // v0.2.107 (UPDATE-ALL, A-016 / CGWRITE-03): DECIDE before queueing. Was:
+    // every update queued a full pass with prune, unconditionally, beside the
+    // Python step's own detached walk. Now ONE decision —
+    // `codegraph::decide_post_bundle_codegraph_pass` — reads the envelope's
+    // walk facts (driver already walking / forced walk handed to us), the last
+    // build row, the recorded commit and HEAD, and starts at most one pass:
+    // none, incremental since the recorded commit, or one full (forced) walk.
     // Root-update: skip both the pending-row insert and the spawn (no
     // dangling PENDING pill in the GUI for a build that will never run).
     if !is_orchestrator_root_update {
-        if let Err(e) = db.upsert_code_graph_build(
-            project_id,
-            build_status::PENDING,
-            Some(now),
-            None,
-            None,
-            0,
-            None,
-            false,
-            None,
-            None,
-        ) {
-            tracing::warn!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
+        let (walk, walk_reason) = bundle
+            .map(|b| (b.codegraph_walk.clone(), b.codegraph_walk_reason.clone()))
+            .unwrap_or_default();
+        let last_build = codegraph::classify_last_build(
+            db.get_code_graph_build(project_id).ok().flatten().as_ref(),
+            now,
+            kg_sync::heartbeat_stale_secs(),
+        );
+        let recorded_commit = db
+            .get_project_codegraph_binding(project_id)
+            .ok()
+            .flatten()
+            .and_then(|b| b.last_analyzed_commit);
+        // git is asked only when the cheap legs leave the decision open.
+        let git = if is_initial_create
+            || walk != BundleCodegraphWalk::NotOwed
+            || !matches!(last_build, codegraph::LastBuild::Completed)
+        {
+            codegraph::GitFacts::default()
         } else {
-            codegraph::spawn_initial_build(
-                app.clone(),
-                project_id.to_string(),
-                project_name.to_string(),
-                folder_path_str.clone(),
-                // First-time builds for a freshly-created project: no
-                // pre-existing per-project code-graph rows can possibly
-                // be stale, so --prune-stale is a no-op here. Pass false
-                // explicitly to avoid the iterator-then-delete pass.
-                // Re-builds (update path) set this to `true` to reap
-                // rows referencing files the user deleted post-create.
-                prune_stale,
-            );
+            codegraph::probe_git_facts(folder, recorded_commit.as_deref()).await
+        };
+        let pass = codegraph::decide_post_bundle_codegraph_pass(
+            is_initial_create,
+            &walk,
+            walk_reason.as_deref(),
+            &last_build,
+            recorded_commit.as_deref(),
+            &git,
+        );
+        tracing::info!("[vct] code-graph decision for {}: {:?}", project_id, pass);
+        if !is_initial_create {
+            notices.push(codegraph::codegraph_pass_notice(&pass));
+        }
+        if let codegraph::CodegraphPass::Run { mode, .. } = pass {
+            if let Err(e) = db.upsert_code_graph_build(
+                project_id,
+                build_status::PENDING,
+                Some(now),
+                None,
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            ) {
+                tracing::warn!(
+                    "[vct] warning: could not queue code-graph build for {}: {}",
+                    project_id, e
+                );
+            } else {
+                // First create: `Full { prune_stale: false }` — no row can be
+                // stale yet. Update: whatever the decision chose (a full pass
+                // reaps rows of deleted files with --prune-stale; an
+                // incremental pass removes them through --since-commit).
+                codegraph::spawn_build(
+                    app.clone(),
+                    project_id.to_string(),
+                    project_name.to_string(),
+                    folder_path_str.clone(),
+                    mode,
+                );
+            }
         }
     }
 
@@ -1232,6 +1309,14 @@ pub(crate) async fn apply_post_bundle_steps(
     if let Some(msg) = kg_sync_decision_warning(&kg_decision) {
         tracing::warn!("[vct] {} ({})", msg, project_id);
         warnings.push(msg);
+    }
+    // v0.2.107 (UPDATE-ALL): the update's notices say what was queued and why,
+    // or that nothing was needed (one line; a warned decision has no notice).
+    if !is_initial_create {
+        let paths = bundle.map(|b| b.kg_content_changed_paths.as_slice()).unwrap_or(&[]);
+        if let Some(line) = kg_sync_decision_notice(&kg_decision, paths) {
+            notices.push(line);
+        }
     }
     if let KgSyncDecision::Spawn(reason) = &kg_decision {
         match reason {
@@ -1950,6 +2035,13 @@ async fn run_install_bundle_core(
     cmd.args(&argv)
         .current_dir(&vco_lib_root)
         .stdin(std::process::Stdio::null());
+    // v0.2.107 (UPDATE-ALL, CGWRITE-03): ONE walk per project. When this
+    // launcher's post-bundle step will run the project's code-graph build, the
+    // Python step hands an owed forced walk to it instead of spawning its own
+    // detached driver (`codegraph_extractor_generation.WALK_OWNER_ENV`).
+    if launcher_owns_codegraph_walk(mode, folder, &vco_lib_root) {
+        cmd.env(CODEGRAPH_WALK_OWNER_ENV, CODEGRAPH_WALK_OWNER_LAUNCHER);
+    }
 
     #[cfg(windows)]
     {
@@ -2030,6 +2122,25 @@ async fn run_install_bundle_core(
         }
     }
     (warnings, summary)
+}
+
+/// Env var + value that hand an owed code-graph walk from the Python bundle
+/// step to this launcher. MUST MATCH `WALK_OWNER_ENV` / `WALK_OWNER_LAUNCHER`
+/// in `vco_lib/codegraph_extractor_generation.py`.
+pub(crate) const CODEGRAPH_WALK_OWNER_ENV: &str = "VCT_CODEGRAPH_WALK_OWNER";
+pub(crate) const CODEGRAPH_WALK_OWNER_LAUNCHER: &str = "launcher";
+
+/// PURE: does this launcher run the post-bundle code-graph build of `folder`?
+/// Update mode only (a create builds anyway; a re-added project whose old
+/// graph is owed a forced walk keeps today's Python driver), and never the
+/// orchestrator root (install.py's resync owns its walk — the same
+/// `is_orchestrator_root_folder` test `apply_post_bundle_steps` applies).
+pub(crate) fn launcher_owns_codegraph_walk(
+    mode: BundleMode,
+    folder: &Path,
+    orchestrator_root: &Path,
+) -> bool {
+    mode == BundleMode::Update && !is_orchestrator_root_folder(folder, orchestrator_root)
 }
 
 /// PR 4 (2026-05-01): subprocess-call vco_lib.project_init install-bundle.
@@ -3169,9 +3280,10 @@ pub async fn update_project_v2(
     //     manifest) as a fresh v0.2.52 create of the same name + folder
     //     contents.
     //
-    //     `is_initial_create=false` → codegraph spawn passes
-    //     `prune_stale=true` to reap rows for files the user deleted
-    //     between create and update (audit AF-6).
+    //     `is_initial_create=false` → the code-graph pass is decided
+    //     (v0.2.107): none / incremental since the recorded commit / one
+    //     full pass with `prune_stale=true` (audit AF-6) — see
+    //     `codegraph::decide_post_bundle_codegraph_pass`.
     //
     //     ORDER MATTERS: this MUST run AFTER `apply_project_env_via_python`
     //     above (so the codegraph + kg-sync background tasks read the
@@ -3190,7 +3302,13 @@ pub async fn update_project_v2(
         // v0.2.71 Piece 5b: gate the kg-sync re-embed on whether this bundle
         // update actually wrote knowledge/** or docs/** content. A settings-
         // only update (the field-reported case) → `false` → no full re-embed.
+        // v0.2.107 (A-015): read from the envelope's own `kg_content_changed`
+        // statement (a README/sidecar change is no longer "content").
         summary.kg_or_docs_content_changed,
+        // v0.2.107 (UPDATE-ALL): the envelope's code-graph walk facts, and
+        // the notices channel the "queued and why" lines ride on.
+        Some(&summary),
+        &mut notices,
     )
     .await;
     for w in post_bundle_warnings {
@@ -3520,6 +3638,10 @@ pub async fn update_all_projects(
     let _single_flight = crate::commands::single_flight::begin_or_refuse(
         crate::commands::single_flight::OP_UPDATE_ALL_PROJECTS,
     )?;
+    // v0.2.107 (UPDATER-07): never during an orchestrator update (it stops the
+    // hub every project update and its index jobs rely on); while this runs,
+    // an orchestrator update is refused in turn.
+    let _update_exclusion = crate::commands::embed_admission::begin_update_all_exclusion()?;
     let opts = opts.unwrap_or_default();
     let projects = db.list_projects()?;
 
@@ -11497,4 +11619,87 @@ mod standby_tests {
         assert_typed_standby(&apply_project_env_via_python("p1", tmp.path(), &db).unwrap_err());
     }
 
+}
+
+#[cfg(test)]
+mod v02107_update_all_gating_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A-015 through the ONE tally the launcher uses: the README-only envelope
+    /// of v0.2.106 no longer reports KG content; a real node does, and names it.
+    #[test]
+    fn the_tally_reads_the_envelopes_own_kg_statement() {
+        let readme_only = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+            "kg_content_changed": false,
+            "kg_content_changed_paths": [],
+        }));
+        assert!(!readme_only.kg_or_docs_content_changed);
+        assert!(!should_spawn_kg_sync_on_bundle(false, readme_only.kg_or_docs_content_changed));
+
+        let node = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {"create": ["knowledge/concepts/n.md"]},
+            "kg_content_changed": true,
+            "kg_content_changed_paths": ["knowledge/concepts/n.md"],
+        }));
+        assert!(node.kg_or_docs_content_changed);
+        assert_eq!(node.kg_content_changed_paths, vec!["knowledge/concepts/n.md"]);
+    }
+
+    /// New launcher reading an OLD envelope (no key): the v0.2.71 path rule.
+    #[test]
+    fn an_old_envelope_keeps_the_path_rule() {
+        let old = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+        }));
+        assert!(old.kg_or_docs_content_changed, "no statement → conservative path rule");
+        assert_eq!(old.codegraph_walk, BundleCodegraphWalk::NotOwed);
+    }
+
+    /// OLD launcher reading a NEW envelope: its reader only ever looked at
+    /// `actions` (a `serde_json::Value`, no typed struct, so no
+    /// `deny_unknown_fields`), and the new keys change no field it reads —
+    /// its verdict on the new envelope equals its verdict without them.
+    #[test]
+    fn the_new_keys_change_nothing_the_old_reader_reads() {
+        let with_keys = json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+            "kg_content_changed": false,
+            "kg_content_changed_paths": [],
+            "extractor_reindex": {"status": "handed_off"},
+            "codegraph_audits": {"status": "launched"},
+        });
+        let without = json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+        });
+        assert_eq!(
+            envelope_kg_or_docs_content_changed(&with_keys),
+            envelope_kg_or_docs_content_changed(&without)
+        );
+    }
+
+    #[test]
+    fn the_tally_carries_the_codegraph_walk_facts() {
+        let forced = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {},
+            "extractor_reindex": {"status": "handed_off", "reason_text": "rung 0.2.107"},
+        }));
+        assert_eq!(forced.codegraph_walk, BundleCodegraphWalk::Forced);
+        assert_eq!(forced.codegraph_walk_reason.as_deref(), Some("rung 0.2.107"));
+    }
+
+    /// The env hand-off is set exactly when this launcher builds the project.
+    #[test]
+    fn the_walk_is_handed_to_the_launcher_only_for_updated_non_root_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        assert!(launcher_owns_codegraph_walk(BundleMode::Update, project.path(), root.path()));
+        assert!(!launcher_owns_codegraph_walk(BundleMode::Update, root.path(), root.path()));
+        assert!(!launcher_owns_codegraph_walk(
+            BundleMode::Create { safe_add: false },
+            project.path(),
+            root.path()
+        ));
+    }
 }
