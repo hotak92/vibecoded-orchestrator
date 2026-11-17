@@ -1427,12 +1427,20 @@ def _promote_warm_held(project_root: str, key: str) -> None:
             continue
 
 
+#: HR-3 (v0.2.107): the longest a ``--warm-legs`` child holds a machine-wide
+#: query slot for one leg (``VCO_WARM_LEG_TIMEOUT_S`` overrides). Far above a
+#: healthy lookup; it only stops a producer whose own network timeouts add up
+#: from starving every hook of a slot.
+WARM_LEG_TIMEOUT_S = 120.0
+
+
 def _warm_legs_main() -> int:
-    """The ``--warm-legs`` child: re-run the specced producer legs with NO
-    deadline and write their output into the query cache. Emits nothing,
-    records no seen-store, charges no budget and stages NO citation ctx —
-    the interactive run owns all of those; this process only warms the
-    cache. A citation ctx the producer would have staged is HELD beside the
+    """The ``--warm-legs`` child: re-run the specced producer legs with no
+    interactive deadline (each leg is bounded only by
+    :data:`WARM_LEG_TIMEOUT_S`, HR-3) and write their output into the query
+    cache. Emits nothing, records no seen-store, charges no budget and
+    stages NO citation ctx — the interactive run owns all of those; this
+    process only warms the cache. A citation ctx the producer would have staged is HELD beside the
     cache entry instead (:func:`_install_warm_hold_interceptor`): until an
     interactive run shows that entry, nobody has seen the retrieval, so it
     is not a training label (v0.2.105). A finished empty output is cached for
@@ -1473,7 +1481,15 @@ def _warm_legs_main() -> int:
         with _query_slot() as acquired:
             if not acquired:
                 continue
-            leg_results = _hds.run_legs({str(name): _run})
+            # HR-3: the slot is held for at most WARM_LEG_TIMEOUT_S; a leg
+            # still running then is abandoned and this process ends (below),
+            # which releases the slot (an OS file lock) with it.
+            leg_results = _hds.run_legs(
+                {str(name): _run},
+                leg_timeout_s=env_float("VCO_WARM_LEG_TIMEOUT_S", WARM_LEG_TIMEOUT_S,
+                                        above=0))
+        if _hds.legs_abandoned():
+            _flush_and_exit(0)
         out = (leg_results or {}).get(str(name)) or ""
         status = getattr(leg_results, "status", {}).get(str(name), "error")
         out = out.strip()
@@ -2051,7 +2067,8 @@ def _flush_and_exit(rc: int) -> None:
 # :data:`_EMIT_LOCK`), i.e. it degrades to "no injection", never to a hook the
 # harness has to kill. It is armed only for a real hook run (``__main__``),
 # never for an in-process caller and never for the detached ``--warm-legs``
-# cache warmer (no deadline by design, L4).
+# cache warmer (no hard deadline by design, L4; its hold of a query slot is
+# bounded per leg by WARM_LEG_TIMEOUT_S, HR-3).
 
 #: Seconds from the run's anchor (:func:`_run_deadline_anchor` — the wrapper's
 #: start when it exported ``VCO_HOOK_STARTED_AT``) to the hard exit. Above the

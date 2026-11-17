@@ -210,3 +210,11 @@ def test_warmer_caches_a_finished_leg(tmp_path: Path) -> None:
     assert run.returncode == 0, run.stderr
     assert cached["kg"] is not None and "KG: Whole" in cached["kg"]
 
+
+def test_warmer_holds_a_slot_for_a_bounded_time(tmp_path: Path) -> None:
+    run, cached, elapsed = _warm(
+        tmp_path, "import time\ndef main():\n    time.sleep(20)\n",
+        names=("kg", "cg_0"), VCO_WARM_LEG_TIMEOUT_S="1")
+    assert run.returncode == 0, run.stderr
+    assert elapsed < 12, f"the warmer held its slot for {elapsed:.1f}s past the bound"
+    assert cached == {"kg": None, "cg_0": None}
