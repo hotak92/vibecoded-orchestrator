@@ -446,12 +446,13 @@ class TranscriptScanner:
 
         # The requestId we attribute work to. Each unique requestId is one
         # logical API call (Claude Code emits ~3 JSONL entries per call
-        # during streaming; we dedup by gating BOTH usage and tool_use
-        # credits on `is_new_request`).
+        # during streaming; usage is credited once per requestId, a tool_use
+        # once per its own block id — see the tool_use section below).
         req_id = entry.get("requestId") or msg.get("id") or ""
-        # B10 fix: empty requestId means we can't dedup → skip both usage
-        # and tool_use accounting. This avoids inflating work via duplicate
-        # streaming entries that lack req_id (rare but possible).
+        # B10 fix: empty requestId means we can't dedup the USAGE → skip it,
+        # which avoids inflating work via duplicate streaming entries that
+        # lack req_id (rare but possible). A tool_use that carries its own
+        # block id is deduped by that id and is credited regardless.
         is_new_request = bool(req_id) and (req_id not in result.seen_request_ids)
         if is_new_request:
             result.seen_request_ids.add(req_id)

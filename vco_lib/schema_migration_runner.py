@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Versioned schema-migration runner (v0.2.60, verified NO-OP today).
+"""Versioned schema-migration runner (v0.2.60; a no-op for every artifact type without an edge).
 
 This module is the single, generalized successor to the two hardcoded
 migration scripts that ``install.py:_run_schema_migration_scripts`` ran

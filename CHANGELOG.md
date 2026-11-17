@@ -47,6 +47,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container restarted), at most three times per episode; a worker that died still counts. Job logs are named
   `owed-work-<project>-<pid>-<time>.log`. Preferences → Services shows the queue.
 
+- **Code-graph reads are bounded.** Every code-graph read names the properties it needs and resolved links carry only
+  the fields their readers use; a reply-too-large error is logged once with the collection and call site and returns
+  no result instead of being retried. A class without `project_source` now fails with the additive-migration hint
+  instead of running an unscoped callers read.
+- **A listing that returns nothing is "empty" only when the class count agrees.** Class listings go through one
+  cursor; when a listing returns no rows and the count says there are some, the sweep, prune, purge, copy or
+  convergence decision stops, deletes and clears nothing, and the run ends PARTIAL.
+- **A whole-repo code-graph walk over an empty or missing folder (an unmounted drive) no longer deletes that
+  folder's rows.** The deleted-file sweep counts a file as deleted only when the folder still holds other entries.
+- **`migrate_to_new_embeddings.py` and the MCP `migrate_embeddings` function add missing named vectors in place.** A
+  legacy single-vector class is rebuilt only when the rows read match Weaviate's count, and every object keeps its
+  id. The automatic drop of empty legacy code-graph classes now re-checks the project bindings at run time, like the
+  manual drop command.
+- **A full KG sync no longer re-embeds the same nodes on every pass while the chunker re-sync entry is pending.** The
+  entry now clears on every project (a completed forced code-graph walk records its half in the project it walked,
+  and projects already stuck clear at the next session start or update); a knowledge node without a title is a named
+  skip, not a failed summary refresh; and `external_links` is no longer added twice in one schema pass.
+- **A vendor's server-side tool blocks no longer break the next route.** Blocks and other block types the next route
+  cannot accept are converted to text notes (the note keeps the URL) at all four seams of the gateway, and the
+  vendor-bound request is sanitised too. On the Anthropic-bound route a block is converted only on positive vendor
+  evidence, and user-role blocks never. `vco fix-transcript` repairs request-blob rows and reports conversion counts.
+- **Hook injections cost far fewer Weaviate requests.** At most two routers query Weaviate at once machine-wide (a
+  router with no free slot waits up to 5 s, then skips its injection for that call); the code-graph leg is cached per
+  symbol; an identical re-Read with nothing new returns before any query; a lookup that finished empty is cached for
+  300 s and a timeout or error never is (a failed lookup is re-run by a detached warmer, whose lookups are bounded by
+  `VCO_WARM_LEG_TIMEOUT_S`); citation context is staged only for results actually shown; neighbour chunks appear on
+  hook surfaces only at the full-render score; when any hook finds Weaviate unreachable every hook skips its queries
+  for the next 30 s; and the cache is cleaned past its first 200 entries.
+- **Update all decides each project's index work, and says why.** After a bundle update, a KG sync is queued only when
+  a knowledge node the sync ingests changed (or the store is missing nodes), and a code-graph pass only when HEAD
+  moved since the last build (incremental) or a full re-walk is owed - one walk per project, handed between the
+  schedulers through `VCT_CODEGRAPH_WALK_OWNER`. Update all and an orchestrator update exclude each other, and every
+  project gets its own notice. A code-graph pass queued by a bundle update keeps its decided shape across a launcher
+  restart: an owed forced re-walk resumes with `--force-rewalk`, and an incremental pass keeps its since-commit while
+  that is still an ancestor of HEAD (launcher.db migration 052, `code_graph_builds.pending_mode` and
+  `pending_requeues`; at most three boot requeues, then the row fails with Retry).
+- **Index jobs refuse only the start of an orchestrator update or a hardware reconfiguration.** Continuing, resuming,
+  aborting or re-applying an update already under way is never refused for code-graph or knowledge-graph jobs, and the
+  refusal names the action and says it can start when the jobs finish. When the launcher cannot run git, a bundle
+  update queues a full code-graph pass instead of treating the project as having no git HEAD; the bundle's
+  knowledge-change statement counts Markdown files under dot-prefixed folders, as the sync does; and rows left at
+  embed revision 0 by a failed embed are healed by the next incremental pass (next commit or edit), not by every
+  bundle update.
+- **An update moves Weaviate to the pinned image only through a protected, verified move.** A Weaviate container this
+  install's compose created, on the installer's data mount, is recorded as VCO-managed and moved through
+  `vco_lib.container_upgrade`: every class counted, a raft snapshot by the old image, a free-space check and a copy of
+  the data to a `vco-weaviate-backup-<stamp>` volume, recreate, verify (image, mount, every index, no class lost an
+  object; objects written during the move are reported, not a failure), and a rollback to the old image on the
+  restored copy on any failure. A failed move is not retried until
+  `python -m vco_lib.container_upgrade retry --service weaviate`; `VCO_CONTAINER_UPGRADE=off|dry-run` keeps or plans.
+  No other path changes a Weaviate's version: session hooks, the launcher's Services actions, the port move, the
+  volume migration and install step 5 refuse such a recreate (a stuck container is started by name instead), and
+  `service_endpoints hand-to-vco --service weaviate` takes a foreign Weaviate over on its own version, then makes the
+  same protected move. The backup volume stays reported in `UPDATE_DEFERRED.md` while it exists, with the command to
+  delete it; VCO never deletes it. A Weaviate VCO did not create is never recreated: it gets the memory limit in
+  place (40 % of the smaller of host and container-engine memory), re-applied at every session start.
+- **The owed-work queue is safer to leave running.** A narrow sync-failure retry falls back to `--all` above 200
+  paths / 24,000 characters; a spawn that cannot start counts as a failed attempt, not a dead worker; the worker
+  stands down during an orchestrator update; code-graph resync drivers share the owed-work pool and its RAM-sized
+  slot count (`VCO_RESYNC_DRIVER_SLOTS` still overrides it); and `python -m vco_lib.owed_work
+  status|ensure|enqueue|worker` is documented.
+- **Smaller fixes.** The hub is revived once per outage under a file lock and the starter is reaped; no retry driver
+  starts when every owed condition is at the cap; the Playwright pre-cache is skipped when the pinned package and
+  browser are already present; first-boot rebind notes are not printed as failures; no drop command is printed for a
+  case-only sibling class; the launcher's "pause while hidden" timers work again; the work-unit counter credits a
+  tool call by its block id; the analyzer retries a 503 from the code-embedding service; a settings-change reload
+  (SIGHUP) ends the MCP server instead of leaving it hung; and the MCP server's Weaviate connect no longer asks
+  pypi.org for the client version.
+
 ## [0.2.106] - 2026-11-12
 
 ### Added

@@ -6169,7 +6169,7 @@ def main() -> int:
         _rebuild_was_performed = False
 
         if _maybe_prompt_rebuild_collections(args, deferral_report=_deferral_report):
-            # PR 3: smart per-collection dispatch (copy-with-vectors etc.)
+            # PR 3: smart per-collection dispatch (noop / patch_props / add_slots / copy / rebuild)
             # replaces the old drop-and-re-embed default. --force-rebuild
             # is the escape hatch back to today's behaviour.
             if getattr(args, "force_rebuild", False):
@@ -12916,6 +12916,17 @@ def _check_dual_clone() -> Optional[tuple]:
         return None
 
 
+# The rebind emitter's deferral wording ("nothing to rebind yet", not a failure).
+# ONE predicate for the printer and the error-propagation loop in
+# _seed_weaviate_shared_kg_only; tests/test_v0244_adversarial_fixes.py pins it
+# against the REAL emitter's messages, so rewording one here breaks that test.
+_REBIND_DEFERRAL_MARKERS = ("(skipped)", "(skipped —", "reconciled on next launcher boot")
+
+
+def _is_rebind_deferral(message: str) -> bool:
+    return any(marker in message for marker in _REBIND_DEFERRAL_MARKERS)
+
+
 def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
     """v0.2.44 V44-A: rebind orchestrator-root pointers to canonical KG name.
 
@@ -13221,7 +13232,7 @@ def _seed_weaviate_shared_kg_only(
             for e in rebind_errors:
                 # A root the launcher has not registered yet (a fresh install,
                 # before its first start) is the expected state, not a fault.
-                if "(skipped)" in e or "reconciled on next launcher boot" in e:
+                if _is_rebind_deferral(e):
                     print(f"    · rebind: {e} — expected before the launcher's "
                           "first start, which registers the root and its bindings")
                 else:
@@ -13237,9 +13248,7 @@ def _seed_weaviate_shared_kg_only(
             #     the launcher's env-refresh, so they stay print-only.
             for e in rebind_errors:
                 is_deferral = (
-                    "(skipped)" in e
-                    or "(skipped —" in e  # V44-H/H5 dual-clone short-circuit
-                    or "reconciled on next launcher boot" in e
+                    _is_rebind_deferral(e)  # incl. the V44-H/H5 dual-clone skip
                     or "config_projection apply failed" in e
                 )
                 if not is_deferral:

@@ -1145,10 +1145,11 @@ def uncapped_entry(finding: Any):
     detail = getattr(finding, "detail", None) or {}
     return _entry(
         CID_UNCAPPED, "Weaviate container has no memory limit", finding,
-        ("VCO sizes Weaviate's limit from the host (VCT_WEAVIATE_MEM_LIMIT) only for "
-         "containers it creates; a container it adopted keeps the limit it was created "
-         "with — here none. VCO never recreates a running Weaviate on its own. The entry "
-         "clears itself once the container has a limit."),
+        ("VCO sets Weaviate's limit at create time (VCT_WEAVIATE_MEM_LIMIT) only for "
+         "containers it creates; a container VCO did not create is never recreated by "
+         "VCO's session hooks, and is capped in place instead (re-applied at every "
+         "session start unless VCO_WEAVIATE_FOREIGN_LIMIT=off) — here none is set yet. "
+         "The entry clears itself once the container has a limit."),
         {"container": str(detail.get("container") or "")})
 
 

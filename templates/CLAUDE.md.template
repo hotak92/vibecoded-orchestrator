@@ -62,7 +62,7 @@ have opened this session for something else.
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
 2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about. Triage each entry by its `Disposition:` line (its class), not by how alarming it reads, and do not assume an entry clears itself: every condition declares its class and the mechanism that clears it in the orchestrator's `vco_lib/deferral_conditions.toml`, and the entry's **For your Claude assistant** block carries the specific recovery. The CLAUDE.md reminder block gives you the split ("N actionable, M informational/records") before you open the file.
    - `action_required` — a human must do the named thing; it will not resolve on its own. Surface it.
-   - `auto_retryable` — owed work (a KG seed, a code-graph walk) skipped because a backend was down; the session-start hook hands it to a detached retry driver. Don't ask the user to do anything.
+   - `auto_retryable` — owed work (a KG seed, a code-graph walk) skipped because a backend was down; it is queued as the machine's owed work, and its one worker runs it once the backend is ready. Don't ask the user to do anything.
    - `environmental` — a true description of this machine (e.g. two Ollama daemons). It persists while it is true; that is not a bug. If the user is happy with it, silence it: `python -m vco_lib.project_init dismiss-deferral --folder <project> --condition-id <id>` (run from the orchestrator root; the dismissal holds until the underlying state actually changes).
    - `informational_record` — already done, or a by-design skip. Nothing is pending; do not surface it as a problem.
 
