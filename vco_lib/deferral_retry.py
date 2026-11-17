@@ -2018,6 +2018,20 @@ def session_start_owed_check(folder: Path, *, python: str = "") -> list[str]:
         return []
     if not owed:
         return []
+    # A driver whose EVERY condition is at the attempt cap does nothing but
+    # log "attempt cap reached" (the cap gate in `_dispatch_pass` records
+    # nothing) — so do not start an interpreter and a log file for it at
+    # every session start. The owed list is still returned: the hook prints
+    # it. A trail that cannot be counted is not "capped" — spawn and let the
+    # driver decide.
+    try:
+        all_capped = all(
+            attempt_count(Path(folder), cid) >= MAX_ATTEMPTS for cid in owed
+        )
+    except Exception:  # noqa: BLE001 — could-not-count ⇒ spawn
+        all_capped = False
+    if all_capped:
+        return owed
     try:
         spawn_detached(Path(folder), python=python)
     except Exception:  # noqa: BLE001 — a failed spawn is a no-op
