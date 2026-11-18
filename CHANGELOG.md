@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every shipped hook registration states its timeout.** Six registrations (`pre-compact-save`, `agent-alerts-deliver`
+  on two events, `subagent-start-kg-inject`, `subagent-stop-reconcile`, `worktree-guard`) had none and ran on Claude
+  Code's default. They now state 600 s, which is that default: the bound is unchanged, now written down. A project
+  that already has these registrations keeps them as they are.
 - **Every hook clears secrets from one list.** The list of secret environment variables a hook clears before it starts
   anything was copied into every hook, while `.claude/hooks/_lib/scrub-env.sh` described itself as the single source
   and no bash hook read it. Every hook, bash and PowerShell, now loads `_lib/scrub-env.{sh,ps1}` and clears the names

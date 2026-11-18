@@ -53,7 +53,9 @@ try {
 # v0.2.102 W6-C2 (census L2/F7): an agent with its OWN worktree (a
 # worktree-guard record with mode head|snapshot|reservation|
 # reservation_existing) is reconciled from that worktree's git state: skip
-# the shared-tree snapshot. MUST MATCH the .sh sibling.
+# the shared-tree snapshot. The registered timeout is 600 s (the harness
+# default, stated explicitly since v0.2.107), so a slow walk for a
+# shared-tree agent finishes. MUST MATCH the .sh sibling.
 $SkipSnapshot = $false
 $WtrecLib = Join-Path $ScriptDir "_lib/worktree-records.ps1"
 if ($AgentId -and (Test-Path -LiteralPath $WtrecLib)) {

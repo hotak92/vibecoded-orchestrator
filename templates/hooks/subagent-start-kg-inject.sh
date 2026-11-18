@@ -84,9 +84,9 @@ AGENT_ID="$PARSED"
 # WorktreeCreate runs before SubagentStart) is reconciled from that
 # worktree's git state, so the shared-tree hash snapshot is neither needed
 # nor its evidence: skip it. That removes the whole synchronous walk (up to
-# 50 000 files) from every isolated launch. The hook carries no explicit
-# registered timeout any more (harness default), so a slow walk for a
-# shared-tree agent finishes instead of being killed. MUST MATCH the .ps1.
+# 50 000 files) from every isolated launch. The hook's registered timeout is
+# 600 s (the harness default, stated explicitly since v0.2.107), so a slow
+# walk for a shared-tree agent finishes instead of being killed. MUST MATCH the .ps1.
 _SKIP_SNAPSHOT=0
 if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     # shellcheck source=_lib/worktree-records.sh disable=SC1091

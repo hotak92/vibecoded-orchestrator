@@ -147,7 +147,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-compact-save.ps1\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-compact-save.ps1\"",
+            "timeout": 600
           }
         ]
       }
@@ -194,7 +195,8 @@
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\"",
+            "timeout": 600
           }
         ]
       }
@@ -216,7 +218,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-start-kg-inject.ps1\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-start-kg-inject.ps1\"",
+            "timeout": 600
           },
           {
             "type": "command",
@@ -231,7 +234,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-stop-reconcile.ps1\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-stop-reconcile.ps1\"",
+            "timeout": 600
           },
           {
             "type": "command",
@@ -247,7 +251,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.ps1\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.ps1\"",
+            "timeout": 600
           }
         ]
       }
@@ -917,7 +922,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\""
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-alerts-deliver.ps1\"",
+            "timeout": 600
           }
         ]
       }

@@ -375,8 +375,8 @@ write_notice() {
 # empty or partial path. MUST MATCH worktree-guard.ps1.
 # No VCO-side time bound here: `git worktree add` on a very large repo can
 # take minutes and must never be killed mid-run. The WorktreeCreate
-# registration carries no `timeout`, so the harness's own command-hook
-# default (600 s) is the outer bound.
+# registration's explicit `timeout` of 600 s (the harness's own command-hook
+# default, stated since v0.2.107) is the outer bound.
 LANE_PENDING="$PROJECT_ROOT/.claude/state/lane-reservations/pending"
 if [ -n "$WT_NAME" ] && ls "$LANE_PENDING"/res-*.json >/dev/null 2>&1; then
     VCO_VENV_PYTHON=""

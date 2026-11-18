@@ -235,8 +235,8 @@ function Write-Notice([string]$text) {
 # malformed success: the reservation is already claimed, so it is the same
 # loud abort. No VCO-side time bound: `git worktree add` on a very large repo
 # can take minutes and must never be killed mid-run; the WorktreeCreate
-# registration carries no timeout, so the harness default (600 s) is the
-# outer bound.
+# registration's explicit `timeout` of 600 s (the harness's own default,
+# stated since v0.2.107) is the outer bound.
 # No enclosing VCO project => no reservation can exist (same as the .sh
 # sibling, whose `ls` on the root-less path fails quietly).
 $LanePending = ""
