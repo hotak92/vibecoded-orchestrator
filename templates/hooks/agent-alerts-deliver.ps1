@@ -22,8 +22,11 @@
 # no Test-Path/Remove-Item, so the no-pending fast path below pays no cmdlet
 # module autoload for it. Setting a variable to $null removes it for this process
 # and every child it starts.
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     [System.Environment]::SetEnvironmentVariable($v, $null)
+}
 }
 
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
@@ -54,6 +57,7 @@ try {
     }
 } catch { $hasPending = $false }
 if (-not $hasPending) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # Something is pending: the rest lives in _lib/ so PowerShell does not parse
 # it on every no-pending call (see that file). A missing lib is a broken
@@ -64,7 +68,7 @@ if (-not [System.IO.File]::Exists($PendingLib)) {
     $plMsg = "[Subagent alerts] Alerts your subagents hit are pending in $StateDir/agent_alerts_*.jsonl* but cannot be read: .claude/hooks/_lib/agent-alerts-deliver-pending.ps1 is missing (a broken VCO install - repair it with the orchestrator update). Read those files directly."
     [Console]::Error.WriteLine("agent-alerts-deliver: $plMsg")
     $plStdin = ""
-    try { $plStdin = [Console]::In.ReadToEnd() } catch { }
+    try { $plStdin = Read-VcoHookStdin } catch { }
     $plEvent = if ($plStdin -match '"UserPromptSubmit"') { "UserPromptSubmit" } else { "PostToolUse" }
     Write-Output (@{ hookSpecificOutput = @{ hookEventName = $plEvent; additionalContext = $plMsg } } | ConvertTo-Json -Compress -Depth 4)
     exit 0

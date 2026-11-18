@@ -923,7 +923,9 @@ def test_registrations(os_name: str) -> None:
                         ("PostToolUse", "agent-alerts-deliver"),
                         ("UserPromptSubmit", "agent-alerts-deliver")):
         ((_m, h),) = _hooks_for(doc, event, stem)
-        assert "timeout" not in h, f"{event}/{stem} must not carry a killing timeout"
+        # v0.2.107: explicit, never shorter than the harness default (600 s)
+        # these hooks were left on -- still no killing timeout.
+        assert h.get("timeout", 0) >= 600, f"{event}/{stem} must not carry a killing timeout"
 
 
 # ── PreCompact for a subagent leaves the main chat's snapshot alone ───────

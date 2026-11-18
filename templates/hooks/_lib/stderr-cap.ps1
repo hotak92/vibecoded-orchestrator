@@ -34,73 +34,74 @@ $capBytes = if ($env:STDERR_CAP_BYTES) {
 if ([Console]::Error.GetType().Name -eq "CappedTextWriter") { return }
 
 # Build a TextWriter that forwards to the real stderr until the cap is
-# hit, then silently drops further writes. We compile this inline so the
-# helper has no external file dependencies.
-$source = @"
-using System;
-using System.IO;
-using System.Text;
+# hit, then silently drops further writes.
+#
+# A PowerShell class, never C# through Add-Type (v0.2.107): Windows
+# PowerShell 5.1 has no cross-process cache for Add-Type, so every hook fire
+# started csc.exe + cvtres.exe, wrote a temporary assembly and had Defender
+# scan it -- measured ~150 ms per fire under 5.1 and ~310 ms under 7, on
+# every tool call (pre-tool-use loads this file). A PowerShell class is
+# emitted in-process (Reflection.Emit): no compiler process, no file. Same
+# members and the same counting as the C# writer it replaces.
+#
+# The class source is compiled through [scriptblock]::Create inside the
+# try below rather than written as a top-level `class` statement: a
+# top-level class is processed when this file is PARSED, so a host that
+# refuses type definitions (Constrained Language Mode) would fail the
+# dot-source itself -- and with it the hook. Here a refusal is caught and
+# stderr stays uncapped, as the Add-Type failure path did.
+# The abstract Encoding property is overridden by its getter method
+# (get_Encoding), the way PowerShell classes implement abstract properties.
+$vcoCapClassSource = @'
+class CappedTextWriter : System.IO.TextWriter {
+    hidden [System.IO.TextWriter] $Inner
+    hidden [long] $Cap
+    hidden [long] $Written = 0
 
-public class CappedTextWriter : TextWriter
-{
-    private readonly TextWriter _inner;
-    private readonly long _cap;
-    private long _written;
-
-    public CappedTextWriter(TextWriter inner, long cap)
-    {
-        _inner = inner;
-        _cap = cap;
-        _written = 0;
+    CappedTextWriter([System.IO.TextWriter] $inner, [long] $cap) {
+        $this.Inner = $inner
+        $this.Cap = $cap
     }
 
-    public override Encoding Encoding { get { return _inner.Encoding; } }
+    [System.Text.Encoding] get_Encoding() { return $this.Inner.Encoding }
 
-    public override void Write(char value)
-    {
-        if (_written >= _cap) return;
-        _inner.Write(value);
-        _written++;
+    [void] Write([char] $value) {
+        if ($this.Written -ge $this.Cap) { return }
+        $this.Inner.Write($value)
+        $this.Written++
     }
 
-    public override void Write(string value)
-    {
-        if (value == null || _written >= _cap) return;
-        long remaining = _cap - _written;
-        if (value.Length <= remaining)
-        {
-            _inner.Write(value);
-            _written += value.Length;
+    [void] Write([string] $value) {
+        if ($null -eq $value -or $this.Written -ge $this.Cap) { return }
+        $remaining = $this.Cap - $this.Written
+        if ($value.Length -le $remaining) {
+            $this.Inner.Write($value)
+            $this.Written += $value.Length
+        } else {
+            $this.Inner.Write($value.Substring(0, [int]$remaining))
+            $this.Written = $this.Cap
         }
-        else
-        {
-            _inner.Write(value.Substring(0, (int)remaining));
-            _written = _cap;
-        }
     }
 
-    public override void Write(char[] buffer, int index, int count)
-    {
-        if (_written >= _cap) return;
-        long remaining = _cap - _written;
-        int toWrite = (int)Math.Min(count, remaining);
-        _inner.Write(buffer, index, toWrite);
-        _written += toWrite;
+    [void] Write([char[]] $buffer, [int] $index, [int] $count) {
+        if ($this.Written -ge $this.Cap) { return }
+        $remaining = $this.Cap - $this.Written
+        $toWrite = [int][Math]::Min([long]$count, $remaining)
+        $this.Inner.Write($buffer, $index, $toWrite)
+        $this.Written += $toWrite
     }
 
-    public override void Flush() { _inner.Flush(); }
+    [void] Flush() { $this.Inner.Flush() }
 }
-"@
+[CappedTextWriter]
+'@
 
-# Add-Type is the standard PS 5.1+ way to compile inline C#. Re-running
-# in the same session is a no-op (PS caches compiled types by name).
 try {
-    Add-Type -TypeDefinition $source -ErrorAction Stop
+    $vcoCapType = . ([scriptblock]::Create($vcoCapClassSource))
+    [Console]::SetError($vcoCapType::new([Console]::Error, $capBytes))
 } catch {
-    # If compilation fails (extremely unlikely), don't block the hook —
-    # just leave stderr uncapped. Better to risk a freeze than break a
-    # hook on a platform we didn't anticipate.
+    # If the type cannot be defined (a locked-down host), don't block the
+    # hook — just leave stderr uncapped. Better to risk a freeze than break
+    # a hook on a platform we didn't anticipate.
     return
 }
-
-[Console]::SetError([CappedTextWriter]::new([Console]::Error, $capBytes))

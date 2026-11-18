@@ -3,10 +3,14 @@
 # behaviour must match the post-compact.sh sibling).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # post-compact.ps1
 # Fires on PostCompact event — after context compaction completes.
 # Logs the event to <metrics dir>/compactions.jsonl and notifies.
@@ -31,7 +35,7 @@ if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # Read stdin payload (may be empty).
 $Payload = ""
-try { $Payload = [Console]::In.ReadToEnd() } catch { }
+try { $Payload = Read-VcoHookStdin } catch { }
 
 # `trigger` is a label only (logged + shown in the notification) and never
 # reaches a file path, so it keeps its own lightweight parse. session_id DOES

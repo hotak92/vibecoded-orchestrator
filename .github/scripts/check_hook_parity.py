@@ -100,6 +100,11 @@ PS1_ONLY_LIB = frozenset({
     # is nothing to mirror. Must also be listed in the ratchet test's
     # PS1_ONLY_LIB.
     "run-python-program.ps1",
+    # v0.2.107: the ONE UTF-8 payload reader of the PowerShell hooks. .NET
+    # decodes [Console]::In in the console code page (OEM on Windows); bash
+    # reads the payload's bytes as they are, so there is nothing to mirror.
+    # Must also be listed in the ratchet test's PS1_ONLY_LIB.
+    "hook-stdin.ps1",
     # v0.2.102 W6-ALERTS2: the pending path of agent-alerts-deliver.ps1, out
     # of the hook file so PowerShell does not parse it on every tool call
     # (matcher *). bash reads a script as it runs it — nothing to split.

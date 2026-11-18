@@ -94,6 +94,8 @@
 #                                  effect on the real no-path payload).
 
 # Scrub sensitive env vars before any subprocess spawning.
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 
 # Global bypass — echo nothing (the harness uses its own default) and exit 0.
@@ -373,8 +375,8 @@ write_notice() {
 # empty or partial path. MUST MATCH worktree-guard.ps1.
 # No VCO-side time bound here: `git worktree add` on a very large repo can
 # take minutes and must never be killed mid-run. The WorktreeCreate
-# registration carries no `timeout`, so the harness's own command-hook
-# default (600 s) is the outer bound.
+# registration's explicit `timeout` of 600 s (the harness's own command-hook
+# default, stated since v0.2.107) is the outer bound.
 LANE_PENDING="$PROJECT_ROOT/.claude/state/lane-reservations/pending"
 if [ -n "$WT_NAME" ] && ls "$LANE_PENDING"/res-*.json >/dev/null 2>&1; then
     VCO_VENV_PYTHON=""

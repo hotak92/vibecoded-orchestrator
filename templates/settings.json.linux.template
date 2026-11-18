@@ -147,7 +147,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-save.sh\""
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/pre-compact-save.sh\"",
+            "timeout": 600
           }
         ]
       }
@@ -194,7 +195,8 @@
           },
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\""
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\"",
+            "timeout": 600
           }
         ]
       }
@@ -216,7 +218,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-kg-inject.sh\""
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-start-kg-inject.sh\"",
+            "timeout": 600
           },
           {
             "type": "command",
@@ -231,7 +234,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-stop-reconcile.sh\""
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/subagent-stop-reconcile.sh\"",
+            "timeout": 600
           },
           {
             "type": "command",
@@ -247,7 +251,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/worktree-guard.sh\""
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/worktree-guard.sh\"",
+            "timeout": 600
           }
         ]
       }
@@ -917,7 +922,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\""
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/agent-alerts-deliver.sh\"",
+            "timeout": 600
           }
         ]
       }

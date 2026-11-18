@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every shipped hook registration states its timeout.** Six registrations (`pre-compact-save`, `agent-alerts-deliver`
+  on two events, `subagent-start-kg-inject`, `subagent-stop-reconcile`, `worktree-guard`) had none and ran on Claude
+  Code's default. They now state 600 s, which is that default: the bound is unchanged, now written down. A project
+  that already has these registrations keeps them as they are.
+- **Every hook clears secrets from one list.** The list of secret environment variables a hook clears before it starts
+  anything was copied into every hook, while `.claude/hooks/_lib/scrub-env.sh` described itself as the single source
+  and no bash hook read it. Every hook, bash and PowerShell, now loads `_lib/scrub-env.{sh,ps1}` and clears the names
+  listed there; its own copy of the list runs only when that file is missing.
+- **Windows hooks read their input as UTF-8.** Claude Code sends a hook its input as UTF-8, but the PowerShell hooks
+  decoded it in the console code page (850, 437, ...), so a path with a non-ASCII character reached them mangled: an
+  unread file was overwritten without the Build Anchor block, the pre-edit backup and the credential scan looked at a
+  file that does not exist, the command lean-ctx runs was rewritten into different bytes, and the kill guard changed
+  the text of the command it wrapped. Every hook now reads its input through one helper
+  (`.claude/hooks/_lib/hook-stdin.ps1`) that decodes it as UTF-8 and writes its output, and what it pipes to Python, in
+  UTF-8 as well. A user whose Windows account name has an accent had all of this on every project.
+- **Windows hooks no longer compile C# on every fire.** The stderr cap that most PowerShell hooks load (among them
+  the one that runs on every tool call) built its writer with `Add-Type`, so each fire started `csc.exe` and
+  `cvtres.exe` and wrote a temporary DLL for Defender to scan (about 150 ms per fire under Windows PowerShell 5.1,
+  310 ms under PowerShell 7). The writer is now a PowerShell class, defined in-process with no compiler; the cap,
+  its 1 MB default and `STDERR_CAP_DISABLE` behave as before.
 - **A count that cannot be read never authorises a delete.** Four copies of the Weaviate object count read an
   error-shaped reply (HTTP 200 with an `errors` array and a null class field: a shard not ready, memory pressure, a
   timeout inside the server) as "0 objects", and 0 was the licence to drop. There is now one count

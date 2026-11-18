@@ -14,10 +14,14 @@
 # MATCH it.
 
 # Scrub sensitive env vars before any subprocess spawning.
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 $ScriptDir = $PSScriptRoot
 
@@ -35,7 +39,7 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
 # Parse the SubagentStart payload: agent identity ONLY (no prompt/task
 # text -- that is why the retired KG half could never fire).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { exit 0 }
 
 $AgentId = ""
@@ -49,7 +53,9 @@ try {
 # v0.2.102 W6-C2 (census L2/F7): an agent with its OWN worktree (a
 # worktree-guard record with mode head|snapshot|reservation|
 # reservation_existing) is reconciled from that worktree's git state: skip
-# the shared-tree snapshot. MUST MATCH the .sh sibling.
+# the shared-tree snapshot. The registered timeout is 600 s (the harness
+# default, stated explicitly since v0.2.107), so a slow walk for a
+# shared-tree agent finishes. MUST MATCH the .sh sibling.
 $SkipSnapshot = $false
 $WtrecLib = Join-Path $ScriptDir "_lib/worktree-records.ps1"
 if ($AgentId -and (Test-Path -LiteralPath $WtrecLib)) {

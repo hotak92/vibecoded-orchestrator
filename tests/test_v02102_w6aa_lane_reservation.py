@@ -575,14 +575,15 @@ def test_worktree_add_is_never_time_bounded(pr, monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.parametrize("os_name", ["linux", "windows"])
-def test_worktree_create_registration_has_no_explicit_timeout(os_name: str) -> None:
-    """A1: the guard's WorktreeCreate registration carries no `timeout`, so
-    the harness default (600 s) applies rather than a VCO-chosen kill."""
+def test_worktree_create_registration_never_cuts_below_the_harness_default(os_name: str) -> None:
+    """A1: the guard's WorktreeCreate registration is never cut below the
+    harness default (600 s) by a VCO-chosen kill; since v0.2.107 it states
+    that default explicitly."""
     doc = json.loads((REPO_ROOT / "templates" / f"settings.json.{os_name}.template")
                      .read_text(encoding="utf-8"))
     guards = [h for g in doc["hooks"]["WorktreeCreate"] for h in g["hooks"]
               if "worktree-guard" in h.get("command", "")]
-    assert len(guards) == 1 and "timeout" not in guards[0], guards
+    assert len(guards) == 1 and guards[0].get("timeout", 0) >= 600, guards
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
