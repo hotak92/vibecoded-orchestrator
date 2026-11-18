@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every hook clears secrets from one list.** The list of secret environment variables a hook clears before it starts
+  anything was copied into every hook, while `.claude/hooks/_lib/scrub-env.sh` described itself as the single source
+  and no bash hook read it. Every hook, bash and PowerShell, now loads `_lib/scrub-env.{sh,ps1}` and clears the names
+  listed there; its own copy of the list runs only when that file is missing.
 - **Windows hooks read their input as UTF-8.** Claude Code sends a hook its input as UTF-8, but the PowerShell hooks
   decoded it in the console code page (850, 437, ...), so a path with a non-ASCII character reached them mangled: an
   unread file was overwritten without the Build Anchor block, the pre-edit backup and the credential scan looked at a

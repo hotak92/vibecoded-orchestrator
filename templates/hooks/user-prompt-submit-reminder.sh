@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Parity-touch 2026-11-11 (v0.2.106): the .ps1 sibling now runs its embedded Python body through _lib/run-python-program.ps1 (Windows PowerShell 5.1 drops embedded double quotes from `python -c` arguments — SyntaxError on every run); no .sh-side behaviour change.
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # Context preservation reminder - triggers on output volume (work units).

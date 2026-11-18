@@ -7,18 +7,18 @@
 # hooks (risk R10): adding a new secret env var meant editing 80 files,
 # and a single miss is a credential-leak surface.
 #
-# Single consumer:
+# Consumers (v0.2.107):
+#   * Every templates/hooks/*.sh sources this file at its top and calls
+#     vct_scrub_secret_env; the hook's inline `unset ...` line runs only when
+#     this file is missing or fails to load (a broken install), as the .ps1
+#     hooks do with _lib/scrub-env.ps1.
 #   * The parity gate (tests/test_scrub_env_parity_v0273.py) reads
 #     ``VCT_SCRUB_SECRET_KEYS`` as the canonical set and asserts every hook's
-#     inline `unset ... GITHUB_TOKEN ...` line covers EXACTLY it — so a hook
-#     that drifts from the list fails CI.
+#     inline fallback covers EXACTLY it.
 #
-# HK-2 (v0.2.75): the `vct_scrub_secret_env()` HELPER FUNCTION that used to
-# live here was DELETED — it had ZERO callers (every hook carries its own
-# inline `unset ...` line, enforced by the parity gate, so hooks stay
-# dependency-free single files). Keeping a never-called function around was
-# dead code that implied a sourcing contract no hook actually uses. The
-# canonical VALUE below stays; the parity gate is the enforcement.
+# HK-2 (v0.2.75) had deleted an uncalled `vct_scrub_secret_env`; v0.2.107
+# brings it back WITH its callers, so this file is the live list rather
+# than a reference copy (tests/test_v02107_scrub_env_lib_sourced.py).
 #
 # MUST MATCH ``_lib/scrub-env.ps1::$VctScrubSecretKeys`` and the inline
 # unset lists in every templates/hooks/*.sh (enforced by the parity gate).
@@ -26,5 +26,17 @@
 # points at every hook whose inline list needs the same key.
 
 # Canonical list — keep sorted-by-topic, one string, space-separated.
+# Internal (docs/CONFIGURATION.md): assigned here, never read from the
+# environment, and not exported -- no child needs the list.
 VCT_SCRUB_SECRET_KEYS="SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY"
-export VCT_SCRUB_SECRET_KEYS
+
+# Unset every key in the canonical list (this shell and every child it
+# starts). Always succeeds, so a hook's `... && vct_scrub_secret_env ||
+# <inline unset>` takes the fallback only when this file did not load.
+vct_scrub_secret_env() {
+    local _vct_k
+    for _vct_k in $VCT_SCRUB_SECRET_KEYS; do
+        unset "$_vct_k" 2>/dev/null
+    done
+    return 0
+}

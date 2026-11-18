@@ -17,11 +17,8 @@
 $PSScriptRootLocal = $PSScriptRoot
 $LibDir = Join-Path $PSScriptRootLocal "_lib"
 
-$ScrubLib = Join-Path $LibDir "scrub-env.ps1"
-if (Test-Path $ScrubLib) {
-    . $ScrubLib
-    Invoke-VctScrubSecretEnv
-} else {
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
     foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
         if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
     }

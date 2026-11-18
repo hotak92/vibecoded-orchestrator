@@ -4,6 +4,8 @@
 # parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
 # audit confirmed — every .sh-side guard check is present in this .ps1 sibling:
 #   - Sensitive env-var scrub (foreach loop below, lines 3-5) mirrors .sh
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 #     `unset SUPABASE_KEY ...` (line 4 of sibling).
 #   - VCT_DISABLE_HOOKS short-circuit (line 6) mirrors `.sh` line 5.
 #   - Tool-name == "Bash" early-out (line 33) mirrors `.sh` line 55.
@@ -18,6 +20,7 @@
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+}
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 . "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)

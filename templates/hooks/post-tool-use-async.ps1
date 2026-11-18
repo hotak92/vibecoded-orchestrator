@@ -88,6 +88,8 @@
 #                           (v0.2.102 W6-F; the retired "if" key widened)
 
 # Scrub sensitive env vars before any subprocess spawning.
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 $secretEnvNames = @(
     "SUPABASE_KEY", "SUPABASE_URL", "GITHUB_TOKEN", "GH_TOKEN",
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY",
@@ -96,6 +98,7 @@ $secretEnvNames = @(
 )
 foreach ($name in $secretEnvNames) {
     if (Test-Path "Env:$name") { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+}
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 . "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
