@@ -68,12 +68,13 @@ if (Test-Path $ScrubLib) {
 }
 
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 if ($env:VCO_WAIT_GUARD) {
     $wg = $env:VCO_WAIT_GUARD.Trim().ToLowerInvariant()
     if ($wg -in @('off','0','false','no')) { exit 0 }
 }
 
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if ([string]::IsNullOrWhiteSpace($HookStdin)) { exit 0 }
 
 $FindPy = Join-Path $LibDir "find-python.ps1"

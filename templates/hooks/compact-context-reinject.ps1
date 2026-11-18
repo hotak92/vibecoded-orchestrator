@@ -4,6 +4,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # compact-context-reinject.ps1
 # Fires on SessionStart matchers "compact" and "startup"
 # (v0.2.102 W6-F: the ORCHESTRATOR template documented "SessionStart
@@ -40,7 +41,7 @@ if (-not $ProjectDir) { exit 0 }
 # split: shared CONTEXT_STATE.md uncapped at START, per-session file (if
 # present) injected right after with a 120-line sub-cap.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
 
 # v0.2.102 W6-F (items 5+6): which SessionStart source fired us. The

@@ -30,7 +30,8 @@ function Invoke-AgentAlertsPendingDelivery {
     }
 
     $HookStdin = ""
-    try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+    # Read-VcoHookStdin comes from _lib/hook-stdin.ps1, loaded by agent-alerts-deliver.ps1.
+    try { $HookStdin = Read-VcoHookStdin } catch { }
     if (-not $HookStdin) { return }
 
     # The stderr cap is loaded only once there is something to say, never on

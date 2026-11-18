@@ -39,6 +39,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
@@ -70,7 +71,7 @@ if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # --- Hook input -----------------------------------------------------------
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { exit 0 }
 
 $ToolName = ""

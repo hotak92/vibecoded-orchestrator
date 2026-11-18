@@ -18,6 +18,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 $ScriptDir = $PSScriptRoot
 
@@ -72,7 +73,7 @@ if (-not (Test-Path $Matcher)) {
 # field. v0.2.29: also extract `session_id` so the matcher can dedup
 # already-suggested items across prompts in the same session.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { exit 0 }
 
 # v0.2.102 W6-C1 (F14): a background subagent's completion arrives in the

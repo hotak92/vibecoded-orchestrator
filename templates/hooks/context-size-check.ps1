@@ -7,6 +7,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # Context Size Check Hook (PowerShell port)
 # Monitor CONTEXT_STATE.md size and surface a warning when threshold exceeded.
 
@@ -88,7 +89,7 @@ $MemoryMaxLines = Resolve-Threshold -Key "MEMORY_MAX_LINES" -Default 200
 # Defense-in-depth (review C-1): the helper sanitises the id to [A-Za-z0-9_-]
 # before it reaches the file path below (hostile `/`/`..` → "default").
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
 
 # Test-ContextSizeThreshold: emit a size alert/notice for $File against the

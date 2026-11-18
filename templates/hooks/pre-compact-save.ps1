@@ -8,6 +8,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # pre-compact-save.ps1
 # Fires BEFORE every context compaction (PreCompact event, matcher "*" --
 # v0.2.102 W6-D widened it from "auto": the vendor hooks doc gives PreCompact
@@ -34,7 +35,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # (including session_id and transcript_path) via stdin JSON; CLAUDE_*
 # env vars are NOT populated by Claude Code (verified 2026-05-08).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { $HookStdin = "{}" }
 
 $SessionId = ""

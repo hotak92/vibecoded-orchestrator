@@ -6,6 +6,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
 #   Calls .claude/scripts/kg-sync (writes to the project's own
@@ -77,7 +78,7 @@ function Add-Nudge([string]$msg) {
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $EditedFile = ""
 # V52-L.2 Fix 2b: parse subagent identity + session_id. We don't write
 # a JSONL log directly, but the kg-sync / code-graph-incremental child

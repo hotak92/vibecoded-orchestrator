@@ -6,6 +6,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # config-change-audit.ps1
 # Fires on ConfigChange event — logs all settings changes for audit trail.
 # Background: does NOT write to stdout (not injected into context).
@@ -18,7 +19,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # `old_value`, `new_value`) without re-modifying this hook. Mirrors
 # the .sh sibling's payload-capture schema.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 
 # Re-parse stdin as a structured PSCustomObject; emit the original
 # payload as a value under `payload`. ConvertFrom-Json gives us the

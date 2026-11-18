@@ -6,6 +6,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # diff-context-inject.ps1
 # Diff-based context injection - only inject CHANGED sections of CONTEXT_STATE.md.
 # First prompt: create baseline snapshot. The FULL injection the baseline
@@ -39,7 +40,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # vco_hook_session_id. This hook always wants a key, so an empty parse
 # collapses to "default" at the $SessionId assignment below.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $SessionIdFromStdin = Get-VcoHookSessionId -Stdin $HookStdin
 
 # Snapshot state lives under the project (gitignored .claude/state/) so it

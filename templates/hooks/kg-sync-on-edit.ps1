@@ -33,11 +33,12 @@ if (Test-Path $ScrubLib) {
 
 # (a) Guard.
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # Read the untrusted JSON payload from stdin.
 $HookStdin = ""
 try {
-    $HookStdin = [Console]::In.ReadToEnd()
+    $HookStdin = Read-VcoHookStdin
 } catch {
     exit 0
 }

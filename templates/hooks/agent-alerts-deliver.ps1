@@ -54,6 +54,7 @@ try {
     }
 } catch { $hasPending = $false }
 if (-not $hasPending) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # Something is pending: the rest lives in _lib/ so PowerShell does not parse
 # it on every no-pending call (see that file). A missing lib is a broken
@@ -64,7 +65,7 @@ if (-not [System.IO.File]::Exists($PendingLib)) {
     $plMsg = "[Subagent alerts] Alerts your subagents hit are pending in $StateDir/agent_alerts_*.jsonl* but cannot be read: .claude/hooks/_lib/agent-alerts-deliver-pending.ps1 is missing (a broken VCO install - repair it with the orchestrator update). Read those files directly."
     [Console]::Error.WriteLine("agent-alerts-deliver: $plMsg")
     $plStdin = ""
-    try { $plStdin = [Console]::In.ReadToEnd() } catch { }
+    try { $plStdin = Read-VcoHookStdin } catch { }
     $plEvent = if ($plStdin -match '"UserPromptSubmit"') { "UserPromptSubmit" } else { "PostToolUse" }
     Write-Output (@{ hookSpecificOutput = @{ hookEventName = $plEvent; additionalContext = $plMsg } } | ConvertTo-Json -Compress -Depth 4)
     exit 0

@@ -7,6 +7,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # post-tool-security.ps1
 # Fires after Write/Edit. Non-blocking (always exits 0).
 # Scans the text the call INTRODUCED for credentials and notifies.
@@ -20,7 +21,7 @@ if (Test-Path $EmitContextLib) { . $EmitContextLib }
 # similar env vars don't exist — settings.json substitutes to "". Verified
 # empirically 2026-05-08 via stdin-capture diagnostic.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $EditedFile = ""
 # v0.2.76 P5 (hook-latency parity): the bash sibling consolidated its stdin
 # parse from FOUR `python -c` spawns into ONE NUL-delimited decode (each

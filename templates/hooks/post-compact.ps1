@@ -7,6 +7,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # post-compact.ps1
 # Fires on PostCompact event — after context compaction completes.
 # Logs the event to <metrics dir>/compactions.jsonl and notifies.
@@ -31,7 +32,7 @@ if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # Read stdin payload (may be empty).
 $Payload = ""
-try { $Payload = [Console]::In.ReadToEnd() } catch { }
+try { $Payload = Read-VcoHookStdin } catch { }
 
 # `trigger` is a label only (logged + shown in the notification) and never
 # reaches a file path, so it keeps its own lightweight parse. session_id DOES

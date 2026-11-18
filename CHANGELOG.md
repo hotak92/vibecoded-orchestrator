@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows hooks read their input as UTF-8.** Claude Code sends a hook its input as UTF-8, but the PowerShell hooks
+  decoded it in the console code page (850, 437, ...), so a path with a non-ASCII character reached them mangled: an
+  unread file was overwritten without the Build Anchor block, the pre-edit backup and the credential scan looked at a
+  file that does not exist, the command lean-ctx runs was rewritten into different bytes, and the kill guard changed
+  the text of the command it wrapped. Every hook now reads its input through one helper
+  (`.claude/hooks/_lib/hook-stdin.ps1`) that decodes it as UTF-8 and writes its output, and what it pipes to Python, in
+  UTF-8 as well. A user whose Windows account name has an accent had all of this on every project.
 - **Windows hooks no longer compile C# on every fire.** The stderr cap that most PowerShell hooks load (among them
   the one that runs on every tool call) built its writer with `Add-Type`, so each fire started `csc.exe` and
   `cvtres.exe` and wrote a temporary DLL for Defender to scan (about 150 ms per fire under Windows PowerShell 5.1,

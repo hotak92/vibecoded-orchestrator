@@ -59,12 +59,13 @@ foreach ($k in @('SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI
 
 # 1. Global kill-switch (one switch for "turn off all VCT hook side-effects").
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
-# Capture the PreToolUse stdin payload ONCE (reading [Console]::In drains
+# Capture the PreToolUse stdin payload ONCE (reading stdin drains
 # it), FIRST: the kill-guard stage below needs it before the lean-ctx knobs
 # are consulted. MUST MATCH lean-ctx-rewrite.sh ($_lc_cmd).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { exit 0 }
 
 # === STAGE 1: kill guard (v0.2.105) ===========================================

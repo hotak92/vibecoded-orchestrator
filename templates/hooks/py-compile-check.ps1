@@ -3,6 +3,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # py-compile-check.ps1 -- PostToolUse syntax check for Python writes (Windows).
 #
 # P2a (v0.2.75): replaces the INLINE powershell `python -m py_compile` entry
@@ -21,7 +22,7 @@ if (-not $PY) { exit 0 }  # No Python -- nothing to check with.
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 
 # Parse file_path and distinguish malformed-stdin (NOT a syntax error ->
 # silent exit 0) from a real py_compile failure (surface the true message).

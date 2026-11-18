@@ -7,6 +7,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # stop-failure-notify.ps1
 # Fires on StopFailure event — when a turn ends due to API error.
 # Sends urgent desktop notification and logs the failure.
@@ -240,7 +241,7 @@ main()
 '@
 
 $Payload = ""
-try { $Payload = [Console]::In.ReadToEnd() } catch { }
+try { $Payload = Read-VcoHookStdin } catch { }
 
 # Parse + dedup + ledger in ONE interpreter run. The old hook spent three
 # separate `& $PY -c` calls re-parsing the payload and built the ledger line

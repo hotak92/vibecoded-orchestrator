@@ -20,6 +20,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # pre-vercel-token-guard.ps1
 # PreToolUse hook: Block `vercel --token=...` invocations that would leak the
 # token back into stdout (Claude Code shows tool output to the user/agent).
@@ -31,7 +32,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY —
 # verified empirically 2026-05-08 via stdin-capture diagnostic.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $ToolName = ""
 $cmd = ""
 try {

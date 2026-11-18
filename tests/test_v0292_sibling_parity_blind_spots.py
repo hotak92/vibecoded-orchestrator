@@ -58,6 +58,11 @@ PS1_ONLY_LIB: frozenset[str] = frozenset({
     # quotes, bash heredocs have no quoting to lose. Mirrored in
     # `.github/scripts/check_hook_parity.py`.
     "run-python-program.ps1",
+    # v0.2.107: the ONE UTF-8 payload reader of the PowerShell hooks; .NET
+    # decodes [Console]::In in the console code page, bash reads the bytes as
+    # they are -- nothing to mirror. Mirrored in
+    # `.github/scripts/check_hook_parity.py`.
+    "hook-stdin.ps1",
 })
 
 

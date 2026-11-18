@@ -13,6 +13,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # v0.2.105: the hook's start, for the router's run deadline AND its hard
 # end-to-end deadline (the harness timeout counts from HERE).
@@ -46,7 +47,7 @@ $env:CLAUDE_PROJECT_DIR = $ProjectRoot
 # stdin passthrough: the router re-parses the full hook payload itself
 # (query text never travels through argv, R31 privacy discipline).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 
 # The broken-install notice is keyed per SESSION -- extract the payload's
 # session_id the pattern way (no JSON parser needed at this stage). The

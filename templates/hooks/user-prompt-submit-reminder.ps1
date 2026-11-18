@@ -4,6 +4,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # user-prompt-submit-reminder.ps1
 # Context preservation reminder triggered on output volume (work units).
 #
@@ -36,7 +37,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # $env:CLAUDE_TOOL_NAME is always empty. Verified empirically 2026-05-08
 # via stdin-capture diagnostic.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop

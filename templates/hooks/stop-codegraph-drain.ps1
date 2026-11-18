@@ -19,6 +19,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 if (Test-Path "$PSScriptRoot/_lib/stderr-cap.ps1") { . "$PSScriptRoot/_lib/stderr-cap.ps1" }
 if (Test-Path "$PSScriptRoot/_lib/resolve-powershell.ps1") { . "$PSScriptRoot/_lib/resolve-powershell.ps1" }
@@ -43,7 +44,7 @@ if ($env:VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS -match '^\d+$') {
 }
 
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop

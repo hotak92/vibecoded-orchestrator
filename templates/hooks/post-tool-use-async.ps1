@@ -98,6 +98,7 @@ foreach ($name in $secretEnvNames) {
     if (Test-Path "Env:$name") { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # ROUTING TABLE - the ONE declaration (parsed by the loop below; the row
 # lines are mirrored byte-for-byte in the .sh sibling's ROUTE_TABLE and both
@@ -232,7 +233,7 @@ $TmpInput = $null
 $WorkDir = $null
 try {
     # Read stdin ONCE to a temp file every sub-hook shares.
-    $payload = [Console]::In.ReadToEnd()
+    $payload = Read-VcoHookStdin
     if (-not $payload) { exit 0 }
     $TmpInput = [System.IO.Path]::GetTempFileName()
     [System.IO.File]::WriteAllText($TmpInput, $payload)

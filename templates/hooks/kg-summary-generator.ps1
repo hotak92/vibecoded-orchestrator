@@ -8,6 +8,7 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 
 # VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
@@ -49,7 +50,7 @@ if (-not (Test-Path $generator)) { exit 0 }
 # always evaluated to empty and the fallback path silently skipped to
 # the MCP branch. Verified via stdin-capture diagnostic.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 
 $FilePath = ""
 # Single Python extractor handles both Edit/Write (tool_input.file_path)
