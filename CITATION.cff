@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use VibeCoded Orchestrator in your work, please cite it as below."
+type: software
+title: "VibeCoded Orchestrator"
+abstract: "A local knowledge graph and code graph for Claude Code, with automation hooks, MCP servers and a launcher GUI, so the assistant keeps your project's decisions and structure between sessions."
+authors:
+  - name: "VibeCoded Tools"
+license: AGPL-3.0-or-later
+repository-code: "https://github.com/hotak92/vibecoded-orchestrator"
+url: "https://vibecodedtools.com"
+keywords:
+  - claude-code
+  - knowledge-graph
+  - code-graph
+  - mcp
+  - ai-coding
+  - persistent-memory

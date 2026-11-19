@@ -288,6 +288,40 @@ Entire repository is **[AGPL-3.0-or-later](LICENSE)**. No source-level dual lice
 
 **Commercial-module model**: free source under AGPL, plus optional paid binaries delivered via signed-URL CDN. Paid modules ship as pre-compiled, Ed25519-signed artifacts gated by Lemon Squeezy — subscribers receive binaries, not source. The license validator in this repo (`VCThelpers/`) is AGPL like the rest; the trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
 
+## FAQ
+
+**What is VibeCoded Orchestrator?**
+A local knowledge graph and code graph for Claude Code, plus hooks, MCP servers and a launcher GUI, so Claude stops losing your project's decisions and structure between sessions.
+
+**Doesn't Claude Code already have memory?**
+Claude Code starts every session with a fresh context window. Its built-in `CLAUDE.md` files and auto memory cover short rules and notes. VCO adds a searchable knowledge graph and a code graph on top, stored as plain markdown on your disk. See [How to write a good CLAUDE.md](https://vibecodedtools.com/blog/come-scrivere-claude-md) and [How to give Claude Code persistent memory](https://vibecodedtools.com/blog/memoria-persistente-claude-code).
+
+**Is it free and open source?**
+Yes. The whole repository is AGPL-3.0-or-later with no feature gating in the open source code. Companies that cannot comply with the AGPL can get a commercial license (see [Licensing](#licensing)).
+
+**Does my code leave my machine?**
+VCO runs entirely on your machine. Telemetry is opt-in and off unless you enable it; see [Telemetry](#telemetry) for exactly what is and is not collected.
+
+**Which operating systems are supported?**
+Validated end-to-end on Linux and Windows. macOS is Tier-2: install scripts are ready, but there is no signed binary yet.
+
+**Does it work with the VS Code extension, the desktop app and the CLI?**
+Yes, all three Claude Code surfaces. The VS Code extension is the primary target. See [Compatibility](#compatibility).
+
+**How do I install it?**
+Follow the [QuickStart](https://vibecodedtools.com/quickstart), or the [Install](#install-5-min--first-run-downloads) section above.
+
+## Guides
+
+- [QuickStart: install VibeCoded Orchestrator](https://vibecodedtools.com/quickstart)
+- [How to give Claude Code persistent memory](https://vibecodedtools.com/blog/memoria-persistente-claude-code)
+- [Why Claude Code forgets context between sessions](https://vibecodedtools.com/blog/claude-code-dimentica-il-contesto)
+- [How to write a good CLAUDE.md](https://vibecodedtools.com/blog/come-scrivere-claude-md)
+- [How to cut token use and context bloat in Claude Code](https://vibecodedtools.com/blog/ridurre-token-contesto-claude-code)
+- [Using Claude Code as a team](https://vibecodedtools.com/blog/claude-code-in-team-contesto-condiviso)
+- [Knowledge graph vs vector database (classic RAG)](https://vibecodedtools.com/blog/knowledge-graph-vs-rag-classico)
+- [Code graphs for AI coding](https://vibecodedtools.com/blog/code-graphs-for-ai-coding)
+
 ## Contributing
 
 Small fixes and bug reports especially welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for workflow and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
@@ -307,6 +341,8 @@ Small fixes and bug reports especially welcome. See [CONTRIBUTING.md](CONTRIBUTI
 
 - [Report Issues](https://github.com/hotak92/vibecoded-orchestrator/issues)
 - [vibecodedtools.com](https://vibecodedtools.com)
+- [QuickStart](https://vibecodedtools.com/quickstart)
+- [Blog](https://vibecodedtools.com/blog)
 
 ---
 
