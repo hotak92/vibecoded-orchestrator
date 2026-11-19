@@ -177,6 +177,14 @@ impl Db {
         let conn = Connection::open(&path)
             .map_err(|e| format!("open {}: {}", path.display(), e))?;
 
+        // A-014 (v0.2.107): a NEW launcher.db is created with incremental
+        // auto-vacuum, so the RL retention pass can hand the pages it frees
+        // back to the file system (`Db::incremental_vacuum`). SQLite applies
+        // the mode only before the first table exists; on an existing DB this
+        // statement changes nothing (the mode switches at its next full
+        // VACUUM).
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .map_err(|e| format!("set auto_vacuum: {}", e))?;
         apply_connection_pragmas(&conn)?;
 
         migrations::apply(&conn)?;
