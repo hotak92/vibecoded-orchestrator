@@ -54,6 +54,10 @@ and ``git checkout`` on an untracked path would either error or, worse, be
 widened by a careless caller into a delete. The dirty-set filter is the
 destructive gate for this module and both of its legs are unit-tested.
 
+The one exception is :func:`restore_missing_from_backups` (UPDATER-02): it
+renames a dead PID's ``.old-<pid>`` backup back to its canonical name, and only
+when that canonical file is missing — it never deletes and never overwrites.
+
 Everything here is best-effort: a repair failure must never abort an install.
 """
 
@@ -71,8 +75,10 @@ from typing import Callable, Iterable, Optional
 
 __all__ = [
     "RepairOutcome",
+    "decide_backup_restore",
     "dist_dirty_paths",
     "repair_dist_binaries",
+    "restore_missing_from_backups",
     "restore_paths_from_head",
     "run_repair_leg",
     "scan_for_launcher_pid",
@@ -509,3 +515,118 @@ def scan_for_launcher_pid(
         p for p in pids if p > 0 and p != own and p != (exclude_pid or -1)
     )
     return candidates[0] if candidates else None
+
+
+# ---------------------------------------------------------------------------
+# UPDATER-02 (v0.2.107): restore a canonical binary from its `.old-<pid>` backup
+# ---------------------------------------------------------------------------
+#
+# The Windows update renames ``vct-launcher.exe`` / ``vct-hub.exe`` to
+# ``<name>.old-<pid>`` so ``git pull`` can write the canonical path; the
+# launcher refills the path right after the git operation. When the launcher
+# process dies before that, the bytes sit next to an empty canonical path. The
+# session-start hooks (through :func:`vco_lib.hub_ensure.find_dist_binary`)
+# and ``start-launcher.bat`` put them back with the function below.
+#
+# The launcher's own boot sweep applies the SAME rule in Rust
+# (``binary_freshness.rs::decide_stale_sibling``, must match
+# :func:`decide_backup_restore`): it has to work when this venv does not.
+
+_BACKUP_MARK = ".old-"
+
+
+def decide_backup_restore(*, canonical_exists: bool, backup_pid_alive: bool) -> bool:
+    """Restore a ``.old-<pid>`` backup onto its canonical name?
+
+    Only when the canonical path is MISSING (a present file is never
+    overwritten) and the PID that made the backup is gone (a live PID is an
+    update in progress, which refills the path itself). Must match
+    ``binary_freshness.rs::decide_stale_sibling``'s restore leg.
+    """
+    return (not canonical_exists) and (not backup_pid_alive)
+
+
+def _backup_pid(name: str, canonical_name: str) -> Optional[int]:
+    prefix = canonical_name + _BACKUP_MARK
+    if not name.startswith(prefix):
+        return None
+    tail = name[len(prefix):]
+    return int(tail) if tail.isdigit() else None
+
+
+def restore_missing_from_backups(
+    directory: Path,
+    names: Iterable[str],
+    *,
+    pid_alive: Optional[Callable[[int], bool]] = None,
+) -> list[Path]:
+    """Put back every binary in ``directory`` whose canonical file is missing.
+
+    For each canonical ``name`` that is absent, the newest (by mtime)
+    ``<name>.old-<pid>`` whose PID is no longer alive is renamed back to
+    ``name``. Returns the canonical paths restored. Never raises: an
+    unreadable directory or a failed rename restores nothing for that name.
+    """
+    if pid_alive is None:
+        from vco_lib.deferral_probes import pid_is_alive as pid_alive
+    directory = Path(directory)
+    try:
+        entries = [p for p in directory.iterdir() if p.is_file()]
+    except OSError:
+        return []
+    restored: list[Path] = []
+    for name in names:
+        canonical = directory / name
+        canonical_exists = os.path.lexists(canonical)
+        backups: list[tuple[float, Path, int]] = []
+        for entry in entries:
+            pid = _backup_pid(entry.name, name)
+            if pid is None:
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            backups.append((mtime, entry, pid))
+        for _mtime, backup, pid in sorted(backups, key=lambda b: b[0], reverse=True):
+            if not decide_backup_restore(
+                canonical_exists=canonical_exists, backup_pid_alive=pid_alive(pid)
+            ):
+                continue
+            try:
+                os.replace(backup, canonical)
+            except OSError:
+                continue
+            restored.append(canonical)
+            break
+    return restored
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.dist_binary_repair",
+        description="Dist-binary repair helpers.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    rb = sub.add_parser(
+        "restore-backups",
+        help="Restore a missing launcher/hub binary from its <name>.old-<pid> "
+        "backup left by an interrupted update.",
+    )
+    rb.add_argument("--dir", required=True, help="The launcher/dist/<os-arch> directory.")
+    rb.add_argument(
+        "--name",
+        action="append",
+        required=True,
+        help="Canonical binary file name (repeatable), e.g. vct-launcher.exe.",
+    )
+    args = parser.parse_args(argv)
+    for path in restore_missing_from_backups(Path(args.dir), args.name):
+        print(f"restored {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

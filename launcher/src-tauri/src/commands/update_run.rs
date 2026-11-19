@@ -20,7 +20,7 @@
 //! | 4 | `sweep_and_gate` | MCP kill-sweep + update gate — only after every refusal (L2-F14) |
 //! | 5 | `hub_stop_and_renames` | stop vct-hub, rename binaries aside (Windows) |
 //! | 6 | `git_op` | by kind: fast-forward pull / merge / rebase / resume check / backed-up hard reset / none |
-//! | 7 | `head_advance` | HEAD reached upstream (the v0.2.62 crash class) |
+//! | 7 | `head_advance` | HEAD reached upstream (the v0.2.62 crash class); then every binary path phase 5 emptied and the git operation did not write is refilled from its `.old-<pid>` backup (UPDATER-02) |
 //! | 8 | `install_py` | `install.py --update` inside `DbUpdateClosedGuard`, streamed to the modal |
 //! | 9 | `db_reopen_and_refresh` | cached update state refreshed |
 //! | 10 | `gate_drop_and_hub_restart` | gate dropped BEFORE the binary check; hub restarted (POSIX; Windows after the handoff decision, v0.2.54 C-1) |
@@ -464,6 +464,9 @@ pub(crate) trait UpdateOps {
     ) -> impl Future<Output = Result<GitOpOutcome, GitOpFailure>> + Send;
     fn head_advance(&mut self, root: &Path) -> impl Future<Output = Result<(), String>> + Send;
     fn abort_restore(&mut self, root: &Path, renames: &PrePullRenames);
+    /// UPDATER-02: end of phase 7 — put a binary back at every canonical path
+    /// phase 5 emptied and the git operation did not write.
+    fn refill_binaries(&mut self, root: &Path, renames: &PrePullRenames);
     // phase 8-9
     fn run_install_py(
         &mut self,
@@ -697,6 +700,14 @@ async fn drive_phases<O: UpdateOps + Send>(
             }
         },
     }
+
+    // UPDATER-02: the canonical binary paths are never left empty while
+    // install.py runs. Phase 5 renamed them aside (Windows) so the git
+    // operation could write there; one it did not write (no binary change in
+    // the pulled commits, or ApplyOnly) is refilled now — not at install.py's
+    // late dist repair — so a launcher that dies during install.py leaves a
+    // startable launcher and hub behind. Failure legs above use abort_restore.
+    ops.refill_binaries(&root, &renames);
 
     // ── 8. install.py --update (DB closed, streamed) ──────────────────────
     let run = match ops.run_install_py(&root, &python_cmd).await {
@@ -1256,6 +1267,10 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
             renames.launcher.as_deref(),
             renames.hub.as_deref(),
         );
+    }
+
+    fn refill_binaries(&mut self, _root: &Path, renames: &PrePullRenames) {
+        crate::commands::update_pipeline::refill_canonical_binaries(renames);
     }
 
     fn run_install_py(
@@ -2429,11 +2444,12 @@ pub(crate) mod tests {
     }
 
     /// The ops that change something outside the launcher process's memory.
-    const MUTATING: [&str; 10] = [
+    const MUTATING: [&str; 11] = [
         "arm_gate",
         "stop_hub_and_rename",
         "git_op",
         "abort_restore",
+        "refill_binaries",
         "run_install_py",
         "refresh_after_install",
         "restart_hub",
@@ -2543,6 +2559,9 @@ pub(crate) mod tests {
         }
         fn abort_restore(&mut self, _root: &Path, _renames: &PrePullRenames) {
             self.rec("abort_restore");
+        }
+        fn refill_binaries(&mut self, _root: &Path, _renames: &PrePullRenames) {
+            self.rec("refill_binaries");
         }
         fn run_install_py(
             &mut self,
@@ -2813,6 +2832,54 @@ pub(crate) mod tests {
             assert!(!ops.called("run_install_py"));
             assert_eq!(ledger.failed_phase(), Some(Phase::GitOp));
         }
+    }
+
+    /// UPDATER-02: on every kind that reaches install.py, the emptied binary
+    /// paths are refilled AFTER the git operation and the HEAD check and
+    /// BEFORE install.py; never on a leg that does not reach install.py (the
+    /// abort tail or the up-to-date heal restores those).
+    #[tokio::test]
+    async fn binaries_are_refilled_after_the_git_op_and_before_install_py() {
+        for kind in [UpdateKind::PullFf, UpdateKind::ApplyOnly, UpdateKind::ResetHard] {
+            let mut ops = FakeOps::happy();
+            let (r, _) = run(&mut ops, kind).await;
+            r.expect("happy path");
+            let pos = |n: &str| {
+                ops.calls
+                    .iter()
+                    .position(|c| c == n)
+                    .unwrap_or_else(|| panic!("{kind:?}: {n} not called: {:?}", ops.calls))
+            };
+            assert!(pos("refill_binaries") > pos("stop_hub_and_rename"), "{kind:?}");
+            assert!(pos("refill_binaries") < pos("run_install_py"), "{kind:?}");
+            if kind != UpdateKind::ApplyOnly {
+                assert!(pos("refill_binaries") > pos("git_op"), "{kind:?}");
+            }
+            if kind == UpdateKind::ResetHard {
+                assert!(pos("refill_binaries") > pos("head_advance"), "{kind:?}");
+            }
+        }
+        // Leave-alone legs: git failure, HEAD check failure, already up to date.
+        let mut ops = FakeOps::happy();
+        ops.git_op = Err(GitOpFailure {
+            error: UpdateSurfaceError::Raw("boom".into()),
+            restored: false,
+        });
+        let _ = run(&mut ops, UpdateKind::PullFf).await;
+        assert!(!ops.called("refill_binaries") && ops.called("abort_restore"));
+        let mut ops = FakeOps::happy();
+        ops.head = Err("not advanced".into());
+        let _ = run(&mut ops, UpdateKind::ResetHard).await;
+        assert!(!ops.called("refill_binaries") && ops.called("abort_restore"));
+        let mut ops = FakeOps::happy();
+        ops.git_op = Ok(GitOpOutcome {
+            already_up_to_date: true,
+            dist_binary_stale: false,
+            branch: "main".into(),
+            reset_backup: None,
+        });
+        let _ = run(&mut ops, UpdateKind::PullFf).await;
+        assert!(!ops.called("refill_binaries"));
     }
 
     /// ApplyOnly runs no git operation and no HEAD check, but everything else.

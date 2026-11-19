@@ -31,6 +31,8 @@
 //! |---|---|
 //! | pre-pull rename of the running binary (Windows) | [`pre_pull_rename_running_binary`] |
 //! | non-clobbering revert of that rename (WI-3) | [`revert_pre_pull_rename`] + pure [`decide_revert`] |
+//! | refill a canonical path the rename left empty, after the git operation (UPDATER-02) | [`refill_canonical_from_backup`] + pure [`decide_refill`] |
+//! | boot sweep's per-sibling decision: keep / delete / restore (UPDATER-02) | pure [`decide_stale_sibling`] |
 //! | freshness probe (running ↔ metadata.json ↔ git status) | [`probe_freshness`] + pure [`decide_binary_freshness`] |
 //! | stage `<target>.new` from `git show HEAD:<rel>` | [`stage_dirty_binaries`] / [`stage_locked_binaries_for_handoff`] |
 //! | shared post-update staging + handoff tail (WI-4) | [`stage_and_handoff_after_update`] |
@@ -571,6 +573,148 @@ pub(crate) fn revert_and_record(install_path: &Path, backup: &Path) -> RevertOut
     revert_and_record_with(backup, &mut |b, c| {
         emit_clobber_averted_condition(install_path, b, c)
     })
+}
+
+// ---------------------------------------------------------------------------
+// UPDATER-02 — the canonical binary path is never left empty
+// ---------------------------------------------------------------------------
+
+/// What to do with a canonical binary path once the git operation is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefillDecision {
+    /// The canonical path is empty and the backup is there: copy the backup
+    /// back to the canonical name.
+    CopyBackupToCanonical,
+    /// The canonical path holds a file (the pull wrote it, or it was never
+    /// emptied), or there is no backup to copy: touch nothing.
+    LeaveAlone,
+}
+
+/// UPDATER-02 — the pure refill decision. It gates a write onto the canonical
+/// path, so both legs are unit-tested (act + leave-alone): a canonical file
+/// that exists is NEVER overwritten here — it holds either the bytes the pull
+/// just wrote (newer) or the bytes that were never moved.
+pub(crate) fn decide_refill(canonical_exists: bool, backup_exists: bool) -> RefillDecision {
+    if !canonical_exists && backup_exists {
+        RefillDecision::CopyBackupToCanonical
+    } else {
+        RefillDecision::LeaveAlone
+    }
+}
+
+/// Outcome of one [`refill_canonical_from_backup`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefillOutcome {
+    /// The canonical path was empty; it now holds a copy of the backup.
+    Refilled,
+    /// Nothing to do (see [`RefillDecision::LeaveAlone`]).
+    LeftAlone,
+    /// The copy failed (logged); the canonical path is still empty.
+    Failed,
+    /// `backup` did not carry the `.old-<pid>` shape — nothing was touched.
+    NotABackupPath,
+}
+
+/// UPDATER-02 (v0.2.107): after the git operation of an update, put a binary
+/// back at every canonical path the pre-pull rename left empty.
+///
+/// The Windows pre-pull rename moves `vct-launcher.exe` / `vct-hub.exe` to
+/// `<name>.old-<pid>` so `git pull` can write the canonical path. When the
+/// pulled commits do not touch the binaries (an `ApplyOnly`, any mid-cycle
+/// commit, a release merge before its binary-refresh commit) nothing writes
+/// there again until install.py's dist repair near its end — minutes in which
+/// a launcher that dies leaves the install with no launcher and no hub. This
+/// runs right after the git operation, before install.py.
+///
+/// It COPIES (never renames) the backup: the backup of the running launcher is
+/// the running image, and it stays as the backup the abort tails revert from
+/// ([`revert_pre_pull_rename`] then meets `Identical`) and the boot sweep
+/// collects. The copy goes through a `<name>.pending-<pid>` sibling and one
+/// rename, so the canonical path never holds a half-written binary; a sibling
+/// left by a crash mid-copy is collected by the boot sweep (dead pid).
+///
+/// Why not right after the rename: a copy at the canonical path during the
+/// pull is a tracked file git compares with HEAD, and a running binary that
+/// differs from HEAD (a hand-placed exe) would then make `git pull` refuse
+/// with "local changes would be overwritten", where an absent file does not.
+pub(crate) fn refill_canonical_from_backup(backup: &Path) -> RefillOutcome {
+    let canonical = match canonical_path_for_backup(backup) {
+        Some(p) => p,
+        None => return RefillOutcome::NotABackupPath,
+    };
+    // `symlink_metadata`: anything at the canonical path — a dangling link
+    // included — counts as present and is left alone.
+    let canonical_exists = std::fs::symlink_metadata(&canonical).is_ok();
+    match decide_refill(canonical_exists, backup.is_file()) {
+        RefillDecision::LeaveAlone => RefillOutcome::LeftAlone,
+        RefillDecision::CopyBackupToCanonical => {
+            let fname = canonical
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let staging =
+                canonical.with_file_name(format!("{}.pending-{}", fname, std::process::id()));
+            let result = std::fs::copy(backup, &staging)
+                .and_then(|_| std::fs::rename(&staging, &canonical));
+            match result {
+                Ok(()) => {
+                    tracing::info!(
+                        "[vct] binary_freshness: {} was empty after the git operation; \
+                         restored it from {} (UPDATER-02)",
+                        canonical.display(),
+                        backup.display(),
+                    );
+                    RefillOutcome::Refilled
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&staging);
+                    tracing::warn!(
+                        "[vct] binary_freshness: could not restore {} from {}: {}. \
+                         install.py's dist repair restores it from git later in this update.",
+                        canonical.display(),
+                        backup.display(),
+                        e,
+                    );
+                    RefillOutcome::Failed
+                }
+            }
+        }
+    }
+}
+
+/// What the launcher's boot sweep does with one PID-suffixed sibling in the
+/// dist directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleSiblingAction {
+    /// The PID is alive (an update in progress owns it): leave it.
+    Keep,
+    /// A dead PID's leftover whose canonical file is present: delete it.
+    Delete,
+    /// A dead PID's `.old-<pid>` backup whose canonical file is MISSING: it is
+    /// the only copy of that binary — rename it back to the canonical name.
+    RestoreToCanonical,
+}
+
+/// UPDATER-02 — the boot sweep's per-file decision. Pure; both destructive
+/// legs (delete vs restore) are unit-tested.
+///
+/// Must match `vco_lib/dist_binary_repair.py::decide_backup_restore`, the
+/// Python sibling the session-start hooks and `start-launcher.bat` use: a dead
+/// PID's `.old-<pid>` backup is restored when the canonical path is missing.
+/// The rule is mirrored rather than shared because the boot sweep has to work
+/// when the venv does not (it recovers a broken install).
+pub(crate) fn decide_stale_sibling(
+    is_old_backup: bool,
+    pid_alive: bool,
+    canonical_exists: bool,
+) -> StaleSiblingAction {
+    if pid_alive {
+        StaleSiblingAction::Keep
+    } else if is_old_backup && !canonical_exists {
+        StaleSiblingAction::RestoreToCanonical
+    } else {
+        StaleSiblingAction::Delete
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2233,6 +2377,84 @@ mod tests {
         assert!(!backup.exists());
         assert_eq!(std::fs::read(&canonical).unwrap(), b"SAME");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- UPDATER-02: refill an emptied canonical path ----------------------
+
+    #[test]
+    fn decide_refill_acts_only_on_an_empty_canonical_with_a_backup() {
+        assert_eq!(decide_refill(false, true), RefillDecision::CopyBackupToCanonical);
+        assert_eq!(decide_refill(true, true), RefillDecision::LeaveAlone);
+        assert_eq!(decide_refill(false, false), RefillDecision::LeaveAlone);
+        assert_eq!(decide_refill(true, false), RefillDecision::LeaveAlone);
+    }
+
+    /// ACT: canonical missing + `.old-<pid>` present → canonical restored as a
+    /// COPY; the backup stays for the abort tail and the boot sweep.
+    #[test]
+    fn refill_copies_the_backup_back_when_canonical_is_missing() {
+        let dir = tmpdir("refill-act");
+        let canonical = dir.join("vct-launcher.exe");
+        let backup = dir.join("vct-launcher.exe.old-4242");
+        std::fs::write(&backup, b"RUNNING-BYTES").unwrap();
+
+        assert_eq!(refill_canonical_from_backup(&backup), RefillOutcome::Refilled);
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"RUNNING-BYTES");
+        assert!(backup.is_file(), "the backup must survive the refill");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".pending-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging sibling left behind: {leftovers:?}");
+        // The abort tail later meets `Identical` and restores the name.
+        assert_eq!(
+            compare_backup_to_canonical(&backup, &canonical),
+            CanonicalState::Identical
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LEAVE-ALONE: the pull wrote new bytes at the canonical path — they are
+    /// never overwritten by the backup.
+    #[test]
+    fn refill_leaves_a_pulled_canonical_untouched() {
+        let dir = tmpdir("refill-leave");
+        let canonical = dir.join("vct-hub.exe");
+        let backup = dir.join("vct-hub.exe.old-4242");
+        std::fs::write(&canonical, b"NEW-BYTES-FROM-THE-PULL").unwrap();
+        std::fs::write(&backup, b"OLD-BYTES").unwrap();
+
+        assert_eq!(refill_canonical_from_backup(&backup), RefillOutcome::LeftAlone);
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"NEW-BYTES-FROM-THE-PULL");
+        assert!(backup.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refill_refuses_paths_that_are_not_backups() {
+        let dir = tmpdir("refill-foreign");
+        let f = dir.join("vct-launcher");
+        std::fs::write(&f, b"X").unwrap();
+        assert_eq!(refill_canonical_from_backup(&f), RefillOutcome::NotABackupPath);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The boot sweep's decision: a live PID is never touched; a dead PID's
+    /// `.old-<pid>` is restored when it is the only copy (canonical missing)
+    /// and deleted otherwise; any other dead-PID sibling is deleted.
+    #[test]
+    fn decide_stale_sibling_restores_only_the_only_copy() {
+        use StaleSiblingAction::*;
+        // live pid: keep, whatever else holds.
+        for (old, canon) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(decide_stale_sibling(old, true, canon), Keep);
+        }
+        assert_eq!(decide_stale_sibling(true, false, false), RestoreToCanonical);
+        assert_eq!(decide_stale_sibling(true, false, true), Delete);
+        assert_eq!(decide_stale_sibling(false, false, false), Delete);
+        assert_eq!(decide_stale_sibling(false, false, true), Delete);
     }
 
     #[test]
