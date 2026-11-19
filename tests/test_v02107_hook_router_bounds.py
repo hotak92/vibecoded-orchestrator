@@ -118,14 +118,16 @@ def _request_measurement(tmp_path: Path) -> dict[str, int]:
             "tool_response": {"file": {"filePath": str(source), "content": body}},
         }
         first = fire(read, "read", "read1")
-        read["prompt_id"] = "p2"  # same Read in the next turn; cache must not key on this
-        second = fire(read, "read", "read2")
+        second = fire(read, "read", "read2")  # same Read, same turn
+        read["prompt_id"] = "p2"  # next turn: the KG leg (per-turn key) re-queries
+        next_turn = fire(read, "read", "read3")
         prompt = {
             "session_id": "measure-prompt", "prompt_id": "p3", "cwd": str(project),
             "prompt": "Find the project decision governing this otherwise empty retrieval query, with enough detail to pass the prompt-length gate.",
         }
         empty = fire(prompt, "prompt", "prompt")
         return {"one_read": first, "identical_read": second,
+                "identical_read_next_turn": next_turn,
                 "empty_prompt_including_warmer": empty}
     finally:
         httpd.shutdown()
@@ -138,6 +140,7 @@ def test_fake_endpoint_request_counts(tmp_path: Path) -> None:
     assert counts == {
         "one_read": 57,
         "identical_read": 0,
+        "identical_read_next_turn": 12,
         "empty_prompt_including_warmer": 19,
     }
 
@@ -189,7 +192,7 @@ def test_leg_completion_controls_empty_cache_and_warmer(tmp_path: Path, monkeypa
             router._hds.LegResults({name: "" for name in legs},
                                    status={name: s for name in legs})))
         router._run_legs(plan, "s", "p", str(tmp_path), "", time.monotonic() + 5)
-        key = router.cache_key("kgi", "prompt", plan.kg_query, "3")
+        key = router.cache_key("kgi", "prompt", plan.kg_query, "3", "p")
         if status == "finished":
             assert router.cache_get(str(tmp_path), key) == ""
             assert warmed == []
@@ -412,10 +415,10 @@ def test_read_replay_returns_before_legs_only_when_everything_is_seen(tmp_path: 
     root = str(tmp_path)
     (tmp_path / ".claude" / "state").mkdir(parents=True)
     plan = _read_plan()
-    kg_key = router.cache_key("kgi", "read_code", "read query", "3")
+    kg_key = router._kg_cache_key(plan, "t1")
     cg_key = router.cache_key("cgi", "read_code", "alpha", "a.py")
     # Leave-alone: a cache miss always runs the producer.
-    assert router._read_replay_is_fully_seen(plan, "s1", root) is False
+    assert router._read_replay_is_fully_seen(plan, "s1", root, "t1") is False
     kg_block = "KG: Node | concept | score=0.90 | TITLES | src=knowledge/node.md\n"
     cg_block = "CODE: mod.alpha | function | def a.py:1 | callers: (none) | src=a.py\n"
     router.cache_put(root, kg_key, kg_block)
@@ -423,15 +426,75 @@ def test_read_replay_returns_before_legs_only_when_everything_is_seen(tmp_path: 
     inject = router.seen_store_path("inject", "s1", root)
     # Leave-alone: cached but never shown → the run proceeds (and the check
     # itself records nothing).
-    assert router._read_replay_is_fully_seen(plan, "s1", root) is False
+    assert router._read_replay_is_fully_seen(plan, "s1", root, "t1") is False
     assert not Path(inject).exists() or Path(inject).read_text() == ""
-    # Act: once both blocks were emitted (recorded), the replay is a no-op.
+    # Act: once both blocks were emitted (recorded), the replay is a no-op
+    # in the SAME turn.
     reads = router.seen_store_path("reads", "s1", root)
     router.filter_seen_blocks(kg_block + "\n" + cg_block, inject, reads, root)
-    assert router._read_replay_is_fully_seen(plan, "s1", root) is True
+    assert router._read_replay_is_fully_seen(plan, "s1", root, "t1") is True
+    # R31 (per-turn KG key): a NEW turn misses the KG entry → the KG leg
+    # re-runs, even though the code-graph entry is still cached.
+    assert router._read_replay_is_fully_seen(plan, "s1", root, "t2") is False
     # Leave-alone: a new symbol in the same file is a miss → proceed.
     plan.cg_symbols.append(("beta", "a.py"))
-    assert router._read_replay_is_fully_seen(plan, "s1", root) is False
+    assert router._read_replay_is_fully_seen(plan, "s1", root, "t1") is False
+
+
+def test_same_turn_identical_reread_makes_no_requests_new_turn_requeries_kg(
+        tmp_path: Path) -> None:
+    """Through ``_run_legs``: a second identical Read in the same turn is
+    answered from the cache (the KG producer is not run again); a new turn
+    runs the KG leg again."""
+    root = str(tmp_path)
+    (tmp_path / ".claude" / "state").mkdir(parents=True)
+    plan = _read_plan()
+    plan.cg_profile = ""
+    plan.cg_symbols = []
+    router.cache_put(root, router._kg_cache_key(plan, "t1"),
+                     "KG: Node | concept | score=0.90 | TITLES | src=k.md\n")
+    kg_same, _ = router._run_legs(plan, "s1", "t1", root, "", time.monotonic() + 5)
+    assert "KG: Node" in kg_same, "same turn: served from the cache"
+    assert router.cache_get(root, router._kg_cache_key(plan, "t2")) is None, (
+        "a new turn must miss the KG entry (it re-queries)")
+
+
+def test_read_surface_passes_the_prompt_id_to_the_replay_check(
+        tmp_path: Path, monkeypatch) -> None:
+    """The main() call site hands the payload's prompt id to the replay check,
+    so a same-turn identical re-Read returns before any leg; with the check
+    answering False the legs run (leave-alone)."""
+    (tmp_path / ".claude" / "state").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct"))
+    monkeypatch.delenv("VCO_INJECT_PROFILE", raising=False)
+    monkeypatch.setitem(router._PLAN_BUILDERS, "read",
+                        lambda _payload, _cwd: _read_plan())
+    got: list = []
+    legs: list = []
+
+    def fake_seen(plan, state_sid, project_root, prompt_id=""):
+        got.append(prompt_id)
+        return answer["value"]
+
+    def fake_legs(*args, **kwargs):
+        legs.append(1)
+        return "", ""
+
+    answer = {"value": True}
+    monkeypatch.setattr(router, "_read_replay_is_fully_seen", fake_seen)
+    monkeypatch.setattr(router, "_run_legs", fake_legs)
+    for value in (True, False):
+        answer["value"] = value
+        monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(json.dumps({
+            "session_id": "s", "prompt_id": "turn-7", "cwd": str(tmp_path),
+            "tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "a.py")},
+            "tool_response": {"file": {"filePath": str(tmp_path / "a.py"),
+                                       "content": "def alpha():\n    return 1\n"}},
+        })))
+        router.main(["read"])
+    assert got == ["turn-7", "turn-7"]
+    assert len(legs) == 1, "True returns before any leg; False runs them"
 
 
 def test_no_free_slot_skips_uncached_legs_without_caching_or_warming(
@@ -471,9 +534,9 @@ def test_no_free_slot_skips_uncached_legs_without_caching_or_warming(
         kg, cg = router._run_legs(plan("busy"), "s", "p", str(root), "", time.monotonic() + 5)
         assert (kg, cg) == ("", "")
         assert ran == [] and warmed == []
-        assert router.cache_get(str(root), router.cache_key("kgi", "prompt", "busy", "3")) is None
+        assert router.cache_get(str(root), router.cache_key("kgi", "prompt", "busy", "3", "p")) is None
         # Leave-alone: a cache hit needs no slot and is served while both are held.
-        router.cache_put(str(root), router.cache_key("kgi", "prompt", "hit", "3"), "KG: Hit\n")
+        router.cache_put(str(root), router.cache_key("kgi", "prompt", "hit", "3", "p"), "KG: Hit\n")
         started = time.monotonic()
         kg, _cg = router._run_legs(plan("hit"), "s", "p", str(root), "", time.monotonic() + 5)
         assert kg == "KG: Hit\n" and time.monotonic() - started < 0.25

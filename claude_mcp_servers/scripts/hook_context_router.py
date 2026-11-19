@@ -1063,6 +1063,17 @@ def _cg_argv(symbol: str, source_file: str, policy, profile: str) -> List[str]:
     return argv
 
 
+def _kg_cache_key(plan: _Plan, prompt_id: str) -> str:
+    """The KG leg's cache key — PER TURN (owner decision 2026-11-18, R31).
+
+    ``prompt_id`` is part of the key, so a KG result lives for one turn: a
+    later turn re-queries (the result follows that turn's conversation text
+    and the current KG). The code-graph leg is keyed per symbol WITHOUT it.
+    """
+    return cache_key("kgi", plan.kg_profile, plan.kg_query,
+                     str(plan.kg_limit), prompt_id)
+
+
 def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
               transcript_path: str, deadline: float) -> Tuple[str, str]:
     """Run the enabled (cache-missing) legs concurrently; return (kg, cg)
@@ -1074,8 +1085,7 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
     cg_keys: Dict[int, Tuple[str, str, str]] = {}
 
     if plan.kg_profile and plan.kg_query:
-        kg_key = cache_key("kgi", plan.kg_profile, plan.kg_query,
-                           str(plan.kg_limit))
+        kg_key = _kg_cache_key(plan, prompt_id)
         cached = cache_get(project_root, kg_key)
         if cached is not None:
             kg_text = cached
@@ -1225,7 +1235,8 @@ def _run_legs(plan: _Plan, sid: str, prompt_id: str, project_root: str,
     return kg_text, cg_text
 
 
-def _read_replay_is_fully_seen(plan: _Plan, state_sid: str, project_root: str) -> bool:
+def _read_replay_is_fully_seen(plan: _Plan, state_sid: str, project_root: str,
+                               prompt_id: str = "") -> bool:
     """True when every cached block for this Read is already suppressed.
 
     Any cache miss (including a legacy absent/timeout result) returns False so
@@ -1234,7 +1245,7 @@ def _read_replay_is_fully_seen(plan: _Plan, state_sid: str, project_root: str) -
     """
     texts: List[str] = []
     if plan.kg_profile and plan.kg_query:
-        key = cache_key("kgi", plan.kg_profile, plan.kg_query, str(plan.kg_limit))
+        key = _kg_cache_key(plan, prompt_id)
         cached = cache_get(project_root, key)
         if cached is None:
             return False
@@ -2258,7 +2269,8 @@ def _main(argv: List[str]) -> int:
         return 0
     # v0.2.107 (A-008): an identical re-Read whose cached blocks are all
     # already shown has nothing new to emit — return before any leg.
-    if surface == "read" and _read_replay_is_fully_seen(plan, state_sid, project_root):
+    if surface == "read" and _read_replay_is_fully_seen(
+            plan, state_sid, project_root, prompt_id):
         _write_intent_out()
         return 0
 
