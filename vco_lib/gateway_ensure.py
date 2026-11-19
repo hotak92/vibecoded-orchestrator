@@ -22,11 +22,14 @@ deliberate:
   unit in ``failed`` does nothing at all: ``reset-failed`` comes first, or the
   ensure is a no-op exactly when it is needed. macOS and Windows have no
   equivalent park — see :func:`vco_lib.boot_service.ensure_commands`.
-* **There is no second single-instance guard here.** The daemon owns that (an
-  ``O_CREAT|O_EXCL`` pid file plus a ``/health`` identity check), and a start
-  that finds a live gateway exits 0. This module READS that pid file, the same
-  way ``hub_ensure.is_running`` reads ``hub.pid``, so "already running" is an
-  honest answer rather than an opaque "started".
+* **The daemon owns its single instance.** It claims an ``O_CREAT|O_EXCL``
+  pid file (plus a ``/health`` identity check), and a start that finds a live
+  gateway exits 0. This module READS that pid file, the same way
+  ``hub_ensure.is_running`` reads ``hub.pid``, so "already running" is an
+  honest answer rather than an opaque "started". What it adds is spawn-ONCE:
+  the read and the start run under the shared ensure lock
+  (:mod:`vco_lib.ensure_lock`), so two session starts in the same instant
+  request one start, not two.
 * **"Registered but unrunnable" is its own state.** The eight hours of
   2026-09-10 were exactly that: a unit whose ``ExecStart`` named an interpreter
   which cannot import ``model_router``, enabled, failing, with the launcher
@@ -72,6 +75,7 @@ from vco_lib.paths import vct_root_dir
 
 __all__ = [
     "ENSURE_EXIT_CODES",
+    "GATEWAY_SETTLE_S",
     "GatewayState",
     "GatewayEnsureResult",
     "ensure_running",
@@ -114,6 +118,11 @@ ENSURE_EXIT_CODES: dict[GatewayState, int] = {
     GatewayState.REGISTERED_BUT_UNRUNNABLE: 3,
     GatewayState.START_FAILED: 4,
 }
+
+#: How long :func:`ensure_running` keeps the ensure lock after a start while it
+#: waits for the daemon to claim its pid file (an interpreter start plus the
+#: router's imports).
+GATEWAY_SETTLE_S = 10.0
 
 #: The deferral condition this module and the doctor both emit. Declared in
 #: ``vco_lib/deferral_conditions.toml``; cleared by
@@ -476,12 +485,19 @@ def ensure_running(
     verify: bool = True,
     runner=None,
     command_runner=None,
+    settle_s: Optional[float] = None,
 ) -> GatewayEnsureResult:
     """Start a REGISTERED gateway that is not running. Idempotent.
 
     The leave-alone cases come first and each is silent-and-successful: the
     kill switch, an unregistered gateway, and one that is already serving.
     Only a registration that is present, runnable and idle is started.
+
+    The status read and the start run under the ``gateway`` ensure lock
+    (:func:`vco_lib.ensure_lock.spawn_lock`), held after a start until the
+    daemon's pid file names a live process or ``settle_s`` (default
+    :data:`GATEWAY_SETTLE_S`) expires, so concurrent session starts request
+    ONE start and the others answer ``running``.
     """
     if boot_service.boot_registration_disabled():
         return GatewayEnsureResult(
@@ -492,6 +508,30 @@ def ensure_running(
             ),
         )
 
+    from vco_lib.ensure_lock import spawn_lock, wait_until_up
+
+    bound = GATEWAY_SETTLE_S if settle_s is None else settle_s
+    with spawn_lock("gateway", settle_s=bound, root=state_dir):
+        result = _ensure_locked(
+            home=home, system=system, state_dir=state_dir, folder=folder,
+            verify=verify, runner=runner, command_runner=command_runner,
+        )
+        if result.state is GatewayState.STARTED:
+            wait_until_up(lambda: is_running(state_dir), bound_s=bound)
+        return result
+
+
+def _ensure_locked(
+    *,
+    home: Optional[Path],
+    system: Optional[str],
+    state_dir: Optional[Path],
+    folder: Optional[Path],
+    verify: bool,
+    runner,
+    command_runner,
+) -> GatewayEnsureResult:
+    """The body of :func:`ensure_running`, run under the ensure lock."""
     found = gateway_status(
         home=home, system=system, state_dir=state_dir, verify=verify,
         runner=runner,

@@ -247,8 +247,11 @@ if (Test-Path $GwErr) { Remove-Item $GwErr -Force -ErrorAction SilentlyContinue 
 # which the launcher applies to its window config before `CreateWindowEx`, so
 # no window is created and none is given SW_SHOW / SetForegroundWindow -- the
 # taskbar never flashes. "Is it running" is `tasklist /FI IMAGENAME eq
-# vct-launcher.exe`, and the single-instance plugin refuses a duplicate that
-# races the probe. No launcher binary on the machine is a silent success.
+# vct-launcher.exe`, run with the spawn under the shared ensure lock
+# (vco_lib.ensure_lock) so this hook and the folderOpen task spawn ONE
+# launcher; a duplicate that races it anyway exits at the launcher's per-user
+# instance lock (LockFileEx) before any start-up work. No launcher binary on
+# the machine is a silent success.
 # ---------------------------------------------------------------------------
 $GuiArgs = @("-m", "vco_lib.launcher_ensure", "ensure", "--json", "--repo-root", $RepoRoot)
 $GuiRes = $null

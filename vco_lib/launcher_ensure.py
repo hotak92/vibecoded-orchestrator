@@ -39,13 +39,18 @@ took down a whole GNOME session twice on 2026-09-09 (KG
 ``bare-tokio-spawn-in-sync-fns-kills-tauri-boot-and-tokio-test-masks-it``).
 The tray icon is created as usual, so the launcher is one click away.
 
-**No second instance.** ``tauri-plugin-single-instance`` already owns that,
-and this module does not add a second guard: it READS the answer with
-:func:`vco_lib.dist_binary_repair.scan_for_launcher_pid` — the same process
-scan install.py uses to find a launcher holding the binary open — and only
-spawns when nothing answers. If the probe still races a launcher that is
-mid-boot, the plugin refuses the duplicate, and the flag it was started with
-tells the FIRST instance not to take focus either.
+**No second instance.** Two layers. Here, the check and the spawn run under
+the one cross-process ensure lock (:func:`vco_lib.ensure_lock.spawn_lock`),
+held until the started launcher shows up in the process table or
+:data:`LAUNCHER_SETTLE_S` expires — so two hooks firing in the same instant
+(SessionStart and the ``folderOpen`` task, two windows restored at login)
+spawn ONE launcher; the second finds it running. The check itself READS the
+answer with :func:`vco_lib.dist_binary_repair.scan_for_launcher_pid` — the
+same process scan install.py uses to find a launcher holding the binary open.
+In the launcher, a per-user instance lock is the FIRST thing ``run()`` takes,
+before the database or any other start-up work: a duplicate that gets through
+anyway (an older ensure, a user double-click) exits there, and the flag it was
+started with means it does not hand focus to the first instance either.
 
 **Cheap and idempotent.** The common case — a launcher already running from
 the previous session — costs one ``pgrep``/``tasklist`` and stops. Nothing
@@ -108,6 +113,7 @@ __all__ = [
     "ENSURE_EXIT_CODES",
     "HIDDEN_START_FLAG",
     "LAUNCHER_BIN_ENV",
+    "LAUNCHER_SETTLE_S",
     "LauncherEnsureResult",
     "LauncherState",
     "autostart_enabled",
@@ -151,6 +157,11 @@ APP_STATE_SESSION_AUTOSTART = "launcher.session_autostart"
 #: "no migration": an install that has never heard of the key reads absence as
 #: yes, and only a user who turns it OFF ever gets a row.
 DEFAULT_SESSION_AUTOSTART = True
+
+#: How long :func:`ensure_running` keeps the ensure lock after a spawn while it
+#: waits for the launcher to appear in the process table (it normally appears
+#: at once — the scan sees the process, not a ready GUI).
+LAUNCHER_SETTLE_S = 5.0
 
 
 class LauncherState(str, Enum):
@@ -251,9 +262,9 @@ def launcher_pid(scanner: Optional[Callable[..., Optional[int]]] = None) -> Opti
 
     Reads the answer from :func:`vco_lib.dist_binary_repair.scan_for_launcher_pid`
     — the ONE process scan in the tree, already cross-OS and already
-    conservative about multiple matches. The launcher's single-instance
-    guarantee belongs to ``tauri-plugin-single-instance``; this is a read of
-    reality, not a second lock.
+    conservative about multiple matches. A read of reality: the spawn-once
+    lock is :func:`vco_lib.ensure_lock.spawn_lock`, and the launcher's own
+    instance lock is the backstop.
     """
     if scanner is None:
         from vco_lib.dist_binary_repair import scan_for_launcher_pid
@@ -522,34 +533,45 @@ def ensure_running(
     env: Optional[Mapping[str, str]] = None,
     system: Optional[str] = None,
     spawner: Optional[Callable[[Sequence[str], Optional[Path]], None]] = None,
+    settle_s: Optional[float] = None,
 ) -> LauncherEnsureResult:
     """Start the launcher hidden when every gate says yes. Idempotent.
 
     Every leave-alone case is silent and successful; only a machine that has a
     launcher, wants one, can show one, and has none running is acted on.
-    """
-    found = _gather(
-        repo_root=repo_root, extra_dirs=extra_dirs, scanner=scanner,
-        pref_reader=pref_reader, env=env, system=system,
-    )
-    if found.state is not LauncherState.STARTED:
-        return found
 
-    cwd = _spawn_cwd()
-    # `is not None`, never `or`: an injected recorder that happens to be an
-    # empty container is falsy, and `or` would silently run the REAL spawn in
-    # a test that believed it had replaced it.
-    launch = _spawn if spawner is None else spawner
-    try:
-        launch(found.argv, cwd)
-    except OSError as exc:
-        return LauncherEnsureResult(
-            state=LauncherState.SPAWN_FAILED,
-            reason=f"could not execute {found.binary}: {exc}",
-            binary=found.binary,
-            argv=found.argv,
+    The check and the spawn run under the ``launcher`` ensure lock, held after
+    a spawn until the launcher is in the process table or ``settle_s``
+    (default :data:`LAUNCHER_SETTLE_S`) expires: a concurrent ensure waits,
+    then finds it running and spawns nothing.
+    """
+    from vco_lib.ensure_lock import spawn_lock, wait_until_up
+
+    bound = LAUNCHER_SETTLE_S if settle_s is None else settle_s
+    with spawn_lock("launcher", settle_s=bound):
+        found = _gather(
+            repo_root=repo_root, extra_dirs=extra_dirs, scanner=scanner,
+            pref_reader=pref_reader, env=env, system=system,
         )
-    return found
+        if found.state is not LauncherState.STARTED:
+            return found
+
+        cwd = _spawn_cwd()
+        # `is not None`, never `or`: an injected recorder that happens to be an
+        # empty container is falsy, and `or` would silently run the REAL spawn
+        # in a test that believed it had replaced it.
+        launch = _spawn if spawner is None else spawner
+        try:
+            launch(found.argv, cwd)
+        except OSError as exc:
+            return LauncherEnsureResult(
+                state=LauncherState.SPAWN_FAILED,
+                reason=f"could not execute {found.binary}: {exc}",
+                binary=found.binary,
+                argv=found.argv,
+            )
+        wait_until_up(lambda: launcher_pid(scanner) is not None, bound_s=bound)
+        return found
 
 
 def _spawn_cwd() -> Path:
