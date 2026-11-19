@@ -14,7 +14,8 @@
 #
 # V52-L.1 (v0.2.52): belt-and-suspenders reconciler. Side effects:
 #   1. JSONL audit log (V52-L.2 baseline; format unchanged). FOREGROUND.
-#   1b. Reap the agent's worktree when it is provably unchanged.
+#   1b. Mark the agent's provably unchanged worktree a reap candidate (never
+#       removed here: session-worktree-reap removes it once its session ended).
 #   2. KG/docs sync — every changed `knowledge/**` / `docs/**.md` file goes
 #      through `_lib/route-touched-path.sh`, the ONE home for "a file was
 #      touched" (access-matrix gate + per-file debounce + detached runner
@@ -381,40 +382,35 @@ if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     fi
 fi
 
-# Step 1b (v0.2.102 W6-Q follow-up): reap the agent's worktree when it is
-# provably unchanged. worktree-guard creates every isolated agent's worktree,
-# and for a hook-created worktree the harness neither removes it nor runs
-# WorktreeRemove when a subagent finishes
-# (https://code.claude.com/docs/en/hooks#worktreeremove) — so without this
-# step every launch left one behind. The decision (and every condition that
-# keeps a worktree) lives in _lib/worktree-records.sh :: wtrec_reap. A kept
-# worktree is logged with its path and reason to
-# .claude/logs/worktree-guard.jsonl and named on stderr. Runs before the
-# snapshot reconciler's early exits so it never depends on them; never
-# blocks (SubagentStop context would keep the subagent running). A kept
-# worktree's notice is sent to the parent ONCE per path per session (v0.2.105:
-# an interim stop, with the agent waiting on its own background work, is not
-# distinguishable in the payload from a final one), and it says so.
+# Step 1b (v0.2.102 W6-Q follow-up; v0.2.107 REAP-INTERIM): decide the agent's
+# worktree, but NEVER remove it here. worktree-guard creates every isolated
+# agent's worktree, and for a hook-created worktree the harness neither
+# removes it nor runs WorktreeRemove when a subagent finishes
+# (https://code.claude.com/docs/en/hooks#worktreeremove), so VCO reaps the
+# unchanged ones itself. SubagentStop also fires on an INTERIM stop (the agent
+# waits on its own background work or a lock and resumes later) and the
+# payload cannot tell interim from final, so removing here lost paused agents
+# (SendMessage: "its worktree no longer exists"). A provably unchanged
+# worktree is therefore only marked a reap CANDIDATE; session-worktree-reap
+# removes it at a later SessionStart, once its session has ended, after
+# checking again that it is still unchanged. The decision (and every
+# condition that keeps a worktree) lives in _lib/worktree-records.sh ::
+# wtrec_reap. Every decision is logged to .claude/logs/worktree-guard.jsonl;
+# a kept worktree is also named on stderr. Runs before the snapshot
+# reconciler's early exits so it never depends on them; never blocks
+# (SubagentStop context would keep the subagent running). A kept worktree's
+# notice is sent to the parent ONCE per path per session (v0.2.105), and it
+# says the agent may still be running.
 if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     # shellcheck source=_lib/worktree-records.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/worktree-records.sh"
-    REAP="$(wtrec_reap "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
+    REAP="$(wtrec_reap "$PROJECT_ROOT" "$AGENT_ID" "$SESSION_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
     if [ -n "$REAP" ]; then
         REAP_DECISION="$(printf '%s' "$REAP" | cut -f1)"
         REAP_REASON="$(printf '%s' "$REAP" | cut -f2)"
         REAP_PATH="$(printf '%s' "$REAP" | cut -f3-)"
-        AGENT_ID_FOR_PY="$AGENT_ID" DEC_FOR_PY="$REAP_DECISION" REASON_FOR_PY="$REAP_REASON" \
-        PATH_FOR_PY="$REAP_PATH" OUT_FOR_PY="$LOG_DIR/worktree-guard.jsonl" "$PY" -c '
-import json, os
-from datetime import datetime, timezone
-e = os.environ
-row = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-       "hook": "subagent-stop-reconcile", "decision": "reap_" + e["DEC_FOR_PY"],
-       "reason": e["REASON_FOR_PY"], "agent_id": e["AGENT_ID_FOR_PY"],
-       "resolved_path": e["PATH_FOR_PY"]}
-with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
-    fh.write(json.dumps(row) + "\n")
-' 2>/dev/null || true
+        wtrec_log_reap "$LOG_DIR/worktree-guard.jsonl" subagent-stop-reconcile "$AGENT_ID" \
+            "$REAP_DECISION" "$REAP_REASON" "$REAP_PATH"
         if [ "$REAP_DECISION" = "kept" ]; then
             # v0.2.105: an interim SubagentStop (the agent is waiting on its
             # own background work and will resume) is indistinguishable from a
@@ -424,10 +420,10 @@ with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
             # #subagentstop-input). So tell the parent ONCE per worktree path
             # per session (_lib/worktree-records.sh :: wtrec_kept_alert_once),
             # and say plainly that the agent may still be running. In the
-            # ordinary sequence the second stop of one launch is already
-            # suppressed by wtrec_reap's PRE-EXISTING `already_handled` gate;
-            # the marker covers the rewritten-record case and the detached-job
-            # race.
+            # ordinary sequence the second stop of one launch whose worktree
+            # was kept is already suppressed by wtrec_reap's PRE-EXISTING
+            # `already_handled` gate; the marker covers the rewritten-record
+            # case and the detached-job race.
             KEPT_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
             if [ -z "$KEPT_REC" ] || wtrec_kept_alert_once "$KEPT_REC" "$SESSION_ID" "$REAP_PATH"; then
                 KEPT_HEAD="$(_reconcile_head_desc "$REAP_PATH")"

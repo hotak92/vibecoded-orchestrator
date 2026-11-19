@@ -134,12 +134,15 @@ Context nearing limit
 ### SubagentStop (blocking)
 
 **subagent-stop-reconcile.sh** / **stop-drain-citations.sh** (async)
-- Reconciles subagent output in a DETACHED job (v0.2.102): reaps an unchanged worktree, scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
+- Reconciles subagent output in a DETACHED job (v0.2.102): marks an unchanged worktree a reap candidate (never removed at SubagentStop — it also fires on an interim stop; `session-worktree-reap` removes candidates at SessionStart once their session has ended, v0.2.107), scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
 
 ### SessionEnd
 
 **stop-drain-citations.sh** (synchronous, timeout 5; v0.2.102)
 - The main chat's end: records it, then scores the session's pending RL citations with the terminal and soft-label floors in a DETACHED drain. RL citations have no scoring deadline — a citation below the full token gate waits for its own chat to end and is scored against that chat's transcript only. A file is removed before then only when provably abandoned (`RL_CITATION_ABANDONED_DAYS`, default 7, and no live owner), scored first or logged as unscored.
+
+**session-worktree-reap.sh** (synchronous, timeout 5; v0.2.107)
+- Records that the session ended, so the next SessionStart (same hook, background) can remove the unchanged worktrees of that session's isolated agents — the reap point SubagentStop cannot be, because it also fires on an interim stop.
 
 ### PreToolUse
 

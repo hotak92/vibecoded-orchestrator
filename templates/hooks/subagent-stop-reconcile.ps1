@@ -295,31 +295,25 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
     } catch { }
 }
 
-# Step 1b (v0.2.102 W6-Q follow-up) - must match the .sh sibling: reap the
-# agent's worktree when it is provably unchanged (the harness neither removes
-# a hook-created worktree nor runs WorktreeRemove when a subagent finishes).
-# Conditions live in _lib/worktree-records.ps1 :: Invoke-WtrecReap. A kept
-# worktree is logged with path + reason and named on stderr. Never blocks.
-# A kept worktree's notice reaches the parent ONCE per path per session
-# (v0.2.105: an interim stop, the agent waiting on its own background work,
-# is indistinguishable in the payload from a final one) and says so.
+# Step 1b (v0.2.102 W6-Q follow-up; v0.2.107 REAP-INTERIM) - must match the
+# .sh sibling: decide the agent's worktree, but NEVER remove it here (the
+# harness neither removes a hook-created worktree nor runs WorktreeRemove when
+# a subagent finishes, and SubagentStop also fires on an INTERIM stop that the
+# payload cannot tell from a final one - removing here lost paused agents). A
+# provably unchanged worktree is only marked a reap candidate;
+# session-worktree-reap removes it at a later SessionStart once its session
+# ended, re-checking it first. Conditions live in _lib/worktree-records.ps1 ::
+# Invoke-WtrecReap. Every decision is logged; a kept worktree is also named on
+# stderr. Never blocks. A kept worktree's notice reaches the parent ONCE per
+# path per session (v0.2.105) and says the agent may still be running.
 $WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
 if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
     . $WtrecHelper
     $reap = $null
-    try { $reap = Invoke-WtrecReap $ProjectRoot $AgentId } catch { $reap = $null }
+    try { $reap = Invoke-WtrecReap $ProjectRoot $AgentId $SessionId $TranscriptPath } catch { $reap = $null }
     if ($reap) {
-        try {
-            $row = [ordered]@{
-                timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                hook          = "subagent-stop-reconcile"
-                decision      = "reap_" + $reap.Decision
-                reason        = $reap.Reason
-                agent_id      = $AgentId
-                resolved_path = $reap.Path
-            }
-            Add-Content -Path (Join-Path $LogDir "worktree-guard.jsonl") -Value ($row | ConvertTo-Json -Compress) -ErrorAction Stop
-        } catch { }
+        Write-WtrecReapLog (Join-Path $LogDir "worktree-guard.jsonl") "subagent-stop-reconcile" $AgentId `
+            ([string]$reap.Decision) ([string]$reap.Reason) ([string]$reap.Path)
         if ($reap.Decision -eq "kept") {
             # v0.2.105 - must match the .sh sibling: an interim SubagentStop
             # (the agent is waiting on its own background work and will resume)
@@ -329,9 +323,10 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
             # Tell the parent ONCE per worktree path per session
             # (_lib/worktree-records.ps1 :: Test-WtrecKeptAlertOnce), worded so
             # the reader knows the agent may still be running. In the ordinary
-            # sequence the second stop of one launch is already suppressed by
-            # Invoke-WtrecReap's PRE-EXISTING already_handled gate; the marker
-            # covers the rewritten-record case and the detached-job race.
+            # sequence the second stop of one launch whose worktree was kept is
+            # already suppressed by Invoke-WtrecReap's PRE-EXISTING
+            # already_handled gate; the marker covers the rewritten-record case
+            # and the detached-job race.
             $keptRec = Find-WtrecRecord $ProjectRoot $AgentId
             if (-not $keptRec -or (Test-WtrecKeptAlertOnce $keptRec $SessionId ([string]$reap.Path))) {
                 $keptHead = Get-ReconcileHeadDescription ([string]$reap.Path)

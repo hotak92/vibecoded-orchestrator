@@ -23,8 +23,14 @@
 #                             repo, branch, base_ref, base_sha, branch_created;
 #                             its `toplevel` is the TARGET repo R, so the reap
 #                             below runs `git -C R`, never against the project.
-#   subagent-stop-reconcile   reaps the worktree when it is provably unchanged
-#                             (wtrec_reap) and records the outcome in `status`
+#   subagent-stop-reconcile   NEVER removes a worktree (v0.2.107 REAP-INTERIM):
+#                             a provably unchanged one becomes a reap
+#                             CANDIDATE (wtrec_reap → status reap_candidate),
+#                             a changed one is kept; outcome in `status`
+#   session-worktree-reap     SessionEnd records that the session ended
+#                             (wtrec_session_ended); SessionStart reaps the
+#                             candidates no session can resume any more
+#                             (wtrec_sweep), re-checking each is unchanged
 #   subagent-start-isolation-check
 #                             asks whether the guard handled this agent at all
 #                             (wtrec_isolation_skipped) to detect a skipped
@@ -221,9 +227,10 @@ except Exception:
 # running (the call site owns that wording).
 #
 # WHICH GATE DECIDES: in the ordinary sequence the SECOND stop of one launch
-# is already suppressed by the PRE-EXISTING `already_handled` gate in
-# wtrec_reap (the first stop's reap flips `status` off `created`) before this
-# function is ever called. This marker is the belt to that suspender: it
+# whose worktree was KEPT is already suppressed by the PRE-EXISTING
+# `already_handled` gate in wtrec_reap (the first stop flipped `status` to
+# `kept`) before this function is ever called; a reap CANDIDATE gets no
+# notice at all. This marker is the belt to that suspender: it
 # covers the rewritten-record case (a record re-made re-reapable that still
 # carries kept_alert_*) and the detached-job race (stop 2's job reaps before
 # stop 1's job has written its status). Both directions fail OPEN — a
@@ -277,7 +284,9 @@ print("emit")
 # SubagentStart must still find it (isolation-check), or the skipped-isolation
 # warning and the Layer 3b worktree-violation alert fire for an agent the
 # guard DID isolate. So:
-#   * notices (one-shot, consumed at SubagentStart) go after 30 days;
+#   * notices (one-shot, consumed at SubagentStart) and session-ended markers
+#     (wtrec_session_ended) go after 30 days — a candidate whose session
+#     marker is gone is still reaped by wtrec_sweep's idle rule (7 days);
 #   * records of ANY status go only once IDLE (mtime — wtrec_find bumps it on
 #     every lookup) longer than max(30, cleanupPeriodDays) + 30 days. A
 #     `wt-*.json.tmp` (or the .ps1 sibling's `.json.bak`) left by a crash
@@ -298,7 +307,7 @@ print("emit")
 wtrec_prune() {
     local root="$1" d="$1/$WTREC_SUBDIR"
     [ -d "$d" ] || return 0
-    find "$d" -maxdepth 1 -type f -name 'notice-*.txt' -mtime +30 \
+    find "$d" -maxdepth 1 -type f \( -name 'notice-*.txt' -o -name 'session-ended-*' \) -mtime +30 \
         -exec rm -f {} + 2>/dev/null || true
     [ -n "${PY:-}" ] || return 0
     WTREC_DIR="$d" WTREC_ROOT="$root" "$PY" -c '
@@ -421,14 +430,52 @@ _wtrec_lexnorm() {
     if [ "${#stack[@]}" -eq 0 ]; then printf '/\n'; else printf '/%s' "${stack[@]}"; printf '\n'; fi
 }
 
-# wtrec_reap PROJECT_ROOT AGENT_ID — remove the agent's worktree when it is
-# provably unchanged; keep it otherwise. Prints one line:
-#   "<decision>\t<reason>\t<path>"  decision ∈ removed|kept|skipped
-# and prints nothing when the agent has no record (the guard never ran).
-#
-# Removed ONLY when ALL hold (conservative — any doubt keeps the worktree):
+# ── Reaping (v0.2.107 REAP-INTERIM) ─────────────────────────────────────────
+# WHY TWO PHASES: SubagentStop also fires on an INTERIM stop — the agent ends
+# its turn waiting on its own background work or a lock and resumes later —
+# and its payload cannot tell interim from final (see wtrec_kept_alert_once
+# for the field list). Removing the worktree there removed it under a paused
+# agent, and SendMessage then could not resume it ("its worktree no longer
+# exists"). So:
+#   1. SubagentStop (wtrec_reap) never removes anything: a provably unchanged
+#      worktree is marked `status: reap_candidate`, with the PARENT session id
+#      (reap_session), the transcript path from the payload (reap_transcript)
+#      and the marking time (reap_marked_epoch). A changed one is kept, as
+#      before. A later stop of the same agent re-checks a candidate (it may
+#      have written since) and turns it into `kept` when it has.
+#   2. wtrec_sweep, run at SessionStart by session-worktree-reap, removes a
+#      candidate only once no session can resume its agent: the parent
+#      session ENDED (a `session-ended-<sid>` marker written at SessionEnd,
+#      newer than the candidate mark — a resumed session's marker is deleted
+#      at its SessionStart and would be older anyway), or the candidate is
+#      abandoned (record and transcript untouched for WTREC_ABANDON_DAYS — a
+#      session that crashed before SessionEnd). A candidate of the CURRENT
+#      session is never swept. Every unchanged-check below runs again at
+#      sweep time, and only then is `git worktree remove` run.
+
+# Idle days after which a candidate whose session never recorded its end is
+# treated as abandoned. MUST MATCH $script:WtrecAbandonDays in the .ps1.
+WTREC_ABANDON_DAYS=7
+
+# wtrec_reap PROJECT_ROOT AGENT_ID [SESSION_ID] [TRANSCRIPT] — SubagentStop's
+# step: decide the agent's worktree WITHOUT removing it. Prints one line:
+#   "<decision>\t<reason>\t<path>"  decision ∈ candidate|removed|kept|skipped
+# (`removed` only as `already_gone`: the worktree no longer exists) and prints
+# nothing when the agent has no record (the guard never ran).
+wtrec_reap() {
+    local rec
+    rec="$(wtrec_find "$1" "$2")" || return 0
+    _wtrec_reap_rec "$rec" candidate "${3:-}" "${4:-}"
+}
+
+# _wtrec_reap_rec RECORD_FILE ACTION [SESSION_ID] [TRANSCRIPT] — the one
+# decision. ACTION `candidate` (SubagentStop) marks an unchanged worktree as a
+# reap candidate; ACTION `remove` (wtrec_sweep) removes it. Removed (or
+# marked) ONLY when ALL hold (conservative — any doubt keeps the worktree):
 #   * mode is head, snapshot or reservation (in_place = the user's own
 #     folder, reservation_existing = a worktree the coordinator made: NEVER);
+#   * status is `created` or `reap_candidate` (candidate) / `reap_candidate`
+#     (remove) — `kept` / `removed` are final: already_handled;
 #   * the path exists, is a registered worktree of the record's toplevel and
 #     is not that toplevel;
 #   * HEAD equals the recorded base (so no commits beyond it, and no switch);
@@ -436,18 +483,16 @@ _wtrec_lexnorm() {
 #     empty — nothing modified, nothing untracked, and no IGNORED file either
 #     (a fresh checkout has none, so any is the agent's output, e.g. a report
 #     under the git-excluded `.claude/state/`);
-#   * `git worktree remove` (no --force) agrees — git refuses an unclean or
-#     locked worktree on its own.
+#   * (remove) `git worktree remove` (no --force) agrees — git refuses an
+#     unclean or locked worktree on its own.
 # worktree-guard creates DETACHED worktrees for head/snapshot, so there is no
 # branch to delete; a reservation worktree's new branch is deleted with it
 # (compare-and-delete against the base, above), and the lanes directory it
 # lived in goes too once it is empty (_wtrec_rmdir_lanes_parent). A snapshot
 # base commit is on no ref once the worktree is gone; git's normal gc
 # collects it.
-
-wtrec_reap() {
-    local root="$1" id="$2" rec mode path base top head st err listed
-    rec="$(wtrec_find "$root" "$id")" || return 0
+_wtrec_reap_rec() {
+    local rec="$1" action="$2" sid="${3:-}" tpath="${4:-}" mode path base top head st err listed status
     mode="$(wtrec_get "$rec" mode)"
     path="$(wtrec_get "$rec" path)"
     base="$(wtrec_get "$rec" base)"
@@ -462,10 +507,11 @@ wtrec_reap() {
         reservation_existing) _wtrec_out skipped reservation_existing_never_removed; return 0 ;;
         *) _wtrec_out skipped unknown_mode; return 0 ;;
     esac
-    if [ "$(wtrec_get "$rec" status)" != "created" ]; then
-        _wtrec_out skipped already_handled
-        return 0
-    fi
+    status="$(wtrec_get "$rec" status)"
+    case "$action:$status" in
+        candidate:created|candidate:reap_candidate|remove:reap_candidate) ;;
+        *) _wtrec_out skipped already_handled; return 0 ;;
+    esac
     if [ -z "$path" ] || [ -z "$base" ] || [ -z "$top" ] || [ "$path" = "$top" ]; then
         _wtrec_out kept incomplete_record
         return 0
@@ -493,6 +539,11 @@ wtrec_reap() {
         _wtrec_out kept has_changes
         return 0
     fi
+    if [ "$action" = "candidate" ]; then
+        printf '%s\t%s\t%s\n' candidate unchanged_reap_deferred "$path"
+        _wtrec_mark_candidate "$rec" "$sid" "$tpath"
+        return 0
+    fi
     if err="$(git -C "$top" worktree remove "$path" 2>&1)"; then
         # A lane reservation's worktree (mode reservation) was created on a
         # NEW branch (`worktree add -b`); remove that branch too, but only
@@ -514,4 +565,127 @@ wtrec_reap() {
     else
         _wtrec_out kept "git_refused: $(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-200)"
     fi
+}
+
+# _wtrec_mark_candidate RECORD_FILE SESSION_ID TRANSCRIPT — status
+# reap_candidate plus what wtrec_sweep needs to decide when it may go.
+# A non-object or unreadable record is left untouched (never swept then).
+_wtrec_mark_candidate() {
+    [ -n "${PY:-}" ] || return 0
+    WTREC_FILE="$1" WTREC_SID="$2" WTREC_TPATH="$3" "$PY" -c '
+import json, os, time
+from datetime import datetime, timezone
+e = os.environ
+p = e["WTREC_FILE"]
+try:
+    with open(p, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    if not isinstance(rec, dict):
+        raise ValueError("not an object")
+    rec["status"] = "reap_candidate"
+    rec["status_reason"] = "unchanged_reap_deferred"
+    rec["status_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rec["reap_session"] = e.get("WTREC_SID", "")
+    rec["reap_transcript"] = e.get("WTREC_TPATH", "")
+    rec["reap_marked_epoch"] = int(time.time())
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh)
+except Exception:
+    pass
+' 2>/dev/null || true
+}
+
+# wtrec_session_ended PROJECT_ROOT SESSION_ID — SessionEnd: record that this
+# session ended, so wtrec_sweep may reap its candidates. A session id outside
+# [A-Za-z0-9._-] records nothing (its candidates fall to the idle rule).
+wtrec_session_ended() {
+    wtrec_valid_name "${2:-}" || return 0
+    mkdir -p "$1/$WTREC_SUBDIR" 2>/dev/null || return 0
+    : > "$1/$WTREC_SUBDIR/session-ended-$2" 2>/dev/null || true
+}
+
+# wtrec_session_resumed PROJECT_ROOT SESSION_ID — SessionStart of a session
+# that runs again (a resume keeps its session id): its end no longer holds.
+wtrec_session_resumed() {
+    wtrec_valid_name "${2:-}" || return 0
+    rm -f "$1/$WTREC_SUBDIR/session-ended-$2" 2>/dev/null || true
+}
+
+# wtrec_sweep PROJECT_ROOT CURRENT_SESSION_ID — reap every candidate no
+# session can resume any more (see "Reaping" above). Prints one line per
+# candidate it decided: "<decision>\t<reason>\t<path>\t<record name>".
+# No python → nothing is swept (eligibility cannot be read).
+# MUST MATCH Invoke-WtrecSweep in the .ps1.
+wtrec_sweep() {
+    local root="$1" d="$1/$WTREC_SUBDIR" f
+    [ -d "$d" ] || return 0
+    [ -n "${PY:-}" ] || return 0
+    WTREC_DIR="$d" WTREC_SID="${2:-}" WTREC_DAYS="$WTREC_ABANDON_DAYS" "$PY" -c '
+import json, os, re, time
+e = os.environ
+d = e["WTREC_DIR"]
+cur = e.get("WTREC_SID", "")
+window = float(e["WTREC_DAYS"]) * 86400.0
+now = time.time()
+valid = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
+for n in sorted(os.listdir(d)):
+    if not (n.startswith("wt-") and n.endswith(".json")):
+        continue
+    p = os.path.join(d, n)
+    try:
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        with open(p, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        if not isinstance(rec, dict) or rec.get("status") != "reap_candidate":
+            continue
+        sid = str(rec.get("reap_session") or "")
+        if sid and sid == cur:
+            continue
+        marked = rec.get("reap_marked_epoch")
+        marked = float(marked) if isinstance(marked, (int, float)) and not isinstance(marked, bool) else None
+        ok = False
+        if sid and valid.match(sid) and marked is not None:
+            m = os.path.join(d, "session-ended-" + sid)
+            if os.path.isfile(m) and os.path.getmtime(m) >= marked:
+                ok = True
+        if not ok:
+            last = os.path.getmtime(p)
+            t = rec.get("reap_transcript")
+            if isinstance(t, str) and t:
+                try:
+                    last = max(last, os.path.getmtime(t))
+                except OSError:
+                    pass
+            ok = now - last >= window
+        if ok:
+            print(p)
+    except Exception:
+        continue
+' 2>/dev/null | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        _wtrec_reap_rec "$f" remove | while IFS= read -r line; do
+            printf '%s\t%s\n' "$line" "$(basename "$f" .json | sed 's/^wt-//')"
+        done
+    done
+}
+
+# wtrec_log_reap LOG_FILE HOOK AGENT_ID DECISION REASON PATH — one row in
+# .claude/logs/worktree-guard.jsonl for a reap decision (both phases).
+# MUST MATCH Write-WtrecReapLog in the .ps1.
+wtrec_log_reap() {
+    [ -n "${PY:-}" ] || return 0
+    mkdir -p "$(dirname "$1")" 2>/dev/null || true
+    WTREC_LOG="$1" WTREC_HOOK="$2" WTREC_AGENT="$3" WTREC_DEC="$4" WTREC_REASON="$5" \
+    WTREC_PATH="$6" "$PY" -c '
+import json, os
+from datetime import datetime, timezone
+e = os.environ
+row = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "hook": e["WTREC_HOOK"], "decision": "reap_" + e["WTREC_DEC"],
+       "reason": e["WTREC_REASON"], "agent_id": e["WTREC_AGENT"],
+       "resolved_path": e["WTREC_PATH"]}
+with open(e["WTREC_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(row) + "\n")
+' 2>/dev/null || true
 }
