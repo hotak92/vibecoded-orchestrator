@@ -125,12 +125,36 @@ def test_crossing_the_bump_says_yes():
     assert v.reason == ceg.REASON_CROSSES_BUMP
 
 
-def test_project_built_at_or_past_the_bump_says_no_and_stamps():
-    """A graph produced by a >=0.2.92 analyzer already has the fixes."""
+def test_manifest_at_or_past_the_bump_without_a_stamp_stays_owed():
+    """CGWRITE-02 (v0.2.107, owner answer 14): a manifest version at/past the
+    newest bump proves nothing about a walk — the manifest advances on every
+    bundle update, also when the forced walk that update owed was skipped or
+    died. With a graph present and no stamp at the head, the walk stays OWED
+    and nothing is stamped without walking."""
     v = _decide(prev_version="0.2.92", running_version="0.2.95")
+    assert v.needs_reindex is True
+    assert v.reason == ceg.REASON_UNKNOWN_GENERATION
+    assert v.stamp_now is False
+
+
+def test_a_skipped_forced_walk_stays_owed_on_the_next_update():
+    """The field shape: stamp at 0.2.102, manifest already at 0.2.106 (the
+    update that owed the walk advanced it), graph present → owed, and the
+    owed rungs are the ones newer than the stamp."""
+    v = ceg.decide(prev_version="0.2.106", running_version="0.2.106",
+                   stamp_generation="0.2.102", graph_exists=True,
+                   bumps=("0.2.92", "0.2.102", "0.2.105"))
+    assert v.needs_reindex is True
+    assert v.stamp_now is False
+    assert v.bumps == ("0.2.105",)
+
+
+def test_manifest_at_the_bump_with_a_head_stamp_is_left_alone():
+    """LEAVE-ALONE twin: the same manifest plus a stamp at the head → done."""
+    v = _decide(prev_version="0.2.92", running_version="0.2.95",
+                stamp_generation="0.2.92")
     assert v.needs_reindex is False
-    assert v.reason == ceg.REASON_VERSION_AT_OR_PAST_BUMP
-    assert v.stamp_now is True          # so we stop asking every update
+    assert v.reason == ceg.REASON_STAMP_CURRENT
 
 
 def test_no_code_graph_says_no_and_stamps():
