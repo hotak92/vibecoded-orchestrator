@@ -33,7 +33,8 @@ export const UNREGISTER_ANYWAY_LABEL = 'Unregister anyway — leave these values
 export const DEFAULT_UNREGISTER_OPTIONS: Readonly<{
   purgeLauncherFiles: boolean;
   purgeCollections: boolean;
-}> = Object.freeze({ purgeLauncherFiles: true, purgeCollections: false });
+  deleteRlEvents: boolean;
+}> = Object.freeze({ purgeLauncherFiles: true, purgeCollections: false, deleteRlEvents: false });
 
 /** The error text of a failed invoke (Tauri rejects with a string). */
 export function errorText(e: unknown): string {
@@ -131,6 +132,7 @@ export function describeUnregisterReport(
   count(report.settingsEntriesRemoved.length, 'settings entries removed');
   count(report.keysPurgedFromEnv.length, 'env keys cleaned');
   count(report.collectionsDropped.length, 'collections dropped');
+  count(report.rlEventsDeleted ?? 0, 'RL training events deleted');
   count(report.filesKeptModified.length, 'files you changed kept');
   const summary = parts.length > 0
     ? `${verb} "${report.projectName}" — ${parts.join(', ')}`
@@ -149,6 +151,13 @@ export function describeUnregisterReport(
   }
   if (report.settingsEntriesRemoved.length > 0) {
     details.push(`VCO's entries removed from files that stay: ${names(report.settingsEntriesRemoved)}`);
+  }
+  // A-022: the project's RL training events stay unless the user asked to
+  // delete them — say so, with the count.
+  if ((report.rlEventsKept ?? 0) > 0) {
+    details.push(
+      `Kept ${report.rlEventsKept} RL training events in the launcher database, with the project's name`,
+    );
   }
   return { summary, details };
 }

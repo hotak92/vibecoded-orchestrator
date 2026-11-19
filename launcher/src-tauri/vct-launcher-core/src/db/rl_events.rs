@@ -65,6 +65,15 @@ pub struct RlEvent {
 
 /// RL-14: the app_state key guarding the one-time historical marking pass.
 /// Present (any value) ⇒ the backfill already ran on this launcher.db.
+/// What [`Db::insert_rl_event`] returns when `project_id` names no
+/// registered project (migration 053 moved this rule from a foreign key into
+/// the writer). It keeps the words "FOREIGN KEY" on purpose: the hub's POST
+/// handler (`vct-hub/src/rl_events_api.rs`) answers 422 `unknown_project_id`
+/// on exactly that substring, the answer the Python writer re-resolves its
+/// cached project identity on.
+pub const UNKNOWN_PROJECT_ID_ERROR: &str =
+    "insert rl_event: FOREIGN KEY constraint failed (project_id names no registered project)";
+
 pub const QUARANTINE_BACKFILL_STATE_KEY: &str = "rl_events.quarantine_backfill_v1";
 
 /// RL-14: stable reason tag for the historical out-of-range-score class.
@@ -365,13 +374,24 @@ impl Db {
         if let Some(id) = existing {
             return Ok(id);
         }
-        guard
+        // A-022 / migration 053: rl_events has no foreign key to `projects`
+        // any more (a project's events outlive its unregister), so the
+        // "project_id names a registered project" rule lives HERE, in the
+        // one writer: the INSERT inserts nothing when ?4 is set and no such
+        // project exists, in the same statement (no check-then-insert window
+        // against a concurrent unregister). The same statement copies the
+        // project's name into project_name when the writer sent none, so a
+        // row stays attributable after its project is gone.
+        let inserted = guard
             .execute(
                 "INSERT INTO rl_events
                     (event_type, schema_version, ts, project_id, project_name,
                      task_id, task_type, embedding_source, embedding_dim,
                      embedding_model, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 SELECT ?1, ?2, ?3, ?4,
+                        COALESCE(?5, (SELECT p.name FROM projects p WHERE p.id = ?4)),
+                        ?6, ?7, ?8, ?9, ?10, ?11
+                  WHERE ?4 IS NULL OR EXISTS (SELECT 1 FROM projects p WHERE p.id = ?4)",
                 params![
                     event_type,
                     schema_version,
@@ -387,6 +407,9 @@ impl Db {
                 ],
             )
             .map_err(|e| format!("insert rl_event: {}", e))?;
+        if inserted == 0 {
+            return Err(UNKNOWN_PROJECT_ID_ERROR.to_string());
+        }
         Ok(guard.last_insert_rowid())
     }
 
@@ -1381,7 +1404,8 @@ mod tests {
     }
 
     /// Helper: seed a `projects` row so an rl_events insert with that
-    /// `project_id` satisfies the FK constraint (project_id → projects.id).
+    /// `project_id` is accepted (`insert_rl_event` refuses an id that names
+    /// no registered project — migration 053 moved that rule from the FK).
     fn seed_project(db: &Db, id: &str) {
         use crate::db::models::ProjectHost;
         db.insert_project(

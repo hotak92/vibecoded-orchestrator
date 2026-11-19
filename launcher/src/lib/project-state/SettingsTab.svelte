@@ -183,6 +183,20 @@
   //     surfaces the rebuild path so users don't fear the choice.
   let purgeLauncherFiles = $state(DEFAULT_UNREGISTER_OPTIONS.purgeLauncherFiles);
   let purgeCollections = $state(DEFAULT_UNREGISTER_OPTIONS.purgeCollections);
+  // Audit A-022 (owner ruling): the project's RL training events are KEPT
+  // by default (they stay in launcher.db with the project's id and name).
+  // This third checkbox, unticked by default, deletes them instead — in
+  // bounded batches on the backend. `rlEventCount` is what the panel names;
+  // null while unknown (not loaded yet, or the count failed).
+  let deleteRlEvents = $state(DEFAULT_UNREGISTER_OPTIONS.deleteRlEvents);
+  let rlEventCount = $state<number | null>(null);
+  async function loadRlEventCount() {
+    try {
+      rlEventCount = await invoke<number>('count_project_rl_events', { id: projectId });
+    } catch {
+      rlEventCount = null;
+    }
+  }
   let unregisterConfirmText = $state('');
   let unregistering = $state(false);
   // The Unregister button is enabled only when the user has typed the
@@ -361,7 +375,7 @@
     try {
       const outcome = await runUnregister(
         (options) => projects.delete(project!.id, options),
-        { purgeLauncherFiles, purgeCollections },
+        { purgeLauncherFiles, purgeCollections, deleteRlEvents },
         askLeaveAnyway,
       );
       if (outcome.kind === 'kept') {
@@ -588,6 +602,9 @@
   // page already remounts the tab, but keep the effect for safety).
   $effect(() => {
     if (projectId) void load();
+  });
+  $effect(() => {
+    if (projectId) void loadRlEventCount();
   });
 </script>
 
@@ -1063,6 +1080,26 @@
               <em>Tip: collections can always be rebuilt from
               <code>/knowledge</code> + source code via
               <code>install-bundle --update</code>.</em>
+            </small>
+          </span>
+        </label>
+
+        <label class="ps-danger-check">
+          <input type="checkbox" bind:checked={deleteRlEvents} />
+          <span>
+            <strong>
+              Also delete this project's
+              {rlEventCount === null ? '' : `${rlEventCount.toLocaleString()} `}RL training
+              {rlEventCount === 1 ? 'event' : 'events'}
+            </strong>
+            <small>
+              Unticked, they are kept: the retrieval and citation events VCO
+              collected while you worked in this project stay in the
+              launcher database with the project's name, so they can still
+              be exported and used for training. Ticked, they are deleted
+              (in batches — a large project can take a few minutes) before
+              the project is unregistered. Deleted events cannot be
+              recovered.
             </small>
           </span>
         </label>

@@ -322,7 +322,11 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: shape a post-bundle decision queued, so a launcher restart resumes an owed
 #: forced walk WITH --force-rewalk instead of failing it). Bumped ATOMICALLY
 #: with mig 052's Rust registration.
-LAUNCHER_DB_TABLE_SET_VERSION = 52
+#: 53 = migration 053_rl_events_outlive_their_project.sql (v0.2.107, audit
+#: A-022 — rl_events loses its ON DELETE CASCADE foreign key to projects, so
+#: an unregister keeps the project's RL training events, named; project_name
+#: back-filled). Bumped ATOMICALLY with mig 053's Rust registration.
+LAUNCHER_DB_TABLE_SET_VERSION = 53
 
 
 # ===========================================================================

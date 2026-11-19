@@ -11,6 +11,7 @@ import { dirname, resolve } from 'node:path';
 import {
   DEFAULT_UNREGISTER_OPTIONS,
   REMOVE_UNREGISTER_OPTIONS,
+  describeUnregisterReport,
   UNREGISTER_ANYWAY_LABEL,
   UNREGISTER_STOPPED_PREFIX,
   isUnregisterStopped,
@@ -106,7 +107,11 @@ describe('the unregister stop and its escape', () => {
 
 describe('the shared Remove flow (v0.2.106): removal includes the collections', () => {
   it('is the owner definition of removal: launcher files purged AND collections dropped', async () => {
-    expect(DEFAULT_UNREGISTER_OPTIONS).toEqual({ purgeLauncherFiles: true, purgeCollections: false });
+    expect(DEFAULT_UNREGISTER_OPTIONS).toEqual({
+      purgeLauncherFiles: true,
+      purgeCollections: false,
+      deleteRlEvents: false,
+    });
     expect(REMOVE_UNREGISTER_OPTIONS).toEqual({ purgeLauncherFiles: true, purgeCollections: true });
     const del = vi.fn(async (_o: UnregisterOptions) => report());
     await removeUnregister(del, async () => true);
@@ -140,5 +145,24 @@ describe('the shared Remove flow (v0.2.106): removal includes the collections', 
     const out = await removeUnregister(del, async () => false);
     expect(out).toEqual({ kind: 'kept', message: STOP });
     expect(del).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('A-022: the RL training events in the unregister report', () => {
+  it('names the kept events, and the deleted ones in the summary', () => {
+    const kept = describeUnregisterReport(report({ rlEventsKept: 42, rlEventsDeleted: 0 }), 'Unregistered');
+    expect(kept.summary).not.toContain('RL training events deleted');
+    expect(kept.details).toContain(
+      "Kept 42 RL training events in the launcher database, with the project's name",
+    );
+    const deleted = describeUnregisterReport(report({ rlEventsKept: 0, rlEventsDeleted: 7 }), 'Unregistered');
+    expect(deleted.summary).toContain('7 RL training events deleted');
+    expect(deleted.details.join('\n')).not.toContain('Kept');
+  });
+
+  it('a report without the fields (older backend) adds nothing', () => {
+    const out = describeUnregisterReport(report(), 'Unregistered');
+    expect(out.summary).toBe('Unregistered "Gamma"');
+    expect(out.details).toEqual([]);
   });
 });
