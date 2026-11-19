@@ -1,0 +1,25 @@
+# VibeCoded Orchestrator
+
+> A local knowledge graph and code graph for Claude Code, plus automation hooks, MCP servers and a launcher GUI, so Claude stops forgetting your project between sessions. Open source (AGPL-3.0-or-later), runs entirely on your machine. Status: alpha.
+
+## Start here
+
+- [QuickStart](https://vibecodedtools.com/quickstart): install in about 10 minutes of active time (Linux, macOS, Windows)
+- [README](https://github.com/hotak92/vibecoded-orchestrator/blob/main/README.md): what it does, install, compatibility, licensing, telemetry
+- [Getting started](https://github.com/hotak92/vibecoded-orchestrator/blob/main/docs/GETTING_STARTED.md): install and first-session walkthrough
+- [Troubleshooting](https://github.com/hotak92/vibecoded-orchestrator/blob/main/docs/TROUBLESHOOTING.md)
+
+## Guides
+
+- [How to give Claude Code persistent memory](https://vibecodedtools.com/blog/memoria-persistente-claude-code)
+- [Why Claude Code forgets context between sessions](https://vibecodedtools.com/blog/claude-code-dimentica-il-contesto)
+- [How to write a good CLAUDE.md](https://vibecodedtools.com/blog/come-scrivere-claude-md)
+- [How to cut token use and context bloat in Claude Code](https://vibecodedtools.com/blog/ridurre-token-contesto-claude-code)
+- [Using Claude Code as a team](https://vibecodedtools.com/blog/claude-code-in-team-contesto-condiviso)
+- [Knowledge graph vs vector database (classic RAG)](https://vibecodedtools.com/blog/knowledge-graph-vs-rag-classico)
+- [Code graphs for AI coding](https://vibecodedtools.com/blog/code-graphs-for-ai-coding)
+
+## Optional
+
+- [Compatibility with Claude Code surfaces](https://github.com/hotak92/vibecoded-orchestrator/blob/main/docs/CLAUDE_CODE_COMPATIBILITY.md)
+- [Website](https://vibecodedtools.com)
