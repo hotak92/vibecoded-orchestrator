@@ -376,6 +376,9 @@ def test_stop_drain_runs_the_root_drain_for_the_project(tmp_path):
         f"open({str(marker)!r}, 'w').write(json.dumps({{'cpd': os.environ.get('CLAUDE_PROJECT_DIR', ''), 'argv': sys.argv[1:]}}))\n",
         encoding="utf-8",
     )
+    # RL-DRAIN (v0.2.107): the hook spawns a drain only when a pending file exists.
+    (proj / ".claude" / "state" / "rl_pending").mkdir(parents=True)
+    (proj / ".claude" / "state" / "rl_pending" / "s-drain__t1.json").write_text("{}")
     payload = {"session_id": "s-drain", "transcript_path": str(tmp_path / "t.jsonl")}
     proc = subprocess.run(
         ["bash", str(HOOKS / "stop-drain-citations.sh")],

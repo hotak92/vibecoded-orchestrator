@@ -44,6 +44,12 @@
 # short harness budget; this hook only parses stdin and spawns the DETACHED
 # drain (setsid below), so the drain itself outlives the session's exit.
 #
+# v0.2.107 RL-DRAIN (A-024): no drain is spawned while the session has no
+# pending file (its own, or one staged without a session id); a spawned drain
+# runs single-flight per transcript (a second one leaves a rerun request for
+# the running one and exits) and reads only the transcript bytes appended
+# since the last drain (rl_drain_citations.py).
+#
 # Constraints:
 #   - Stop hooks' plain stdout is discarded by the harness; this hook only
 #     writes telemetry.
@@ -72,6 +78,19 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 
+# RL-DRAIN (v0.2.107, A-024): no drain without a pending file. A drain only
+# ever acts on staged citations, so a project whose queue is empty spawns
+# nothing — not even the payload parse below. The exact per-session rule
+# follows the parse. MUST MATCH citation_pending.session_may_drain.
+PENDING_DIR="$PROJECT_ROOT/.claude/state/rl_pending"
+_any_pending() {  # $1: a glob under PENDING_DIR (ends in .json: claims excluded)
+    for _f in "$PENDING_DIR"/$1; do
+        [ -f "$_f" ] && return 0
+    done
+    return 1
+}
+_any_pending '*.json' || exit 0
+
 # Parse session_id + transcript_path from the Stop stdin JSON in one call.
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
@@ -89,6 +108,8 @@ try:
     print(str(d.get('tool_use_id', '') or ''))
     print(str(resp.get('agentId', '') or ''))
     print('0' if (resp.get('isAsync') or resp.get('status') == 'async_launched') else '1')
+    import re
+    print(re.sub(r'[^A-Za-z0-9._-]', '-', str(d.get('session_id', '') or '')))
 except Exception:
     print(''); print(''); print(''); print('')
 " 2>/dev/null || printf '\n\n\n\n')
@@ -102,6 +123,13 @@ TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '6p')
 TOOL_USE_ID=$(printf '%s' "$_PARSED" | sed -n '7p')
 RESP_AGENT=$(printf '%s' "$_PARSED" | sed -n '8p')
 AGENT_FINISHED=$(printf '%s' "$_PARSED" | sed -n '9p')
+# The session id as it names its pending files (citation_pending._safe).
+SAFE_SID=$(printf '%s' "$_PARSED" | sed -n '10p')
+# A drain of this session reads its own files and the ones staged without a
+# session (the MCP / kg-search CLI path); an empty id drains every file.
+if [ -n "$SAFE_SID" ]; then
+    _any_pending "${SAFE_SID}__*.json" || _any_pending 'nosession__*.json' || exit 0
+fi
 # PostToolUse:Agent (R4c-8): re-tag the brief's citations — main chat only
 # (a subagent's own Agent call is not a brief the parent staged), and only
 # when the payload names both the call and the agent.

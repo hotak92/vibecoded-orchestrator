@@ -521,6 +521,10 @@ def test_stop_drain_hook_on_subagent_stop_uses_agent_transcript(tmp_path: Path, 
         "esac\n"
         f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
     py.chmod(0o755)
+    # RL-DRAIN (v0.2.107): the hook spawns a drain only when a pending file exists.
+    _pend = project / ".claude" / "state" / "rl_pending"
+    _pend.mkdir(parents=True, exist_ok=True)
+    (_pend / "sessS__t1.json").write_text("{}", encoding="utf-8")
     payload = {"hook_event_name": "SubagentStop", "session_id": "sessS",
                "transcript_path": "/parent.jsonl", "agent_id": "lane2",
                "agent_transcript_path": "/agent-lane2.jsonl"}
@@ -1203,6 +1207,10 @@ def test_stop_drain_hook_adopts_brief_on_post_tool_use_agent(tmp_path: Path, fla
         "esac\n"
         f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
     py.chmod(0o755)
+    # RL-DRAIN (v0.2.107): the hook spawns a drain only when a pending file exists.
+    _pend = project / ".claude" / "state" / "rl_pending"
+    _pend.mkdir(parents=True, exist_ok=True)
+    (_pend / "sessS__t1.json").write_text("{}", encoding="utf-8")
     env = _env(project, VCT_VENV=str(venv))
     base = {"hook_event_name": "PostToolUse", "tool_name": "Agent", "session_id": "sessS",
             "transcript_path": "/parent.jsonl", "tool_use_id": "toolu_77",
