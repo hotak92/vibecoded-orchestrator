@@ -71,7 +71,19 @@ function Test-VcoPendingFile([string]$Pattern) {
     } catch { }
     return $false
 }
-if (-not (Test-VcoPendingFile "*.json")) { exit 0 }
+function Test-VcoClaimFile([string]$Pattern) {
+    # A claim: <name>.json.draining.<pid> (citation_pending.CLAIM_MARK).
+    try {
+        foreach ($f in [System.IO.Directory]::EnumerateFiles($PendingDir, $Pattern)) {
+            if ($f.Contains(".json.draining.")) { return $true }
+        }
+    } catch { }
+    return $false
+}
+# A claim passes this cheap gate too: on SessionEnd a session whose only file
+# the MCP monitor holds still drains, to record its end (wave-2 check L-4).
+# The per-session rule below decides.
+if (-not (Test-VcoPendingFile "*.json") -and -not (Test-VcoClaimFile "*__*.json.draining.*")) { exit 0 }
 
 $SessionId = ""
 $TranscriptPath = ""
@@ -103,10 +115,14 @@ try {
 # The session id as it names its pending files (citation_pending._safe;
 # -creplace: case-sensitive, exactly the Python class). A drain of this
 # session reads its own files and the ones staged without a session (the MCP /
-# kg-search CLI path); an empty id drains every file.
+# kg-search CLI path); an empty id drains every file. The main chat's
+# SessionEnd also drains for a file of its own under a claim.
 $SafeSid = $SessionId -creplace '[^A-Za-z0-9._-]', '-'
 if ($SafeSid) {
-    if (-not (Test-VcoPendingFile "$($SafeSid)__*.json") -and -not (Test-VcoPendingFile "nosession__*.json")) { exit 0 }
+    $EndClaim = ($HookEvent -eq "SessionEnd") -and (-not $AgentId) -and (Test-VcoClaimFile "$($SafeSid)__*.json.draining.*")
+    if (-not (Test-VcoPendingFile "$($SafeSid)__*.json") -and -not (Test-VcoPendingFile "nosession__*.json") -and -not $EndClaim) { exit 0 }
+} elseif (-not (Test-VcoPendingFile "*.json")) {
+    exit 0
 }
 
 # PostToolUse:Agent (R4c-8): re-tag the brief's citations - main chat only,

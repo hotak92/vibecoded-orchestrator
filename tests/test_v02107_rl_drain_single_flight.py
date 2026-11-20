@@ -415,6 +415,21 @@ class TestEndMarkers:
                             compute_fn=lambda *a, **k: None)
         assert f.exists() and cp.ended_sessions(tmp_path) == ["s1"]
 
+    def test_a_session_end_whose_only_file_is_claimed_keeps_its_marker(
+            self, tmp_path: Path) -> None:
+        """Wave-2 check L-4: the hook now spawns this drain (the rule test
+        below); the drain records the end and keeps it for the claimed file,
+        so the file the monitor hands back is finalized by the next drain."""
+        f = _stage(tmp_path, "s1", "t1")
+        claim = f.with_name(f.name + cp.CLAIM_MARK + str(os.getpid()))  # the monitor holds it
+        f.rename(claim)
+        assert cp.session_may_drain("s1", tmp_path, session_end=True)
+        tp = tmp_path / "s1.jsonl"
+        _write(tp, [_assistant_text("x", 1)])
+        drain.drain_session("s1", str(tp), project_root=str(tmp_path), session_end=True,
+                            compute_fn=lambda *a, **k: None)
+        assert claim.exists() and cp.ended_sessions(tmp_path) == ["s1"]
+
 
 # ── 1. no spawn without a pending file (both hook siblings) ────────────────
 
@@ -425,7 +440,13 @@ _CASES = [
     ("own", ["sessH__t.json"], True),
     ("nosession", ["nosession__kg_cli_1.json"], True),
     ("marker_only", ["sessH.session_ended"], False),
+    ("other_claim", ["other__t.json.draining.9"], False),
 ]
+
+#: At the main chat's SessionEnd a file of its own under a claim (the MCP
+#: monitor's) also makes the drain run, so the session's end is recorded
+#: (wave-2 check L-4); someone else's claim still does not.
+_END_WANT = {"claim_only": True}
 
 
 @pytest.mark.parametrize("name,files,want", _CASES, ids=[c[0] for c in _CASES])
@@ -434,19 +455,26 @@ def test_session_may_drain_rule(tmp_path: Path, name: str, files: list, want: bo
     for f in files:
         (d / f).write_text("{}")
     assert cp.session_may_drain("sessH", tmp_path) is want
-    # An empty session id drains every file: any ``*.json`` counts.
-    assert cp.session_may_drain("", tmp_path) is (name in ("other_session", "own", "nosession"))
+    assert cp.session_may_drain("sessH", tmp_path, session_end=True) is _END_WANT.get(name, want)
+    # An empty session id drains every file: any ``*.json`` counts — a claim
+    # never does, SessionEnd or not.
+    for end in (False, True):
+        assert cp.session_may_drain("", tmp_path, session_end=end) is (
+            name in ("other_session", "own", "nosession"))
 
 
-_HOOK_CASES = [(sid, *c) for c in _CASES for sid in ("sessH", "")]
+_HOOK_CASES = [(sid, event, *c) for c in _CASES for sid in ("sessH", "")
+               for event in ("Stop", "SessionEnd")
+               if event == "Stop" or c[0] in ("claim_only", "other_claim", "own", "empty")]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX fake venv")
 @pytest.mark.parametrize("flavour", ["sh", "ps1"])
-@pytest.mark.parametrize("sid,name,files,want", _HOOK_CASES,
-                         ids=[f"{c[1]}-{c[0] or 'nosid'}" for c in _HOOK_CASES])
+@pytest.mark.parametrize("sid,event,name,files,want", _HOOK_CASES,
+                         ids=[f"{c[2]}-{c[0] or 'nosid'}-{c[1]}" for c in _HOOK_CASES])
 def test_hook_spawns_exactly_when_the_rule_says(tmp_path: Path, flavour: str, sid: str,
-                                                name: str, files: list, want: bool) -> None:
+                                                event: str, name: str, files: list,
+                                                want: bool) -> None:
     if flavour == "sh" and not BASH:
         pytest.skip("bash required")
     if flavour == "ps1" and not PWSH:
@@ -456,7 +484,7 @@ def test_hook_spawns_exactly_when_the_rule_says(tmp_path: Path, flavour: str, si
     d = cp.pending_dir(project)
     for f in files:
         (d / f).write_text("{}")
-    want = cp.session_may_drain(sid, project)
+    want = cp.session_may_drain(sid, project, session_end=event == "SessionEnd")
     argv_log = tmp_path / "argv.json"
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
@@ -474,7 +502,7 @@ def test_hook_spawns_exactly_when_the_rule_says(tmp_path: Path, flavour: str, si
     script = HOOKS / f"stop-drain-citations.{flavour}"
     argv = (["bash", str(script)] if flavour == "sh"
             else ["pwsh", *PWSH_BASE_FLAGS, "-File", str(script)])
-    r = subprocess.run(argv, input=json.dumps({"hook_event_name": "Stop", "session_id": sid,
+    r = subprocess.run(argv, input=json.dumps({"hook_event_name": event, "session_id": sid,
                                                "transcript_path": "/t/sessH.jsonl"}),
                        capture_output=True, text=True, env=env, cwd=str(project), timeout=120)
     assert r.returncode == 0, r.stderr
