@@ -109,7 +109,10 @@ def _env():
 _PRINT_SH = 'printf "%s|%s|%s\\n" "${VCO_TEST_EXTRA_SECRET-unset}" "${GITHUB_TOKEN-unset}" "${VERCEL_TOKEN-unset}"\n'
 
 
-@pytest.mark.skipif(sys.platform == "win32" or not shutil.which("bash"), reason="bash")
+@pytest.mark.skipif(
+    sys.platform == "win32" or not shutil.which("bash"),
+    reason=("bash .sh leg; Windows runs the .ps1 sibling: "
+            "tests/test_v02107_scrub_env_lib_sourced.py::test_ps1_scrub_uses_the_lib_and_falls_back"))
 @pytest.mark.parametrize("hook", _sh_hooks(), ids=lambda p: p.name)
 @pytest.mark.parametrize("lib_present", [True, False], ids=["lib", "no-lib"])
 def test_sh_scrub_uses_the_lib_and_falls_back(hook, lib_present, tmp_path):

@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import deferral_retry as dr  # noqa: E402
+from tests.common.child_env import child_env  # noqa: E402
 
 KG_CID = "kg_sync_no_embedding_backend"
 FAIL_CID = "kg_sync_failures_pending"
@@ -618,7 +619,7 @@ def test_a_worker_that_died_mid_job_still_counts_the_attempt(tmp_path):
     _owe(folder, KG_CID)
     script = tmp_path / "dying_worker.py"
     script.write_text(_DYING_WORKER, encoding="utf-8")
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT), WEAVIATE_URL="http://127.0.0.1:9")
+    env = child_env(WEAVIATE_URL="http://127.0.0.1:9")
     proc = subprocess.run([sys.executable, str(script), str(folder)], env=env,
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 9, proc.stderr

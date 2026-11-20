@@ -108,7 +108,7 @@ def _run_kg_leg(tmp_path: Path, monkeypatch, behaviour: dict):
 def test_kg_search_failing_on_every_collection_is_not_cached(
         tmp_path: Path, monkeypatch) -> None:
     kg, cached, warmed = _run_kg_leg(tmp_path, monkeypatch, {
-        "Self_KnowledgeGraph": "fail", "Peer_KnowledgeGraph": "fail"})
+        "Alpha_KnowledgeGraph": "fail", "Peer_KnowledgeGraph": "fail"})
     assert kg == ""
     assert cached is None, "a KG search that failed everywhere was cached as empty"
     assert warmed == ["kg"]
@@ -116,7 +116,7 @@ def test_kg_search_failing_on_every_collection_is_not_cached(
 
 def test_kg_search_finished_empty_is_still_cached(tmp_path: Path, monkeypatch) -> None:
     kg, cached, warmed = _run_kg_leg(tmp_path, monkeypatch, {
-        "Self_KnowledgeGraph": "empty", "Peer_KnowledgeGraph": "empty"})
+        "Alpha_KnowledgeGraph": "empty", "Peer_KnowledgeGraph": "empty"})
     assert kg == ""
     assert cached == ""
     assert warmed == []
@@ -125,7 +125,7 @@ def test_kg_search_finished_empty_is_still_cached(tmp_path: Path, monkeypatch) -
 def test_a_collection_weaviate_reports_absent_is_not_a_failure(
         tmp_path: Path, monkeypatch) -> None:
     kg, cached, warmed = _run_kg_leg(tmp_path, monkeypatch, {
-        "Self_KnowledgeGraph": "empty", "Peer_KnowledgeGraph": "missing"})
+        "Alpha_KnowledgeGraph": "empty", "Peer_KnowledgeGraph": "missing"})
     assert kg == ""
     assert cached == "", "a never-indexed peer must not make every lookup uncacheable"
     assert warmed == []
@@ -134,16 +134,16 @@ def test_a_collection_weaviate_reports_absent_is_not_a_failure(
 def test_partial_failure_is_shown_but_not_cached_as_the_complete_answer(
         tmp_path: Path, monkeypatch) -> None:
     kg, cached, warmed = _run_kg_leg(tmp_path, monkeypatch, {
-        "Self_KnowledgeGraph": "ok", "Peer_KnowledgeGraph": "fail"})
-    assert "Self_KnowledgeGraph-node-a" in kg, "the answering collection's rows are shown"
+        "Alpha_KnowledgeGraph": "ok", "Peer_KnowledgeGraph": "fail"})
+    assert "Alpha_KnowledgeGraph-node-a" in kg, "the answering collection's rows are shown"
     assert cached is None
     assert warmed == ["kg"]
 
 
 def test_partial_success_without_failures_is_cached(tmp_path: Path, monkeypatch) -> None:
     kg, cached, warmed = _run_kg_leg(tmp_path, monkeypatch, {
-        "Self_KnowledgeGraph": "ok", "Peer_KnowledgeGraph": "empty"})
-    assert "Self_KnowledgeGraph-node-a" in kg
+        "Alpha_KnowledgeGraph": "ok", "Peer_KnowledgeGraph": "empty"})
+    assert "Alpha_KnowledgeGraph-node-a" in kg
     assert cached == kg
     assert warmed == []
 

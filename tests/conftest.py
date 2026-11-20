@@ -388,6 +388,24 @@ if not _ALLOW_REAL_STATE:
         os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
 
 
+# ─── W-GPU (v0.2.107): the suite never allocates on the machine's GPU ─────────
+#
+# torch picks `cuda:0` for every `device="auto"` model when it sees a GPU
+# (`rl_reranker.RLModel._resolve_device`, `RL_DEVICE` defaulting to `auto`).
+# On a developer box that GPU is the one Ollama and code-embed are holding,
+# and the tensors the RL suites create stay allocated in this process (CUDA's
+# caching allocator keeps them): measured, ~7 MB per RLServer, 465 MB by the
+# time `tests/test_v0279_code_embed_idle_unload.py` runs, whose unload path
+# then reads a non-zero `torch.cuda.memory_allocated()` and keeps its mock
+# model loaded — two failures that passed in isolation. CI runners have no GPU,
+# so hiding it here makes every machine run the suite CI runs. Import time:
+# CUDA reads the variable when it initialises, on first use. Children inherit
+# it. A test that needs a device sets its own; `VCO_TEST_ALLOW_REAL_STATE=1`
+# is the one hatch for "use my real install".
+if not _ALLOW_REAL_STATE:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
 # ─── W-CODE-LADDER (v0.2.103 F1, pinned tighter by R41 M3/L1): the ───────────
 # resolver's hardware tail and install-record rung are FIXED, at the
 # resolver's OWN seams — never at vco_lib.host_probe's public probes.
