@@ -101,7 +101,7 @@ def _run_kg_leg(tmp_path: Path, monkeypatch, behaviour: dict):
     plan.kg_query = "how does the error cache rule work"
     plan.kg_limit = 3
     kg, _cg = router._run_legs(plan, "s", "p", str(root), "", time.monotonic() + 30)
-    key = router.cache_key("kgi", "prompt", plan.kg_query, "3")
+    key = router._kg_cache_key(plan, "p")
     return kg, router.cache_get(str(root), key), warmed
 
 

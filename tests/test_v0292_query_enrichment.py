@@ -846,7 +846,8 @@ class TestHookCallSitesForwardTranscript:
       never argv — R31) → router resolves transcript_path/prompt_id →
       KG argv carries ``--transcript <path>`` (literal-token discipline, the
       same shape the original WP-E pin demanded) → the router's kgi/cgi cache
-      keys are prompt_id-scoped (cross-turn re-ask is a MISS, R31 cond. 4).
+      KG key is prompt_id-scoped (cross-turn re-ask is a MISS, R31 cond. 4); the
+      code-graph key is per symbol.
 
     The behavioural end-to-end proof (stub producer records the argv) lives in
     test_v02101_router_surfaces.py; these rows are the literal-token pins.
@@ -861,19 +862,25 @@ class TestHookCallSitesForwardTranscript:
             "defect class WP-E targeted."
         )
 
-    def test_router_cache_keys_are_not_prompt_scoped(self) -> None:
-        """v0.2.107 (audit A-008, owner-approved fix): the router's ``kgi``
-        and ``cgi`` cache keys no longer carry ``prompt_id`` — the R31
-        per-turn scoping made every turn re-run identical retrievals (an
-        identical re-Read cost 57-59 Weaviate requests and emitted nothing).
-        The code-graph key is per symbol; a KG entry is reused across turns
-        for its TTL, so a short trigger's transcript enrichment is the one
-        from the turn that filled the entry (accepted trade-off)."""
+    def test_router_kg_cache_key_is_prompt_scoped_code_graph_key_is_not(self) -> None:
+        """R31 (owner decision 2026-11-18): the KG leg's ``kgi`` cache key is
+        PER TURN (carries ``prompt_id`` via ``_kg_cache_key``), so a short
+        trigger is re-enriched from each turn's conversation. The code-graph
+        ``cgi`` key stays per symbol and never carries ``prompt_id``."""
+        import sys
+        sys.path.insert(0, str(_repo_root() / "claude_mcp_servers" / "scripts"))
+        import hook_context_router as router
+
+        plan = router._Plan()
+        plan.kg_profile = "prompt"
+        plan.kg_query = "q"
+        plan.kg_limit = 3
+        assert router._kg_cache_key(plan, "p1") != router._kg_cache_key(plan, "p2")
+        assert router._kg_cache_key(plan, "p1") == router._kg_cache_key(plan, "p1")
+
         body = (_repo_root() / _ROUTER_REL).read_text(encoding="utf-8")
 
         def _call_text(start: int) -> str:
-            """The balanced-paren call text starting at `start` (the calls
-            span lines — a per-line scan would be vacuous)."""
             depth = 0
             for i in range(start, len(body)):
                 if body[i] == "(":
@@ -884,14 +891,16 @@ class TestHookCallSitesForwardTranscript:
                         return body[start:i + 1]
             return body[start:start + 300]
 
-        for namespace in ("kgi", "cgi"):
-            idx = body.find(f'cache_key("{namespace}"')
-            assert idx > 0, f"the router's {namespace} cache namespace went missing"
-            while idx > 0:
-                assert "prompt_id" not in _call_text(idx), (
-                    f"the {namespace} cache key must not be prompt_id-scoped "
-                    "(v0.2.107 A-008)")
-                idx = body.find(f'cache_key("{namespace}"', idx + 1)
+        idx = body.find('cache_key("cgi"')
+        assert idx > 0, "the router's cgi cache namespace went missing"
+        while idx > 0:
+            assert "prompt_id" not in _call_text(idx), (
+                "the cgi (code-graph) cache key must stay per symbol, "
+                "without prompt_id")
+            idx = body.find('cache_key("cgi"', idx + 1)
+        # Every kgi key is built by the one helper, which carries prompt_id.
+        assert body.count('cache_key("kgi"') == 1
+        assert "prompt_id" in _call_text(body.find('cache_key("kgi"'))
 
     @pytest.mark.parametrize("rel_path", _SH_WRAPPER_SITES)
     def test_sh_wrappers_pipe_the_full_payload_to_the_router(self, rel_path: str) -> None:

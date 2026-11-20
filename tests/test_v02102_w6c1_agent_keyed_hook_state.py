@@ -557,7 +557,7 @@ class TestLegWarmer:
         assert kg_text == ""
         assert "kg" in captured, "a missed KG leg was not handed to the warmer"
         assert captured["kg"]["cache_key"] == hcr.cache_key(
-            "kgi", "prompt", "w6c1 warmer query", "3")
+            "kgi", "prompt", "w6c1 warmer query", "3", "p1")
         assert captured["kg"]["script"] == str(stub)
         assert "w6c1 warmer query" in " ".join(
             str(a) for a in captured["kg"]["argv"])
