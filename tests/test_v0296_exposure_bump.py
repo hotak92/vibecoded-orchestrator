@@ -119,6 +119,8 @@ def _set_verdict(monkeypatch, verdict: str):
 def _quiet_driver_probes(monkeypatch, *, stale_sequence=None):
     """Silence the driver's non-heal machinery; stale_sequence feeds the
     pre-walk then post-walk count_stale_rows calls."""
+    from tests.common.revision_heal_fakes import heal_always_runs
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
     # v0.2.105: the driver's backend-reachability gate must not probe a real
     # code-embed/Ollama from these tests.

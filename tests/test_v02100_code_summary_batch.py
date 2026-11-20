@@ -368,7 +368,10 @@ def _driver_tree(tmp_path: Path) -> Path:
 
 
 def test_driver_spawns_the_summary_generator_after_the_analyzer(monkeypatch, tmp_path):
+    from tests.common.revision_heal_fakes import heal_always_runs
+
     analyzer = _driver_tree(tmp_path)
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     events: list = []
     monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
@@ -402,7 +405,10 @@ def test_driver_spawns_the_summary_generator_after_the_analyzer(monkeypatch, tmp
 
 def test_driver_does_not_spawn_the_generator_when_the_analyzer_never_started(
         monkeypatch, tmp_path):
+    from tests.common.revision_heal_fakes import heal_always_runs
+
     analyzer = _driver_tree(tmp_path)
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     popens: list = []
     monkeypatch.setattr(cr, "code_embed_image_verdict", lambda *a, **k: "current")
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)

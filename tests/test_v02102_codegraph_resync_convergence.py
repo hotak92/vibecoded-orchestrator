@@ -2147,8 +2147,10 @@ def _stub_driver_walk_gates(monkeypatch):
     import subprocess
     from types import SimpleNamespace
 
+    from tests.common.revision_heal_fakes import heal_always_runs
     from vco_lib import codegraph_resync as cr
 
+    heal_always_runs(monkeypatch, cr)  # the heal runs; these tests are about the walk claim
     monkeypatch.setattr(cr, "walk_uses_container", lambda *_a, **_k: False)
     # v0.2.105: the backend-reachability gate must not probe a real service
     # from the driver tests — "reachable" keeps the tests on the walk path.

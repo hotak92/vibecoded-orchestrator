@@ -586,8 +586,20 @@ def _seed_pending_deferral(folder: Path) -> None:
     rep.write(folder)
 
 
+def _no_worktree_no_cleanup(monkeypatch):
+    """The heal's own probes, answered without git or Weaviate: not a linked
+    worktree, no deleted-file rows awaiting the sweep."""
+    import vco_lib.git_meta as _gm
+
+    monkeypatch.setattr(_gm, "linked_worktree_main", lambda _root: None)
+    monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: 0)
+
+
 def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
+    """v0.2.107: a positive zero runs no analyzer (the revision heal pages
+    only owed rows) and still resolves the persisted ledger entry."""
     _seed_pending_deferral(tmp_path)
+    _no_worktree_no_cleanup(monkeypatch)
     rec = _RunRecord(returncode=0)
     monkeypatch.setattr(cr.subprocess, "run", rec)
     # v0.2.105: the driver\'s backend-reachability gate must not probe a
@@ -601,7 +613,7 @@ def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
         "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"
     )
     assert rc == 0
-    assert len(rec.calls) == 1
+    assert rec.calls == [], "nothing owed: no analyzer run"
     assert "codegraph_embed_resync_pending" not in _persisted_cids(tmp_path), (
         "positive zero-stale must resolve the persisted ledger entry"
     )
@@ -641,8 +653,11 @@ def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
 
 def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
     """DESIGN-DECISION: unverifiable convergence must SURFACE (one-time
-    deferral), never soft-fail into a void."""
-    monkeypatch.setattr(cr.subprocess, "run", _RunRecord(returncode=0))
+    deferral), never soft-fail into a void. v0.2.107: and an undeterminable
+    count runs no analyzer at all (the heal changes nothing on doubt)."""
+    _no_worktree_no_cleanup(monkeypatch)
+    rec = _RunRecord(returncode=0)
+    monkeypatch.setattr(cr.subprocess, "run", rec)
     # v0.2.105: the driver's backend-reachability gate must not probe a
     # real code-embed/Ollama from these tests.
     monkeypatch.setattr(cr, "code_backend_down_waiting",
@@ -657,9 +672,14 @@ def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
     assert rep.has_condition("codegraph_embed_resync_pending")
     entry = rep.entries[0]
     assert "could not be verified" in entry.detected
+    assert rec.calls == [], "undeterminable count: no analyzer run"
 
 
 def test_driver_analyzer_crash_never_raises(monkeypatch, tmp_path):
+    from tests.common.revision_heal_fakes import heal_always_runs
+
+    heal_always_runs(monkeypatch, cr)  # the heal runs; its analyzer cannot start
+
     def _boom(*a, **k):
         raise OSError("exec failed")
 

@@ -1104,6 +1104,9 @@ def test_driver_no_progress_names_the_stuck_rows_in_the_ledger(
     """RED-PROOF (item 3): pre-WP-C the driver had no pre-walk probe and
     ``build_unconverged_deferral`` had no stuck-identity argument, so a stuck
     project's entry could only ever say how MANY rows were owed."""
+    from tests.common.revision_heal_fakes import heal_always_runs
+
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: 0)
     # v0.2.105: the driver's backend-reachability gate must not probe a
     # real code-embed/Ollama from these tests.
@@ -1142,6 +1145,9 @@ def test_driver_no_progress_names_the_stuck_rows_in_the_ledger(
 def test_driver_progress_run_does_not_claim_no_progress(monkeypatch, tmp_path):
     """Leave-alone for the no-progress branch: a walk that reduced the owed set
     is NOT reported as stuck and does not enumerate identities."""
+    from tests.common.revision_heal_fakes import heal_always_runs
+
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: 0)
     monkeypatch.setattr(
         cr.subprocess, "run",
@@ -1199,11 +1205,13 @@ def test_end_to_end_stuck_deferral_clears_after_a_reconciling_walk(
     fresh timestamp) — exactly the field behaviour reported on 2026-07-25 and
     reproduced on this machine on 2026-07-31.
     """
+    from tests.common.revision_heal_fakes import heal_always_runs
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
     # v0.2.105: the driver's backend-reachability gate must not probe a
     # real code-embed/Ollama from these tests.
     monkeypatch.setattr(cr, "code_backend_down_waiting",
                         lambda *a, **k: (None, False))
+    heal_always_runs(monkeypatch, cr)  # the fake `_walk` below stands in for the run
 
     _stub_embeddings(analyzer_mod, monkeypatch)
     repo = _make_repo(tmp_path)

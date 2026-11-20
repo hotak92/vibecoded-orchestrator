@@ -6238,10 +6238,10 @@ def main() -> int:
         # v0.2.72 (P7): revision-gated code-graph resync. After the additive
         # `embed_revision` schema migration ran (above, inside
         # analyze_code_graph's create_collections on the next analyze), trigger a
-        # BACKGROUND full re-analyze so the ~7-9% of over-budget Function/Class
-        # rows that P3 chunking invalidated get re-embedded into chunks. The
-        # revision gate makes this LIGHT (rows already at the current revision
-        # hash-skip). Non-blocking (background Popen), no global timeout, and it
+        # BACKGROUND resync so the ~7-9% of over-budget Function/Class rows that
+        # P3 chunking invalidated get re-embedded into chunks. v0.2.107: the
+        # driver re-extracts only the files owning rows at an old revision (the
+        # revision heal). Non-blocking (background Popen), no global timeout, and it
         # degrades to a deferral when the code-embed service (:11440) is down.
         # Only on --update: a fresh install analyzes at the current revision
         # already, so there are no stale rows to resync. Thin shim → the logic

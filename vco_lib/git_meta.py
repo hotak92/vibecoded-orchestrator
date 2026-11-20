@@ -266,6 +266,21 @@ def committed_paths(repo: Path) -> Optional[set[str]]:
     return {p for p in text.split("\0") if p}
 
 
+def uncommitted_paths(repo: Path) -> Optional[set[str]]:
+    """POSIX paths, relative to ``repo``, of every TRACKED file under ``repo``
+    whose working-tree or staged content differs from HEAD (``git diff
+    --name-only -z --relative HEAD`` run from ``repo``). Untracked files are
+    not listed (they are not in HEAD's tree: :func:`committed_paths` tells
+    them apart). None when git cannot answer — "cannot tell", never "clean"."""
+    rc, out, _err = run_git_binary(
+        repo, ["diff", "--name-only", "-z", "--relative", "HEAD", "--"], timeout=60,
+    )
+    if rc != 0:
+        return None
+    text = out.decode("utf-8", errors="surrogateescape")
+    return {p for p in text.split("\0") if p}
+
+
 def is_git_work_tree(repo: Path) -> Optional[bool]:
     """True inside a git work tree, False when git ran and said it is not
     one, None when git could not run (cannot tell)."""

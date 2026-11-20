@@ -110,6 +110,8 @@ def _set_verdict(monkeypatch, verdict: str):
 
 def _quiet_driver_probes(monkeypatch, *, stale=None):
     """Silence the driver's non-gate machinery (Weaviate probes, sweep)."""
+    from tests.common.revision_heal_fakes import heal_always_runs
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     monkeypatch.setattr(cr, "identity_sweep_if_stale", lambda *a, **k: None)
     monkeypatch.setattr(cr, "count_stale_rows", lambda *a, **k: stale)
     # v0.2.105: the driver's backend-reachability gate must not probe a real

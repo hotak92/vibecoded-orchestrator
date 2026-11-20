@@ -592,6 +592,9 @@ def test_analyzer_records_dropped_extras(analyzer_mod, tmp_path):
 # ── the driver's converged verdict (R12-F4) and the deferral (F5) ──────────
 
 def _patch_driver_guts(monkeypatch, tmp_path, *, stale_counts, orphans):
+    from tests.common.revision_heal_fakes import heal_always_runs
+
+    heal_always_runs(monkeypatch, cr)  # the heal runs; these tests are about what follows
     orphan_recorded = []
 
     def _fake_orphan_record(repo_root, project_name, count, command_to_apply):
