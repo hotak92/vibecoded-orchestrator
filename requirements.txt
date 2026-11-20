@@ -41,7 +41,7 @@ ollama>=0.6.2
 
 # ─── Code embedding service (runs in container, but needed for CPU fallback) ───
 # sentence-transformers (Apache 2.0)
-sentence-transformers>=5.4.1
+sentence-transformers>=5.5.0
 # transformers pinned <4.50 because CodeSage-Large-v2's
 # `modeling_codesage.py` (loaded via trust_remote_code) has TWO
 # distinct incompatibilities with newer transformers:
