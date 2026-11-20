@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# session-worktree-reap.ps1 -- SessionEnd + SessionStart hook: the point where
-# an isolated agent's UNCHANGED worktree is removed (v0.2.107 REAP-INTERIM).
-# MUST MATCH session-worktree-reap.sh, which carries the full WHY:
-# SubagentStop also fires on an INTERIM stop the payload cannot tell from a
-# final one, so subagent-stop-reconcile only marks an unchanged worktree a
-# reap candidate, and this hook removes candidates once no session can resume
-# their agent.
-#   SessionEnd   records that this session ended (Set-WtrecSessionEnded; a
-#                marker only -- the harness budget is short).
-#   SessionStart a resumed session withdraws its own end marker, then
-#                Invoke-WtrecSweep removes the candidates of ENDED sessions
-#                (and of sessions idle for days that never recorded an end),
-#                never those of the current session, after re-checking that
-#                each worktree is still unchanged. Each decision is logged to
-#                .claude/logs/worktree-guard.jsonl.
+# session-worktree-reap.ps1 -- SessionStart hook: the point where an isolated
+# agent's worktree is removed (v0.2.107 REAP-INTERIM; owner rulings
+# 2026-11-20). MUST MATCH session-worktree-reap.sh, which carries the full
+# WHY: SubagentStop also fires on an INTERIM stop the payload cannot tell from
+# a final one, so subagent-stop-reconcile only marks a worktree, and this
+# hook's Invoke-WtrecSweep removes an UNCHANGED candidate idle for 7 days and
+# a KEPT worktree whose commits are merged into the main checkout's current
+# branch and that is clean (with the branch VCO created for it), never one of
+# the starting session, after re-checking every condition; any doubt keeps
+# it. Each decision is logged to .claude/logs/worktree-guard.jsonl.
 # Prints NOTHING on stdout (SessionStart stdout becomes model context);
 # always exits 0.
 
@@ -39,21 +34,17 @@ if (-not $ProjectRoot) { exit 0 }
 
 $HookStdin = ""
 try { $HookStdin = Read-VcoHookStdin } catch { }
-$EventName = ""; $SessionId = ""; $Source = ""
+$EventName = ""; $SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -is [System.Management.Automation.PSCustomObject]) {
         if ($payload.hook_event_name -is [string]) { $EventName = $payload.hook_event_name }
         if ($payload.session_id -is [string]) { $SessionId = $payload.session_id }
-        if ($payload.source -is [string]) { $Source = $payload.source }
     }
 } catch { }
 
 try {
-    if ($EventName -ceq "SessionEnd") {
-        Set-WtrecSessionEnded $ProjectRoot $SessionId
-    } elseif ($EventName -ceq "SessionStart") {
-        if ($Source -ceq "resume") { Clear-WtrecSessionEnded $ProjectRoot $SessionId }
+    if ($EventName -ceq "SessionStart") {
         $log = Join-Path $ProjectRoot ".claude/logs/worktree-guard.jsonl"
         foreach ($r in @(Invoke-WtrecSweep $ProjectRoot $SessionId)) {
             $agent = [string]$r.Name

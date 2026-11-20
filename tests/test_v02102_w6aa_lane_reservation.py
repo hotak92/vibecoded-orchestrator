@@ -477,17 +477,19 @@ def test_subagent_start_names_the_reservation(flavour: str, pr, hub: _Hub) -> No
 
 
 def _stop(flavour: str, p: Path, agent_id: str, env: dict) -> None:
-    """The agent's final stop, then its session's end and the next session's
-    start: SubagentStop only marks an unchanged worktree a reap candidate
-    (v0.2.107 REAP-INTERIM); session-worktree-reap removes it at the next
-    SessionStart once the session that ran the agent has ended."""
+    """The agent's final stop, 8 idle days, then the next session's start:
+    SubagentStop only marks an unchanged worktree a reap candidate (v0.2.107
+    REAP-INTERIM); session-worktree-reap removes it at a SessionStart once
+    it has been idle for 7 days (owner 2026-11-20)."""
     proc = _hook("subagent-stop-reconcile", flavour,
                  {"hook_event_name": "SubagentStop", "agent_id": agent_id, "session_id": "s"}, p, env)
     assert proc.returncode == 0, proc.stderr
-    for payload in ({"hook_event_name": "SessionEnd", "session_id": "s", "reason": "other"},
-                    {"hook_event_name": "SessionStart", "session_id": "s-next", "source": "startup"}):
-        proc = _hook("session-worktree-reap", flavour, payload, p, env)
-        assert proc.returncode == 0, proc.stderr
+    old = time.time() - 8 * 86400
+    for rec in (p / ".claude" / "state" / "worktree-guard").glob("wt-*.json"):
+        os.utime(rec, (old, old))
+    proc = _hook("session-worktree-reap", flavour,
+                 {"hook_event_name": "SessionStart", "session_id": "s-next", "source": "startup"}, p, env)
+    assert proc.returncode == 0, proc.stderr
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)

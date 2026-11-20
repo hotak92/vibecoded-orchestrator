@@ -25,12 +25,13 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import ensure_lock as el  # noqa: E402
 from vco_lib import gateway_ensure as ge  # noqa: E402
-from vco_lib import hub_ensure as he  # noqa: E402
 from vco_lib import launcher_ensure as le  # noqa: E402
 
 
@@ -108,13 +109,6 @@ _HOLDER = textwrap.dedent(
 )
 
 
-def _child_env(state: Path) -> dict:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env["VCT_STATE_DIR"] = str(state)
-    return env
-
-
 def _wait_for(path: Path, timeout: float = 20.0) -> None:
     deadline = time.monotonic() + timeout
     while not path.exists():
@@ -129,7 +123,7 @@ def test_a_dead_holder_does_not_block_the_next_ensure(state, tmp_path):
     lock.parent.mkdir(parents=True, exist_ok=True)
     ready = tmp_path / "held"
     holder = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER, str(lock), str(ready)], env=_child_env(state),
+        [sys.executable, "-c", _HOLDER, str(lock), str(ready)], env=child_env(VCT_STATE_DIR=str(state)),
     )
     try:
         _wait_for(ready)
@@ -159,7 +153,7 @@ def test_a_live_holder_past_the_bound_lets_the_waiter_proceed_unlocked(
     lock.parent.mkdir(parents=True, exist_ok=True)
     ready = tmp_path / "held"
     holder = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER, str(lock), str(ready)], env=_child_env(state),
+        [sys.executable, "-c", _HOLDER, str(lock), str(ready)], env=child_env(VCT_STATE_DIR=str(state)),
     )
     try:
         _wait_for(ready)
@@ -235,7 +229,7 @@ def _good_launcher(tmp_path: Path) -> Path:
 
 def _race(script: str, args: list[str], workdir: Path, state: Path, *, n: int = 2,
           extra_env: dict | None = None) -> tuple[list[str], int]:
-    env = _child_env(state)
+    env = child_env(VCT_STATE_DIR=str(state))
     env.update(extra_env or {})
     procs = [
         subprocess.Popen(

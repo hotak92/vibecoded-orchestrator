@@ -9,8 +9,9 @@
 # v0.2.102 W6-AA), same reap conditions and decision/reason vocabulary. See the
 # .sh sibling for the full WHY: the harness keeps a hook-created worktree and
 # runs no WorktreeRemove when a subagent finishes, so VCO reaps the provably
-# unchanged ones itself -- never at SubagentStop (v0.2.107 REAP-INTERIM: a reap
-# candidate there, removed by session-worktree-reap at a later SessionStart).
+# unchanged and the merged ones itself -- never at SubagentStop (v0.2.107
+# REAP-INTERIM: only marked there; session-worktree-reap's SessionStart sweep
+# removes them).
 
 . (Join-Path $PSScriptRoot "utf8-nobom.ps1")  # BOM-free writes (review R5-8)
 $script:WtrecSubdir = ".claude/state/worktree-guard"
@@ -126,7 +127,12 @@ function Read-WtrecRecord([string]$file) {
     try { return (Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
 }
 
-function Set-WtrecStatus([string]$file, [string]$status, [string]$reason) {
+# Set-WtrecStatus FILE STATUS REASON [SESSION TRANSCRIPT] -- record the reap
+# outcome. With -WithSession (a SubagentStop decision) the session and
+# transcript of that stop are stored too (reap_session, reap_transcript), so
+# Invoke-WtrecSweep can leave the starting session's worktrees alone. Must
+# match wtrec_set in the .sh sibling.
+function Set-WtrecStatus([string]$file, [string]$status, [string]$reason, [string]$sessionId = "", [string]$transcript = "", [switch]$WithSession) {
     $rec = Read-WtrecRecord $file
     if (-not $rec) { return }
     try {
@@ -135,6 +141,10 @@ function Set-WtrecStatus([string]$file, [string]$status, [string]$reason) {
         $h["status"] = $status
         $h["status_reason"] = $reason
         $h["status_at"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        if ($WithSession) {
+            $h["reap_session"] = $sessionId
+            $h["reap_transcript"] = $transcript
+        }
         Set-VcoUtf8Content -Path $file -Value ($h | ConvertTo-Json -Compress)
     } catch { }
 }
@@ -223,7 +233,7 @@ function Get-WtrecCleanupDays([string]$root) {
 }
 
 # Remove-WtrecStale: keep the directory bounded without breaking a resume.
-# Notices and session-ended markers go after 30 days; records of ANY status go only once IDLE
+# Notices go after 30 days; records of ANY status go only once IDLE
 # (LastWriteTime - Find-WtrecRecord bumps it on every lookup) longer than
 # max(30, cleanupPeriodDays) + 30 days, so a resumed subagent still finds
 # its record. A `wt-*.json.tmp` (or `.bak`) left by a crash between
@@ -236,7 +246,7 @@ function Remove-WtrecStale([string]$root) {
     try {
         $cut = (Get-Date).AddDays(-30)
         Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Name -like 'notice-*.txt' -or $_.Name -like 'session-ended-*') -and $_.LastWriteTime -lt $cut } |
+            Where-Object { $_.Name -like 'notice-*.txt' -and $_.LastWriteTime -lt $cut } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     } catch { }
     try {
@@ -313,16 +323,20 @@ function Remove-WtrecLanesParent([string]$top, [string]$path) {
     } catch { }
 }
 
-# Reaping (v0.2.107 REAP-INTERIM) -- must match the "Reaping" block of the .sh
-# sibling, which carries the full WHY. SubagentStop (Invoke-WtrecReap) never
-# removes a worktree: SubagentStop also fires on an INTERIM stop and the
-# payload cannot tell it from a final one, so a provably unchanged worktree is
-# only marked `status: reap_candidate` (with reap_session, reap_transcript,
-# reap_marked_epoch). Invoke-WtrecSweep, run at SessionStart by
-# session-worktree-reap, removes a candidate once its parent session ended (a
-# `session-ended-<sid>` marker newer than the mark) or it is abandoned
-# (record and transcript idle for WtrecAbandonDays); a candidate of the
-# CURRENT session is never swept, and every unchanged-check runs again first.
+# Reaping (v0.2.107 REAP-INTERIM, owner rulings 2026-11-20) -- must match the
+# "Reaping" block of the .sh sibling, which carries the full WHY.
+# SubagentStop (Invoke-WtrecReap) never removes a worktree: SubagentStop also
+# fires on an INTERIM stop and the payload cannot tell it from a final one,
+# so a provably unchanged worktree is only marked `status: reap_candidate`
+# (with reap_marked_epoch) and a changed one `kept`; both store the stop's
+# reap_session and reap_transcript. Invoke-WtrecSweep, run at SessionStart by
+# session-worktree-reap, removes (a) an unchanged candidate idle for
+# WtrecAbandonDays and (b) a kept worktree whose HEAD is merged into the main
+# checkout's current branch and whose status is clean (ignored files do not
+# count), with the branch VCO created for it (`git branch -d`). Never a
+# worktree of the starting session, a record without a session, in_place or
+# reservation_existing; every condition is re-checked right before
+# `git worktree remove` (never --force), and any doubt keeps the worktree.
 $script:WtrecAbandonDays = 7  # MUST MATCH WTREC_ABANDON_DAYS in the .sh
 
 # Invoke-WtrecReap: SubagentStop's step -- decide the agent's worktree WITHOUT
@@ -353,27 +367,68 @@ function Set-WtrecCandidate([string]$file, [string]$sessionId, [string]$transcri
     } catch { }
 }
 
-# Set-WtrecSessionEnded / Clear-WtrecSessionEnded ROOT SESSION -- SessionEnd
-# records the end; a resumed session's SessionStart withdraws it. Must match
-# wtrec_session_ended / wtrec_session_resumed in the .sh.
-function Set-WtrecSessionEnded([string]$root, [string]$sessionId) {
-    if (-not (Test-WtrecName $sessionId)) { return }
-    try {
-        $dir = Join-Path $root $script:WtrecSubdir
-        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
-        $m = Join-Path $dir "session-ended-$sessionId"
-        [System.IO.File]::WriteAllText($m, "")
-        [System.IO.File]::SetLastWriteTime($m, (Get-Date))
-    } catch { }
-}
-function Clear-WtrecSessionEnded([string]$root, [string]$sessionId) {
-    if (-not (Test-WtrecName $sessionId)) { return }
-    try { Remove-Item -LiteralPath (Join-Path (Join-Path $root $script:WtrecSubdir) "session-ended-$sessionId") -Force -ErrorAction Stop } catch { }
+# Get-WtrecWorktreeBlock LISTED PATH -- the `git worktree list --porcelain`
+# lines (LISTED, an array) of the worktree at PATH (compared as full,
+# normalized paths: git prints forward slashes on Windows); $null when PATH
+# is not listed. Must match _wtrec_wt_block in the .sh.
+function Get-WtrecWorktreeBlock([string[]]$listed, [string]$path) {
+    $norm = { param($p) try { [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { $p } }
+    $want = & $norm $path
+    $block = $null
+    foreach ($l in $listed) {
+        if ($l -like 'worktree *') {
+            if ($null -ne $block) { break }
+            if ((& $norm $l.Substring(9)) -eq $want) { $block = New-Object System.Collections.Generic.List[string]; $block.Add($l) }
+        } elseif ($null -ne $block) {
+            if ($l -eq "") { break }
+            $block.Add($l)
+        }
+    }
+    if ($null -eq $block) { return $null }
+    return ,($block.ToArray())
 }
 
-# Invoke-WtrecSweep ROOT CURRENT_SESSION -- reap every candidate no session
-# can resume any more. Returns one object per decided candidate (Decision,
-# Reason, Path, Name). Must match wtrec_sweep in the .sh.
+# Test-WtrecInUse PATH -- 'yes' when a process has its cwd at or under PATH,
+# 'no' when none has, 'unknown' when that cannot be told: Linux reads
+# /proc/<pid>/cwd, macOS asks `lsof -d cwd`, anything else (Windows) is
+# unknown. A process whose cwd cannot be read is skipped. Must match
+# _wtrec_in_use in the .sh.
+function Test-WtrecInUse([string]$path) {
+    try {
+        $want = New-Object System.Collections.Generic.List[string]
+        $want.Add([System.IO.Path]::GetFullPath($path).TrimEnd('/'))
+        $cwds = New-Object System.Collections.Generic.List[string]
+        if ($IsLinux -and (Test-Path -LiteralPath '/proc/self')) {
+            try { $rp = @(& realpath -- $path 2>$null); if ($LASTEXITCODE -eq 0 -and $rp.Count -gt 0) { $want.Add(([string]$rp[0]).TrimEnd('/')) } } catch { }
+            foreach ($d in [System.IO.Directory]::GetDirectories('/proc')) {
+                if ([System.IO.Path]::GetFileName($d) -notmatch '^[0-9]+$') { continue }
+                try { $c = [System.IO.DirectoryInfo]::new("$d/cwd").LinkTarget } catch { continue }
+                if (-not $c) { continue }
+                if ($c.EndsWith(" (deleted)")) { $c = $c.Substring(0, $c.Length - 10) }
+                $cwds.Add($c)
+            }
+        } elseif ($IsMacOS) {
+            try { $rp = @(& realpath -- $path 2>$null); if ($LASTEXITCODE -eq 0 -and $rp.Count -gt 0) { $want.Add(([string]$rp[0]).TrimEnd('/')) } } catch { }
+            $lines = @(& lsof -a -d cwd -Fn 2>$null)
+            if ($LASTEXITCODE -ne 0) { return "unknown" }
+            foreach ($l in $lines) { if ($l.StartsWith("n")) { $cwds.Add($l.Substring(1)) } }
+        } else {
+            return "unknown"
+        }
+        foreach ($c in $cwds) {
+            $cn = $c.TrimEnd('/')
+            foreach ($w in $want) {
+                if ($cn -ceq $w -or $cn.StartsWith($w + "/", [System.StringComparison]::Ordinal)) { return "yes" }
+            }
+        }
+        return "no"
+    } catch { return "unknown" }
+}
+
+# Invoke-WtrecSweep ROOT CURRENT_SESSION -- run the two sweep rules over every
+# record whose stop session is known and is not the starting session. Returns
+# one object per decision (Decision, Reason, Path, Name). Must match
+# wtrec_sweep in the .sh.
 function Invoke-WtrecSweep([string]$root, [string]$currentSession) {
     $dir = Join-Path $root $script:WtrecSubdir
     if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
@@ -387,33 +442,22 @@ function Invoke-WtrecSweep([string]$root, [string]$currentSession) {
         try {
             $rec = Read-WtrecRecord $f.FullName
             if (-not $rec -or $rec -isnot [System.Management.Automation.PSCustomObject]) { continue }
-            if ([string]$rec.status -cne "reap_candidate") { continue }
-            $sid = [string]$rec.reap_session
-            if ($sid -and $sid -ceq $currentSession) { continue }
-            $marked = $null
-            $mv = $rec.reap_marked_epoch
-            if ($null -ne $mv -and $mv -isnot [bool] -and $mv -isnot [string]) {
-                try { $marked = [double]$mv } catch { $marked = $null }
-            }
-            $ok = $false
-            if ($sid -and (Test-WtrecName $sid) -and $null -ne $marked) {
-                $m = Join-Path $dir "session-ended-$sid"
-                if (Test-Path -LiteralPath $m -PathType Leaf) {
-                    $mEpoch = ([DateTimeOffset](Get-Item -LiteralPath $m).LastWriteTimeUtc).ToUnixTimeMilliseconds() / 1000.0
-                    if ($mEpoch -ge $marked) { $ok = $true }
-                }
-            }
-            if (-not $ok) {
+            $sid = $rec.reap_session
+            if ($sid -isnot [string] -or -not $sid -or $sid -ceq $currentSession) { continue }
+            $status = [string]$rec.status
+            $r = $null
+            if ($status -ceq "kept") {
+                $r = Invoke-WtrecReapMerged $f.FullName
+            } elseif ($status -ceq "reap_candidate") {
                 $last = $f.LastWriteTimeUtc
                 $t = [string]$rec.reap_transcript
                 if ($t -and (Test-Path -LiteralPath $t -PathType Leaf)) {
                     $tl = (Get-Item -LiteralPath $t).LastWriteTimeUtc
                     if ($tl -gt $last) { $last = $tl }
                 }
-                $ok = (($now - $last) -ge $window)
+                if (($now - $last) -lt $window) { continue }
+                $r = Invoke-WtrecReapRecord $f.FullName "remove" "" ""
             }
-            if (-not $ok) { continue }
-            $r = Invoke-WtrecReapRecord $f.FullName "remove" "" ""
             if ($r) {
                 $name = $f.Name.Substring(3, $f.Name.Length - 8)
                 $out.Add([pscustomobject]@{ Decision = $r.Decision; Reason = $r.Reason; Path = $r.Path; Name = $name })
@@ -442,8 +486,10 @@ function Write-WtrecReapLog([string]$log, [string]$hook, [string]$agent, [string
 }
 
 # Invoke-WtrecReapRecord FILE ACTION SESSION TRANSCRIPT -- the one decision
-# (ACTION candidate: mark an unchanged worktree; remove: remove it). Same
-# conditions as _wtrec_reap_rec in the .sh sibling.
+# for an UNCHANGED worktree (ACTION candidate: mark it; remove: remove it,
+# sweep rule a). Same conditions as _wtrec_reap_rec in the .sh sibling,
+# including `deferred` (record left a candidate) for a locked worktree or one
+# a process works in (or when that cannot be told).
 function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$sessionId, [string]$transcript) {
     $rec = Read-WtrecRecord $file
     if (-not $rec) { return $null }
@@ -451,7 +497,10 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
     $base = [string]$rec.base; $top = [string]$rec.toplevel
     $out = {
         param($d, $r)
-        if ($d -ne "skipped") { Set-WtrecStatus $file $d $r }
+        if ($d -ne "skipped" -and $d -ne "deferred") {
+            if ($action -eq "candidate") { Set-WtrecStatus $file $d $r $sessionId $transcript -WithSession }
+            else { Set-WtrecStatus $file $d $r }
+        }
         return [pscustomobject]@{ Decision = $d; Reason = $r; Path = $path }
     }
     if ($mode -eq "in_place") { return (& $out "skipped" "in_place_never_removed") }
@@ -467,16 +516,9 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
         return $r
     }
     $listed = @()
-    try {
-        $listed = @((& git -C $top worktree list --porcelain 2>$null) |
-            Where-Object { $_ -like 'worktree *' } | ForEach-Object { $_.Substring(9) })
-    } catch { }
-    # git prints forward slashes on Windows; compare full, normalized paths.
-    $norm = { param($p) try { [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { $p } }
-    $want = & $norm $path
-    $hit = $false
-    foreach ($l in $listed) { if ((& $norm $l) -eq $want) { $hit = $true; break } }
-    if (-not $hit) { return (& $out "kept" "not_a_registered_worktree") }
+    try { $listed = @(& git -C $top worktree list --porcelain 2>$null) } catch { }
+    $block = Get-WtrecWorktreeBlock $listed $path
+    if ($null -eq $block) { return (& $out "kept" "not_a_registered_worktree") }
     $head = ""
     try { $head = [string](& git -C $path rev-parse HEAD 2>$null | Select-Object -First 1) } catch { }
     if ($head.Trim() -ne $base) { return (& $out "kept" "head_moved_or_commits") }
@@ -487,6 +529,10 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
         Set-WtrecCandidate $file $sessionId $transcript
         return [pscustomobject]@{ Decision = "candidate"; Reason = "unchanged_reap_deferred"; Path = $path }
     }
+    if (@($block | Where-Object { $_ -like 'locked*' }).Count -gt 0) { return (& $out "deferred" "locked") }
+    $use = Test-WtrecInUse $path
+    if ($use -eq "yes") { return (& $out "deferred" "in_use") }
+    if ($use -ne "no") { return (& $out "deferred" "in_use_unknown") }
     $err = (& git -C $top worktree remove $path 2>&1 | Out-String)
     if ($LASTEXITCODE -eq 0) {
         # A reservation worktree's NEW branch goes too, but only while it still
@@ -507,4 +553,84 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
     $msg = ($err -replace '[\t\r\n]+', ' ').Trim()
     if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) }
     return (& $out "kept" "git_refused: $msg")
+}
+
+# Invoke-WtrecReapMerged FILE -- sweep rule (b): remove a KEPT worktree whose
+# work is merged into the main checkout's current branch. Returns an object
+# (Decision removed|deferred, Reason, Path) when it removed the worktree or a
+# doubt held a merged one back, and $null when the worktree is simply not
+# eligible (wrong mode or status, gone, unchanged, not merged yet). Writes
+# the record only on removal. Must match _wtrec_reap_merged in the .sh.
+function Invoke-WtrecReapMerged([string]$file) {
+    $rec = Read-WtrecRecord $file
+    if (-not $rec) { return $null }
+    $mode = [string]$rec.mode; $path = [string]$rec.path
+    $base = [string]$rec.base; $top = [string]$rec.toplevel
+    if (@("head", "snapshot", "reservation") -cnotcontains $mode) { return $null }
+    if ([string]$rec.status -cne "kept") { return $null }
+    if (-not $path -or -not $base -or -not $top -or $path -eq $top) { return $null }
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { return $null }
+    $defer = { param($r) return [pscustomobject]@{ Decision = "deferred"; Reason = $r; Path = $path } }
+    # (No `| Select-Object -First 1` on these: it stops the native command and
+    # leaves $LASTEXITCODE meaningless.)
+    $o = @(& git -C $path rev-parse --verify -q HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $o.Count -lt 1) { return $null }
+    $head = ([string]$o[0]).Trim()
+    if (-not $head -or $head -eq $base) { return $null }
+    $listed = @(& git -C $top worktree list --porcelain 2>$null)
+    if ($LASTEXITCODE -ne 0) { return (& $defer "worktree_list_failed") }
+    # The MAIN checkout is the first entry git lists (the main worktree).
+    $main = ""
+    if ($listed.Count -gt 0 -and ([string]$listed[0]) -like 'worktree *') { $main = ([string]$listed[0]).Substring(9) }
+    if (-not $main) { return (& $defer "main_checkout_unknown") }
+    $norm = { param($p) try { [System.IO.Path]::GetFullPath($p).TrimEnd('\', '/') } catch { $p } }
+    if ((& $norm $main) -eq (& $norm $path)) { return $null }
+    $o = @(& git -C $main symbolic-ref -q HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $o.Count -lt 1 -or -not ([string]$o[0]).Trim()) { return (& $defer "main_branch_unknown") }
+    $mref = ([string]$o[0]).Trim()
+    $o = @(& git -C $main rev-parse --verify -q "$mref^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $o.Count -lt 1 -or -not ([string]$o[0]).Trim()) { return (& $defer "main_branch_unknown") }
+    $mhead = ([string]$o[0]).Trim()
+    & git -C $main merge-base --is-ancestor $head $mhead 2>$null | Out-Null
+    $rc = $LASTEXITCODE
+    if ($rc -eq 1) { return $null }
+    if ($rc -ne 0) { return (& $defer "ancestry_unknown") }
+    # -- merged: every doubt below keeps it --
+    $block = Get-WtrecWorktreeBlock $listed $path
+    if ($null -eq $block) { return (& $defer "not_a_registered_worktree") }
+    $br = ""
+    if ($mode -eq "reservation") {
+        $br = [string]$rec.branch
+        if (-not $br -or ($block -cnotcontains "branch refs/heads/$br")) { return (& $defer "record_mismatch") }
+    } elseif ($block -cnotcontains "detached") { return (& $defer "record_mismatch") }
+    if (@($block | Where-Object { $_ -like 'locked*' }).Count -gt 0) { return (& $defer "locked") }
+    $st = (& git -C $path status --porcelain --untracked-files=all 2>$null | Out-String)
+    if ($LASTEXITCODE -ne 0) { return (& $defer "status_unreadable") }
+    if ($st.Trim()) { return (& $defer "has_changes") }
+    # Re-check right before the removal: HEAD unchanged since the ancestry test.
+    $o = @(& git -C $path rev-parse --verify -q HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $o.Count -lt 1 -or ([string]$o[0]).Trim() -ne $head) { return (& $defer "head_moved") }
+    $use = Test-WtrecInUse $path
+    if ($use -eq "yes") { return (& $defer "in_use") }
+    if ($use -ne "no") { return (& $defer "in_use_unknown") }
+    $err = (& git -C $top worktree remove $path 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        $msg = ($err -replace '[\t\r\n]+', ' ').Trim()
+        if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) }
+        return (& $defer "git_refused: $msg")
+    }
+    $reason = "merged"
+    if ($mode -eq "reservation") {
+        # Only the branch VCO created for the lane, and only through
+        # `git branch -d` in the main checkout (refuses an unmerged branch).
+        $deleted = $false
+        if ([string]$rec.branch_created -eq "yes" -and -not $br.StartsWith("-")) {
+            & git -C $main branch -d $br 2>$null | Out-Null
+            $deleted = ($LASTEXITCODE -eq 0)
+        }
+        if (-not $deleted) { $reason = "merged_branch_kept" }
+        Remove-WtrecLanesParent $top $path
+    }
+    Set-WtrecStatus $file "removed" $reason
+    return [pscustomobject]@{ Decision = "removed"; Reason = $reason; Path = $path }
 }

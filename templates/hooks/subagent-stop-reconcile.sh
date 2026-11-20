@@ -15,7 +15,8 @@
 # V52-L.1 (v0.2.52): belt-and-suspenders reconciler. Side effects:
 #   1. JSONL audit log (V52-L.2 baseline; format unchanged). FOREGROUND.
 #   1b. Mark the agent's provably unchanged worktree a reap candidate (never
-#       removed here: session-worktree-reap removes it once its session ended).
+#       removed here: session-worktree-reap removes it after 7 idle days, and
+#       a kept one once its commits are merged into the main checkout).
 #   2. KG/docs sync — every changed `knowledge/**` / `docs/**.md` file goes
 #      through `_lib/route-touched-path.sh`, the ONE home for "a file was
 #      touched" (access-matrix gate + per-file debounce + detached runner
@@ -375,8 +376,9 @@ fi
 # payload cannot tell interim from final, so removing here lost paused agents
 # (SendMessage: "its worktree no longer exists"). A provably unchanged
 # worktree is therefore only marked a reap CANDIDATE; session-worktree-reap
-# removes it at a later SessionStart, once its session has ended, after
-# checking again that it is still unchanged. The decision (and every
+# removes it at a SessionStart once it has been idle for 7 days (a kept one
+# once its commits are merged into the main checkout's branch), after
+# checking every condition again. The decision (and every
 # condition that keeps a worktree) lives in _lib/worktree-records.sh ::
 # wtrec_reap. Every decision is logged to .claude/logs/worktree-guard.jsonl;
 # a kept worktree is also named on stderr. Runs before the snapshot

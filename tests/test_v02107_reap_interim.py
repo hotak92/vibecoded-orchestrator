@@ -10,12 +10,14 @@ tell interim from final (https://code.claude.com/docs/en/hooks
 paused agent, and SendMessage could no longer resume it ("its worktree no
 longer exists"). Now:
 
-  * SubagentStop marks an unchanged worktree ``status: reap_candidate`` and
-    leaves it on disk;
-  * SessionEnd records the session's end; the next SessionStart
-    (``session-worktree-reap``) removes the candidates of ENDED sessions
-    (and of long-idle ones that never recorded an end), never the current
-    session's, and only after re-checking that each is still unchanged.
+  * SubagentStop marks an unchanged worktree ``status: reap_candidate`` (a
+    changed one ``kept``) and leaves it on disk;
+  * every SessionStart (``session-worktree-reap``) removes an unchanged
+    candidate idle for 7 days, and a kept lane whose commits are merged into
+    the main checkout's branch and that is clean (owner rulings 2026-11-20),
+    never one of the starting session, re-checking every condition first;
+    any doubt (lock, a process working in it, git failure, detached main,
+    record mismatch) keeps it.
 
 Both siblings, act + leave-alone for every destructive branch.
 """
@@ -24,11 +26,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
 from tests.test_v02102_worktree_guard_no_head import (
     FLAVOURS,
     _LEAK_ENV_KEYS,
@@ -119,43 +124,68 @@ def test_writes_after_an_interim_stop_turn_the_candidate_into_kept_once(
     assert "KEPT" not in again.stderr, "one notice per worktree"
 
 
-# ── the sweep: act ──────────────────────────────────────────────────────────
+# ── the sweep, rule (a): an unchanged candidate goes after 7 idle days ──────
+
+_WG = (".claude", "state", "worktree-guard")
+
+
+def _rec_file(project: Path, agent_id: str) -> Path:
+    return project.joinpath(*_WG) / f"wt-agent-{agent_id}.json"
+
+
+def _age(project: Path, agent_id: str, days: float, transcript: Path | None = None) -> None:
+    old = time.time() - days * 86400
+    os.utime(_rec_file(project, agent_id), (old, old))
+    if transcript is not None:
+        os.utime(transcript, (old, old))
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_ended_session_candidate_is_removed_at_the_next_session_start(
+def test_ended_chat_alone_does_not_remove_an_unchanged_candidate(
         flavour: str, tmp_path: Path) -> None:
+    """Owner 2026-11-20 "keep longer": the chat that ran the agent ending is
+    not enough — it can still be resumed. Under 7 idle days it stays."""
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "swp001")
     _stop(flavour, "swp001", repo, sid="s1")
+    _age(repo, "swp001", 6)
     _session(flavour, "SessionEnd", repo, "s1")
-    assert wt.is_dir(), "SessionEnd only records the end"
     _session(flavour, "SessionStart", repo, "s2")
-    assert not wt.exists() and not _registered(repo, wt)
-    rec = _record(repo, "swp001")
-    assert (rec["status"], rec["status_reason"]) == ("removed", "clean")
-    row = _rows(repo, "session-worktree-reap")[-1]
-    assert (row["decision"], row["agent_id"], row["resolved_path"]) == ("reap_removed", "swp001", str(wt))
-    assert (repo / "app.py").read_text(encoding="utf-8") == "print('v1')\n"
+    assert wt.is_dir() and _registered(repo, wt)
+    assert _record(repo, "swp001")["status"] == "reap_candidate"
+    assert not repo.joinpath(*_WG, "session-ended-s1").exists(), "no end marker any more"
+    assert _rows(repo, "session-worktree-reap") == []
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_abandoned_candidate_without_an_end_marker_is_removed(flavour: str, tmp_path: Path) -> None:
+def test_candidate_idle_seven_days_is_removed(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "swp002")
     transcript = tmp_path / "agent.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
     _stop(flavour, "swp002", repo, sid="s1", transcript=str(transcript))
-    old = time.time() - 8 * 86400
-    rec_file = repo / ".claude" / "state" / "worktree-guard" / "wt-agent-swp002.json"
-    os.utime(rec_file, (old, old))
-    os.utime(transcript, (old, old))
+    _age(repo, "swp002", 8, transcript)
     _session(flavour, "SessionStart", repo, "s2")
-    assert not wt.exists()
-    assert _record(repo, "swp002")["status"] == "removed"
+    assert not wt.exists() and not _registered(repo, wt)
+    rec = _record(repo, "swp002")
+    assert (rec["status"], rec["status_reason"]) == ("removed", "clean")
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["agent_id"], row["resolved_path"]) == ("reap_removed", "swp002", str(wt))
+    assert (repo / "app.py").read_text(encoding="utf-8") == "print('v1')\n"
 
 
-# ── the sweep: leave alone ──────────────────────────────────────────────────
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_recent_transcript_keeps_an_idle_record(flavour: str, tmp_path: Path) -> None:
+    """The idle clock is the LATER of record and transcript: an agent whose
+    transcript still moves is not abandoned."""
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "swp010")
+    transcript = tmp_path / "agent.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    _stop(flavour, "swp010", repo, sid="s1", transcript=str(transcript))
+    _age(repo, "swp010", 8)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir() and _record(repo, "swp010")["status"] == "reap_candidate"
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
@@ -164,7 +194,7 @@ def test_candidate_changed_since_its_stop_is_kept_by_the_sweep(flavour: str, tmp
     wt = _launch(flavour, repo, "swp003")
     _stop(flavour, "swp003", repo, sid="s1")
     (wt / "late.txt").write_text("written after the stop\n", encoding="utf-8")
-    _session(flavour, "SessionEnd", repo, "s1")
+    _age(repo, "swp003", 8)
     _session(flavour, "SessionStart", repo, "s2")
     assert (wt / "late.txt").is_file()
     rec = _record(repo, "swp003")
@@ -177,73 +207,287 @@ def test_current_session_candidate_is_never_swept(flavour: str, tmp_path: Path) 
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "swp004")
     _stop(flavour, "swp004", repo, sid="s1")
-    # Even with an end marker on disk and an idle record, the session that is
-    # starting (a resume, compact or clear of s1) never sweeps its own agents.
-    _session(flavour, "SessionEnd", repo, "s1")
-    old = time.time() - 30 * 86400
-    os.utime(repo / ".claude" / "state" / "worktree-guard" / "wt-agent-swp004.json", (old, old))
+    # Even idle for a month, the session that is starting (a resume, compact
+    # or clear of s1) never sweeps its own agents.
+    _age(repo, "swp004", 30)
     _session(flavour, "SessionStart", repo, "s1", source="compact")
     assert wt.is_dir()
     assert _record(repo, "swp004")["status"] == "reap_candidate"
 
 
+# The in-use check reads /proc/<pid>/cwd on Linux and asks lsof on macOS;
+# elsewhere (Windows) it cannot tell, and "cannot tell" keeps the worktree too.
+_CWD_SCAN = sys.platform.startswith("linux") or sys.platform == "darwin"
+_IN_USE_REASON = "in_use" if _CWD_SCAN else "in_use_unknown"
+
+
+def _idle_process(cwd: Path) -> subprocess.Popen:
+    """A process whose cwd is inside the worktree (portable: no `sleep`)."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                            cwd=str(cwd), env=child_env())
+
+
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_live_other_session_candidate_is_not_swept(flavour: str, tmp_path: Path) -> None:
-    """A second chat starting in the same project must not reap the first
-    chat's paused agent: s1 never ended."""
+def test_locked_idle_candidate_is_deferred(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "swp005")
     _stop(flavour, "swp005", repo, sid="s1")
+    _git(repo, "worktree", "lock", str(wt))
+    _age(repo, "swp005", 8)
     _session(flavour, "SessionStart", repo, "s2")
-    assert wt.is_dir()
-    assert _record(repo, "swp005")["status"] == "reap_candidate"
+    assert wt.is_dir() and _registered(repo, wt)
+    assert _record(repo, "swp005")["status"] == "reap_candidate", "a deferral is retried, not final"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"]) == ("reap_deferred", "locked")
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_resumed_session_withdraws_its_end(flavour: str, tmp_path: Path) -> None:
+def test_idle_candidate_a_process_works_in_is_deferred(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "swp006")
     _stop(flavour, "swp006", repo, sid="s1")
-    _session(flavour, "SessionEnd", repo, "s1")
-    marker = repo / ".claude" / "state" / "worktree-guard" / "session-ended-s1"
-    assert marker.is_file()
-    _session(flavour, "SessionStart", repo, "s1", source="resume")
-    assert not marker.exists()
-    # s1 is live again: a concurrent chat's start leaves its agent alone.
-    _session(flavour, "SessionStart", repo, "s2")
-    assert wt.is_dir() and _record(repo, "swp006")["status"] == "reap_candidate"
+    _age(repo, "swp006", 8)
+    (wt / "sub").mkdir()  # an empty directory is invisible to git status
+    proc = _idle_process(wt / "sub")
+    try:
+        _session(flavour, "SessionStart", repo, "s2")
+    finally:
+        proc.kill()
+        proc.wait()
+    assert wt.is_dir()
+    assert _record(repo, "swp006")["status"] == "reap_candidate"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"]) == ("reap_deferred", _IN_USE_REASON)
+    if _CWD_SCAN:
+        # The process gone, the next sweep removes it.
+        _session(flavour, "SessionStart", repo, "s3")
+        assert not wt.exists()
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_end_marker_older_than_the_candidate_does_not_count(flavour: str, tmp_path: Path) -> None:
-    """A stale marker (the session was resumed, and its end hook never
-    withdrew it) predates the candidate: not evidence the agent is final."""
+def test_session_end_payload_does_nothing(flavour: str, tmp_path: Path) -> None:
+    """The SessionEnd marker is retired with the "chat ended" trigger: a
+    SessionEnd payload reaching the hook is a no-op."""
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "swp007")
-    d = repo / ".claude" / "state" / "worktree-guard"
-    d.mkdir(parents=True, exist_ok=True)
-    marker = d / "session-ended-s1"
-    marker.write_text("", encoding="utf-8")
-    old = time.time() - 3600
-    os.utime(marker, (old, old))
     _stop(flavour, "swp007", repo, sid="s1")
-    _session(flavour, "SessionStart", repo, "s2")
-    assert wt.is_dir() and _record(repo, "swp007")["status"] == "reap_candidate"
+    _age(repo, "swp007", 8)
+    _session(flavour, "SessionEnd", repo, "s1")
+    assert wt.is_dir()
+    assert not repo.joinpath(*_WG, "session-ended-s1").exists()
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_sweep_never_touches_a_kept_or_created_record(flavour: str, tmp_path: Path) -> None:
+def test_sweep_never_touches_a_created_record(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
-    kept = _launch(flavour, repo, "swp008")
-    (kept / "work.py").write_text("W = 1\n", encoding="utf-8")
-    _stop(flavour, "swp008", repo, sid="s1")
     running = _launch(flavour, repo, "swp009")  # never stopped: status created
-    _session(flavour, "SessionEnd", repo, "s1")
+    rec = _record(repo, "swp009")
+    rec["reap_session"] = "s1"
+    _rec_file(repo, "swp009").write_text(json.dumps(rec), encoding="utf-8")
+    _age(repo, "swp009", 30)
     _session(flavour, "SessionStart", repo, "s2")
-    assert kept.is_dir() and running.is_dir()
-    assert _record(repo, "swp008")["status"] == "kept"
+    assert running.is_dir()
     assert _record(repo, "swp009")["status"] == "created"
     assert _rows(repo, "session-worktree-reap") == []
+
+
+# ── the sweep, rule (b): a kept lane is removed once merged ─────────────────
+
+
+def _kept_with_commit(flavour: str, repo: Path, agent_id: str, sid: str = "s1") -> Path:
+    wt = _launch(flavour, repo, agent_id)
+    (wt / "feature.py").write_text("F = 1\n", encoding="utf-8")
+    _git(wt, "add", "feature.py")
+    _git(wt, "commit", "-qm", "lane work")
+    _stop(flavour, agent_id, repo, sid=sid)
+    rec = _record(repo, agent_id)
+    assert (rec["status"], rec["reap_session"]) == ("kept", sid)
+    return wt
+
+
+def _merge(repo: Path, wt: Path) -> None:
+    _git(repo, "merge", "-q", "--ff-only", _git(wt, "rev-parse", "HEAD").stdout.strip())
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_clean_lane_is_removed(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg001")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert not wt.exists() and not _registered(repo, wt)
+    rec = _record(repo, "mrg001")
+    assert (rec["status"], rec["status_reason"]) == ("removed", "merged")
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"], row["agent_id"]) == ("reap_removed", "merged", "mrg001")
+    assert (repo / "feature.py").read_text(encoding="utf-8") == "F = 1\n"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_with_only_ignored_files_is_removed(flavour: str, tmp_path: Path) -> None:
+    """The merged rule reads `git status --porcelain` WITHOUT ignored files
+    (build output, caches): owner rule 2026-11-20."""
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg002")
+    (wt / "build").mkdir()
+    (wt / "build" / "out.bin").write_text("x\n", encoding="utf-8")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+@pytest.mark.parametrize("change", ["untracked", "modified"])
+def test_merged_dirty_lane_is_kept(flavour: str, change: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg003")
+    _merge(repo, wt)
+    if change == "untracked":
+        (wt / "notes.md").write_text("unmerged thought\n", encoding="utf-8")
+    else:
+        (wt / "feature.py").write_text("F = 2\n", encoding="utf-8")
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir() and _registered(repo, wt)
+    assert _record(repo, "mrg003")["status"] == "kept"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"]) == ("reap_deferred", "has_changes")
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_unmerged_lane_is_kept_silently(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg004")
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir() and _record(repo, "mrg004")["status"] == "kept"
+    assert _rows(repo, "session-worktree-reap") == [], "a lane awaiting merge logs nothing"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_of_the_current_session_is_kept(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg005")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s1", source="compact")
+    assert wt.is_dir() and _record(repo, "mrg005")["status"] == "kept"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_without_a_recorded_session_is_kept(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg006")
+    rec = _record(repo, "mrg006")
+    del rec["reap_session"]
+    _rec_file(repo, "mrg006").write_text(json.dumps(rec), encoding="utf-8")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir()
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_locked_lane_is_kept(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg007")
+    _merge(repo, wt)
+    _git(repo, "worktree", "lock", str(wt))
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir()
+    assert _rows(repo, "session-worktree-reap")[-1]["reason"] == "locked"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_a_process_works_in_is_kept(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg008")
+    _merge(repo, wt)
+    proc = _idle_process(wt)
+    try:
+        _session(flavour, "SessionStart", repo, "s2")
+    finally:
+        proc.kill()
+        proc.wait()
+    assert wt.is_dir() and _record(repo, "mrg008")["status"] == "kept"
+    assert _rows(repo, "session-worktree-reap")[-1]["reason"] == _IN_USE_REASON
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_is_kept_while_the_main_checkout_is_detached(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg009")
+    _merge(repo, wt)
+    _git(repo, "checkout", "-q", "--detach")
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir()
+    assert _rows(repo, "session-worktree-reap")[-1]["reason"] == "main_branch_unknown"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_that_does_not_match_its_record_is_kept(flavour: str, tmp_path: Path) -> None:
+    """worktree-guard makes head worktrees DETACHED: one now on a branch is
+    not the worktree the record describes."""
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg010")
+    _git(wt, "switch", "-q", "-c", "someone-elses")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir()
+    assert _rows(repo, "session-worktree-reap")[-1]["reason"] == "record_mismatch"
+    assert _git(repo, "show-ref", "--verify", "-q", "refs/heads/someone-elses",
+                check=False).returncode == 0
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_lane_whose_git_fails_is_kept(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _kept_with_commit(flavour, repo, "mrg011")
+    _merge(repo, wt)
+    gitfile = wt / ".git"
+    saved = gitfile.read_text(encoding="utf-8")
+    gitfile.write_text("gitdir: /nonexistent/broken\n", encoding="utf-8")
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir() and (wt / "feature.py").is_file()
+    gitfile.write_text(saved, encoding="utf-8")
+
+
+def _handmade(repo: Path, name: str, mode: str, wt: Path, base: str, **extra: str) -> None:
+    d = repo.joinpath(*_WG)
+    d.mkdir(parents=True, exist_ok=True)
+    rec = {"name": f"agent-{name}", "mode": mode, "path": str(wt), "base": base,
+           "toplevel": str(repo), "status": "kept", "reap_session": "s1", **extra}
+    (d / f"wt-agent-{name}.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_merged_reservation_lane_is_removed_with_its_branch(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    wt = (tmp_path / "proj.vco-lanes" / "lane-x-r1").resolve()
+    _git(repo, "worktree", "add", "-q", "-b", "lane-x", str(wt), base)
+    (wt / "feature.py").write_text("F = 1\n", encoding="utf-8")
+    _git(wt, "add", "feature.py")
+    _git(wt, "commit", "-qm", "lane work")
+    _handmade(repo, "res001", "reservation", wt, base, branch="lane-x", branch_created="yes")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert not wt.exists() and not (tmp_path / "proj.vco-lanes").exists()
+    assert _git(repo, "show-ref", "--verify", "-q", "refs/heads/lane-x", check=False).returncode != 0
+    assert _record(repo, "res001")["status_reason"] == "merged"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_adopted_reservation_worktree_is_never_removed(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    wt = (tmp_path / "proj.vco-lanes" / "adopted").resolve()
+    _git(repo, "worktree", "add", "-q", "-b", "adopted", str(wt), base)
+    (wt / "feature.py").write_text("F = 1\n", encoding="utf-8")
+    _git(wt, "add", "feature.py")
+    _git(wt, "commit", "-qm", "lane work")
+    _handmade(repo, "res002", "reservation_existing", wt, base, branch="adopted")
+    _merge(repo, wt)
+    _session(flavour, "SessionStart", repo, "s2")
+    assert wt.is_dir()
+    assert _git(repo, "show-ref", "--verify", "-q", "refs/heads/adopted", check=False).returncode == 0
+    assert _record(repo, "res002")["status"] == "kept"
 
 
 # ── delivery: the bundle update registers the hook in existing installs ─────
@@ -264,10 +508,11 @@ def _reap_events(doc: dict) -> dict[str, list]:
 
 
 @pytest.mark.parametrize("os_name", sorted(_TEMPLATES))
-def test_template_registers_session_end_and_every_session_start(os_name: str) -> None:
+def test_template_registers_every_session_start_only(os_name: str) -> None:
     doc = json.loads(_TEMPLATES[os_name].read_text(encoding="utf-8"))
-    # One SessionStart group with no matcher (fires on every source), one SessionEnd.
-    assert _reap_events(doc) == {"SessionStart": [None], "SessionEnd": [None]}
+    # One SessionStart group with no matcher (fires on every source); no
+    # SessionEnd since the "chat ended" trigger was retired (2026-11-20).
+    assert _reap_events(doc) == {"SessionStart": [None]}
 
 
 @pytest.mark.parametrize("os_name", sorted(_TEMPLATES))
@@ -278,4 +523,4 @@ def test_bundle_update_adds_the_registration_to_an_older_install(os_name: str) -
     assert _reap_events(old) == {}
     template = json.loads(_TEMPLATES[os_name].read_text(encoding="utf-8"))
     merged = settings_merge.smart_merge_settings(old, template)
-    assert _reap_events(merged) == {"SessionStart": [None], "SessionEnd": [None]}
+    assert _reap_events(merged) == {"SessionStart": [None]}

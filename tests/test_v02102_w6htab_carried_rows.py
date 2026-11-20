@@ -100,10 +100,14 @@ def test_a_stop_disable_yields_one_parked_entry_per_new_event(os_name: str) -> N
         assert r["command"] == _drain_cmd(template, r["event"])
         entry = json.loads(r["parked_json"])
         assert entry["schema"] == hooks_settings.PARKED_SCHEMA_VERSION
-        # v0.2.107: the user's event already holds the provably-VCO group the
-        # template ships this hook in, so the entry JOINS it (the merge's fold
-        # would) instead of founding a second group.
-        assert entry["event"] == r["event"] and entry["group_removed"] is False
+        # v0.2.107: where the user's event still holds the provably-VCO group
+        # the template ships this hook in (SubagentStop, beside
+        # subagent-stop-reconcile), the entry JOINS it (the merge's fold
+        # would) instead of founding a second group; SessionEnd ships the
+        # drain alone, so with it disabled the event is gone and the entry
+        # recreates it.
+        assert entry["event"] == r["event"]
+        assert entry["group_removed"] is (r["event"] not in user["hooks"])
         shipped = next(h for g in template["hooks"][r["event"]] for h in g["hooks"]
                        if STEM in h["command"])
         assert entry["item"] == shipped, "the shipped registration, verbatim"
@@ -143,22 +147,22 @@ def test_restoring_one_carried_entry_adds_exactly_that_registration(os_name: str
 
 @pytest.mark.parametrize("os_name", sorted(TEMPLATES))
 def test_restoring_into_a_group_of_the_users_own_keeps_its_own_group(os_name: str) -> None:
-    """LEAVE-ALONE (v0.2.107). The SessionEnd group also holds a command of the
-    user's: the merge never folds it, so the carried entry keeps its own group
-    and the restore leaves the user's group byte-for-byte."""
+    """LEAVE-ALONE (v0.2.107). The SubagentStop group also holds a command of
+    the user's: the merge never folds it, so the carried entry keeps its own
+    group and the restore leaves the user's group byte-for-byte."""
     template = _template(os_name)
     user = _parked_on_stop_everywhere_off(template)
-    own = {"type": "command", "command": "my-session-end-backup"}
-    user["hooks"]["SessionEnd"][0]["hooks"].append(own)
-    users_group = copy.deepcopy(user["hooks"]["SessionEnd"][0])
+    own = {"type": "command", "command": "my-subagent-stop-backup"}
+    user["hooks"]["SubagentStop"][0]["hooks"].append(own)
+    users_group = copy.deepcopy(user["hooks"]["SubagentStop"][0])
     rows = {r["event"]: r for r in parked_hooks.carried_registrations(
         user["hooks"], template["hooks"], [ParkedHook("Stop", "", _drain_cmd(template))])}
-    entry = json.loads(rows["SessionEnd"]["parked_json"])
+    entry = json.loads(rows["SubagentStop"]["parked_json"])
     assert entry["group_removed"] is True
     doc = _doc(copy.deepcopy(user))
     assert hooks_settings.insert_hook(doc, entry)
-    assert doc.data["hooks"]["SessionEnd"][0] == users_group
-    assert _events_running(doc.data["hooks"]) == ["SessionEnd"]
+    assert doc.data["hooks"]["SubagentStop"][0] == users_group
+    assert _events_running(doc.data["hooks"]) == ["SubagentStop"]
 
 
 @pytest.mark.parametrize("os_name", sorted(TEMPLATES))
@@ -167,7 +171,8 @@ def test_a_carried_event_the_user_lacks_is_recreated_as_its_own_group(os_name: s
     join; the entry recreates the event (the pre-v0.2.107 shape)."""
     template = _template(os_name)
     user = _parked_on_stop_everywhere_off(template)
-    user["hooks"].pop("SessionEnd")
+    user["hooks"].pop("SessionEnd", None)  # the template ships the drain alone there
+    assert "SessionEnd" not in user["hooks"]
     rows = {r["event"]: r for r in parked_hooks.carried_registrations(
         user["hooks"], template["hooks"], [ParkedHook("Stop", "", _drain_cmd(template))])}
     entry = json.loads(rows["SessionEnd"]["parked_json"])
