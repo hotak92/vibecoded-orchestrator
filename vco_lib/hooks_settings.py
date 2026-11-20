@@ -1330,7 +1330,10 @@ def parked_entry_for_registration(
     WOULD have produced had the registration been added the way the merge
     adds it — its own group, appended after the event's existing groups,
     the event key appended if absent — so :func:`insert_hook` restores it
-    exactly there. ``group`` is the template group (its non-``hooks`` keys
+    exactly there. (When the user's event already holds the provably-VCO
+    group the merge would fold it into, the caller —
+    :func:`vco_lib.parked_hooks.carried_registrations` — re-targets the entry
+    to join that group, v0.2.107.) ``group`` is the template group (its non-``hooks`` keys
     and key order are kept); ``items`` the template inner hooks of that one
     command, copied. Several items (an ``if`` group) produce the ``items``
     form, as :func:`_remove_if_group` does. Pure; one home of the blob shape.
