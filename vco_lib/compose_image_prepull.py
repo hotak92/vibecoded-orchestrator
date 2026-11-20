@@ -18,18 +18,48 @@ running on its current image — and the run records
 ``service_image_pull_failed`` so the next update retries. Only the services
 VCO pulls from a registry are checked (a locally built image, code_embed, is
 the build step's business).
+
+A-021 (v0.2.107): before that pull, the image has to FIT. A pinned-image bump
+of Ollama pulled ~10 GB while the old image was still in use and took a test
+machine's system drive from 11.4 GB free to 0 (under Docker Desktop the image
+store is a growing disk image on the host drive, so the engine does not fail
+first — the user's disk does). :func:`pull_space_shortfall` compares the free
+space where the engine stores images with an estimate of what the pull needs;
+when it does not fit, the service is not recreated (it keeps running on its
+current image) and the run records ``service_image_no_disk_space`` naming both
+numbers and the place to free. When either number is unknown the pull runs as
+before.
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 #: The deferral a refused pull records (``vco_lib/deferral_conditions.toml``).
 CID_PULL_FAILED = "service_image_pull_failed"
+#: The deferral a pull refused for disk space records (A-021).
+CID_NO_DISK_SPACE = "service_image_no_disk_space"
 #: Services whose pinned image comes from a registry.
 PULLED_SERVICES: tuple[str, ...] = ("weaviate", "ollama")
+
+#: A-021 — what a pull needs, estimated WITHOUT a network call: the on-disk
+#: (uncompressed) size of the image of the SAME repository already installed
+#: (the one the running container uses — a new tag of a repository is about
+#: the size of the old one) times this factor, plus the doctor's free-space
+#: floor (``VCT_DISK_SPACE_MIN_FREE_GB``, 2 GiB by default). The factor covers
+#: the compressed layer blobs that sit next to the extracted layers while the
+#: pull runs (about half the extracted size for these images). It is an
+#: estimate: layers the new tag shares with the old one need no space, so the
+#: real need is usually lower — the check refuses only a pull that this
+#: estimate says cannot fit.
+PULL_SPACE_FACTOR = 1.5
+_GIB = 1024 ** 3
 
 RunFn = Callable[..., Any]
 
@@ -129,6 +159,196 @@ def _pull_from_mirror(runtime: str, image: str, refusal: str, *, run: Optional[R
     return True, ""
 
 
+# ---------------------------------------------------------------------------
+# A-021: does the pull fit?
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpaceShortfall:
+    """A pull refused because it does not fit (both numbers in bytes)."""
+
+    service: str
+    image: str
+    need_bytes: int
+    free_bytes: int
+    where: str
+    basis: str  # what the estimate was made from
+
+
+def decide_pull_fits(need_bytes: Optional[int], free_bytes: Optional[int]) -> bool:
+    """The gate: refuse ONLY when both numbers are known and free < need.
+    Unknown → pull as before (a probe that cannot see must not block)."""
+    if need_bytes is None or free_bytes is None:
+        return True
+    return free_bytes >= need_bytes
+
+
+def _repo_key(ref: str) -> str:
+    """Repository of an image reference, normalised across engines: no tag or
+    digest, no ``docker.io`` / ``registry-1.docker.io`` / ``index.docker.io``
+    host, no ``library/`` (docker lists ``ollama/ollama``, podman
+    ``docker.io/ollama/ollama``)."""
+    ref = (ref or "").strip().split("@", 1)[0]
+    head, _, last = ref.rpartition("/")
+    last = last.split(":", 1)[0]
+    ref = f"{head}/{last}" if head else last
+    first, _, rest = ref.partition("/")
+    if rest and first in ("docker.io", "registry-1.docker.io", "index.docker.io"):
+        ref = rest
+    if ref.startswith("library/"):
+        ref = ref[len("library/"):]
+    return ref
+
+
+def installed_repo_size(runtime: str, image: str, *, run: Optional[RunFn] = None) -> Optional[tuple[int, str]]:
+    """``(bytes, ref)`` of the largest local image of *image*'s repository
+    (any tag), or ``None`` when there is none / the engine cannot list them.
+    Local only: ``image ls`` + ``image inspect --format {{.Size}}``."""
+    rc, out = _capture(run, [runtime, "image", "ls", "--format",
+                             "{{.Repository}}:{{.Tag}} {{.ID}}"], 60.0)
+    if rc != 0:
+        return None
+    want = _repo_key(image)
+    best: Optional[tuple[int, str]] = None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or _repo_key(parts[0]) != want:
+            continue
+        rc, size = _capture(run, [runtime, "image", "inspect", "--format",
+                                  "{{.Size}}", parts[1]], 60.0)
+        size = size.strip()
+        if rc == 0 and size.isdigit() and (best is None or int(size) > best[0]):
+            best = (int(size), parts[0])
+    return best
+
+
+def _desktop_vm_dirs(is_podman: bool) -> list[Path]:
+    """Host folders holding the engine VM's growing disk image (Docker Desktop,
+    podman machine) — where an image pull lands on the HOST under Windows and
+    macOS. Never the VM's virtual size: the host drive is what fills."""
+    home = Path.home()
+    if is_podman:
+        return [home / ".local" / "share" / "containers" / "podman" / "machine"]
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        return [Path(local) / "Docker" / "wsl"] if local else []
+    if sys.platform == "darwin":
+        return [home / "Library" / "Containers" / "com.docker.docker" / "Data"]
+    return []
+
+
+def engine_storage_path(runtime: str, *, run: Optional[RunFn] = None) -> Optional[Path]:
+    """The HOST path whose filesystem receives a pulled image, or ``None``.
+
+    The engine's own image store first (podman ``Store.GraphRoot``, docker
+    ``DockerRootDir`` from ``<runtime> info``) when it exists on this host —
+    native Linux. Under a VM engine that path is inside the VM, so the host
+    folder of the VM's disk image is used instead (:func:`_desktop_vm_dirs`).
+    Never the repository's disk: the two are often different drives."""
+    is_podman = "podman" in Path(runtime).name.lower()
+    fmt = "{{.Store.GraphRoot}}" if is_podman else "{{.DockerRootDir}}"
+    rc, out = _capture(run, [runtime, "info", "--format", fmt], 60.0)
+    root = out.strip() if rc == 0 else ""
+    if root and os.path.isabs(root) and Path(root).is_dir():
+        return Path(root)
+    for candidate in _desktop_vm_dirs(is_podman):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _free_bytes(path: Path) -> Optional[int]:
+    try:
+        return int(shutil.disk_usage(path).free)
+    except OSError:
+        return None
+
+
+def _floor_bytes() -> int:
+    try:
+        from vco_lib.doctor import disk_min_free_bytes  # noqa: PLC0415 — the one floor
+
+        return disk_min_free_bytes()[0]
+    except Exception:  # noqa: BLE001
+        return 2 * _GIB
+
+
+def pull_space_shortfall(service: str, runtime: str, image: str, *,
+                         run: Optional[RunFn] = None,
+                         free: Optional[Callable[[Path], Optional[int]]] = None,
+                         ) -> Optional[SpaceShortfall]:
+    """A :class:`SpaceShortfall` when pulling *image* would not fit, else
+    ``None`` — including whenever the size or the free space cannot be read
+    (then the pull runs as before). Never raises."""
+    try:
+        installed = installed_repo_size(runtime, image, run=run)
+        if installed is None:
+            return None
+        where = engine_storage_path(runtime, run=run)
+        if where is None:
+            return None
+        free_b = (free or _free_bytes)(where)
+        need = int(installed[0] * PULL_SPACE_FACTOR) + _floor_bytes()
+        if free_b is None or decide_pull_fits(need, free_b):
+            return None
+        return SpaceShortfall(service=service, image=image, need_bytes=need,
+                              free_bytes=int(free_b), where=str(where),
+                              basis=f"{installed[1]}, {installed[0] / _GIB:.1f} GB installed")
+    except Exception:  # noqa: BLE001 — a probe fault never blocks the pull
+        return None
+
+
+def split_no_space(services: Sequence[str], *, runtime: str, root: Path,
+                   run: Optional[RunFn] = None,
+                   pinned: Optional[Callable[[str, Path], Optional[str]]] = None,
+                   free: Optional[Callable[[Path], Optional[int]]] = None,
+                   ) -> tuple[list[str], list[SpaceShortfall]]:
+    """``(services to go on with, shortfalls)``: a service whose pinned image
+    is NOT present locally and whose pull does not fit is taken out. A present
+    image needs no pull and is never checked."""
+    if pinned is None:
+        from vco_lib.service_adoption import pinned_image as pinned  # noqa: PLC0415
+    go_on: list[str] = []
+    short: list[SpaceShortfall] = []
+    for svc in services:
+        image = pinned(svc, root) if svc in PULLED_SERVICES else None
+        if image and _run(run, [runtime, "image", "inspect", image], 60.0)[0] != 0:
+            sf = pull_space_shortfall(svc, runtime, image, run=run, free=free)
+            if sf is not None:
+                short.append(sf)
+                continue
+        go_on.append(svc)
+    return go_on, short
+
+
+def _gb(n: int) -> str:
+    return f"{n / _GIB:.1f} GB"
+
+
+def no_space_entry(short: Sequence[SpaceShortfall], *, runtime: str, rerun: str):
+    from vco_lib.deferral_report import DeferralEntry  # noqa: PLC0415
+
+    lines = "\n".join(
+        f"  - {s.service}: `{s.image}` needs about {_gb(s.need_bytes)} free on {s.where}; "
+        f"{_gb(s.free_bytes)} free (estimate from {s.basis})" for s in short)
+    gap = max(s.need_bytes - s.free_bytes for s in short)
+    return DeferralEntry(
+        condition_id=CID_NO_DISK_SPACE,
+        title="A service's new image does not fit on the disk; it was not updated",
+        detected=f"The update did not download the pinned image of:\n{lines}",
+        why_deferred=(
+            "Downloading it would have filled the drive the container engine stores images "
+            "on. The service keeps running on its current image and its data is untouched. "
+            f"Free at least {_gb(gap)} on that drive (`{runtime} system df` shows what the "
+            f"engine holds; `{runtime} image prune` removes images no container uses), then "
+            "re-run the update; every update checks again."),
+        command_to_apply=rerun,
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+
 def ensure_image(runtime: str, image: str, *, run: Optional[RunFn] = None,
                  timeout: float = 900.0,
                  note: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
@@ -196,10 +416,31 @@ def drop_unpullable_recreates(services_to_recreate: list, *, runtime: str, root:
                               deferral_report: Any, rerun: str,
                               run: Optional[RunFn] = None, timeout: float = 900.0,
                               log_event: Optional[Callable[..., None]] = None) -> None:
-    """Step 5's call: pull first, then remove (in place) every service whose
-    image could not be pulled from *services_to_recreate*, print why, and
-    record :data:`CID_PULL_FAILED`. Never raises."""
+    """Step 5's call: check that each new image fits (A-021), pull first, then
+    remove (in place) every service whose image does not fit or could not be
+    pulled from *services_to_recreate*, print why, and record
+    :data:`CID_NO_DISK_SPACE` / :data:`CID_PULL_FAILED`. Never raises."""
     if not services_to_recreate or not runtime:
+        return
+    try:
+        fits, short = split_no_space(list(services_to_recreate), runtime=runtime,
+                                     root=root, run=run)
+    except Exception as exc:  # noqa: BLE001 — a probe fault keeps the old plan
+        print(f"  [!] image disk-space check failed ({exc}); continuing as planned")
+        fits, short = list(services_to_recreate), []
+    if short:
+        services_to_recreate[:] = fits
+        for s in short:
+            print(f"  [!] {s.service}: {s.image} needs about {_gb(s.need_bytes)} free on "
+                  f"{s.where}, {_gb(s.free_bytes)} is free. Not downloading it; keeping the "
+                  f"running container. Free space and re-run the update.")
+        if log_event is not None:
+            log_event("5/10", "warn", "image pull refused: not enough disk space",
+                      data={"refused": [[s.service, s.image, s.need_bytes, s.free_bytes,
+                                         s.where] for s in short]})
+        if deferral_report is not None:
+            deferral_report.add_entry(no_space_entry(short, runtime=runtime, rerun=rerun))
+    if not services_to_recreate:
         return
     try:
         keep, refused = split_recreates(list(services_to_recreate), runtime=runtime,

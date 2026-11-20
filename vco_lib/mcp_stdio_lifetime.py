@@ -34,6 +34,34 @@ it, both closed here:
    looks exactly like a dead client: the server is reparented and exits.
    VCO registers the server so Claude Code spawns it directly; do not put an
    exiting wrapper in front of it.
+4. **An exit requested on the loop's thread.** The env-reload SIGHUP handler
+   (``claude_mcp_servers/_lib/sighup_handler.py``) raises ``SystemExit`` while
+   the loop runs. Left to propagate, interpreter shutdown joins the SDK's
+   stdin worker thread (not a daemon), which is blocked reading stdin: the
+   process stayed alive with a dead loop, read every later request and
+   answered none. :func:`run_stdio_server` turns that exit into
+   :func:`_finish`, like the other three.
+
+Two safety nets sit behind those four paths (v0.2.107; field case: a server
+stayed alive 54 h after a SIGHUP, all threads parked, its stdin unread, while
+Claude Code's ``/mcp`` still said "connected"):
+
+5. **Exit backstop.** Every shutdown path arms :func:`arm_exit_backstop`
+   FIRST: a daemon thread that ``os._exit``\\ s the process if it is still
+   alive :data:`EXIT_BACKSTOP_SECONDS` later — whatever blocks the exit (a
+   logging handler stuck on a full stderr pipe, a non-daemon thread joined by
+   interpreter shutdown, an exception that escaped this module). Once a
+   shutdown has begun the process ends; a hang there is never the outcome.
+6. **Liveness heartbeat.** While the server runs, :class:`Heartbeat` keeps
+   ``<vct_root>/run/mcp/<pid>.json`` (pid, process start token, server name,
+   script marker, start time) and touches its mtime every
+   :data:`HEARTBEAT_SECONDS` — only while the event loop is running and its
+   own loop task has ticked within :data:`LOOP_STALL_SECONDS`. The hub's
+   watchdog (``launcher/src-tauri/vct-hub/src/mcp_liveness.rs``) ends a
+   server that is alive with a stale file (identity checked by pid + start
+   token + cmdline), so Claude Code sees EOF and starts a fresh one. The
+   file is removed on every exit through :func:`_finish`; one left by a hard
+   exit is deleted by the hub once its pid is gone.
 
 The reaper in :mod:`vco_lib.mcp_singleton` stays as it was: it handles
 cross-workspace peers at spawn time; this module makes each server end itself.
@@ -51,14 +79,22 @@ import logging
 import os
 import sys
 import threading
+import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EXIT_BACKSTOP_SECONDS",
     "EXIT_GRACE_SECONDS",
+    "HEARTBEAT_SECONDS",
+    "LOOP_STALL_SECONDS",
     "PARENT_POLL_SECONDS",
+    "Heartbeat",
     "ParentWatch",
+    "arm_exit_backstop",
+    "heartbeat_dir",
     "run_stdio_server",
     "start_parent_watchdog",
 ]
@@ -75,6 +111,24 @@ EXIT_HANDLERS_SECONDS = 10.0
 
 #: How often the parent watchdog checks that the spawning process still lives.
 PARENT_POLL_SECONDS = 5.0
+
+#: Once a shutdown path has started, the process is gone this long afterwards
+#: at the latest. Above :data:`EXIT_HANDLERS_SECONDS` so :func:`_finish`'s own
+#: bounded ``atexit`` run always gets its whole budget before the backstop.
+EXIT_BACKSTOP_SECONDS = EXIT_HANDLERS_SECONDS + 5.0
+
+#: How often the liveness heartbeat file is touched. The hub's stale bound
+#: (``mcp_liveness.rs`` ``STALE_SECS``, 10 min) is twenty of these.
+HEARTBEAT_SECONDS = 30.0
+
+#: The heartbeat stops (and the hub may end the server) once the event loop
+#: has not run its own tick for this long. weaviate-kg's tools do synchronous
+#: backend I/O ON the loop — one embedding request may take up to 660 s by
+#: default (``vco_lib.retry_after.CODE_EMBED_CLIENT_TIMEOUT_SECS``) and a call
+#: can make several — so a legitimately long call holds the loop for tens of
+#: minutes. Two hours is far past any single call, and still ends a loop that
+#: is wedged for good.
+LOOP_STALL_SECONDS = 7200.0
 
 
 class ParentWatch:
@@ -230,14 +284,193 @@ def _win_process_exited(handle: Any) -> bool:
         return False
 
 
+# Re-entrant: the SIGHUP handler arms it on the main thread, which may be
+# inside this very function when the signal lands.
+_BACKSTOP_LOCK = threading.RLock()
+_backstop: Optional[threading.Thread] = None
+
+
+def arm_exit_backstop(name: str, code: int = 0, *, delay_s: Optional[float] = None,
+                      _exit: Callable[[int], Any] = os._exit) -> bool:
+    """A shutdown has begun: make sure the process is gone ``delay_s`` from now.
+
+    Starts a daemon thread that calls ``_exit(code)`` after ``delay_s``
+    (default :data:`EXIT_BACKSTOP_SECONDS`). A daemon thread still runs while
+    interpreter shutdown joins the non-daemon ones, which is exactly the hang
+    it ends. Armed once per process — the first shutdown path to arm it sets
+    the deadline; later calls return ``False`` and change nothing. The thread
+    neither logs nor writes: the thing blocking the exit may be a full stderr
+    pipe, and a write there would block the backstop too.
+    """
+    global _backstop
+    wait = EXIT_BACKSTOP_SECONDS if delay_s is None else delay_s
+    with _BACKSTOP_LOCK:
+        if _backstop is not None:
+            return False
+
+        def _fire() -> None:
+            threading.Event().wait(wait)
+            _exit(code)
+
+        _backstop = threading.Thread(target=_fire, name=f"{name}-exit-backstop", daemon=True)
+        _backstop.start()
+    return True
+
+
+def heartbeat_dir(root: Optional[Path] = None) -> Path:
+    """``<vct_root>/run/mcp`` — per user; the hub's watchdog scans it.
+    ``root`` overrides the resolved vct root (the uninstaller plans against
+    the root it was given).
+
+    Must match ``launcher/src-tauri/vct-hub/src/mcp_liveness.rs::heartbeat_dir``.
+    """
+    if root is None:
+        from vco_lib.paths import vct_root_dir  # noqa: PLC0415
+
+        root = vct_root_dir()
+    return root / "run" / "mcp"
+
+
+def heartbeat_marker(argv0: Optional[str] = None) -> Optional[str]:
+    """The script marker the hub looks for in the server's cmdline.
+
+    The last two components of the running script's path, ``/``-joined
+    (``weaviate_mcp/server.py``). ``None`` when ``argv[0]`` is not a file
+    (``python -c``, an embedded interpreter): a process the hub could not
+    identify by its cmdline gets no heartbeat file, so it is never ended.
+    """
+    raw = sys.argv[0] if argv0 is None else argv0
+    if not raw or not os.path.isfile(raw):
+        return None
+    parts = Path(os.path.abspath(raw)).parts
+    return "/".join(parts[-2:])
+
+
+class Heartbeat:
+    """The liveness file of one stdio MCP server process (see module doc, 6.).
+
+    Two sources feed one signal, the file's mtime: a loop task records when
+    the event loop last ran it (:meth:`loop_tick`), and a daemon thread
+    touches the file every ``interval_s`` while the loop is running and that
+    tick is younger than ``stall_s``. The thread rather than the loop does the
+    touch so that a tool call holding the loop for minutes (synchronous
+    backend I/O) does not read as a hang; a loop that stopped running — the
+    54 h field case — or that has been wedged past ``stall_s`` stops it.
+
+    Record fields (must match ``mcp_liveness.rs::McpRecord``): ``pid``,
+    ``start_token`` (:func:`vco_lib.deferral_probes.process_start_token`),
+    ``server``, ``marker`` (:func:`heartbeat_marker`), ``started_at`` (epoch s).
+    """
+
+    def __init__(self, name: str, loop: asyncio.AbstractEventLoop, *, marker: str,
+                 directory: Optional[Path] = None,
+                 interval_s: float = HEARTBEAT_SECONDS,
+                 stall_s: float = LOOP_STALL_SECONDS) -> None:
+        self.name = name
+        self.marker = marker
+        self.loop = loop
+        self.interval_s = interval_s
+        self.stall_s = stall_s
+        self.directory = directory if directory is not None else heartbeat_dir()
+        self.path = self.directory / f"{os.getpid()}.json"
+        self.last_tick = time.monotonic()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _write_record(self) -> None:
+        from vco_lib.atomic import atomic_write_json  # noqa: PLC0415
+        from vco_lib.deferral_probes import process_start_token  # noqa: PLC0415
+
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        atomic_write_json(self.path, {
+            "pid": os.getpid(),
+            "start_token": process_start_token(os.getpid()),
+            "server": self.name,
+            "marker": self.marker,
+            "started_at": time.time(),
+        }, fsync=False, mode=0o600)
+
+    def loop_is_live(self) -> bool:
+        return (self.loop.is_running() and not self.loop.is_closed()
+                and time.monotonic() - self.last_tick < self.stall_s)
+
+    def touch(self) -> None:
+        try:
+            os.utime(self.path)
+        except FileNotFoundError:
+            try:
+                self._write_record()  # removed under us (a hub sweep, a cleanup): recreate
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    async def loop_tick(self) -> None:
+        while True:
+            self.last_tick = time.monotonic()
+            await asyncio.sleep(self.interval_s)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            if self.loop_is_live():
+                self.touch()
+
+    def start(self) -> None:
+        self._write_record()
+        self._thread = threading.Thread(target=self._run, name=f"{self.name}-heartbeat",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+_heartbeat: Optional[Heartbeat] = None
+
+
+def _start_heartbeat(name: str, loop: asyncio.AbstractEventLoop,
+                     directory: Optional[Path]) -> Optional[Heartbeat]:
+    """Best effort: a server that cannot write its heartbeat still serves —
+    it is then simply not watched by the hub (logged)."""
+    global _heartbeat
+    marker = heartbeat_marker()
+    if marker is None:
+        logger.info("%s: no script path in argv; liveness heartbeat not written", name)
+        return None
+    hb = Heartbeat(name, loop, marker=marker, directory=directory)
+    try:
+        hb.start()
+    except Exception as exc:  # noqa: BLE001 — never block serving
+        logger.warning("%s: liveness heartbeat not written (%s); the hub cannot "
+                       "end this server if it hangs", name, exc)
+        return None
+    _heartbeat = hb
+    return hb
+
+
+def _stop_heartbeat() -> None:
+    global _heartbeat
+    hb, _heartbeat = _heartbeat, None
+    if hb is not None:
+        hb.stop()
+
+
 def _finish(name: str, reason: str, code: int = 0, *,
             _exit: Callable[[int], Any] = os._exit) -> None:
     """Flush what must not be lost, then end the process NOW.
 
-    ``atexit`` handlers run first (they are how runs land their telemetry —
+    The exit backstop is armed before anything else (a log write below can
+    itself block on a full stderr pipe), and the heartbeat file is removed.
+    ``atexit`` handlers run next (they are how runs land their telemetry —
     e.g. ``embedding_fidelity``'s summary row); then logging is flushed and
     the process exits without joining worker threads, which is the point.
     """
+    arm_exit_backstop(name, code, _exit=_exit)
+    _stop_heartbeat()
     logger.warning("%s: %s — exiting", name, reason)
     def _handlers() -> None:
         try:
@@ -295,8 +528,19 @@ def start_parent_watchdog(
     return t
 
 
-async def _serve_then_drain(serve: Callable[[], Awaitable[Any]], grace_s: float) -> None:
-    await serve()
+async def _serve_then_drain(serve: Callable[[], Awaitable[Any]], grace_s: float,
+                            name: str = "mcp", heartbeat: Optional[Heartbeat] = None,
+                            _exit: Callable[[int], Any] = os._exit) -> None:
+    ticker = (asyncio.get_running_loop().create_task(heartbeat.loop_tick())
+              if heartbeat is not None else None)
+    try:
+        await serve()
+    finally:
+        if ticker is not None:
+            ticker.cancel()
+    # stdin EOF: the shutdown has begun. The drain below is bounded by
+    # ``grace_s``; the backstop covers whatever could still block after it.
+    arm_exit_backstop(name, 0, delay_s=grace_s + EXIT_BACKSTOP_SECONDS, _exit=_exit)
     loop = asyncio.get_running_loop()
     try:
         await asyncio.wait_for(loop.shutdown_default_executor(), timeout=grace_s)
@@ -315,15 +559,21 @@ def run_stdio_server(
     name: str,
     grace_s: float = EXIT_GRACE_SECONDS,
     watchdog_interval_s: float = PARENT_POLL_SECONDS,
+    heartbeat_directory: Optional[Path] = None,
     _finish_fn: Optional[Callable[[str, str, int], Any]] = None,
+    _exit_fn: Callable[[int], Any] = os._exit,
 ) -> None:
     """Run a stdio MCP server whose process ends with its client.
 
     ``serve`` is the server's stdio coroutine factory (FastMCP's
-    ``run_stdio_async``). Arms the parent watchdog, serves until stdin EOF,
-    gives in-flight work ``grace_s``, then exits via :func:`_finish`.
+    ``run_stdio_async``). Arms the parent watchdog, writes the liveness
+    heartbeat (``heartbeat_directory``, default :func:`heartbeat_dir`),
+    serves until stdin EOF, gives in-flight work ``grace_s``, then exits via
+    :func:`_finish`. Every way out arms :func:`arm_exit_backstop` first.
+    ``_finish_fn`` / ``_exit_fn`` are test seams.
     """
-    finish = _finish_fn if _finish_fn is not None else _finish
+    finish = _finish_fn if _finish_fn is not None else (
+        lambda n, r, c: _finish(n, r, c, _exit=_exit_fn))
     start_parent_watchdog(
         name,
         interval_s=watchdog_interval_s,
@@ -333,17 +583,31 @@ def run_stdio_server(
     # again (Python 3.12: up to 300 s) and interpreter exit joins the pool's
     # threads — the very wait this function exists to bound.
     loop = asyncio.new_event_loop()
+    heartbeat = _start_heartbeat(name, loop, heartbeat_directory)
     reason, code = "stdin closed (its client is gone)", 0
     try:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(_serve_then_drain(serve, grace_s))
+        loop.run_until_complete(_serve_then_drain(serve, grace_s, name, heartbeat,
+                                                  _exit_fn))
     except KeyboardInterrupt:
         reason = "interrupted"
+    except SystemExit as exc:
+        # An exit requested on this thread while the loop ran (the SIGHUP
+        # env-reload handler). Re-raising would hang: interpreter shutdown
+        # joins the stdio reader thread, which is blocked on stdin.
+        reason = "exit requested (env reload)"
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
     except Exception:  # noqa: BLE001 — logged, then a non-zero exit
         logger.exception("%s: the stdio server loop failed", name)
         reason, code = "the stdio server loop failed", 1
+    except BaseException as exc:  # noqa: BLE001 — e.g. a BaseExceptionGroup
+        # Anything else that ends the loop is still an exit: letting it
+        # propagate would hand the process to interpreter shutdown, which
+        # joins the blocked stdin reader thread (the hang 4. describes).
+        reason, code = f"the stdio server loop ended ({type(exc).__name__})", 1
     finish(name, reason, code)
     # Reached only when ``finish`` returns (tests). ``close`` shuts the
     # executor down WITHOUT waiting.
+    _stop_heartbeat()
     asyncio.set_event_loop(None)
     loop.close()

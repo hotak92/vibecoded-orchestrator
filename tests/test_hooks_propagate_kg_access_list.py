@@ -259,7 +259,6 @@ def test_centralization_marker_present_on_kg_touching_hooks() -> None:
     expected = {
         "pre-edit-context-inject",
         "post-file-edit",
-        "code-graph-incremental",
         "kg-summary-generator",
         "kg-update-nudge",
         "post-git-commit-kg-sync",

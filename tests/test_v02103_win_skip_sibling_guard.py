@@ -101,7 +101,26 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: ::test_a_symlinked_checkpoint_is_managed creates a symlink, which needs a
 #: privilege Windows runners lack — a POSIX-only primitive, no .ps1 sibling; the
 #: marker/plain ownership classes were split out and run on Windows too.
-NON_CONVENTION_BASELINE = 193
+#: 193 -> 194 (v0.2.107 audit): tests/test_v02105_hub_supervision.py
+#: ::test_detached_hub_starter_is_reaped reads /proc for a zombie and uses a
+#: `#!/bin/sh` starter — POSIX-only primitives, no .ps1 sibling; the reap itself
+#: (`wait()` called on the starter) is asserted on every OS in
+#: tests/test_v0292_hub_ensure.py::test_real_spawn_invokes_start_if_not_running.
+#: 194 -> 195 (v0.2.107 wave 2): tests/test_v02107_ps1_hook_stdin_utf8.py
+#: ::test_lean_ctx_command_file_holds_the_original_bytes puts a fake
+#: ``#!/usr/bin/env bash`` lean-ctx binary on PATH for the .ps1 hook — a
+#: POSIX-only primitive, and the test IS the .ps1 leg, so there is no sibling
+#: to name. The file's other bash legs use the sibling convention.
+#: 195 -> 196 (v0.2.107 wave 2): tests/test_v02107_rl_drain_single_flight.py
+#: ::test_hook_spawns_exactly_when_the_rule_says drives BOTH hook flavours
+#: (its own [sh]/[ps1] params) through a fake ``#!/bin/sh`` venv python that
+#: records the drain argv — a POSIX-only primitive with no sibling to name. The
+#: spawn rule itself (``session_may_drain``) runs on every OS in
+#: ::test_session_may_drain_rule.
+#: 196 -> 197 (v0.2.107 fix round): tests/test_v02107_fixcg_codegraph.py skips
+#:   the checkout-lock pid-reuse test off Linux — it reads a process start token
+#:   from /proc, a Linux-only primitive with no .ps1 sibling to name.
+NON_CONVENTION_BASELINE = 197
 
 
 # -- which conditions skip on Windows --------------------------------------

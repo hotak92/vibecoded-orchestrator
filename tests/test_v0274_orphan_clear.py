@@ -107,6 +107,14 @@ class _FakeColl:
         self.aggregate = types.SimpleNamespace(
             over_all=lambda **kw: types.SimpleNamespace(total_count=agg_count)
         )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if False or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return types.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = types.SimpleNamespace(fetch_objects=_probe)
 
     def iterator(self, return_properties=None):
         self.iter_calls += 1
@@ -298,7 +306,7 @@ def test_orphan_clear_never_deletes_extra_path_rows(analyzer_mod, tmp_path):
     primary-matching project_source) are eligible."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
     # Primary root has NOTHING on disk → both rows are absent-under-primary.
-    root = _make_repo(tmp_path, [])
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file; an EMPTY root sweeps nothing
     rows = [
         # Primary-source stale+absent row → legitimately an orphan → delete.
         _Obj("prim", {
@@ -390,7 +398,7 @@ def test_orphan_clear_never_touches_current_revision_row(analyzer_mod, tmp_path)
     """A CURRENT-revision row for a deleted file must NOT be deleted by the
     orphan-clear (scoped to stale rows only)."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
-    root = tmp_path  # nothing on disk
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file on disk
     rows = [
         # current-revision row whose file is gone — out of orphan-clear scope
         _Obj("cur", {"file_path": "pkg/gone.py", "embed_revision": rev}),
@@ -528,7 +536,7 @@ def test_cg4_zero_dispatch_whole_repo_walk_still_sweeps(analyzer_mod, tmp_path):
     (zero-dispatch analogue); the end-of-walk force-trigger `_get_stale_file_set`
     still runs `_build_stale_file_set`, whose whole-repo sweep purges them."""
     rev = analyzer_mod.CODEGRAPH_EMBED_REVISION
-    root = _make_repo(tmp_path, [])  # nothing on disk → every stored row orphaned
+    root = _make_repo(tmp_path, ["README.md"])  # no analyzed file; an EMPTY root sweeps nothing
     rows = [
         _Obj("gone1", {
             "file_path": "pkg/a.py", "embed_revision": rev, "project_source": "",
@@ -749,6 +757,14 @@ class _R3Coll:
         self.aggregate = types.SimpleNamespace(
             over_all=lambda **kw: types.SimpleNamespace(total_count=agg_count)
         )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if False or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return types.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = types.SimpleNamespace(fetch_objects=_probe)
         _names = prop_names if prop_names is not None else (
             "embed_revision", "file_path", "path", "project_source",
         )
@@ -937,17 +953,20 @@ def test_r3_module_uses_path_property(monkeypatch, tmp_path):
 
 
 def test_r3_no_repo_root_counts_all_stale(monkeypatch, tmp_path):
-    """Without repo_root (R3 disabled) the aggregate count is returned as-is —
-    orphans included (pre-R3 behaviour, conservative)."""
+    """Without repo_root (R3 disabled) every stale row counts — orphans
+    included (pre-R3 behaviour, conservative). v0.2.107 CG-1: the count comes
+    from the one exact scan a positive existence probe pays, not from a
+    filtered Aggregate."""
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
     module = _R3Coll(agg_count=0)
     klass = _R3Coll(agg_count=0)
-    func = _R3Coll(agg_count=5)  # aggregate says 5 stale
+    func = _R3Coll(agg_count=5, rows=[
+        {"embed_revision": 0, "file_path": f"gone{i}.py"} for i in range(5)])
     client = _r3_client("Proj", module, klass, func)
 
     counts = cr.count_stale_rows("Proj", current_revision=1, client=client)
     assert counts["Proj_CodeFunction"] == 5
-    assert func.iter_calls == 0, "no repo_root → trust the aggregate, no scan"
+    assert func.iter_calls == 1, "a positive probe pays exactly one scan"
 
 
 def test_r3_escape_path_excluded_from_reachable(monkeypatch, tmp_path):

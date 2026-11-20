@@ -37,6 +37,12 @@
 # wins. The value is never logged, cached to disk, or re-exported into
 # any VCO-written file.
 #
+# No caching in this script. The hub is the source-of-truth: a pause applies
+# to the next call (the active flag is re-read on every request). A value
+# rotated or removed in the launcher can still be served for up to 30 s, the
+# hub's in-process value cache (VCT_HUB_SECRET_CACHE_SECS, see
+# docs/CONFIGURATION.md). Must match the bash sibling's note.
+#
 # Usage:
 #   .\vct_secrets_resolve.ps1 <project_id_or_folder> <secret_key>
 #       Print the value of <secret_key> on stdout. Exits with:

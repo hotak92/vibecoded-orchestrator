@@ -521,6 +521,10 @@ def test_stop_drain_hook_on_subagent_stop_uses_agent_transcript(tmp_path: Path, 
         "esac\n"
         f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
     py.chmod(0o755)
+    # RL-DRAIN (v0.2.107): the hook spawns a drain only when a pending file exists.
+    _pend = project / ".claude" / "state" / "rl_pending"
+    _pend.mkdir(parents=True, exist_ok=True)
+    (_pend / "sessS__t1.json").write_text("{}", encoding="utf-8")
     payload = {"hook_event_name": "SubagentStop", "session_id": "sessS",
                "transcript_path": "/parent.jsonl", "agent_id": "lane2",
                "agent_transcript_path": "/agent-lane2.jsonl"}
@@ -923,7 +927,9 @@ def test_registrations(os_name: str) -> None:
                         ("PostToolUse", "agent-alerts-deliver"),
                         ("UserPromptSubmit", "agent-alerts-deliver")):
         ((_m, h),) = _hooks_for(doc, event, stem)
-        assert "timeout" not in h, f"{event}/{stem} must not carry a killing timeout"
+        # v0.2.107: explicit, never shorter than the harness default (600 s)
+        # these hooks were left on -- still no killing timeout.
+        assert h.get("timeout", 0) >= 600, f"{event}/{stem} must not carry a killing timeout"
 
 
 # ── PreCompact for a subagent leaves the main chat's snapshot alone ───────
@@ -1201,6 +1207,10 @@ def test_stop_drain_hook_adopts_brief_on_post_tool_use_agent(tmp_path: Path, fla
         "esac\n"
         f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
     py.chmod(0o755)
+    # RL-DRAIN (v0.2.107): the hook spawns a drain only when a pending file exists.
+    _pend = project / ".claude" / "state" / "rl_pending"
+    _pend.mkdir(parents=True, exist_ok=True)
+    (_pend / "sessS__t1.json").write_text("{}", encoding="utf-8")
     env = _env(project, VCT_VENV=str(venv))
     base = {"hook_event_name": "PostToolUse", "tool_name": "Agent", "session_id": "sessS",
             "transcript_path": "/parent.jsonl", "tool_use_id": "toolu_77",
@@ -1498,13 +1508,12 @@ def test_ps1_work_record_respects_a_held_lock(tmp_path: Path) -> None:
     row = json.loads(counter.read_text().splitlines()[-1])
     assert row["subagent_work_units"] > 0 and row["baseline"] == 7
     assert lock.exists() and lock.read_text() == "held by the nudge"
-    # Found by this test: both ps1 writers emitted a UTF-8 BOM, which the
-    # Python readers (the nudge's json.loads per line; the drain's path list)
-    # glue onto the first row.
+    # Found by this test: the ps1 writer emitted a UTF-8 BOM, which the
+    # Python reader (the nudge's json.loads per line) glues onto the first row.
     bom = b"\xef\xbb\xbf"
     assert not counter.read_bytes().startswith(bom)
-    queue = project / ".claude" / "state" / "codegraph_drain_shared.txt"
-    assert queue.exists() and not queue.read_bytes().startswith(bom)
+    # v0.2.107 (CG-3): the reconciler queues nothing for the code graph.
+    assert not (project / ".claude" / "state" / "codegraph_drain_shared.txt").exists()
 
 
 # ── R4c-7: a worktree file with a space in its name ───────────────────────

@@ -48,6 +48,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import shutil
 import sys
 import tempfile
 import warnings
@@ -385,6 +386,24 @@ _AMBIENT_CODE_EMBED_URL = os.environ.get("CODE_EMBED_SERVICE_URL")
 if not _ALLOW_REAL_STATE:
     for _key in _CODE_EMBED_URL_KEYS:
         os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+
+
+# ─── W-GPU (v0.2.107): the suite never allocates on the machine's GPU ─────────
+#
+# torch picks `cuda:0` for every `device="auto"` model when it sees a GPU
+# (`rl_reranker.RLModel._resolve_device`, `RL_DEVICE` defaulting to `auto`).
+# On a developer box that GPU is the one Ollama and code-embed are holding,
+# and the tensors the RL suites create stay allocated in this process (CUDA's
+# caching allocator keeps them): measured, ~7 MB per RLServer, 465 MB by the
+# time `tests/test_v0279_code_embed_idle_unload.py` runs, whose unload path
+# then reads a non-zero `torch.cuda.memory_allocated()` and keeps its mock
+# model loaded — two failures that passed in isolation. CI runners have no GPU,
+# so hiding it here makes every machine run the suite CI runs. Import time:
+# CUDA reads the variable when it initialises, on first use. Children inherit
+# it. A test that needs a device sets its own; `VCO_TEST_ALLOW_REAL_STATE=1`
+# is the one hatch for "use my real install".
+if not _ALLOW_REAL_STATE:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 # ─── W-CODE-LADDER (v0.2.103 F1, pinned tighter by R41 M3/L1): the ───────────
@@ -965,6 +984,18 @@ def child_env() -> dict:
     from tests.common.child_env import child_env as _child_env
 
     return _child_env()
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_endpoint_down_marker():
+    """v0.2.107 (A-063): the hook router skips every leg for 30 s after any
+    client on the machine found Weaviate unreachable — a marker under
+    ``$VCT_STATE_DIR/hook_endpoint_down/``. Every test shares the redirected
+    state dir and the unroutable ``WEAVIATE_URL`` sentinel, so one test's
+    refused connection would silence the router in the tests after it. Each
+    test starts without a marker; a test that wants one writes it."""
+    shutil.rmtree(_VCO_STATE_REDIRECT / "hook_endpoint_down", ignore_errors=True)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -2838,3 +2869,27 @@ def _gateway_vendor_keys_all_resolve():
         yield
     finally:
         _mgd._default_vendor_probe = saved
+
+
+# -- Code-graph class listings (v0.2.107, CG-2) -------------------------------
+# Production code lists a class only through `vco_lib.codegraph_cursor`
+# (`fetch_objects(after=...)` pages + a count cross-check on a 0-row pass).
+# The pre-CG-2 fakes model a collection as `iterator(...)`; this adapter serves
+# the cursor's pages from that method so those suites keep testing what they
+# test (the decision made on the rows). Fakes that speak the cursor protocol
+# (`tests/common/cursor_fakes.CursorClass`, `cursor_native = True`) are never
+# adapted. Rationale and limits: the docstring of `tests/common/cursor_fakes.py`.
+# Saved/restored by hand, NOT through `monkeypatch`: an autouse fixture that
+# requests `monkeypatch` would move its teardown after the env-leak guards above.
+@pytest.fixture(autouse=True)
+def _codegraph_cursor_serves_legacy_fakes():
+    try:
+        from tests.common import cursor_fakes as _cursor_fakes
+    except Exception:  # noqa: BLE001 - a suite without vco_lib lists no class
+        yield
+        return
+    restore = _cursor_fakes.install_legacy_adapter()
+    try:
+        yield
+    finally:
+        restore()

@@ -15,14 +15,16 @@ $VctScrubSecretKeys = @(
     'VERCEL_TOKEN', 'CLAUDE_API_KEY'
 )
 
-# HK-2 (v0.2.75) NOTE: unlike the .sh sibling's `vct_scrub_secret_env` (which
-# had ZERO callers and was deleted), this PowerShell helper is LIVE -- it is
-# sourced + called by session-start-retrieval-health.ps1, kg-sync-on-edit.ps1,
-# and session-start-deferral-surface.ps1. So it stays. (The two siblings
-# intentionally diverge here: bash hooks all inline their scrub, but these
-# three .ps1 hooks delegate to this function.)
+# Every templates/hooks/*.ps1 dot-sources this file and calls
+# Invoke-VctScrubSecretEnv; its inline list runs only when this file is
+# missing (v0.2.107, the same shape as the .sh hooks with scrub-env.sh).
+# Plain .NET, no cmdlet: passing a REAL null ([NullString]::Value) removes the
+# variable for this process and every child it starts (what `Remove-Item Env:X`
+# does), and the hooks' fast paths pay no module autoload for it. A bare $null is
+# converted to "" for a [string] parameter, and since .NET 9 (pwsh 7.5) "" SETS
+# an empty variable instead of removing it.
 function Invoke-VctScrubSecretEnv {
     foreach ($k in $VctScrubSecretKeys) {
-        Remove-Item -Path ("Env:" + $k) -ErrorAction SilentlyContinue
+        [System.Environment]::SetEnvironmentVariable($k, [NullString]::Value)
     }
 }

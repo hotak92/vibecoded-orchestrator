@@ -39,7 +39,12 @@ What the container is decides the mode: VCO's own container under the
 installer's compose project → ``vco_managed``; VCO's own container under the
 legacy compose home, or someone else's container → ``adopted_container``
 (started/stopped by name, never recreated); a process or remote host →
-``adopted_external``. code-embed is always ``vco_managed``; a code-embed
+``adopted_external``. v0.2.107: an ``adopted_container`` row whose container
+this install's own compose created, on the installer's data mount, is
+recorded as ``vco_managed`` on the next full run (:func:`reclassify_own`), and
+VCO's own Weaviate is then moved to the pinned image under
+:mod:`vco_lib.container_upgrade` (counts, raft snapshot, volume copy, verify,
+rollback) before step 5 composes anything. code-embed is always ``vco_managed``; a code-embed
 container another compose project owns is recreated WITH its cache by
 ``service_lifecycle.migrate_code_embed`` (plan §4c).
 
@@ -574,6 +579,14 @@ class ServiceInputs:
     #: The runtime answered the container listing (``containers`` is then
     #: complete for what was asked about, so a name absent from it is gone).
     containers_listed: bool = False
+    #: v0.2.107 — what "VCO's own container" is compared against
+    #: (:func:`reclassify_own`): the installer's compose project, this
+    #: install's ``infrastructure/`` directory, and the data mount the
+    #: installer's compose gives the service (``None`` = not readable: nothing
+    #: is then reclassified).
+    installer_project: str = ""
+    infra_dir: Optional[Path] = None
+    installer_mount: Optional[Mapping[str, str]] = None
 
 
 @dataclass
@@ -985,6 +998,44 @@ def _container_drift(inp: ServiceInputs, row: _se.EndpointRow,
     return replace(row, source="live_reconcile", **changes)
 
 
+def reclassify_own(inp: ServiceInputs, row: _se.EndpointRow) -> Optional[_se.EndpointRow]:
+    """The ``vco_managed`` row for an ``adopted_container`` row whose
+    container is in fact VCO's OWN (v0.2.107, audit A-004), else ``None``.
+
+    VCO's own = created by THIS install's compose (project and working
+    directory, under VCO's container name —
+    :func:`vco_lib.service_detection.is_own_compose_container`) AND mounting
+    the data the installer's compose mounts. A container recorded as adopted
+    before VCO compared ownership (every install older than v0.2.105 whose
+    Weaviate VCO itself created) stayed "adopted" for ever and never received
+    the pinned image or the memory limit. Everything else — another compose
+    project, another clone's ``infrastructure/``, a data mount the installer's
+    compose would not give it (a recreate would land on an EMPTY default
+    volume), or a mount that cannot be compared — stays foreign: never
+    recreated."""
+    if row.mode != "adopted_container" or inp.service == "code_embed":
+        return None
+    c = next((x for x in inp.containers if x.name == row.container_name), None)
+    if c is None or inp.installer_mount is None or inp.infra_dir is None:
+        return None
+    if not _det.is_own_compose_container(c, inp.service, inp.installer_project, inp.infra_dir):
+        return None
+    from vco_lib import data_identity as _di  # noqa: PLC0415
+
+    live = _mount_of(inp.service, c)
+    key = _di.mount_key(live) if live else None
+    if key is None or key != _di.mount_key(dict(inp.installer_mount)):
+        return None
+    port = c.host_ports.get(_det.CONTAINER_PORTS[inp.service]) or row.port
+    grpc = row.grpc_port
+    if inp.service == "weaviate":
+        grpc = c.host_ports.get(_det.WEAVIATE_CONTAINER_GRPC_PORT) or row.grpc_port
+    return replace(row, mode="vco_managed", host="localhost", port=port, grpc_port=grpc,
+                   container_name=_containers.canonical_name(inp.service), enabled=True,
+                   data_mount=live, compose_project=c.compose_project or None,
+                   source="live_reconcile")
+
+
 def _decide_existing(inp: ServiceInputs) -> Outcome:
     svc = inp.service
     row = inp.existing
@@ -992,7 +1043,15 @@ def _decide_existing(inp: ServiceInputs) -> Outcome:
     out = Outcome(svc, row=row, how="existing")
     live_at_row = next((c for c in inp.candidates if c.live and c.port == row.port
                         and _norm_host(c.host) == _norm_host(row.host)), None)
-    if row.mode == "adopted_container":
+    # A full run only: the session check never changes what VCO may do to a
+    # container (a managed one is composed and re-created by the hooks).
+    own = reclassify_own(inp, row) if not inp.session else None
+    if own is not None:
+        out.row, out.how = own, "reclassified_own"
+        out.lines.append(
+            f"  [{svc}] {row.container_name} is VCO's own container (this install's compose "
+            "created it, on the installer's data mount) — recorded as VCO-managed")
+    elif row.mode == "adopted_container":
         present = any(x.name == row.container_name for x in inp.containers)
         if not present and (inp.containers_listed or inp.containers):
             out.unreachable = f"your container {row.container_name} no longer exists"
@@ -1368,6 +1427,11 @@ class ReconcileResult:
     written: list[str] = field(default_factory=list)
     apply_report: Optional[_se.ApplyChangeReport] = None
     detection: Optional[_det.Detection] = None
+    #: v0.2.107: what the protected move did per service
+    #: (:class:`vco_lib.container_upgrade.MoveOutcome`), and the in-place
+    #: limit on a foreign Weaviate (:class:`vco_lib.weaviate_memory.ForeignLimit`).
+    moves: dict[str, Any] = field(default_factory=dict)
+    foreign_limit: Any = None
 
     @property
     def weaviate_pending(self) -> bool:
@@ -1384,13 +1448,19 @@ class ReconcileResult:
         own container, running under the installer's project — re-applied
         from the current compose config, the v0.2.61 behaviour), ``start``
         (VCO's own, nothing answering), or ``skip`` (adopted, disabled,
-        awaiting a choice, being migrated, or answered by something VCO
-        cannot see as its own container)."""
+        awaiting a choice, being migrated, answered by something VCO
+        cannot see as its own container, or a Weaviate whose protected move
+        to the pinned image was not made — ``container_upgrade``)."""
         row = self.rows.get(service)
         o = self.outcomes.get(service)
         if row is None or row.mode != "vco_managed" or not row.enabled or o is None:
             return "skip"
         if o.migrate_code_embed:
+            return "skip"
+        move = self.moves.get(service)
+        if move is not None and move.blocks_recreate:
+            # v0.2.107: the protected move was held back, refused or rolled
+            # back — a plain recreate would make that very move, unprotected.
             return "skip"
         cands = self.detection.for_service(service) if self.detection is not None else []
         at_port = [c for c in cands if c.port == row.port and _norm_host(c.host) == "localhost"]
@@ -1449,11 +1519,23 @@ def reconcile(
     vct_config_dirs: Optional[Sequence[Path]] = None,
     installer_project: Optional[str] = None,
     apply_kwargs: Optional[Mapping[str, Any]] = None,
+    protect_moves: Optional[bool] = None,
+    mover: Optional[Callable[..., Any]] = None,
+    limiter: Optional[Callable[..., Any]] = None,
+    installer_mounts: Optional[Mapping[str, Optional[Mapping[str, str]]]] = None,
 ) -> ReconcileResult:
     """Decide, write and follow up the three rows. ``phase``: ``install`` /
     ``update`` (legacy import when rows are missing; prompts allowed when
     ``interactive``) or ``session`` (existing rows only: live drift, no
-    import, no prompt)."""
+    import, no prompt).
+
+    v0.2.107: a full run also (a) records a container that is VCO's own as
+    ``vco_managed`` (:func:`reclassify_own`), (b) moves VCO's own Weaviate
+    onto the pinned image under :mod:`vco_lib.container_upgrade`'s protection
+    BEFORE step 5 composes anything (*protect_moves*; default: every phase
+    but ``session``), and (c) applies the memory limit in place to a Weaviate
+    container VCO did not create. *mover* / *limiter* / *installer_mounts*
+    are the test seams for those three."""
     root = Path(orchestrator_root)
     env = os.environ if env is None else env
     now = _now_ms() if now_ms is None else now_ms
@@ -1500,6 +1582,9 @@ def reconcile(
         # unreadable — say so in the run's output, never silently.
         result.lines.append(f"  ! service detection offered nothing: {detection.refused}")
 
+    infra_dir = root / "infrastructure"
+    if installer_mounts is None:
+        installer_mounts = installer_data_mounts(root) if phase != "session" else {}
     taken = {c.port for s in SERVICES for c in detection.for_service(s) if c.port}
     taken |= {port for c in detection.containers for port in c.host_ports.values()}
     # v0.2.102 W5-A (M3): a declared project's ports are never VCO's to take.
@@ -1519,6 +1604,8 @@ def reconcile(
             prompt=prompt or (_interactive_prompt if interactive else None),
             containers=detection.containers, now_ms=now, session=phase == "session",
             containers_listed=detection.listed,
+            installer_project=installer_project, infra_dir=infra_dir,
+            installer_mount=installer_mounts.get(service),
         )
         out = decide(inp)
         result.outcomes[service] = out
@@ -1560,8 +1647,110 @@ def reconcile(
         if unimported:
             result.entries.append(_legacy_unimported_entry(unimported, result.rows))
     _autostart_adopted(result, runtime, run)
+    if phase != "session" and runtime and result.registry_ok:
+        if protect_moves is None or protect_moves:
+            _protect_weaviate_move(result, root, runtime, installer_project, infra_dir,
+                                   installer_mounts.get("weaviate"), db_path, run, env, mover)
+            _report_kept_backups(result, root, runtime, run)
+        _limit_foreign_weaviate(result, root, runtime, run, env, limiter)
     result.entries.extend(_outcome_entries(result, root))
     return result
+
+
+def installer_data_mounts(orchestrator_root: Path) -> dict[str, Optional[dict[str, str]]]:
+    """Per service, the data mount the installer's compose (base + managed
+    overrides + ``infrastructure/.env``, merged in Python) gives it, as a
+    row-shaped mount; ``None`` where it cannot be read. What
+    :func:`reclassify_own` compares a container's live mount against."""
+    out: dict[str, Optional[dict[str, str]]] = {s: None for s in SERVICES}
+    infra = Path(orchestrator_root) / "infrastructure"
+    try:
+        _files, cfg = _service_adoption._compose_entrypoints(
+            False, None, infra, _service_adoption.infrastructure_env_for_substitution(infra))
+        services = cfg.get("services") if isinstance(cfg, dict) else None
+        if not isinstance(services, dict):
+            return out
+        for service in SERVICES:
+            spec = _service_adoption.config_mounts(
+                services.get(service) or {}, cfg.get("volumes") or {}
+            ).get(DATA_MOUNT_TARGETS[service])
+            if spec is not None:
+                out[service] = {"kind": spec.kind, "source": spec.source,
+                                "destination": spec.destination}
+    except Exception:  # noqa: BLE001 — an unreadable compose names no mount: nothing is reclassified
+        return {s: None for s in SERVICES}
+    return out
+
+
+def _protect_weaviate_move(result: ReconcileResult, root: Path, runtime: str,
+                           installer_project: str, infra_dir: Path,
+                           installer_mount: Optional[Mapping[str, str]],
+                           db_path: Optional[Path], run: Optional[RunFn],
+                           env: Mapping[str, str], mover: Optional[Callable[..., Any]]) -> None:
+    """Step [5b]'s half of the owner ruling "recreate it to get latest": VCO's
+    OWN Weaviate container on an image other than the pinned one is moved
+    under :func:`vco_lib.container_upgrade.protect_weaviate_move` (counts,
+    raft snapshot, volume copy, verify, rollback). A container that is not
+    provably VCO's own is not touched here at all."""
+    row = result.rows.get("weaviate")
+    det = result.detection
+    if row is None or det is None or row.mode != "vco_managed" or not row.enabled:
+        return
+    c = det.container_named(_containers.canonical_name("weaviate"))
+    if c is None or not _det.is_own_compose_container(c, "weaviate", installer_project, infra_dir):
+        return
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+    from vco_lib import data_identity as _di  # noqa: PLC0415
+
+    live_mount = _mount_of("weaviate", c)
+    if installer_mount is None or live_mount is None \
+            or _di.mount_key(live_mount) != _di.mount_key(dict(installer_mount)):
+        return  # not on the installer's mount: step 5's data-identity guard decides
+    if mover is None:
+        # Printed as it happens (a multi-gigabyte copy must not look like a
+        # hang), so its lines are not repeated in ``result.lines``.
+        def live(line: str) -> None:
+            _console_print(line)
+
+        engine = _cu.ContainerEngine(runtime, root, run=run, db_path=db_path, log=live)
+        outcome = _cu.protect_weaviate_move(root=root, runtime=runtime, row=row, container=c,
+                                            engine=engine, environ=env, log=live)
+    else:
+        outcome = mover(root=root, runtime=runtime, row=row, container=c, environ=env)
+        result.lines.extend(outcome.lines)
+    result.moves["weaviate"] = outcome
+    result.entries.extend(outcome.entries)
+
+
+def _report_kept_backups(result: ReconcileResult, root: Path, runtime: str,
+                         run: Optional[RunFn]) -> None:
+    """Every update re-emits ``container_upgrade_backup_kept`` while a
+    pre-move copy of Weaviate's data still exists (audit C-2): the entry is
+    the user's one record of that volume, and VCO never deletes it."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+    moved = result.moves.get("weaviate")
+    skip = [moved.backup] if moved is not None and getattr(moved, "backup", "") else []
+    result.entries.extend(_cu.kept_backup_entries(_cu.ContainerEngine(runtime, root, run=run),
+                                                  skip=skip))
+
+
+def _limit_foreign_weaviate(result: ReconcileResult, root: Path, runtime: str,
+                            run: Optional[RunFn], env: Mapping[str, str],
+                            limiter: Optional[Callable[..., Any]]) -> None:
+    """A Weaviate container VCO did not create gets the memory limit in
+    place (never a recreate); ``ensure-containers`` re-applies it after each
+    restart (:func:`vco_lib.weaviate_memory.ensure_foreign_limit`)."""
+    row = result.rows.get("weaviate")
+    if row is None or row.mode != "adopted_container":
+        return
+    from vco_lib import weaviate_memory as _wm  # noqa: PLC0415
+
+    outcome = (limiter or _wm.ensure_foreign_limit)(
+        root=root, runtime=runtime, row=row, run=run, environ=env)
+    result.foreign_limit = outcome
+    if outcome.line:
+        result.lines.append(outcome.line)
 
 
 def _session_detection(existing: Mapping[str, _se.EndpointRow], *, runtime: Optional[str],
@@ -1927,8 +2116,12 @@ def _outcome_entries(result: ReconcileResult, root: Path) -> list[DeferralEntry]
             title="A container VCO uses lacks some of VCO's tuning",
             detected=("These containers run an older image than VCO pins, or without VCO's "
                       f"behaviour-critical settings:\n{detail}"),
-            why_deferred=("VCO never recreates a container it adopted. The service works; it "
-                          "just does not carry these fixes."),
+            why_deferred=("These containers are not VCO's own (another compose project "
+                          "created them, or their data is not on the mount VCO's compose "
+                          "uses), so VCO never recreates them. The service works; it just "
+                          "does not carry these fixes. Weaviate's memory limit is the one "
+                          "setting VCO applies to such a container in place, at every "
+                          "session start."),
             command_to_apply=remedy + "# Or keep it as it is and dismiss this entry.",
             severity="info",
             dismiss_fields={"service": ",".join(s for s, _n, _d in drift_items),
@@ -2426,6 +2619,8 @@ AdoptFn = Callable[..., Any]
 def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str] = None,
                 db_path: Optional[Path] = None, run: Optional[RunFn] = None,
                 adopt: Optional[AdoptFn] = None,
+                mover: Optional[Callable[..., Any]] = None,
+                environ: Optional[Mapping[str, str]] = None,
                 out: LogFn = _console_print) -> int:  # type: ignore[assignment]
     """``hand-to-vco --service S`` — the opt-in ownership transfer (owner
     ruling Q2): VCO's compose takes over THE container the row names (an
@@ -2436,7 +2631,18 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
     (:func:`vco_lib.service_adoption.adopt_services`). Refused, with nothing
     touched, when there is no such row, the row names no container, the
     container is gone, or it is not under the name VCO's compose creates
-    (:func:`can_hand_to_vco`)."""
+    (:func:`can_hand_to_vco`).
+
+    v0.2.107: a Weaviate on another version than the one VCO's compose pins
+    is handed over in TWO steps and never by a plain recreate across
+    versions: the take-over keeps the image it runs
+    (``adopt_services(hold_weaviate_image=…)``), then the version is changed
+    by THE protected move (:func:`vco_lib.container_upgrade.protect_weaviate_move`
+    — counts, copy, verify, rollback). The hand-over is the user's consent to
+    the move; a move that would be held back (a downgrade,
+    ``VCO_CONTAINER_UPGRADE=off|dry-run``, an earlier failed attempt) holds
+    the hand-over back too, before anything is touched. *mover* / *environ*
+    are test seams."""
     row = _se.load_rows(db_path).get(service)
     refusal = hand_to_vco_refusal(service, row)
     if refusal is not None and refusal != "not_canonical":
@@ -2456,9 +2662,15 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
             "second, differently named container on the same data, so VCO leaves it as it is. "
             "It stays yours: VCO starts and stops it by name.")
         return 1
+    move = None
+    if service == "weaviate":
+        move, held = _weaviate_hand_over_move(Path(orchestrator_root), rt, name, run, environ, out)
+        if held is not None:
+            return held
+    kwargs: dict[str, Any] = {"hold_weaviate_image": move.live} if move is not None else {}
     result = (adopt or _service_adoption.adopt_services)(
         Path(orchestrator_root), services=(service,), runtime=rt, db_path=db_path,
-        container_refs={service: name})
+        container_refs={service: name}, **kwargs)
     for line in result.lines:
         out(line)
     entries = getattr(result, "entries", None)
@@ -2469,7 +2681,74 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
         from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
 
         emit_entries(Path(orchestrator_root), entries)
-    return 0 if service in result.adopted else 1
+    if service not in result.adopted:
+        return 1
+    if move is None:
+        return 0
+    return _move_after_hand_over(Path(orchestrator_root), rt, name, db_path=db_path, run=run,
+                                 environ=environ, mover=mover, out=out)
+
+
+def _weaviate_hand_over_move(root: Path, runtime: str, name: str, run: Optional[RunFn],
+                             environ: Optional[Mapping[str, str]], out: LogFn
+                             ) -> tuple[Any, Optional[int]]:
+    """``(the version move a take-over of *name* entails or None, an exit
+    code when the hand-over is held back before anything is touched)``."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+    listed = _det.list_containers_or_none(runtime, run=run, names={name})
+    c = next((x for x in listed or [] if x.name == name), None)
+    if c is None:
+        out(f"weaviate: {name} could not be inspected — nothing handed over.")
+        return None, 1
+    move = _cu.image_move(c.image, _service_adoption.pinned_image("weaviate", root))
+    if move is None:
+        return None, None
+    mount = c.mount_at(DATA_MOUNT_TARGETS["weaviate"])
+    probe = _cu.MoveOutcome("weaviate", log=out)
+    if _cu.held_back(probe, name, move, mount.to_row() if mount is not None else None,
+                     environ=environ):
+        out(f"weaviate: {name} is not handed over — taking it over moves it from {move.live} "
+            f"to {move.pinned}, and that move is held back ({probe.reason}).")
+        return move, 0 if probe.status == _cu.DRY_RUN else 1
+    out(f"weaviate: {name} runs {move.live}; it is taken over on that version, then moved to "
+        f"{move.pinned} by the protected move (counts, a copy of the data, verify, rollback).")
+    return move, None
+
+
+def _move_after_hand_over(root: Path, runtime: str, name: str, *, db_path: Optional[Path],
+                          run: Optional[RunFn], environ: Optional[Mapping[str, str]],
+                          mover: Optional[Callable[..., Any]], out: LogFn) -> int:
+    """Step two of a Weaviate hand-over: THE protected move of the container
+    VCO now owns. The outcome's ledger rows are written; ``0`` only when it
+    now runs the pinned image."""
+    from vco_lib import container_upgrade as _cu  # noqa: PLC0415
+
+    row = _se.load_rows(db_path).get("weaviate")
+    engine = _cu.ContainerEngine(runtime, root, run=run, db_path=db_path, log=out)
+    container = engine.inspect(name)
+    if row is None or container is None:
+        out(f"weaviate: {name} is VCO's now, but it could not be read back, so it was not moved "
+            "— `python install.py --update` makes the move.")
+        return 1
+    if mover is not None:
+        outcome = mover(root=root, runtime=runtime, row=row, container=container,
+                        environ=environ)
+        for line in outcome.lines:
+            out(line)
+    else:
+        outcome = _cu.protect_weaviate_move(root=root, runtime=runtime, row=row,
+                                            container=container, engine=engine,
+                                            environ=environ, log=out)
+    if outcome.entries:
+        from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
+
+        emit_entries(root, list(outcome.entries))
+    if outcome.status in (_cu.MOVED, _cu.NOT_NEEDED):
+        return 0
+    out(f"weaviate: {name} is VCO's now and stays on its version ({outcome.reason}); "
+        "UPDATE_DEFERRED.md says what to do.")
+    return 1
 
 
 def cli(verb: str, args: argparse.Namespace) -> int:
@@ -2504,7 +2783,10 @@ def cli(verb: str, args: argparse.Namespace) -> int:
                              grpc_port=args.grpc_port, accept_empty_kg=args.accept_empty_kg,
                              db_path=db)
     if verb == "reconcile":
-        result = reconcile(phase=args.phase, orchestrator_root=root, runtime=_runtime(), db_path=db)
+        # The CLI / launcher reconcile records rows; it never moves a
+        # container (that is install.py --update's step [5b]).
+        result = reconcile(phase=args.phase, orchestrator_root=root, runtime=_runtime(), db_path=db,
+                           protect_moves=False)
         # With --json, stdout is a machine contract (the launcher parses it):
         # the human lines go to stderr.
         human = sys.stderr if args.json else sys.stdout

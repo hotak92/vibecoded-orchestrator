@@ -43,6 +43,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import re
 import sys
 import unittest
@@ -549,22 +550,27 @@ class RetryTrailTests(unittest.TestCase):
     def test_spawn_writes_the_header_before_the_child_exists(self):
         """A child that dies before its first print must still leave a file
         that says who spawned it, with what argv, when."""
+        # v0.2.107: the spawned child is the machine's owed-work worker; its
+        # log is written by the spawner before Popen, exactly as before.
+        from vco_lib import owed_work
+
         logs: list = []
 
         class _FakePopen:
             def __init__(self, argv, **kwargs):
                 logs.append((argv, kwargs))
 
+        log_dir = self.folder / "logs"
+        log_dir.mkdir()
         with mock.patch.object(dr.subprocess, "Popen", _FakePopen), \
-                mock.patch.object(
-                    dr, "_log_path_for_stamp",
-                    return_value=self.folder / "deferral-retry-test.log",
-                ):
+                mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(self.folder / "state")}), \
+                mock.patch.object(owed_work, "logs_dir", return_value=log_dir):
             self.assertTrue(dr.spawn_detached(self.folder))
-        written = (self.folder / "deferral-retry-test.log").read_text(encoding="utf-8")
-        self.assertIn("deferral-retry driver spawned", written)
-        self.assertIn(str(self.folder), written)
-        self.assertIn("vco_lib.deferral_retry", written)
+        [log] = list(log_dir.glob("owed-work-worker-*.log"))
+        written = log.read_text(encoding="utf-8")
+        self.assertIn("owed-work worker spawned", written)
+        self.assertIn(f"enqueue {self.folder.name}", written)
+        self.assertIn("vco_lib.owed_work", written)
 
 
 class ConvergenceTests(unittest.TestCase):

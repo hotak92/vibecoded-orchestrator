@@ -884,8 +884,8 @@ fetch_config() {
             if [[ -n "$field" ]]; then
                 # v0.2.47 (extras): the `code_graph_extra_paths` field has
                 # a structured shape on the wire (array of {path, enabled,
-                # last_indexed_commit?}) but consumers — the hook chain in
-                # code-graph-incremental.sh — want plain newline-delimited
+                # last_indexed_commit?}) but bash consumers want plain
+                # newline-delimited
                 # paths of ENABLED rows only. Render it here so every
                 # bash caller gets the consumer-friendly format without
                 # re-parsing JSON. Empty array → empty output + exit 0

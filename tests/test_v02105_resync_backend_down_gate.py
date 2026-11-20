@@ -24,6 +24,8 @@ def _stub_driver_gates(monkeypatch, *, backend_down):
     """Neutralise every gate of the driver's slotted body except the
     backend-reachability one under test (no Weaviate, no hub, no spawn).
     Returns the recorder dicts."""
+    from tests.common.revision_heal_fakes import heal_always_runs
+    heal_always_runs(monkeypatch, cr)  # the heal runs; this test is about what follows
     from types import SimpleNamespace
 
     monkeypatch.setattr(cr, "walk_uses_container", lambda *_a, **_k: False)

@@ -53,18 +53,22 @@
 # parity with every other VCO hook + .sh sibling). The hook itself doesn't
 # read secrets, but spawned children inherit our env; scrubbing first means
 # they can't leak a credential via their own logs / debug output.
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($k in @('SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY')) {
     if (Test-Path "Env:$k") { Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue }
+}
 }
 
 # 1. Global kill-switch (one switch for "turn off all VCT hook side-effects").
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
-# Capture the PreToolUse stdin payload ONCE (reading [Console]::In drains
+# Capture the PreToolUse stdin payload ONCE (reading stdin drains
 # it), FIRST: the kill-guard stage below needs it before the lean-ctx knobs
 # are consulted. MUST MATCH lean-ctx-rewrite.sh ($_lc_cmd).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { exit 0 }
 
 # === STAGE 1: kill guard (v0.2.105) ===========================================

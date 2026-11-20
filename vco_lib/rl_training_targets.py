@@ -7,14 +7,16 @@
 
 Used by THREE paths that must agree numerically:
 
-1. **MCP-side citation detection** (`claude_mcp_servers/weaviate_mcp/server.py::_rl_answer_monitor`)
-   — writes the citation event directly to JSONL.
+1. **Client-side citation detection** (`claude_mcp_servers/rl_client/citation_compute.py::compute_citation`,
+   called by the MCP answer monitor and by the Stop-hook drain) — derives the
+   binary `cited` map of the citation event it writes to the hub (`rl_events`).
 
-2. **Container-side online training** (`claude_mcp_servers/rl_reranker/retrieval_rl.py::_update`)
-   — consumes the same inputs to derive training targets for the online gradient step.
+2. **Container-side online training** (`claude_mcp_servers/rl_reranker/online_learning.py::labelled_query`,
+   v0.2.106; it replaced `retrieval_rl.py::_update`) — recomputes the targets
+   from the raw inputs of each `/rl_update` event for the per-project learner.
 
-3. **Container-side offline training** (`claude_mcp_servers/rl_reranker/offline_trainer.py`)
-   — replays historical JSONL events through the same formula at batch-training time.
+3. **Container-side offline training** (`claude_mcp_servers/rl_reranker/offline_trainer.py::citation_targets`)
+   — replays logged citation events through the same formula at batch-training time.
 
 History — pre-v0.2.9, each path had its own subtly different formula
 (query-name boost on the query text, missed-citation penalty, signed-cosine

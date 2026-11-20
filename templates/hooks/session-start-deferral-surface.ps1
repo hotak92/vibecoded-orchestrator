@@ -17,11 +17,8 @@ $PSScriptRootLocal = $PSScriptRoot
 $LibDir = Join-Path $PSScriptRootLocal "_lib"
 
 # Scrub sensitive env before any subprocess.
-$ScrubLib = Join-Path $LibDir "scrub-env.ps1"
-if (Test-Path $ScrubLib) {
-    . $ScrubLib
-    Invoke-VctScrubSecretEnv
-} else {
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
     foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
         if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
     }
@@ -64,6 +61,8 @@ md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
 # v0.2.91 WP-H: owed-work retry trigger. MUST MATCH the .sh sibling — and it
 # does so by CALLING the same vco_lib helper rather than mirroring its rule.
+# v0.2.107: the helper puts the project in the MACHINE's owed-work queue (one
+# worker per machine, gated on Weaviate) — never a driver per project.
 # v0.2.105: BEFORE the ledger read (so also on an EMPTY ledger) — it first
 # detects owed work the ledger does not hold yet (lost extra-folder rows).
 owed = []
@@ -135,7 +134,7 @@ else:
 for cid, title, sev, _cmd in entries:
     lines.append("  - [%s] %s: %s" % (sev, cid, title))
 if owed:
-    lines.append("  VCO is retrying in the background (backend permitting): "
+    lines.append("  Queued for VCO's background worker (runs when Weaviate is ready): "
                  + ", ".join(owed))
 lines.append("  Details + apply commands: .claude/context/UPDATE_DEFERRED.md "
              "(run the command listed for each).")

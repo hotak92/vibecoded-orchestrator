@@ -12,8 +12,9 @@ analyzer keeps three thin wrappers.
 v0.2.95 F1 folded a FOURTH consequence of a completed walk — the code-graph
 half-stamp of ``chunker_preset_overhaul_pending`` — into
 :func:`record_successful_walk` beside the paired clear, rather than adding a
-second call site to the capped monolith. Same trigger point, same root, one
-line at the analyzer.
+second call site to the capped monolith. Same trigger point, one line at the
+analyzer. v0.2.107: the half is recorded in the WALKED project
+(``walked_root``), not in the ledger root — see :func:`record_successful_walk`.
 
 The tenancy
 -----------
@@ -112,9 +113,16 @@ def clear_backend_deferrals(
     return resolve_conditions(Path(install_root), tuple(condition_ids))
 
 
+#: Default of :func:`record_successful_walk`'s ``walked_root``: "the caller
+#: named no walked project" — the half goes to the ledger root, the pre-v0.2.107
+#: behaviour direct callers rely on. Distinct from an explicit ``None``.
+_LEDGER_ROOT: object = object()
+
+
 def record_successful_walk(
     install_root: Path, force_recreate: bool = False,
     whole_repo_rewalk: bool = False,
+    walked_root: object = _LEDGER_ROOT,
 ) -> int:
     """Everything a COMPLETED analyzer walk owes the ledger, in one call.
 
@@ -144,9 +152,21 @@ def record_successful_walk(
       retires on its own instead of waiting for a destructive command.
 
     ``install_root`` is the ledger root the caller resolved
-    (``--deferral-root``, else its default): emit-root == clear-root ==
-    stamp-root, the MAJOR-A invariant, so a retry cannot record in one tree
-    what another tree is read for.
+    (``--deferral-root``, else its default): emit-root == clear-root, the
+    MAJOR-A invariant, so a retry cannot clear in one tree what another tree
+    is read for.
+
+    ``walked_root`` (v0.2.107) is where the half is RECORDED: the project
+    whose repo this walk covered. The half is a fact about that project's
+    graph, and the clear probe reads that project's
+    ``.claude/state/chunker-resync.json`` — whereas the ledger root defaults
+    to ``$VCT_ORCHESTRATOR_ROOT``, which every session-spawned walk inherits.
+    Recording there left the half of every project except the orchestrator
+    root unrecorded for ever (its entry could never clear) and retired the
+    root's entry on other projects' walks. The analyzer passes ``repo_path``;
+    an explicit ``None`` (a walk of an EXTRA code folder: it covered no
+    project's own repo) records nothing. Omitted, the half goes to
+    ``install_root`` as before.
 
     Returns what :func:`clear_backend_deferrals` returned. Never raises on the
     stamp leg — :func:`vco_lib.chunker_revision.record_resync_half` is
@@ -154,10 +174,11 @@ def record_successful_walk(
     bookkeeping.
     """
     removed = clear_backend_deferrals(install_root)
-    if force_recreate or whole_repo_rewalk:
+    stamp_root = install_root if walked_root is _LEDGER_ROOT else walked_root
+    if (force_recreate or whole_repo_rewalk) and stamp_root is not None:
         from vco_lib.chunker_revision import record_resync_half
 
-        record_resync_half(Path(install_root), "codegraph")
+        record_resync_half(Path(str(stamp_root)), "codegraph")
     return removed
 
 

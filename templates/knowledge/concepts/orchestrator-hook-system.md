@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-10-13T00:00:00Z
+updated: 2026-11-20T00:00:00Z
 status: active
 ---
 
@@ -87,6 +87,9 @@ Context nearing limit
 **context-size-check.sh**
 - Counts lines in `.claude/CONTEXT_STATE.md`; warns to stdout if line count exceeds a threshold.
 
+**session-worktree-reap.sh** (every SessionStart source, background; v0.2.107)
+- Removes isolated agents' worktrees VCO created — the reap point SubagentStop cannot be, because it also fires on an interim stop: an UNCHANGED one after 7 idle days (not when its chat ends — the chat may be resumed), and a kept lane whose commits are merged into the main checkout's current branch and whose `git status` is clean (ignored files aside), with the branch VCO created for it (`git branch -d`). Never a worktree of the starting session, an adopted (`--existing-path`) one or the user's own folder; every condition is re-checked right before `git worktree remove` (no `--force`), and any doubt — a `git worktree lock`, a process whose cwd is inside it (or a failed read of that), a git failure, a detached main checkout, a record that does not match — keeps it. On Windows no process's working folder can be read, so Windows' own lock is the in-use check there: the folder is renamed aside and straight back (refused while a process works in it, and nothing is deleted) before the plain `git worktree remove`; a refusal at either step keeps the worktree, its branch and its record for the next session start. Decisions are logged to `.claude/logs/worktree-guard.jsonl`.
+
 ### SessionStart — matcher: compact
 
 **compact-context-reinject.sh**
@@ -134,7 +137,7 @@ Context nearing limit
 ### SubagentStop (blocking)
 
 **subagent-stop-reconcile.sh** / **stop-drain-citations.sh** (async)
-- Reconciles subagent output in a DETACHED job (v0.2.102): reaps an unchanged worktree, scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
+- Reconciles subagent output in a DETACHED job (v0.2.102): marks an unchanged worktree a reap candidate and a changed one kept (never removed at SubagentStop — it also fires on an interim stop; `session-worktree-reap` removes them at SessionStart, v0.2.107), credential-scans what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), syncs the shared tree's changed `knowledge/**` and `docs/**.md` files to the KG (a worktree's files are indexed when its work is merged; code reaches the code graph only through the commit that moves the main checkout's HEAD), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
 
 ### SessionEnd
 
@@ -170,7 +173,7 @@ Context nearing limit
 - Routes edited files to the appropriate sync pipeline:
   - `knowledge/**/*.md` → `sync_knowledge_graph.py` → Weaviate KG collection
   - `docs/**/*.md` → development docs collection
-  - code files → appended to the per-session code-graph queue in `.claude/state/`, drained at end-of-turn by the `Stop` hook `stop-codegraph-drain.sh` (ONE analyzer pass per canonical root, rate-limited). `code-graph-incremental.sh` is NOT called by it — that hook ships unregistered and uninvoked, for standalone use.
+  - code files → the end-of-turn edit reminder only. Since v0.2.107 the code graph follows commits of the main checkout: the `Stop`/`SessionStart` hook `stop-codegraph-drain.sh` runs the HEAD catch-up when HEAD moved; worktree edits are never indexed (they arrive with the merge).
 - Runs duplicate detection periodically.
 
 **post-tool-use-async.sh** (matcher: `*`, async — the ONE async PostToolUse registration, v0.2.101)
@@ -212,7 +215,7 @@ The source-of-truth for all hook scripts is `templates/hooks/*.sh` (and their `.
 
 ## Python Environment (venv) Resolution
 
-The hooks that call Python helpers (`code-graph-incremental.sh`, `kg-summary-generator.sh`, the injection wrappers' `hook_context_router.py` spawn) need a Python interpreter from the orchestrator venv. The resolution order is:
+The hooks that call Python helpers (`stop-codegraph-drain.sh`, `kg-summary-generator.sh`, the injection wrappers' `hook_context_router.py` spawn) need a Python interpreter from the orchestrator venv. The resolution order is:
 
 1. `$VCT_PYTHON` / `$VCT_VENV` — explicit override (highest priority).
 2. `$REPO_ROOT/.venv/bin/python` — top-level venv layout (installs where `install.py` creates `.venv` at the install root).

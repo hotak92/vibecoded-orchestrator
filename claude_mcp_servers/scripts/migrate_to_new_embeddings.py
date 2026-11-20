@@ -44,7 +44,6 @@ from pathlib import Path
 
 import requests
 import weaviate
-from weaviate.classes.config import Configure, Property
 
 # v0.2.91 (Decision #21): honors the global VCO_LOG_LEVEL pref via the
 # shared vco_lib helper instead of a hardcoded INFO level. Bare import —
@@ -60,6 +59,10 @@ from vco_lib.log_setup import configure_logging
 # `vco_lib.log_setup` import above is bare for the reason stated there, so
 # vco_lib is already a hard requirement of this script.
 from vco_lib.weaviate_helpers import weaviate_url_default
+# v0.2.107 (CG-2): every whole-class read goes through the shared cursor. A
+# class that lists nothing while it is not confirmed empty raises - so a
+# migration never drops and recreates a class it could not read.
+from vco_lib.codegraph_cursor import iter_class
 
 configure_logging(format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("migrate_embeddings")
@@ -340,100 +343,38 @@ def add_named_vector_to_collection(
     vec_dim: int,
     dry_run: bool = False,
 ) -> bool:
-    """Add a new named vector slot to a collection by recreating it.
+    """Give ``coll_name`` the named vector ``vec_name`` (``vec_dim``).
 
-    WARNING: This deletes and recreates the collection. All data must be
-    backed up first (the caller handles backup/restore).
+    v0.2.107 (S-2): one home, :mod:`vco_lib.named_vector_migration`. A class
+    that already has named vectors gets the slot IN PLACE — nothing is read,
+    dropped or re-inserted. Only a legacy single-vector class is rebuilt, and
+    only after the rows read equal the server's count (else
+    ``MigrationRefused``, nothing dropped); every row keeps its uuid and its
+    flat vector moves to the legacy named slot.
     """
+    from vco_lib import named_vector_migration as nvm
+
     if dry_run:
         logger.info("[DRY RUN] Would add named vector '%s' (%dd) to '%s'", vec_name, vec_dim, coll_name)
         return True
 
+    added = nvm.add_missing_slots_in_place(
+        coll_name, {vec_name: vec_dim}, weaviate_url=WEAVIATE_URL)
+    if added is not None:
+        logger.info("Added named vector(s) %s to '%s' in place", added or "(none missing)", coll_name)
+        return True
+
+    legacy_vec_name = "ollama_code_embed" if is_code_collection(coll_name) else "ollama_embed"
     coll = client.collections.get(coll_name)
-    config = coll.config.get()
-
-    # Determine the legacy vector name for flat-vector collections
-    _is_code = is_code_collection(coll_name)
-    _legacy_vec_name = "ollama_code_embed" if _is_code else "ollama_embed"
-
-    # Read all objects with vectors
-    logger.info("Reading all objects from '%s'...", coll_name)
-    all_objects = []
-    for obj in coll.iterator(include_vector=True):
-        if isinstance(obj.vector, dict):
-            vec_dict = obj.vector
-        elif obj.vector:
-            # Flat vector → map to legacy named vector
-            vec_dict = {_legacy_vec_name: obj.vector}
-        else:
-            vec_dict = {}
-        all_objects.append({
-            "properties": dict(obj.properties),
-            "vector": vec_dict,
-        })
-    logger.info("Read %d objects from '%s'", len(all_objects), coll_name)
-
-    # Clone properties
-    def _clone_prop(prop_obj) -> Property:
-        nested = getattr(prop_obj, "nested_properties", None)
-        kwargs = {
-            "name": prop_obj.name,
-            "data_type": prop_obj.data_type,
-            "description": getattr(prop_obj, "description", None),
-        }
-        if nested:
-            kwargs["nested_properties"] = [_clone_prop(np) for np in nested]
-        return Property(**kwargs)
-
-    existing_props = [_clone_prop(prop) for prop in config.properties]
-
-    # Build vector config — keep existing + add new
-    existing_vec_names = set()
-    if config.vector_config:
-        for vc in config.vector_config:
-            existing_vec_names.add(vc)
-
-    # Always include the legacy vector name so old embeddings are preserved
-    all_vec_names = existing_vec_names | {vec_name, _legacy_vec_name}
-    vectorizer_config = [
-        Configure.NamedVectors.none(name=vn)
-        for vn in sorted(all_vec_names)
-    ]
-
-    # Delete and recreate. Preserve `index_null_state=True` so the
-    # MCP `_stale_filter()` (`valid_until is_none(True) | > now`) keeps
-    # working on KG collections post-migration. CANNOT be retro-added
-    # via Reconfigure on Weaviate ≤1.30, so we must include it here.
-    # Audit finding 2026-04-30 (Code-M2 / KG schema gotchas).
-    logger.info("Recreating '%s' with named vectors: %s", coll_name, sorted(all_vec_names))
-    # v0.2.106: same-name drop + create (safe on replay); recorded for the
-    # case-variant create guard (vco_lib.weaviate_case_history).
-    from vco_lib.fixture_class_guard import record_collection_delete
-    record_collection_delete(client, coll_name)
-    client.collections.create(
-        name=coll_name,
-        properties=existing_props,
-        vectorizer_config=vectorizer_config,
-        inverted_index_config=Configure.inverted_index(index_null_state=True),
-    )
-
-    # Re-insert objects with existing vectors
-    new_coll = client.collections.get(coll_name)
-    inserted = 0
-    for obj_data in all_objects:
-        vectors = {}
-        for vname, vec in obj_data["vector"].items():
-            if vec and vname in all_vec_names:
-                vectors[vname] = vec
-        new_coll.data.insert(
-            properties=obj_data["properties"],
-            vector=vectors if vectors else None,
-        )
-        inserted += 1
-        if inserted % 100 == 0:
-            logger.info("Re-inserted %d/%d objects", inserted, len(all_objects))
-
-    logger.info("Recreated '%s': %d objects with named vectors %s", coll_name, inserted, sorted(all_vec_names))
+    logger.info("Reading all objects from legacy single-vector class '%s'...", coll_name)
+    rows = nvm.snapshot_rows(
+        coll, call_site="migrate_to_new_embeddings.migrate_collection",
+        flat_vector_slot=legacy_vec_name, weaviate_url=WEAVIATE_URL)
+    logger.info("Read %d objects from '%s' (matches the server count)", len(rows), coll_name)
+    inserted = nvm.rebuild_with_named_vectors(
+        client, coll_name, [vec_name, legacy_vec_name], rows, log=logger.info)
+    logger.info("Recreated '%s': %d objects with named vectors %s",
+                coll_name, inserted, sorted({vec_name, legacy_vec_name}))
     return True
 
 
@@ -456,7 +397,8 @@ def backfill_new_embeddings(
 
     if dry_run:
         coll = client.collections.get(coll_name)
-        count = sum(1 for _ in coll.iterator())
+        count = sum(1 for _ in iter_class(
+            coll, "migrate_to_new_embeddings.backfill_dry_run", return_properties=[]))
         logger.info("[DRY RUN] Would backfill %d objects in '%s' with '%s'", count, coll_name, target_vec)
         return {"collection": coll_name, "target": target_vec, "total": count, "dry_run": True}
 
@@ -466,7 +408,8 @@ def backfill_new_embeddings(
     skipped = 0
     errors = 0
 
-    for obj in coll.iterator(include_vector=True):
+    for obj in iter_class(coll, "migrate_to_new_embeddings.backfill_collection",
+                          return_properties=None, include_vector=True):
         total += 1
 
         # Skip if already has the new vector
@@ -584,7 +527,8 @@ def main():
             config = coll.config.get()
             vc = config.vector_config
             vecs = list(vc.keys()) if vc and hasattr(vc, 'keys') else (list(vc) if vc else ["default"])
-            count = sum(1 for _ in coll.iterator())
+            count = sum(1 for _ in iter_class(
+                coll, "migrate_to_new_embeddings.status", return_properties=[]))
             scheme = "code" if is_code_collection(name) else "kg"
             print(f"  {name} ({scheme}): {count} objects, vectors: {vecs}")
         client.close()

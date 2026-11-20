@@ -129,13 +129,14 @@ def test_a_populated_stale_shared_kg_is_deferred_to_the_roots_ledger(machine, mo
     assert CID not in _ledger(folder)
 
 
-def test_a_missing_slot_is_labelled_a_lossless_copy(machine, monkeypatch):
+def test_a_missing_slot_is_labelled_an_in_place_add(machine, monkeypatch):
     folder, _bind_root = machine
     fake = _StaleWeaviate({KG: 7}, {KG: _missing_core_slot})
     result = _run(monkeypatch, fake, folder)
     assert fake.deleted == []
-    assert result["schema_deferred"][0]["migrate_action"] == "copy"
-    assert "**copy** (lossless: vectors preserved)" in _ledger(folder)
+    # v0.2.107: a missing slot is added in place, no longer a staging copy.
+    assert result["schema_deferred"][0]["migrate_action"] == "add_slots"
+    assert "**add_slots** (in place: nothing dropped or copied)" in _ledger(folder)
 
 
 def test_dry_run_reports_would_defer_and_writes_nothing(machine, monkeypatch):

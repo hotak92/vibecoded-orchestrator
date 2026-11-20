@@ -2,6 +2,8 @@
 # Parity: kept in step with ensure-containers.ps1 (its UTF-8 BOM serves Windows
 # PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
@@ -602,11 +604,26 @@ if [ "${#compose_list[@]}" -gt 0 ]; then
                 fi
                 ;;
             *)
-                log_recovery "$name" "left_as_is" "zombie pid; recreate refused or not run (data identity not proven)"
+                if [ "$($RUNTIME inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]; then
+                    log_recovery "$name" "left_as_is" "zombie pid; not recreated, started by name instead (a version move is made only by python install.py --update)"
+                else
+                    log_recovery "$name" "left_as_is" "zombie pid; recreate refused or not run (data identity not proven or version differs; a version move is made only by python install.py --update)"
+                fi
                 ;;
         esac
     done
 fi
+
+# v0.2.107: a Weaviate container VCO did not create keeps its own compose, so
+# VCO cannot write a memory limit at create time. ONE Python verb
+# (vco_lib.weaviate_memory, the limit's one home) applies it IN PLACE —
+# `<runtime> update --memory`, never a recreate, never a restart — and it runs
+# at every ensure because an in-place limit does not survive a restart on
+# podman 4.9. It does nothing for VCO's own container (its compose carries the
+# limit), for a container that already has a limit, or when the user switched
+# it off (VCO_WEAVIATE_FOREIGN_LIMIT=off). It prints one line only when it
+# changed something or could not (`--quiet`: applied, failed, or unreadable).
+"$RUN_PY" -m vco_lib.weaviate_memory ensure-foreign-limit --quiet 2>/dev/null || true
 
 if [ "$started" -gt 0 ]; then
     echo "Started $started container(s) via $RUNTIME"

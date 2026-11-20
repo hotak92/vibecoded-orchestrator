@@ -20,7 +20,7 @@
 //! | 4 | `sweep_and_gate` | MCP kill-sweep + update gate — only after every refusal (L2-F14) |
 //! | 5 | `hub_stop_and_renames` | stop vct-hub, rename binaries aside (Windows) |
 //! | 6 | `git_op` | by kind: fast-forward pull / merge / rebase / resume check / backed-up hard reset / none |
-//! | 7 | `head_advance` | HEAD reached upstream (the v0.2.62 crash class) |
+//! | 7 | `head_advance` | HEAD reached upstream (the v0.2.62 crash class); then every binary path phase 5 emptied and the git operation did not write is refilled from its `.old-<pid>` backup (UPDATER-02) |
 //! | 8 | `install_py` | `install.py --update` inside `DbUpdateClosedGuard`, streamed to the modal |
 //! | 9 | `db_reopen_and_refresh` | cached update state refreshed |
 //! | 10 | `gate_drop_and_hub_restart` | gate dropped BEFORE the binary check; hub restarted (POSIX; Windows after the handoff decision, v0.2.54 C-1) |
@@ -87,6 +87,24 @@ pub enum UpdateKind {
 
 /// The command argument's type name in the contract.
 pub type UpdateKindDto = UpdateKind;
+
+/// PURE (v0.2.107 U-2): does this kind START an update — refused while index
+/// work runs — or carry on with one already under way (never refused for
+/// it)? `Resume` continues a halted update; `ApplyOnly` re-applies
+/// `install.py --update` to a tree the update already moved. Both must stay
+/// reachable while code-graph / KG jobs run, or a half-applied update has no
+/// way forward.
+pub(crate) fn orchestrator_claim_for(
+    kind: UpdateKind,
+) -> crate::commands::single_flight::OrchestratorClaim {
+    use crate::commands::single_flight::OrchestratorClaim;
+    match kind {
+        UpdateKind::PullFf | UpdateKind::Merge | UpdateKind::Rebase | UpdateKind::ResetHard => {
+            OrchestratorClaim::StartUpdate
+        }
+        UpdateKind::Resume | UpdateKind::ApplyOnly => OrchestratorClaim::Continue,
+    }
+}
 
 
 // ---------------------------------------------------------------------------
@@ -413,7 +431,7 @@ pub(crate) fn decide_binary_refresh(
 pub(crate) trait UpdateOps {
     // phase 1-2
     fn resolve_root(&mut self) -> Result<PathBuf, UpdateSurfaceError>;
-    fn claim(&mut self, root: &Path) -> Result<(), UpdateSurfaceError>;
+    fn claim(&mut self, root: &Path, kind: UpdateKind) -> Result<(), UpdateSurfaceError>;
     // phase 3 (read-only probes, then the remote pin)
     fn git_available(&mut self) -> impl Future<Output = bool> + Send;
     fn python_for_install(
@@ -446,6 +464,9 @@ pub(crate) trait UpdateOps {
     ) -> impl Future<Output = Result<GitOpOutcome, GitOpFailure>> + Send;
     fn head_advance(&mut self, root: &Path) -> impl Future<Output = Result<(), String>> + Send;
     fn abort_restore(&mut self, root: &Path, renames: &PrePullRenames);
+    /// UPDATER-02: end of phase 7 — put a binary back at every canonical path
+    /// phase 5 emptied and the git operation did not write.
+    fn refill_binaries(&mut self, root: &Path, renames: &PrePullRenames);
     // phase 8-9
     fn run_install_py(
         &mut self,
@@ -543,7 +564,7 @@ async fn drive_phases<O: UpdateOps + Send>(
     let log_path = update_failure::install_log_path(&root);
 
     // ── 2. claim (in-process + cross-process) ─────────────────────────────
-    if let Err(e) = ops.claim(&root) {
+    if let Err(e) = ops.claim(&root, kind) {
         ledger.fail(Phase::Claim, e.message());
         return Err(e);
     }
@@ -679,6 +700,14 @@ async fn drive_phases<O: UpdateOps + Send>(
             }
         },
     }
+
+    // UPDATER-02: the canonical binary paths are never left empty while
+    // install.py runs. Phase 5 renamed them aside (Windows) so the git
+    // operation could write there; one it did not write (no binary change in
+    // the pulled commits, or ApplyOnly) is refilled now — not at install.py's
+    // late dist repair — so a launcher that dies during install.py leaves a
+    // startable launcher and hub behind. Failure legs above use abort_restore.
+    ops.refill_binaries(&root, &renames);
 
     // ── 8. install.py --update (DB closed, streamed) ──────────────────────
     let run = match ops.run_install_py(&root, &python_cmd).await {
@@ -1020,10 +1049,12 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         Ok(resolved.path)
     }
 
-    fn claim(&mut self, _root: &Path) -> Result<(), UpdateSurfaceError> {
+    fn claim(&mut self, _root: &Path, kind: UpdateKind) -> Result<(), UpdateSurfaceError> {
         if self.flight.is_none() {
-            let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
-                .map_err(|reason| UpdateSurfaceError::Refused {
+            let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse(
+                orchestrator_claim_for(kind),
+            )
+            .map_err(|reason| UpdateSurfaceError::Refused {
                     code: "already_running",
                     reason,
                 })?;
@@ -1236,6 +1267,10 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
             renames.launcher.as_deref(),
             renames.hub.as_deref(),
         );
+    }
+
+    fn refill_binaries(&mut self, _root: &Path, renames: &PrePullRenames) {
+        crate::commands::update_pipeline::refill_canonical_binaries(renames);
     }
 
     fn run_install_py(
@@ -2306,6 +2341,34 @@ pub(crate) fn require_gui_path_is_resolved_root(
 pub(crate) mod tests {
     use super::*;
 
+    /// U-2: only the kinds that START an update are refused for index work;
+    /// a resume and an apply-only carry on with an update already under way.
+    /// Exhaustive over `UpdateKind` (a new kind must be classified here).
+    #[test]
+    fn only_starting_kinds_are_refused_for_index_work() {
+        use crate::commands::single_flight::OrchestratorClaim;
+        for kind in [
+            UpdateKind::PullFf,
+            UpdateKind::Merge,
+            UpdateKind::Rebase,
+            UpdateKind::ResetHard,
+            UpdateKind::Resume,
+            UpdateKind::ApplyOnly,
+        ] {
+            let expected = match kind {
+                UpdateKind::PullFf
+                | UpdateKind::Merge
+                | UpdateKind::Rebase
+                | UpdateKind::ResetHard => OrchestratorClaim::StartUpdate,
+                UpdateKind::Resume | UpdateKind::ApplyOnly => OrchestratorClaim::Continue,
+            };
+            assert_eq!(orchestrator_claim_for(kind), expected, "{kind:?}");
+        }
+        assert_eq!(orchestrator_claim_for(UpdateKind::Resume), OrchestratorClaim::Continue);
+        assert_eq!(orchestrator_claim_for(UpdateKind::ApplyOnly), OrchestratorClaim::Continue);
+        assert_eq!(orchestrator_claim_for(UpdateKind::PullFf), OrchestratorClaim::StartUpdate);
+    }
+
     /// A recording fake: every op appends its name; outcomes are scripted.
     struct FakeOps {
         calls: Vec<String>,
@@ -2381,11 +2444,12 @@ pub(crate) mod tests {
     }
 
     /// The ops that change something outside the launcher process's memory.
-    const MUTATING: [&str; 10] = [
+    const MUTATING: [&str; 11] = [
         "arm_gate",
         "stop_hub_and_rename",
         "git_op",
         "abort_restore",
+        "refill_binaries",
         "run_install_py",
         "refresh_after_install",
         "restart_hub",
@@ -2399,7 +2463,7 @@ pub(crate) mod tests {
             self.rec("resolve_root");
             self.root.clone()
         }
-        fn claim(&mut self, _root: &Path) -> Result<(), UpdateSurfaceError> {
+        fn claim(&mut self, _root: &Path, _kind: UpdateKind) -> Result<(), UpdateSurfaceError> {
             self.rec("claim");
             Ok(())
         }
@@ -2495,6 +2559,9 @@ pub(crate) mod tests {
         }
         fn abort_restore(&mut self, _root: &Path, _renames: &PrePullRenames) {
             self.rec("abort_restore");
+        }
+        fn refill_binaries(&mut self, _root: &Path, _renames: &PrePullRenames) {
+            self.rec("refill_binaries");
         }
         fn run_install_py(
             &mut self,
@@ -2765,6 +2832,54 @@ pub(crate) mod tests {
             assert!(!ops.called("run_install_py"));
             assert_eq!(ledger.failed_phase(), Some(Phase::GitOp));
         }
+    }
+
+    /// UPDATER-02: on every kind that reaches install.py, the emptied binary
+    /// paths are refilled AFTER the git operation and the HEAD check and
+    /// BEFORE install.py; never on a leg that does not reach install.py (the
+    /// abort tail or the up-to-date heal restores those).
+    #[tokio::test]
+    async fn binaries_are_refilled_after_the_git_op_and_before_install_py() {
+        for kind in [UpdateKind::PullFf, UpdateKind::ApplyOnly, UpdateKind::ResetHard] {
+            let mut ops = FakeOps::happy();
+            let (r, _) = run(&mut ops, kind).await;
+            r.expect("happy path");
+            let pos = |n: &str| {
+                ops.calls
+                    .iter()
+                    .position(|c| c == n)
+                    .unwrap_or_else(|| panic!("{kind:?}: {n} not called: {:?}", ops.calls))
+            };
+            assert!(pos("refill_binaries") > pos("stop_hub_and_rename"), "{kind:?}");
+            assert!(pos("refill_binaries") < pos("run_install_py"), "{kind:?}");
+            if kind != UpdateKind::ApplyOnly {
+                assert!(pos("refill_binaries") > pos("git_op"), "{kind:?}");
+            }
+            if kind == UpdateKind::ResetHard {
+                assert!(pos("refill_binaries") > pos("head_advance"), "{kind:?}");
+            }
+        }
+        // Leave-alone legs: git failure, HEAD check failure, already up to date.
+        let mut ops = FakeOps::happy();
+        ops.git_op = Err(GitOpFailure {
+            error: UpdateSurfaceError::Raw("boom".into()),
+            restored: false,
+        });
+        let _ = run(&mut ops, UpdateKind::PullFf).await;
+        assert!(!ops.called("refill_binaries") && ops.called("abort_restore"));
+        let mut ops = FakeOps::happy();
+        ops.head = Err("not advanced".into());
+        let _ = run(&mut ops, UpdateKind::ResetHard).await;
+        assert!(!ops.called("refill_binaries") && ops.called("abort_restore"));
+        let mut ops = FakeOps::happy();
+        ops.git_op = Ok(GitOpOutcome {
+            already_up_to_date: true,
+            dist_binary_stale: false,
+            branch: "main".into(),
+            reset_backup: None,
+        });
+        let _ = run(&mut ops, UpdateKind::PullFf).await;
+        assert!(!ops.called("refill_binaries"));
     }
 
     /// ApplyOnly runs no git operation and no HEAD check, but everything else.

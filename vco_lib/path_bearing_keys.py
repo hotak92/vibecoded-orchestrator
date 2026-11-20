@@ -290,6 +290,13 @@ PATH_BEARING_DB_COLUMNS: tuple[ColumnPolicy, ...] = (
     *_plain("code_graph_builds", "project_id", "status", "languages"),
     ColumnPolicy(
         "code_graph_builds",
+        "pending_mode",
+        POLICY_NOT_PATH_BEARING,
+        "The queued pass shape as JSON (full flags, or an incremental "
+        "since-commit SHA); never a folder path (v0.2.107, migration 052).",
+    ),
+    ColumnPolicy(
+        "code_graph_builds",
         "error_message",
         POLICY_HISTORICAL,
         "A failure message from a build that ran against the OLD root.",

@@ -532,6 +532,8 @@ class TestW3R10RouterSuppressesStagedCitations:
         sid = "sess-w3r10"
 
         _router_run(proj, "pa", stub, sid)  # seen-store now knows the block
+        # R31: the KG cache key is per turn, so run B (another prompt id)
+        # misses run A's entry and its producer runs and stages.
         out_b = _router_run(proj, "pb", stub, sid,
                             extra_env={"VCO_STUB_WRITE_SIBLING": "1"})
         assert "KG: Stub Node" not in out_b, "run B's own block is suppressed"

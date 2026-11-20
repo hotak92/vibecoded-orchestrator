@@ -696,8 +696,8 @@ struct RecordCodegraphAnalyzedBody {
 ///
 /// Advances the project's PRIMARY code-graph baseline
 /// (`project_codegraph_bindings.last_analyzed_commit` / `last_analyzed_at`)
-/// after `vco_lib.codegraph_head_catchup` indexed the files a merge, a pull or
-/// a shell commit added — none of which the per-edit hook ever queues.
+/// after `vco_lib.codegraph_head_catchup` indexed the files of a HEAD move (a
+/// commit, a merge, a pull) — since v0.2.107 the only way code reaches the graph.
 ///
 /// The writer is `Db::advance_codegraph_binding_analyzed`, the SAME
 /// advance-only function the detached-walk terminal report uses: the

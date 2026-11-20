@@ -484,8 +484,8 @@ def _regenerate_codegraph(
     invoked with ``env=os.environ`` from a CLI that need not carry
     ``CODE_GRAPH_PROJECT``, so without an identity flag a regenerate of a
     moved/renamed project rebuilt the wrong family — and on a basename
-    collision would have dropped another project's. ``--from-resolver`` is the
-    same flag the per-edit hooks and the launcher use;
+    collision would have dropped another project's. ``--from-resolver``
+    resolves the binding prefix the HEAD catch-up and the launcher write under;
     ``vco_lib.codegraph_drop_guard`` (inside ``create_collections``) is the
     run-time backstop when the hub is unreachable and the resolver itself falls
     back. A refusal exits 5 with nothing deleted, surfaced as ``res.error``.

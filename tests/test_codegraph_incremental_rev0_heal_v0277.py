@@ -147,7 +147,7 @@ class _FakeModulesQuery:
     def __init__(self, obj: Optional[_FakeObj]):
         self._obj = obj
 
-    def fetch_objects(self, filters=None, limit=None):  # noqa: ARG002
+    def fetch_objects(self, filters=None, limit=None, return_properties=None):  # noqa: ARG002
         return _FakeResult([self._obj] if self._obj else [])
 
 

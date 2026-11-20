@@ -6,7 +6,8 @@
 # -------------------------------------------------
 # post-file-edit.sh fires on EVERY Edit/Write. For knowledge/, docs/ and
 # code files it spawned an IMMEDIATE background sync (kg-sync /
-# upload_docs.py / code-graph-incremental) on each fire. An agent that
+# upload_docs.py / code-graph-incremental — that code leg is retired since
+# v0.2.107, the code graph follows commits) on each fire. An agent that
 # edits the same file 5× in a minute therefore produced 5 Weaviate
 # upserts of (mostly) the same object. Combined with Weaviate's
 # flush-on-timer + LSM compaction, this is a primary driver of write

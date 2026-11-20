@@ -891,7 +891,14 @@ def _run_enrichment_loop(
 
     # ── Iterate ─────────────────────────────────────────────────────
     try:
-        iterator = col.iterator(include_vector=True)
+        from vco_lib.codegraph_cursor import iter_class
+
+        # v0.2.107 (CG-2): the shared cursor (whole rows: the enrichment
+        # re-embeds from the stored properties).
+        iterator = iter_class(
+            col, "embedding_enrichment.enrich_collection",
+            return_properties=None, include_vector=True,
+        )
     except Exception as e:
         raise CollectionNotFoundError(
             f"Could not iterate collection {collection_name!r}: {e}"
@@ -1029,29 +1036,14 @@ def _emit_progress(
 def _estimate_object_count(collection: str) -> int:
     """Best-effort object count for the progress %. Returns 0 on failure.
 
-    Uses Weaviate's GraphQL aggregate endpoint, which is O(1) on the
-    Weaviate versions VCO has shipped (1.28.4, 1.37.18). Soft-fail to 0 if anything goes wrong
-    — the progress callback degrades to monotonic-fake mode.
+    Reads the ONE count helper
+    (:func:`vco_lib.weaviate_helpers.http_count_objects`). The 0-on-failure
+    here is a DISPLAY fallback only - the progress callback degrades to
+    monotonic-fake mode. Never gate a delete on this function.
     """
-    base_url = _weaviate_url()
-    query = {"query": f'{{ Aggregate {{ {collection} {{ meta {{ count }} }} }} }}'}
-    body = json.dumps(query).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base_url}/v1/graphql",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
-            if resp.status != 200:
-                return 0
-            data = json.loads(resp.read().decode("utf-8"))
-        return int(
-            data["data"]["Aggregate"][collection][0]["meta"]["count"]
-        )
-    except Exception:
-        return 0
+    from vco_lib.weaviate_helpers import http_count_objects
+
+    return http_count_objects(collection, _weaviate_url()) or 0
 
 
 # ---------------------------------------------------------------------------
@@ -1216,8 +1208,13 @@ def count_populated_slots(
     client = None
     try:
         client = factory()
+        from vco_lib.codegraph_cursor import iter_class
+
         col = client.collections.get(collection)
-        for obj in col.iterator(include_vector=True):
+        for obj in iter_class(  # v0.2.107 (CG-2): the shared cursor, no properties
+            col, "embedding_enrichment.slot_population",
+            return_properties=[], include_vector=True,
+        ):
             vec = obj.vector
             if not isinstance(vec, dict):
                 # Legacy single-vector format has no named slots — nothing

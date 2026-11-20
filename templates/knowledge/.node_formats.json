@@ -339,11 +339,11 @@
   },
   "knowledge/concepts/orchestrator-code-graph.md": {
     "title": "Orchestrator Code Graph",
-    "description": "The Orchestrator Code Graph is a semantic index that extracts structural entities from source code to enable purpose-based and structural queries via Weaviate. Its analysis pipeline detects programming languages, parses ASTs or uses regex for extraction, and embeds entities using specialized models before upserting them into project-specific collections. The system supports incremental updates by analyzing only changed files via git diffs and captures detailed properties for modules, classes, functions, and API endpoints. This capability allows developers to locate code by intent, such as finding authentication middleware, and answer structural questions like identifying function callers without manually reading files.",
+    "description": "The Orchestrator Code Graph is a semantic index that extracts structural entities from source code to enable purpose-based and structural queries via Weaviate. Its analysis pipeline detects programming languages, parses ASTs or uses regex for extraction, and embeds entities using specialized models before upserting them into project-specific collections. The graph follows the committed state of the main checkout: each HEAD move is indexed by one analyzer run over the changed files, worktree edits are never indexed, and a daily path reconciliation removes rows of deleted code and captures detailed properties for modules, classes, functions, and API endpoints. This capability allows developers to locate code by intent, such as finding authentication middleware, and answer structural questions like identifying function callers without manually reading files.",
     "summary": "The Orchestrator Code Graph is a semantic index that extracts structural entities (modules, classes, functions, APIs, interactions) from source code using AST parsing for Python or regex for other languages, embeds them via CodeSage-Large-v2 or jina-embeddings-v2-base-code, and stores them in Weaviate to enable purpose-based semantic queries and structural navigation.",
-    "generated_at": "2026-10-30T05:54:15.489025+00:00",
-    "backend": "ollama",
-    "content_hash": "efd9d09723811345",
+    "generated_at": "2026-11-19T23:15:12.883584+00:00",
+    "backend": "manual",
+    "content_hash": "059639280ca46a4b",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-context-management.md": {
@@ -359,9 +359,9 @@
     "title": "Orchestrator Hook System",
     "description": "The Orchestrator Hook System is the orchestrator's automation layer: shell scripts, with some Python helpers, registered in `.claude/settings.json` to bind to Claude Code lifecycle events such as session start, tool use, file edits, compaction, and stop. Each hook can optionally filter by tool-name matcher, and blocking hooks (non-zero exit) can abort an operation while non-blocking hooks run in the background or fire-and-forget. The inventory covers security enforcement (command scanning, credential scrubbing), knowledge-graph sync to Weaviate, context preservation through PreCompact saves and SessionStart reinjection, and quality gates with developer-experience checks. It is the reference for changing how the orchestrator enforces security, syncs knowledge, or preserves context across compaction.",
     "summary": "The orchestrator's lifecycle hooks are shell scripts (with Python helpers) registered in `.claude/settings.json` and bound to Claude Code events such as SessionStart, PreToolUse, PostToolUse, PreCompact, and Stop, where a non-zero exit from a blocking hook aborts the operation. They handle security scanning, Weaviate knowledge-graph sync, and context preservation across compaction.",
-    "generated_at": "2026-10-29T18:08:06.884260+00:00",
-    "backend": "cli",
-    "content_hash": "ab2ec71d23954565",
+    "generated_at": "2026-11-19T23:15:12.883584+00:00",
+    "backend": "manual",
+    "content_hash": "f201e3be94c99e41",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {
@@ -441,11 +441,11 @@
   },
   "knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md": {
     "title": "Project-extra codegraph paths",
-    "description": "Project-extra codegraph paths allow users to index additional filesystem folders into a project's codegraph collection without registering them as full launcher projects. This feature persists configuration in the `project_codegraph_extra_paths` database table and supports lane reservations to create isolated subagent worktrees within these enabled folders. Implementation involves coordinated changes across the database, Tauri launcher commands, Svelte GUI components, and specific CLI hooks that route file edits to scoped drain queues. This capability is critical for users who need to include external repository clones in search queries while preventing those directories from becoming write targets or accumulating local state.",
+    "description": "Project-extra codegraph paths allow users to index additional filesystem folders into a project's codegraph collection without registering them as full launcher projects. This feature persists configuration in the `project_codegraph_extra_paths` database table and supports lane reservations to create isolated subagent worktrees within these enabled folders. Implementation involves coordinated changes across the database, Tauri launcher commands, Svelte GUI components, and a Stop-hook refresh that re-indexes an enabled folder when its own HEAD moves (edits queue nothing since v0.2.107). This capability is critical for users who need to include external repository clones in search queries while preventing those directories from becoming write targets or accumulating local state.",
     "summary": "Since v0.2.105, the `project_codegraph_extra_paths` table enables isolated subagent worktrees in enabled code folders while enforcing a critical invariant where `--prune-stale` runs must visit all source roots in a single invocation to prevent UUID deletion across passes. The system now scopes pruning to only rows whose `project_source` matches the walked root or an extra folder walked in the same run, preventing primary root resyncs from deleting unrelated extra folder rows.",
-    "generated_at": "2026-10-30T05:54:28.623235+00:00",
-    "backend": "ollama",
-    "content_hash": "b500e2e3212d5c75",
+    "generated_at": "2026-11-19T23:15:12.883584+00:00",
+    "backend": "manual",
+    "content_hash": "4a9b9557b64781f0",
     "total_chunks": 1
   },
   "knowledge/concepts/prompt-engineering-fundamentals.md": {

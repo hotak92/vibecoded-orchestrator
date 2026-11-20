@@ -535,6 +535,25 @@ def _first_executable_in(
     return None
 
 
+def _restore_from_update_backup(
+    directory: Path, names: Sequence[str]
+) -> Optional[Path]:
+    """UPDATER-02: an interrupted Windows update can leave the binary only as
+    ``<name>.old-<pid>`` next to an empty canonical path. Put it back (the one
+    write :func:`find_dist_binary` may do — a rename, only onto a MISSING
+    canonical path, only for a dead PID; see
+    :func:`vco_lib.dist_binary_repair.restore_missing_from_backups`) and return
+    it when it is executable."""
+    if not directory.is_dir():
+        return None
+    from vco_lib.dist_binary_repair import restore_missing_from_backups
+
+    for restored in restore_missing_from_backups(directory, names):
+        if _is_executable(restored):
+            return restored
+    return None
+
+
 def find_dist_binary(
     stem: str,
     *,
@@ -552,7 +571,9 @@ def find_dist_binary(
     SAME chain for ``vct-launcher``: the alternative was a fifth hand-written
     copy of a walk that had already drifted once across its first three.
 
-    Never raises and never spawns anything.
+    Never raises and never spawns anything. Its one write: in step 2, when a
+    ``launcher/dist`` directory holds no binary but a dead update's
+    ``<name>.old-<pid>`` backup, the backup is renamed back (UPDATER-02).
 
     :param stem: binary stem, e.g. ``"vct-hub"`` / ``"vct-launcher"``.
     :param env_override: name of the env var that pins an explicit path
@@ -586,13 +607,13 @@ def find_dist_binary(
         for root in _repo_dist_roots(repo_root, environ):
             dist = root / "launcher" / "dist"
             arch = dist_arch_dir()
-            if arch:
-                found = _first_executable_in(dist / arch, names)
+            dirs = [dist / arch, dist] if arch else [dist]
+            for directory in dirs:
+                found = _first_executable_in(directory, names)
+                if found is None:
+                    found = _restore_from_update_backup(directory, names)
                 if found is not None:
                     return found
-            found = _first_executable_in(dist, names)
-            if found is not None:
-                return found
 
     # 3. PATH.
     for name in names:
@@ -753,6 +774,10 @@ def _default_repo_root() -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 
+#: pid of the last detached starter `_spawn` launched (tests read it).
+_LAST_DETACHED_STARTER_PID: Optional[int] = None
+
+
 def _spawn(binary: Path, wait: bool) -> EnsureResult:
     """Invoke ``<binary> --start-if-not-running``.
 
@@ -786,7 +811,7 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
                     ),
                 )
         else:
-            subprocess.Popen(  # noqa: S603 — argv is a resolved absolute path
+            proc = subprocess.Popen(  # noqa: S603 — argv is a resolved absolute path
                 argv,
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -794,6 +819,18 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
                 stderr=subprocess.DEVNULL,
                 **detached_popen_kwargs(),
             )
+            # The starter exits within ~100 ms (the hub it launches is a
+            # separate, detached process). Reap it in the background: a
+            # long-lived caller — the model gateway — otherwise keeps one
+            # zombie per revive for its whole lifetime. A short-lived caller
+            # (a hook) exits first and init reaps the starter, as before.
+            global _LAST_DETACHED_STARTER_PID
+            _LAST_DETACHED_STARTER_PID = proc.pid
+            import threading
+
+            threading.Thread(
+                target=proc.wait, name="vct-hub-starter-reaper", daemon=True,
+            ).start()
     except OSError as exc:
         return EnsureResult(
             state=EnsureState.SPAWN_FAILED,
@@ -807,11 +844,17 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
     )
 
 
+#: How long :func:`ensure_running` keeps the ensure lock after a spawn while
+#: it waits for the new hub to claim ``hub.pid`` (normally well under a second).
+HUB_SETTLE_S = 5.0
+
+
 def ensure_running(
     repo_root: Optional[Path] = None,
     extra_dirs: Sequence[Path] = (),
     wait: bool = False,
     probe_repo_dist: bool = True,
+    settle_s: Optional[float] = None,
 ) -> EnsureResult:
     """Start the hub unless it is already running. Idempotent.
 
@@ -821,31 +864,44 @@ def ensure_running(
     ``already_running`` answer and the pid, instead of an opaque
     ``started``.)
 
+    The check and the spawn run under the ``hub`` ensure lock
+    (:func:`vco_lib.ensure_lock.spawn_lock`), held after a spawn until the new
+    hub owns ``hub.pid`` or ``settle_s`` (default :data:`HUB_SETTLE_S`)
+    expires, so concurrent callers start ONE hub and the others answer
+    ``already_running``.
+
     Callers must check the orchestrator update gate themselves — see the
     module docstring.
     """
-    pid = hub_pid()
-    if pid is not None and is_running():
-        return EnsureResult(
-            state=EnsureState.ALREADY_RUNNING,
-            pid=pid,
-            reason=f"vct-hub already running (pid {pid})",
-        )
+    from vco_lib.ensure_lock import spawn_lock, wait_until_up
 
-    binary = find_hub_binary(
-        repo_root=repo_root, extra_dirs=extra_dirs,
-        probe_repo_dist=probe_repo_dist,
-    )
-    if binary is None:
-        return EnsureResult(
-            state=EnsureState.BINARY_NOT_FOUND,
-            reason=(
-                "vct-hub binary not found: no $VCT_HUB_BIN, no copy under "
-                "launcher/dist/, none on $PATH, none in ~/.vct/bin "
-                "(set VCT_HUB_BIN to override, or run install.py to deploy it)"
-            ),
+    bound = HUB_SETTLE_S if settle_s is None else settle_s
+    with spawn_lock("hub", settle_s=bound):
+        pid = hub_pid()
+        if pid is not None and is_running():
+            return EnsureResult(
+                state=EnsureState.ALREADY_RUNNING,
+                pid=pid,
+                reason=f"vct-hub already running (pid {pid})",
+            )
+
+        binary = find_hub_binary(
+            repo_root=repo_root, extra_dirs=extra_dirs,
+            probe_repo_dist=probe_repo_dist,
         )
-    return _spawn(binary, wait=wait)
+        if binary is None:
+            return EnsureResult(
+                state=EnsureState.BINARY_NOT_FOUND,
+                reason=(
+                    "vct-hub binary not found: no $VCT_HUB_BIN, no copy under "
+                    "launcher/dist/, none on $PATH, none in ~/.vct/bin "
+                    "(set VCT_HUB_BIN to override, or run install.py to deploy it)"
+                ),
+            )
+        res = _spawn(binary, wait=wait)
+        if res.state is EnsureState.STARTED:
+            wait_until_up(is_running, bound_s=bound)
+        return res
 
 
 # ---------------------------------------------------------------------------
@@ -916,19 +972,40 @@ def _claim_revive_slot(min_interval_s: float, now: float) -> bool:
     broken stamp must not silence the revive forever (the spawn itself is
     idempotent, so the worst case is an extra ``--start-if-not-running``)."""
     stamp = _revive_stamp()
+
+    def _check_and_touch() -> bool:
+        try:
+            last = stamp.stat().st_mtime
+        except OSError:
+            last = None
+        # Both signs: a caller whose clock reading was taken a moment BEFORE
+        # the winner's stamp sees a slightly negative age, and it lost the
+        # race all the same. A stamp further in the future than the interval
+        # (a clock set back) still claims, so it cannot silence the revive.
+        if last is not None and -min_interval_s < now - last < min_interval_s:
+            return False
+        try:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.touch()
+            os.utime(stamp, (now, now))
+        except OSError:
+            pass
+        return True
+
+    # The read and the touch happen under one lock: several callers that find
+    # the hub down in the same instant (parallel gateway requests, every open
+    # chat's prompt hook) otherwise all read the old stamp and all spawn. A
+    # caller that arrives while another one is claiming is rate-limited — that
+    # other caller is starting the hub right now.
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
     try:
-        last = stamp.stat().st_mtime
-    except OSError:
-        last = None
-    if last is not None and 0 <= now - last < min_interval_s:
+        with exclusive_file_lock(stamp.with_name(stamp.name + ".lock"), timeout_s=0):
+            return _check_and_touch()
+    except LockTimeout:
         return False
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-        os.utime(stamp, (now, now))
     except OSError:
-        pass
-    return True
+        return _check_and_touch()
 
 
 def revive_if_down(
@@ -1056,6 +1133,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = Path(args.repo_root) if args.repo_root else None
     if args.cmd == "revive":
         rv = revive_if_down(source=args.source, repo_root=repo_root)
+        # v0.2.107 (A-003): the same per-prompt moment restarts the machine's
+        # owed-work worker when work is queued and no worker runs (it exits
+        # when nothing can run, leaving the queue on disk). An empty queue
+        # costs one directory listing; never raises.
+        try:
+            from vco_lib.owed_work import ensure_worker
+
+            ensure_worker(origin=f"revive {args.source}")
+        except Exception:  # noqa: BLE001 — best-effort like the revive itself
+            pass
         if args.json:
             print(json.dumps(rv.to_dict(), sort_keys=True))
         elif not args.quiet:

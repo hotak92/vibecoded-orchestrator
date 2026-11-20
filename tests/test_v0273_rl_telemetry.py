@@ -82,7 +82,10 @@ def _writer(captured: list) -> RLTelemetryWriter:
 
 
 def _payload(envelope: dict) -> dict:
-    return json.loads(envelope["payload_json"])
+    # A-014: the stored vectors are compact strings; read them as the trainer does.
+    from vco_lib.rl_vector_codec import decode_event_vectors
+
+    return decode_event_vectors(json.loads(envelope["payload_json"]))
 
 
 # ---------------------------------------------------------------------------

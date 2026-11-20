@@ -308,8 +308,11 @@ class TestNoDeadline:
         assert "subagent" in by_task["endagent"], "agent file: the agent's transcript"
         assert "main chat" in by_task["endmain"]
         assert summary["computed"] == 2
-        assert cp.ended_sessions(rig.project) == ["sessA"]
-        assert rig.names() == ["sessA" + cp.SESSION_ENDED_SUFFIX]
+        # v0.2.107 A-032: the end is recorded first, and cleared by the same
+        # drain once it has scored everything — nothing is left to finalize.
+        # (A drain that leaves a file keeps it: test below.)
+        assert cp.ended_sessions(rig.project) == []
+        assert rig.names() == []
 
     def test_session_end_that_cannot_score_leaves_the_files(self, tmp_path: Path) -> None:
         """A SessionEnd drain deletes nothing it did not score; the NEXT drain
@@ -637,6 +640,10 @@ def test_session_end_hook_runs_the_drain_with_session_end(tmp_path: Path, flavou
         "esac\n"
         f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
     py.chmod(0o755)
+    # RL-DRAIN (v0.2.107): the hook spawns a drain only when a pending file exists.
+    _pend = project / ".claude" / "state" / "rl_pending"
+    _pend.mkdir(parents=True, exist_ok=True)
+    (_pend / "sessE__t1.json").write_text("{}", encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k != "VCT_DISABLE_HOOKS"}
     env.update(CLAUDE_PROJECT_DIR=str(project), VCT_VENV=str(venv))
     script = HOOKS / f"stop-drain-citations.{flavour}"

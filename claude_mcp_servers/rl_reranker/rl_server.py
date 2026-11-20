@@ -660,7 +660,7 @@ class _HubClient:
         event_type: "str | None" = None,
         since_ms: "int | None" = None,
         until_ms: "int | None" = None,
-        page_limit: int = 10_000,
+        page_limit: int = 200,
         max_events: "int | None" = None,
     ) -> "list[dict]":
         """List this module's RL telemetry events for one project.
@@ -673,11 +673,16 @@ class _HubClient:
         that is gated by ``hub.token``, which containers do not (and should
         not) possess — different trust boundary.
 
-        Pagination: the hub caps a single response at 10,000 rows. We page
-        forward by advancing ``since_ms`` to one past the last returned
-        ``ts_ms`` until a short page (or ``max_events``) is reached. Rows are
-        returned in ascending ``ts_ms`` (the hub's GET order); duplicate
-        ``ts_ms`` at a page boundary are de-duplicated by event ``id``.
+        Pagination (MCPREAD-05, v0.2.107): the hub answers NEWEST FIRST and
+        ends a page at ``page_limit`` rows or 32 MiB of payload, whichever
+        comes first. We page backwards with the keyset cursor
+        ``before_ts``/``before_id`` (the last row of the previous page), so no
+        row is skipped or repeated at a boundary, and stop at the end of the
+        window or at ``max_events`` rows — the NEWEST ``max_events`` of the
+        window are kept. The rows are returned oldest first (ascending
+        ``ts_ms``, then ``id``). Before this, one 10,000-row request could be
+        1–1.5 GB of JSON, and the forward ``since_ms`` cursor stopped after
+        that first (newest) page.
 
         Soft-fail: returns whatever was collected so far on any error (the
         offline trainer treats a short/empty corpus as "nothing to train on"
@@ -691,19 +696,20 @@ class _HubClient:
                 The offline trainer needs both ``retrieval`` and ``citation``,
                 so it leaves this None and filters client-side.
             since_ms / until_ms: Inclusive time-window bounds (unix epoch ms).
-            page_limit: Per-request row cap (hub clamps to 10,000).
-            max_events: Stop after collecting this many rows (None = all).
+            page_limit: Per-request row cap (the hub also clamps to 10,000
+                rows and to 32 MiB).
+            max_events: Keep at most this many rows, the newest (None = all).
 
         Returns:
             List of raw hub row dicts (each carries ``payload_json`` +
-            denormalized columns), ascending by ``ts_ms``.
+            denormalized columns), ascending by ``(ts_ms, id)``.
         """
         await self._maybe_refresh_token()
         collected: list[dict] = []
-        seen_ids: set = set()
-        cursor = since_ms
-        # Hub clamps to 10k; never request more per page than that.
+        cursor: "tuple[int, int] | None" = None
         per_page = max(1, min(int(page_limit), 10_000))
+        if max_events is not None and max_events <= 0:
+            return []
         try:
             session = await self._ensure_session()
             base = (
@@ -714,10 +720,12 @@ class _HubClient:
                 params: "dict[str, Any]" = {"limit": per_page}
                 if event_type:
                     params["event_type"] = event_type
-                if cursor is not None:
-                    params["since_ms"] = cursor
+                if since_ms is not None:
+                    params["since_ms"] = since_ms
                 if until_ms is not None:
                     params["until_ms"] = until_ms
+                if cursor is not None:
+                    params["before_ts"], params["before_id"] = cursor
                 async with session.get(
                     base, headers=self._headers(), params=params
                 ) as resp:
@@ -727,57 +735,32 @@ class _HubClient:
                             "collected so far)",
                             log_safe(project_id), resp.status, len(collected),
                         )
-                        return collected
+                        break
                     body = await resp.json()
                 rows = body.get("rows") if isinstance(body, dict) else body
                 if not isinstance(rows, list) or not rows:
                     break
-                fresh = 0
-                max_ts = cursor if cursor is not None else None
-                page_max_ts: "int | None" = None
-                for row in rows:
-                    rid = row.get("id")
-                    if rid is not None and rid in seen_ids:
-                        continue
-                    if rid is not None:
-                        seen_ids.add(rid)
-                    collected.append(row)
-                    fresh += 1
-                    ts = row.get("ts_ms")
-                    if isinstance(ts, int):
-                        if max_ts is None or ts > max_ts:
-                            max_ts = ts
-                        if page_max_ts is None or ts > page_max_ts:
-                            page_max_ts = ts
-                    if max_events is not None and len(collected) >= max_events:
-                        return collected[:max_events]
-                # Termination: a page that yielded NO fresh rows means we've
-                # drained the window (the server returned only rows we've
-                # already seen, or nothing new past the cursor). We deliberately
-                # do NOT compare len(rows) against the requested limit — the
-                # server may cap a page BELOW what we asked (the real hub clamps
-                # to 10k; a proxy could cap lower), and a short-but-nonempty page
-                # does not imply the end. seen_ids makes re-fetching safe.
-                if fresh == 0:
+                last = rows[-1]
+                ts, rid = last.get("ts_ms"), last.get("id")
+                keyset = (ts, rid) if isinstance(ts, int) and isinstance(rid, int) else None
+                if cursor is not None and (keyset is None or keyset >= cursor):
+                    # A page that does not move past the cursor (a hub that
+                    # ignores it): keep nothing from it and stop, never loop.
                     break
-                # Advance the cursor past this page's newest ts. If the page's
-                # rows all shared the cursor's ts (can't advance), bump by 1ms so
-                # we move forward; seen_ids dedups any boundary overlap.
-                if page_max_ts is None:
-                    # No usable timestamps on this page — can't page by ts_ms.
-                    # Avoid an infinite loop.
+                collected.extend(rows)
+                if max_events is not None and len(collected) >= max_events:
+                    del collected[max_events:]
                     break
-                if cursor is not None and page_max_ts <= cursor:
-                    cursor = cursor + 1
-                else:
-                    cursor = page_max_ts + 1
-            return collected
+                if keyset is None:
+                    break  # no usable keyset on this page — cannot page further
+                cursor = keyset
         except Exception as exc:
             logger.debug(
                 "_HubClient.list_rl_events(%s) soft-failed: %s (returning %d collected)",
                 log_safe(project_id), exc, len(collected),
             )
-            return collected
+        collected.reverse()
+        return collected
 
     async def close(self) -> None:
         """Close the underlying aiohttp session. Idempotent."""

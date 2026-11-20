@@ -42,6 +42,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -271,13 +272,14 @@ def _guard_hooks(doc: dict) -> list[dict]:
 def test_upgraded_install_receives_the_raised_timeout(os_name: str) -> None:
     """The shipped 3 s is reshaped away; v0.2.102 W6-AA review A1: the
     registration then carries NO timeout, so the harness default (600 s)
-    applies and a slow `git worktree add` is never killed by a VCO bound."""
+    applies and a slow `git worktree add` is never killed by a VCO bound.
+    v0.2.107: the template states that 600 s explicitly."""
     template = json.loads(_TEMPLATES[os_name].read_text(encoding="utf-8"))
     old = json.loads((_V02100 / f"{os_name}.json").read_text(encoding="utf-8"))
     assert [h["timeout"] for h in _guard_hooks(old)] == [3]
     merged = settings_merge.smart_merge_settings(old, template)
     assert _guard_hooks(merged) == _guard_hooks(template)
-    assert ["timeout" in h for h in _guard_hooks(merged)] == [False]
+    assert [h.get("timeout") for h in _guard_hooks(merged)] == [600]
 
 
 @pytest.mark.parametrize("os_name", sorted(_TEMPLATES))
@@ -290,18 +292,31 @@ def test_user_tuned_timeout_is_left_alone(os_name: str) -> None:
     assert [h["timeout"] for h in _guard_hooks(merged)] == [15]
 
 
-# ── follow-up 1: SubagentStop reaps an UNCHANGED guard-created worktree ─────
+# ── follow-up 1: an UNCHANGED guard-created worktree is reaped ──────────────
 # "No changes -> worktree is auto-cleaned" (WORKTREE_ISOLATION_GUIDE.md,
 # docs/features/03) was false while worktree-guard creates the worktrees: the
 # harness keeps a hook-created worktree and runs no WorktreeRemove when a
 # subagent finishes (hooks reference, WorktreeRemove). subagent-stop-reconcile
-# now removes it — only when provably unchanged.
+# marks it a reap candidate and session-worktree-reap removes it after 7 idle
+# days (v0.2.107 REAP-INTERIM) — only when provably unchanged.
 
 
 def _stop(flavour: str, agent_id: str, project: Path) -> subprocess.CompletedProcess:
     return _run("subagent-stop-reconcile", flavour,
                 {"hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": agent_id,
                  "agent_type": "expert-coder", "cwd": str(project)}, project)
+
+
+def _end_session(flavour: str, project: Path) -> None:
+    """The candidates have been idle for 8 days and session s2 starts: the
+    v0.2.107 REAP-INTERIM reap point (SubagentStop only marks an unchanged
+    worktree a reap candidate; it goes after 7 idle days, owner 2026-11-20)."""
+    old = time.time() - 8 * 86400
+    for rec in (project / ".claude" / "state" / "worktree-guard").glob("wt-*.json"):
+        os.utime(rec, (old, old))
+    proc = _run("session-worktree-reap", flavour,
+                {"hook_event_name": "SessionStart", "session_id": "s2", "source": "startup"}, project)
+    assert proc.returncode == 0, proc.stderr
 
 
 def _committed_repo(root: Path) -> Path:
@@ -333,7 +348,7 @@ def _reap_rows(project: Path) -> list[dict]:
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_unchanged_worktree_is_removed_at_subagent_stop(flavour: str, tmp_path: Path) -> None:
+def test_unchanged_worktree_is_removed_after_seven_idle_days(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "aaa111")
     assert _record(repo, "aaa111")["mode"] == "head"
@@ -341,9 +356,11 @@ def test_unchanged_worktree_is_removed_at_subagent_stop(flavour: str, tmp_path: 
     proc = _stop(flavour, "aaa111", repo)
 
     assert proc.returncode == 0, proc.stderr
+    assert wt.is_dir(), "never removed at SubagentStop (it may be an interim stop)"
+    assert _reap_rows(repo)[-1]["decision"] == "reap_candidate"
+    _end_session(flavour, repo)
     assert not wt.exists()
     assert str(wt) not in _git(repo, "worktree", "list", "--porcelain").stdout
-    assert _reap_rows(repo)[-1]["decision"] == "reap_removed"
     assert _record(repo, "aaa111")["status"] == "removed"
     # The user's checkout is untouched.
     assert (repo / "app.py").read_text(encoding="utf-8") == "print('v1')\n"
@@ -383,6 +400,7 @@ def test_snapshot_worktree_is_removed_and_leaves_no_ref(flavour: str, tmp_path: 
     assert _record(repo, "ccc333")["mode"] == "snapshot"
     proc = _stop(flavour, "ccc333", repo)
     assert proc.returncode == 0, proc.stderr
+    _end_session(flavour, repo)
     assert not wt.exists()
     # The snapshot commit is on no ref: nothing to delete, git gc collects it.
     assert _git(repo, "for-each-ref").stdout.strip() == ""
@@ -417,7 +435,8 @@ def test_stop_without_a_record_touches_nothing(flavour: str, tmp_path: Path) -> 
 @pytest.mark.parametrize("flavour", FLAVOURS)
 def test_second_stop_is_a_noop(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
-    _launch(flavour, repo, "fff666")
+    wt = _launch(flavour, repo, "fff666")
+    (wt / "out.txt").write_text("work\n", encoding="utf-8")
     assert _stop(flavour, "fff666", repo).returncode == 0
     proc = _stop(flavour, "fff666", repo)
     assert proc.returncode == 0, proc.stderr

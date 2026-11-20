@@ -5470,9 +5470,9 @@ def main() -> int:
                              "preview which collections will be patched in "
                              "place vs copied vs rebuilt.")
     parser.add_argument("--force-rebuild", action="store_true", default=False,
-                        help="With --rebuild-collections: bypass smart "
-                             "copy-with-vectors path and always drop + "
-                             "re-embed (the OLD behaviour, escape hatch). "
+                        help="With --rebuild-collections: bypass the smart "
+                             "path (in-place add_slots / patch_props / copy) "
+                             "and always drop + re-embed (escape hatch). "
                              "Use when the source has legacy single-vector "
                              "format or you suspect vector corruption.")
     parser.add_argument("--migrate-uuid-scheme", action="store_true", default=False,
@@ -6169,7 +6169,7 @@ def main() -> int:
         _rebuild_was_performed = False
 
         if _maybe_prompt_rebuild_collections(args, deferral_report=_deferral_report):
-            # PR 3: smart per-collection dispatch (copy-with-vectors etc.)
+            # PR 3: smart per-collection dispatch (noop / patch_props / add_slots / copy / rebuild)
             # replaces the old drop-and-re-embed default. --force-rebuild
             # is the escape hatch back to today's behaviour.
             if getattr(args, "force_rebuild", False):
@@ -6238,10 +6238,10 @@ def main() -> int:
         # v0.2.72 (P7): revision-gated code-graph resync. After the additive
         # `embed_revision` schema migration ran (above, inside
         # analyze_code_graph's create_collections on the next analyze), trigger a
-        # BACKGROUND full re-analyze so the ~7-9% of over-budget Function/Class
-        # rows that P3 chunking invalidated get re-embedded into chunks. The
-        # revision gate makes this LIGHT (rows already at the current revision
-        # hash-skip). Non-blocking (background Popen), no global timeout, and it
+        # BACKGROUND resync so the ~7-9% of over-budget Function/Class rows that
+        # P3 chunking invalidated get re-embedded into chunks. v0.2.107: the
+        # driver re-extracts only the files owning rows at an old revision (the
+        # revision heal). Non-blocking (background Popen), no global timeout, and it
         # degrades to a deferral when the code-embed service (:11440) is down.
         # Only on --update: a fresh install analyzes at the current revision
         # already, so there are no stale rows to resync. Thin shim → the logic
@@ -7273,23 +7273,11 @@ def _apply_deferred_entries(
                             current_run_report.mark_resolved(cid)
                             continue
                         raise
-                    # Sanity-check row count via aggregate (GraphQL):
-                    count_gql = (
-                        '{"query":"{ Aggregate { '
-                        'VibeCodedOrchestrator_Development { meta { count } } } }"}'
-                    )
-                    req = urllib.request.Request(
-                        f"{weaviate_url}/v1/graphql",
-                        data=count_gql.encode("utf-8"),
-                        method="POST",
-                        headers={"Content-Type": "application/json"},
-                    )
-                    with urllib.request.urlopen(req, timeout=10) as resp:
-                        body = json.loads(resp.read())
-                    count = (body.get("data", {})
-                                 .get("Aggregate", {})
-                                 .get("VibeCodedOrchestrator_Development", [{}])
-                                 [0].get("meta", {}).get("count"))
+                    # Sanity-check row count through the ONE count helper
+                    # (None = could not be read = never a licence to delete).
+                    from vco_lib.weaviate_helpers import http_count_objects
+                    count = http_count_objects(
+                        "VibeCodedOrchestrator_Development", weaviate_url)
                     if count is None or count > 0:
                         print(
                             f"  [skip] {cid}: collection has {count} rows "
@@ -12743,14 +12731,14 @@ def _maybe_prompt_rebuild_collections(
     for feat in missing:
         print(f"  - missing: {feat}")
     print()
-    print("Today's code requires these invariants. Weaviate <=1.30 doesn't")
-    print("allow adding them via Reconfigure -- but most cases can be fixed")
-    print("by COPYING with vectors (no Ollama re-embed). PR 3 smart migrate")
-    print("will pick: noop / patch_props / copy-with-vectors / rebuild per")
-    print("collection.")
+    print("Today's code requires these invariants. A missing named-vector slot")
+    print("is added IN PLACE (add_slots: nothing dropped or copied); a missing")
+    print("indexNullState needs a COPY with vectors (no Ollama re-embed). The")
+    print("smart migrate picks noop / patch_props / add_slots / copy / rebuild")
+    print("per collection.")
     print()
     print("What gets touched:")
-    print("  + Weaviate collections (rebuilt with copy-with-vectors when possible)")
+    print("  + Weaviate collections (slots added in place; copied with vectors only when needed)")
     print("  - Your .md source files in knowledge/ and docs/  (untouched)")
     print("  - .env / .vscode/settings.json / .claude/settings.json (untouched)")
     print("  - The launcher's project bindings (untouched)")
@@ -12926,6 +12914,17 @@ def _check_dual_clone() -> Optional[tuple]:
             return None
     except Exception:
         return None
+
+
+# The rebind emitter's deferral wording ("nothing to rebind yet", not a failure).
+# ONE predicate for the printer and the error-propagation loop in
+# _seed_weaviate_shared_kg_only; tests/test_v0244_adversarial_fixes.py pins it
+# against the REAL emitter's messages, so rewording one here breaks that test.
+_REBIND_DEFERRAL_MARKERS = ("(skipped)", "(skipped —", "reconciled on next launcher boot")
+
+
+def _is_rebind_deferral(message: str) -> bool:
+    return any(marker in message for marker in _REBIND_DEFERRAL_MARKERS)
 
 
 def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
@@ -13192,6 +13191,20 @@ def _seed_weaviate_shared_kg_only(
             orphan_kg
             and canonical != orphan_kg
             and isinstance(primary_count, int) and primary_count > 0
+            and canonical.lower() == orphan_kg.lower()
+        ):
+            # A case-only sibling shares the canonical class's lower-cased
+            # index in Weaviate: no drop of it is safe, so none is printed.
+            print(
+                f"  ⚠ Collection '{orphan_kg}' retains {primary_count} rows after "
+                f"rebind and differs only in case from '{canonical}', which "
+                f"this install now uses. Do not drop it by hand: the two share one "
+                f"on-disk index, and removing either can remove the other's data."
+            )
+        elif (
+            orphan_kg
+            and canonical != orphan_kg
+            and isinstance(primary_count, int) and primary_count > 0
         ):
             print(
                 f"  ⚠ Orphan collection '{orphan_kg}' retains "
@@ -13217,7 +13230,13 @@ def _seed_weaviate_shared_kg_only(
         rebind_errors = _rebind_orchestrator_root_to_canonical(canonical)
         if rebind_errors:
             for e in rebind_errors:
-                print(f"    ! rebind: {e}")
+                # A root the launcher has not registered yet (a fresh install,
+                # before its first start) is the expected state, not a fault.
+                if _is_rebind_deferral(e):
+                    print(f"    · rebind: {e} — expected before the launcher's "
+                          "first start, which registers the root and its bindings")
+                else:
+                    print(f"    ! rebind: {e}")
             # v0.2.44 fix-now-2: propagate the "definitely broken" tier so
             # the audit-log "warn" entry fires on real DB write failures or
             # import errors. Two error classes stay non-propagated and
@@ -13229,9 +13248,7 @@ def _seed_weaviate_shared_kg_only(
             #     the launcher's env-refresh, so they stay print-only.
             for e in rebind_errors:
                 is_deferral = (
-                    "(skipped)" in e
-                    or "(skipped —" in e  # V44-H/H5 dual-clone short-circuit
-                    or "reconciled on next launcher boot" in e
+                    _is_rebind_deferral(e)  # incl. the V44-H/H5 dual-clone skip
                     or "config_projection apply failed" in e
                 )
                 if not is_deferral:
@@ -14759,7 +14776,7 @@ def _w40_run_adoption_uplifts(
             else:
                 smart_action = "noop"  # nothing to do
 
-            if smart_action in ("noop", "patch_props", "copy"):
+            if smart_action in ("noop", "patch_props", "add_slots", "copy"):
                 applied = True
                 _log_install_event(
                     "7e/10", "ok",

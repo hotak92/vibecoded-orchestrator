@@ -114,7 +114,7 @@ The ref row still carries an `is_set` column in the DB. It is a snapshot the ref
 
 #### Gotchas / failure modes
 
-- **The badge is stale after you set a value elsewhere.** The probe runs when the tab loads. Switch tabs and back (or reload) to re-probe. (Before v0.3.0 this column rendered the ref row's stored `is_set` flag, which was written once at registration and NEVER recomputed — no amount of rescanning refreshed it. If you remember this tab claiming "set" for a key you had deleted, that was why.)
+- **The badge is stale after you set a value elsewhere.** The probe runs when the tab loads. Switch tabs and back (or reload) to re-probe. (Before v0.2.92 this column rendered the ref row's stored `is_set` flag, which was written once at registration and NEVER recomputed — no amount of rescanning refreshed it. If you remember this tab claiming "set" for a key you had deleted, that was why.)
 - **"keyring entry for vct.… : platform error"** on Linux usually means there is no running Secret Service. Ensure `gnome-keyring-daemon` (or KWallet) is running and the login keyring is unlocked.
 - **Headless / SSH sessions on Linux**: libsecret requires a D-Bus session and an unlocked keyring. Either run the launcher inside a desktop session, or use `resolution: file` with `~/.vct-secrets/<name>` (chmod 600) instead.
 - **"value does not match validation pattern"** comes from `set_secret_v2` validating against the module manifest's `validation_regex`. Check the module's secrets manifest (e.g. for `GITHUB_TOKEN` the regex usually requires `ghp_…` / `github_pat_…`).
@@ -288,7 +288,7 @@ per-project `enabled` flag and a `source` label.
 | `source` | One of `bundled`, `user`, `paid-module`, `project`. The validator (`VALID_SOURCE`) rejects anything else. `bundled` = shipped with the orchestrator; `user` = user-scope `~/.claude/agents/`; `paid-module` = installed by a paid module; `project` = manually added in this project only. |
 | `source_module` | Optional module slug if `source = paid-module` (e.g. `vct-rl-reranker`). |
 | `model` | Frontmatter `model:` value: `sonnet`, `opus`, `haiku`, `inherit`, or full model id. Display-only — the harness reads this from the `.md` itself. |
-| `enabled` | User-owned toggle. The harness still loads the `.md` regardless; `enabled=false` is a launcher-managed signal that downstream code can consult. **It does not delete the file or block the harness directly.** |
+| `enabled` | User-owned toggle. The harness loads whatever is in `.claude/agents/`, so the toggle MOVES the `.md` between `.claude/agents/` and `.claude/agents.disabled/` (see Gotchas below); the column records which side the file is on. Nothing is deleted. |
 | `file_path` | Absolute path to the `.md`. `null` for rows manually registered without a file. |
 | `config` (JSON) | Currently stores `{"description": "..."}` from frontmatter. Reserved for future per-row overrides (`tools`, `effort`, `mcpServers`). |
 | `installed_at` / `updated_at` | Unix-millis timestamps. |
@@ -530,9 +530,11 @@ blocks the action. Other events (`PostToolUse`, `Notification`,
 
 #### Gotchas
 
-- `enabled = false` does NOT actually disable the hook unless you
-  also edit `settings.json`. Treat the toggle as a launcher-internal
-  flag.
+- The `enabled` DB column alone gates nothing — the harness reads
+  `settings.json`. Since v0.2.91 the tab's checkbox edits
+  `settings.json` itself (see "Changed in v0.2.91" above), so
+  unchecking a hook here does stop it; only a row edited directly in
+  the DB would not.
 - Re-running populate **does not delete** rows that are no longer in
   `settings.json`. Stale rows from removed hooks must be cleaned via
   the **Delete** button.

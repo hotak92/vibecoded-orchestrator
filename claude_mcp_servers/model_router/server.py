@@ -247,6 +247,7 @@ from .tool_ids import (
     normalise_vendor_response,
     restore_vendor_ids,
     sanitise_for_anthropic,
+    sanitise_for_vendor,
     unmark_thinking_signatures,
 )
 
@@ -3362,6 +3363,28 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 ),
             )
         headers[vendor.auth_header] = f"{vendor.auth_scheme}{key_result.key}"
+        # Sanitise inherited history BEFORE restoring ids: a block converted
+        # to text must not leave a mapped id behind, and no vendor may receive
+        # another vendor's server-only block type.
+        if forward_payload is not None:
+            sanitised_pair = _guarded(
+                sanitise_for_vendor,
+                forward_payload,
+                what="vendor-bound block sanitising",
+            )
+            if sanitised_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, sanitised = sanitised_pair
+                if sanitised.changed:
+                    mutated = True
+                    logger.info(
+                        "model-gateway: sanitised inherited blocks before "
+                        "the vendor route (%s) at message index(es) %s",
+                        sanitised.summary(),
+                        ", ".join(str(i) for i in sanitised.touched_indexes) or "-",
+                    )
+
         # Hand the vendor back its OWN ids: we rewrote them on the way out.
         if forward_payload is not None:
             restored_pair = _guarded(

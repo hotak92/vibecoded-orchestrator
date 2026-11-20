@@ -1,0 +1,33 @@
+-- v0.2.107 (UPDATE-ALL fix round, audit U-1): the decided pass shape of a
+-- queued code-graph build survives a launcher restart.
+--
+-- After a bundle update the launcher decides which pass a project owes
+-- (commands/codegraph.rs::decide_post_bundle_codegraph_pass): none, an
+-- incremental pass since the recorded commit, or one full pass — with
+-- --force-rewalk when an extractor-generation walk was handed to it. That
+-- shape lived only in the spawned task's memory. A queued build's row is
+-- RUNNING ("queued" phase) while it waits for an admission permit, so a
+-- launcher restart (the orchestrator update itself ends with one) flipped it
+-- to failed, and a Retry or boot-resume ran a plain full pass: an owed forced
+-- walk ran without --force-rewalk, wrote no generation stamp, and stayed owed.
+--
+-- pending_mode (TEXT, nullable) holds the decided shape as JSON
+-- ({"kind":"full","prune_stale":..,"force_rewalk":..} or
+-- {"kind":"incremental","since_commit":"<sha>"}), written with the PENDING
+-- row by the post-bundle path only. It is kept through the RUNNING
+-- transition and cleared by every other lifecycle write, so a row carries it
+-- exactly while the decided pass is owed. NULL = no decided shape (first
+-- builds, user re-analyses, project moves): those resume as before.
+--
+-- pending_requeues (INTEGER NOT NULL DEFAULT 0, audit N-1) counts the boot
+-- requeues of that owed pass. Boot requeues a row only while the count is
+-- below 3 and increments it; at 3 the row is left to the orphan sweep
+-- (failed, "click Retry"), so a walk that takes the launcher down is not
+-- re-run at every start. Kept through RUNNING with pending_mode, reset to 0
+-- by every other lifecycle write (a completion, a new decision, a Retry).
+--
+-- Plain additive ALTER TABLE — idempotent via the runner's version check,
+-- not self-transactional.
+
+ALTER TABLE code_graph_builds ADD COLUMN pending_mode TEXT;
+ALTER TABLE code_graph_builds ADD COLUMN pending_requeues INTEGER NOT NULL DEFAULT 0;

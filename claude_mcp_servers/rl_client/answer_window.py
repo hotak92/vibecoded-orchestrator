@@ -14,7 +14,8 @@ tool_use INPUT only. Tool RETURNS are EXCLUDED — RL trains on what the LLM
 EMITS, not on shell output / file dumps / API JSON that would drown the signal.
 
 Pure functions apart from the transcript loaders (file I/O plus one
-process-global, lock-guarded parse cache); no async, no server.py import. The
+process-global, lock-guarded parse cache, and the drain's persisted transcript
+skeleton); no async, no server.py import. The
 transcript-loading and KG-position helpers are also here so the drain doesn't have to reach into
 server.py for them (the modularity rule: one concern, one home).
 """
@@ -42,6 +43,10 @@ __all__ = [
     "find_cli_kg_queries",
     "cli_kg_search_queries",
     "extract_answer_window",
+    "answer_window_chars",
+    "window_token_estimate",
+    "TranscriptSkeleton",
+    "load_transcript_skeleton",
     "match_position_for_query",
     "match_position_by_timestamp",
     "token_estimate",
@@ -398,6 +403,267 @@ def load_messages_cached(transcript_path: "str | Path") -> list[dict]:
         _release_path_lock(key)
 
 
+# ---- RL-DRAIN (v0.2.107, A-024): the persisted transcript skeleton ---------
+#
+# The Stop-hook drain is a one-shot process, so ``load_messages_cached``'s
+# cache starts empty in it: every drain re-parsed the chat's WHOLE transcript
+# at every turn end (measured: 482 MB RSS and 13 CPU-seconds on a 980 MB
+# transcript). The drain reads a SKELETON instead — every message's position,
+# and for an assistant message only what the drain's decisions read: its
+# ``timestamp``, its line's byte offset, each block's ``type`` and the number
+# of characters it adds to an answer window (``_answer_part``), the name of a
+# tool_use, the input of a KG search, and the transcript's CLI ``kg-search``
+# queries. No text is kept. The skeleton is persisted per transcript
+# (``<state dir>/<transcript_key>.idx.json``) with the byte offset of the last
+# complete line it consumed, so a drain parses only the bytes appended since
+# then. A truncated or replaced transcript (size below that offset, a new
+# ``(st_dev, st_ino)``, or the byte before the offset no longer a newline) is
+# indexed again from byte 0. A partial final line is parsed tentatively, as
+# ``load_messages_cached`` does, and never persisted.
+#
+# What the drain computes is unchanged: the matchers and ``find_kg_positions``
+# read a skeleton exactly as they read the slim messages (same positions, same
+# fields); ``answer_window_chars`` gives the window's length by summing the
+# recorded block lengths, so a window below the gate is decided without
+# reading it; and ``extract_answer_window`` on a skeleton reads the window's
+# own lines — from its first message to the one where the cap is reached —
+# and extracts from those exactly as from the full list.
+
+_SKEL_LEN = "_n"
+_SKEL_OFF = "_off"
+_SKELETON_VERSION = 1
+#: File-name suffix of a persisted skeleton in the drain's state dir.
+SKELETON_INDEX_SUFFIX = ".idx.json"
+# Every non-assistant message of a skeleton: one shared, read-only object (the
+# consumers only ever test ``type == "assistant"`` on those).
+_OTHER_MESSAGE: dict = {"type": ""}
+
+
+class TranscriptChanged(Exception):
+    """The transcript was replaced or truncated after its skeleton was read,
+    so the skeleton's byte offsets no longer address its lines."""
+
+
+def transcript_key(transcript_path: "str | Path") -> str:
+    """Stable file-name key of one transcript (its normalised path, hashed)."""
+    import hashlib  # noqa: PLC0415
+
+    norm = _os.path.normpath(str(transcript_path))
+    return hashlib.sha1(norm.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+
+
+class TranscriptSkeleton(list):
+    """A transcript's messages as the drain reads them (see the section
+    comment): a ``list`` of the same length, with the same positions, as
+    ``load_messages_cached`` would return, carrying no text."""
+
+    def __init__(self, items: list, *, path: str, file_id: "tuple[int, int]",
+                 end: int, cli_queries: "frozenset[str]") -> None:
+        super().__init__(items)
+        self.path = path
+        self.file_id = file_id
+        self.end = end  # bytes covered (consumed offset + the tentative tail)
+        self.cli_queries = cli_queries
+
+    def window_source(self, start_msg_idx: int, start_blk_idx: int,
+                      threshold_chars: int) -> "tuple[list, int, int]":
+        """``(messages, start_msg_idx, start_blk_idx)`` to extract a window
+        from: the slim messages of the window's own lines, from its first
+        assistant message to the one where ``threshold_chars`` is reached
+        (or the end). Raises :class:`TranscriptChanged` when the file no
+        longer matches the skeleton."""
+        k = start_msg_idx
+        while k < len(self) and self[k].get("type", "") != "assistant":
+            k += 1
+        if k >= len(self):
+            return [], 0, -1
+        blk = start_blk_idx if k == start_msg_idx else -1
+        last = len(self) - 1
+        total = 0
+        for msg_idx, block in _window_blocks(self, k, blk):
+            total += block.get(_SKEL_LEN, 0)
+            if total >= threshold_chars:
+                last = msg_idx
+                break
+        return self._read_messages(self[k][_SKEL_OFF], last - k + 1), 0, blk
+
+    def _read_messages(self, offset: int, want: int) -> list:
+        out: list = []
+        try:
+            with open(self.path, "rb") as fh:
+                st = _os.fstat(fh.fileno())
+                if (st.st_dev, st.st_ino) != self.file_id or st.st_size < self.end:
+                    raise TranscriptChanged(self.path)
+                fh.seek(offset)
+                for line in fh:
+                    msg = _parse_line(line)
+                    if msg is _NO_MESSAGE:
+                        continue
+                    out.append(slim_message(msg))
+                    if len(out) >= want:
+                        break
+        except OSError as exc:
+            raise TranscriptChanged(self.path) from exc
+        if not out or not isinstance(out[0], dict) or out[0].get("type") != "assistant":
+            raise TranscriptChanged(self.path)
+        return out
+
+
+def _skeleton_record(msg: _Any, msg_idx: int, line_off: int) -> "list | None":
+    """The persisted record of one ASSISTANT message, else ``None``:
+    ``[msg_idx, line_off, timestamp, blocks]``; a block is ``None`` (not a
+    dict) or ``[type, chars]`` (+ ``name`` for a tool_use, + ``input`` for a
+    KG search)."""
+    if not isinstance(msg, dict) or msg.get("type") != "assistant":
+        return None
+    inner = msg.get("message")
+    content = inner.get("content", []) if isinstance(inner, dict) else []
+    blocks: list = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                blocks.append(None)
+                continue
+            part = _answer_part(block)
+            rec: list = [block.get("type"), len(part) if isinstance(part, str) else 0]
+            if block.get("type") == "tool_use":
+                name = block.get("name")
+                rec.append(name)
+                if name in KG_SEARCH_TOOLS and "input" in block:
+                    rec.append(block["input"])
+            blocks.append(rec)
+    return [msg_idx, line_off, msg.get("timestamp"), blocks]
+
+
+def _skeleton_message(rec: list) -> dict:
+    blocks: list = []
+    for b in rec[3]:
+        if b is None:
+            blocks.append(None)
+            continue
+        blk = {"type": b[0], _SKEL_LEN: b[1]}
+        if len(b) > 2:
+            blk["name"] = b[2]
+        if len(b) > 3:
+            blk["input"] = b[3]
+        blocks.append(blk)
+    return {"type": "assistant", "timestamp": rec[2], _SKEL_OFF: rec[1],
+            "message": {"content": blocks}}
+
+
+def _read_skeleton_index(idx_file: Path, path: str,
+                         file_id: "tuple[int, int]") -> "dict | None":
+    """The persisted state of ``path``, or ``None`` when there is none, it is
+    unreadable, or it describes another file."""
+    try:
+        with open(idx_file, "r", encoding="utf-8") as fh:
+            header = _json.loads(fh.readline())
+            if (not isinstance(header, dict)
+                    or header.get("v") != _SKELETON_VERSION
+                    or header.get("path") != path
+                    or [header.get("dev"), header.get("ino")] != list(file_id)):
+                return None
+            body = _json.loads(fh.readline())
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(body, dict) or not isinstance(body.get("offset"), int)
+            or not isinstance(body.get("n"), int)
+            or not isinstance(body.get("asst"), list)
+            or not isinstance(body.get("cli"), list)):
+        return None
+    return body
+
+
+def skeleton_index_transcript(idx_file: "str | Path") -> "str | None":
+    """The transcript a persisted skeleton describes (its header line only),
+    or ``None`` when the file is not a readable skeleton."""
+    try:
+        with open(idx_file, "r", encoding="utf-8") as fh:
+            header = _json.loads(fh.readline())
+    except (OSError, ValueError):
+        return None
+    path = header.get("path") if isinstance(header, dict) else None
+    return path if isinstance(path, str) and path else None
+
+
+def _write_skeleton_index(idx_file: Path, path: str, file_id: "tuple[int, int]",
+                          state: dict) -> None:
+    """Persist ``state`` (best effort: a failed write only means the next
+    drain parses those bytes again)."""
+    header = {"v": _SKELETON_VERSION, "path": path,
+              "dev": file_id[0], "ino": file_id[1]}
+    body = _json.dumps(header) + "\n" + _json.dumps(state, separators=(",", ":")) + "\n"
+    try:
+        from vco_lib.atomic import atomic_write_text  # noqa: PLC0415
+
+        idx_file.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(idx_file, body, fsync=False)
+    except OSError:
+        pass
+
+
+def load_transcript_skeleton(transcript_path: "str | Path",
+                             state_dir: "str | Path | None" = None) -> list:
+    """The transcript's :class:`TranscriptSkeleton`, parsing only the bytes
+    appended since the offset persisted in ``state_dir`` (no ``state_dir``:
+    parsed from byte 0, nothing persisted). ``[]`` when the transcript
+    cannot be read — the same answer ``load_messages_cached`` gives."""
+    path = str(transcript_path)
+    try:
+        st = _os.stat(path)
+    except OSError:
+        return []
+    file_id = (st.st_dev, st.st_ino)
+    idx_file = (Path(state_dir) / f"{transcript_key(path)}{SKELETON_INDEX_SUFFIX}"
+                if state_dir else None)
+    state = _read_skeleton_index(idx_file, path, file_id) if idx_file else None
+    fresh = {"offset": 0, "n": 0, "asst": [], "cli": []}
+    if state is None or state["offset"] > st.st_size:
+        state = fresh
+    tail_msg: object = _NO_MESSAGE
+    tail_len = 0
+    try:
+        with open(path, "rb") as fh:
+            if state["offset"] > 0:
+                fh.seek(state["offset"] - 1)
+                if fh.read(1) != b"\n":
+                    state = fresh  # rewritten in place: index it again
+            start_offset = state["offset"]
+            fh.seek(start_offset)
+            pos = start_offset
+            cli = set(state["cli"])
+            for line in fh:
+                if not line.endswith(b"\n"):
+                    tail_msg = _parse_line(line)
+                    tail_len = len(line)
+                    break
+                line_off = pos
+                pos += len(line)
+                msg = _parse_line(line)
+                if msg is _NO_MESSAGE:
+                    continue
+                rec = _skeleton_record(msg, state["n"], line_off)
+                state["n"] += 1
+                if rec is not None:
+                    state["asst"].append(rec)
+                    cli.update(_message_cli_queries(msg))
+    except OSError:
+        return []
+    state["offset"] = pos
+    state["cli"] = sorted(cli)
+    if idx_file is not None and (pos != start_offset or start_offset == 0):
+        _write_skeleton_index(idx_file, path, file_id, state)
+    items: list = [_OTHER_MESSAGE] * state["n"]
+    for rec in state["asst"]:
+        items[rec[0]] = _skeleton_message(rec)
+    if tail_msg is not _NO_MESSAGE:
+        rec = _skeleton_record(tail_msg, state["n"], pos)
+        items.append(_skeleton_message(rec) if rec is not None else _OTHER_MESSAGE)
+        cli.update(_message_cli_queries(tail_msg))
+    return TranscriptSkeleton(items, path=path, file_id=file_id,
+                              end=pos + tail_len, cli_queries=frozenset(cli))
+
+
 def find_kg_positions(messages: list[dict]) -> list[tuple[int, int]]:
     """Return (msg_idx, blk_idx) for every KG-search tool_use block."""
     positions: list[tuple[int, int]] = []
@@ -523,26 +789,37 @@ def find_cli_kg_queries(messages: list[dict]) -> frozenset[str]:
     """The first 120 characters (the staged snippet length) of every query
     the transcript's assistant ran through the ``kg-search`` CLI in a
     Bash / PowerShell tool call."""
+    if isinstance(messages, TranscriptSkeleton):
+        return messages.cli_queries  # computed per message when it was indexed
     found: set[str] = set()
     for msg in messages:
-        if not isinstance(msg, dict) or msg.get("type") != "assistant":
-            continue
-        content = msg.get("message", {}).get("content", [])
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") in CLI_SHELL_TOOLS
-            ):
-                inp = block.get("input")
-                cmd = inp.get("command", "") if isinstance(inp, dict) else ""
-                for q in cli_kg_search_queries(
-                        cmd, powershell=block.get("name") == "PowerShell"):
-                    if q:
-                        found.add(q[:120])
+        found.update(_message_cli_queries(msg))
     return frozenset(found)
+
+
+def _message_cli_queries(msg: _Any) -> "list[str]":
+    """The CLI ``kg-search`` query snippets of ONE transcript message — the
+    per-message rule :func:`find_cli_kg_queries` and the persisted skeleton
+    (:func:`load_transcript_skeleton`) share."""
+    found: list[str] = []
+    if not isinstance(msg, dict) or msg.get("type") != "assistant":
+        return found
+    content = msg.get("message", {}).get("content", [])
+    if not isinstance(content, list):
+        return found
+    for block in content:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") in CLI_SHELL_TOOLS
+        ):
+            inp = block.get("input")
+            cmd = inp.get("command", "") if isinstance(inp, dict) else ""
+            for q in cli_kg_search_queries(
+                    cmd, powershell=block.get("name") == "PowerShell"):
+                if q:
+                    found.append(q[:120])
+    return found
 
 
 def _chars_per_token_text() -> int:
@@ -600,9 +877,39 @@ def extract_answer_window(
 
     Returns (text, complete).
     """
+    threshold_chars = threshold_tokens * _chars_per_token_text()
+    if isinstance(messages, TranscriptSkeleton):
+        # RL-DRAIN: a skeleton holds no text — read the window's own lines
+        # (and no further than the line where the cap is reached).
+        messages, start_msg_idx, start_blk_idx = messages.window_source(
+            start_msg_idx, start_blk_idx, threshold_chars)
     parts: list[str] = []
     total_chars = 0
-    threshold_chars = threshold_tokens * _chars_per_token_text()
+    for _msg_idx, block in _window_blocks(messages, start_msg_idx, start_blk_idx):
+        part = _answer_part(block, tool_content_limit)
+        if part:
+            parts.append(part)
+            total_chars += len(part)
+        if total_chars >= threshold_chars:
+            return "".join(parts)[:threshold_chars], True
+
+    return "".join(parts), False
+
+
+def window_token_estimate(skeleton: "TranscriptSkeleton", start_msg_idx: int,
+                          start_blk_idx: int) -> int:
+    """``token_estimate(extract_answer_window(skeleton, ...)[0])`` without
+    reading the window: :func:`answer_window_chars` in the same unit."""
+    return answer_window_chars(skeleton, start_msg_idx, start_blk_idx) // _chars_per_token_text()
+
+
+def _window_blocks(messages: list, start_msg_idx: int, start_blk_idx: int):
+    """Every answer-window block after the search at
+    ``(start_msg_idx, start_blk_idx)``, as ``(msg_idx, block)``: the dict
+    blocks of assistant messages,
+    skipping the start message's blocks up to and including the search
+    itself. The one walk :func:`extract_answer_window` and
+    :func:`answer_window_chars` share."""
     for msg_idx in range(start_msg_idx, len(messages)):
         msg = messages[msg_idx]
         if msg.get("type", "") != "assistant":
@@ -614,32 +921,46 @@ def extract_answer_window(
             # Skip blocks up to and including the search tool_use itself.
             if msg_idx == start_msg_idx and blk_idx <= start_blk_idx:
                 continue
-            btype = block.get("type", "")
-            if btype == "text":
-                text = block.get("text", "")
-                if text:
-                    parts.append(text)
-                    total_chars += len(text)
-            elif btype == "thinking":
-                text = block.get("thinking", "")
-                if text:
-                    parts.append(text)
-                    total_chars += len(text)
-            elif btype == "tool_use":
-                tool_name = block.get("name", "")
-                tool_input = block.get("input", {})
-                try:
-                    input_serialized = _json.dumps(tool_input, default=str)
-                except Exception:
-                    input_serialized = str(tool_input)
-                snippet = f"{tool_name}: {input_serialized}"[:tool_content_limit]
-                if snippet:
-                    parts.append(snippet)
-                    total_chars += len(snippet)
-            if total_chars >= threshold_chars:
-                return "".join(parts)[:threshold_chars], True
+            yield msg_idx, block
 
-    return "".join(parts), False
+
+def _answer_part(block: dict, tool_content_limit: int = TOOL_CONTENT_LIMIT) -> _Any:
+    """What ONE block adds to the answer window (D5.1: text, thinking, and a
+    tool_use's name + serialized input, capped); ``""`` for anything else."""
+    btype = block.get("type", "")
+    if btype == "text":
+        return block.get("text", "")
+    if btype == "thinking":
+        return block.get("thinking", "")
+    if btype == "tool_use":
+        tool_name = block.get("name", "")
+        tool_input = block.get("input", {})
+        try:
+            input_serialized = _json.dumps(tool_input, default=str)
+        except Exception:
+            input_serialized = str(tool_input)
+        return f"{tool_name}: {input_serialized}"[:tool_content_limit]
+    return ""
+
+
+def answer_window_chars(
+    skeleton: "TranscriptSkeleton",
+    start_msg_idx: int,
+    start_blk_idx: int,
+    *,
+    threshold_tokens: int = DEFAULT_ANSWER_THRESHOLD_TOKENS,
+) -> int:
+    """``len(extract_answer_window(...)[0])`` for a skeleton, by subtraction:
+    the per-block lengths recorded when the transcript was indexed, summed
+    over the same walk, capped where the extraction would cut. Reads no
+    transcript bytes (RL-DRAIN, A-024)."""
+    threshold_chars = threshold_tokens * _chars_per_token_text()
+    total = 0
+    for _msg_idx, block in _window_blocks(skeleton, start_msg_idx, start_blk_idx):
+        total += block.get(_SKEL_LEN, 0)
+        if total >= threshold_chars:
+            return threshold_chars
+    return total
 
 
 def match_position_for_query(

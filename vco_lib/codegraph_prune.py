@@ -27,8 +27,12 @@ Extracted from the analyzer monolith (P2f line-count ratchet:
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+
+from vco_lib.codegraph_cursor import iter_class, undeterminable_classes
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +206,8 @@ def prune_collection(
         return_props.append("project_source")
 
     try:
-        for obj in collection.iterator(
+        for obj in iter_class(
+            collection, "codegraph_prune.prune_collection",
             return_properties=return_props,
         ):
             props = obj.properties or {}
@@ -310,13 +315,17 @@ def prune_collection(
                     f"Failed to prune {obj.uuid} from {collection.name}: {exc}"
                 )
     except Exception as exc:
-        # Iterating a freshly-created collection can fail if it
-        # has no data yet; treat as zero-prune. This is an enumeration
-        # failure (not a per-row delete failure) — we cannot tell how many
-        # rows were owed, so we do NOT count it as a prune failure here;
-        # a walk that produced zero visited UUIDs against a populated
-        # collection is caught by higher-level insert-error accounting.
-        logger.debug(f"Prune enumeration on {collection.name} failed: {exc}")
+        # The class could not be listed whole (v0.2.107 CG-2: the cursor
+        # raises ``CursorUndeterminable`` for a failed page AND for a 0-row
+        # pass over a class that is not confirmed empty; it has logged the
+        # class and this call site, and remembered the class). Nothing more is
+        # deleted on this read. It is not a per-row delete failure, so the
+        # count returned here is unchanged; the run still ends PARTIAL because
+        # :func:`prune_failure_stats` adds every unlisted class to the total.
+        logger.debug(
+            "Prune of %s stopped: the class could not be listed (%s) - "
+            "no further row is judged stale this run", collection.name, exc,
+        )
         # v0.2.103 (defect 7): enumeration failure = uncertainty → the
         # deferred orphan candidates are DROPPED, never deleted.
         orphan_candidates = []
@@ -369,6 +378,111 @@ def prune_collection(
             f"folders — attribution unknown)"
         )
     return pruned, failures
+
+
+@dataclass
+class PruneWalkGuard:
+    """What a finished walk is evidence of, for the ``--prune-stale`` pass
+    (:func:`prune_walk_guard`)."""
+
+    #: Non-empty = the prune must delete NOTHING this run; the text says why.
+    refusal: str = ""
+    #: ``discovered - walked`` PLUS the files whose write did not complete:
+    #: the preserve set (rows anchored to these files are never judged stale).
+    skipped: Set[Any] = field(default_factory=set)
+    #: The part of ``skipped`` that was walked but not fully written.
+    incomplete: Set[Any] = field(default_factory=set)
+    #: ``project_source`` values whose rows are kept whole: the refused extras
+    #: plus every walked extra root under which no file was discovered.
+    preserve_sources: Set[str] = field(default_factory=set)
+    #: The walked extra roots under which no file was discovered.
+    silent_roots: List[str] = field(default_factory=list)
+
+
+def _same_root(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:  # noqa: BLE001 - an unresolvable form is simply not equal
+        return False
+
+
+def prune_walk_guard(analyzer: Any) -> PruneWalkGuard:
+    """Decide what the walk that just ended lets ``--prune-stale`` delete.
+
+    v0.2.107 (DESTRUCTIVE-03). The prune deletes every row of the walked
+    root(s) that this run did not write. That is only sound when the walk is
+    evidence of what exists on disk, and of what a file now contains. A walk
+    that found nothing is NOT evidence of deletion, and a half-written file is
+    not evidence that its old entities are gone. Four rules, all in the
+    leave-alone direction:
+
+    1. **Scoped walk** (``--only-file`` / ``--only-files-from``): it never saw
+       the other files - refuse. (``main()`` rejects the flag pair; a direct
+       ``analyze_repository(prune_stale=True, only_file=...)`` caller did not
+       pass through that check.)
+    2. **Root missing**: the walked root is not a directory now (unmounted
+       drive, removed checkout) - refuse.
+    3. **No file discovered** by the whole walk, or none under the PRIMARY
+       root (empty mount point, a checkout of an empty branch, a finder that
+       failed upstream) - refuse. A walked EXTRA root with no discovered file
+       does not stop the run: its rows are kept whole (``preserve_sources``)
+       while the other roots are pruned as usual.
+    4. **Half-written file**: a file is "walked" as soon as its module row is
+       written. If a later entity write failed (embedding backend down,
+       Weaviate refusing) its old entity rows are unvisited although the code
+       is still on disk. The per-file reconcile already knows which files
+       were written completely (``_reconcile_walked`` holds a file only after
+       its LAST pass committed); a walked file absent from it joins the
+       preserve set. An analyzer without that state (a minimal test stub)
+       keeps the pre-v0.2.107 reading of ``walked``.
+
+    Reads the analyzer's own state (duck-typed, ``getattr``-defensive - this
+    module never imports the analyzer) and performs no I/O beyond one
+    ``isdir`` per walked root.
+    """
+    discovered = set(getattr(analyzer, "_prune_discovered_paths", None) or ())
+    walked = set(getattr(analyzer, "_prune_walked_paths", None) or ())
+    guard = PruneWalkGuard(
+        skipped=discovered - walked,
+        preserve_sources=set(getattr(analyzer, "_refused_extra_sources", None) or ()),
+    )
+    if not getattr(analyzer, "_analyze_whole_repo", True):
+        guard.refusal = ("this walk was scoped to named files, so it is no "
+                         "evidence about any other file")
+        return guard
+    primary = str(getattr(analyzer, "_analyze_repo_root_raw", "") or "")
+    extras = [str(e) for e in (getattr(analyzer, "_walked_extra_roots", None) or ())]
+    for root in ([primary] if primary else []) + extras:
+        if not os.path.isdir(root):
+            guard.refusal = f"the walked root {root} is missing or not a directory"
+            return guard
+    if not discovered:
+        guard.refusal = ("this walk discovered no file - a walk that found "
+                         "nothing is not evidence that the code was deleted")
+        return guard
+    # Per-root evidence needs (root, rel) keys; a bare-str entry (a caller
+    # that cannot name the root) attributes to no root, so nothing is silent.
+    seen_roots = {e[0] for e in discovered if isinstance(e, tuple)}
+    if all(isinstance(e, tuple) for e in discovered):
+        if primary and not any(_same_root(primary, r) for r in seen_roots):
+            guard.refusal = (f"this walk discovered no file under the project "
+                             f"root {primary}")
+            return guard
+        for extra in extras:
+            if not any(_same_root(extra, r) for r in seen_roots):
+                from vco_lib.codegraph_source_scope import walk_own_sources
+
+                guard.silent_roots.append(extra)
+                guard.preserve_sources |= walk_own_sources(extra, extra)
+    committed = getattr(analyzer, "_reconcile_walked", None)
+    if isinstance(committed, dict):
+        guard.incomplete = {
+            e for e in walked if isinstance(e, tuple) and e not in committed
+        }
+        guard.skipped |= guard.incomplete
+    return guard
 
 
 def expand_preserve_entries(
@@ -426,6 +540,39 @@ def record_prune_failures(holder: Any, collection_name: str, failures: int) -> N
     holder._prune_failure_collections = per_coll
 
 
+def reset_prune_ledgers(holder: Any) -> None:
+    """Start-of-run reset of everything :func:`prune_failure_stats` reports:
+    the delete-failure total, its per-collection map, and the process record
+    of classes that could not be listed (``codegraph_cursor``)."""
+    from vco_lib.codegraph_cursor import reset_undeterminable
+
+    holder._prune_failures = 0
+    holder._prune_failure_collections = {}
+    reset_undeterminable()
+
+
+def prune_failure_stats(holder: Any) -> Dict[str, Any]:
+    """The end-of-run stats keys for stale-row work that did NOT complete.
+
+    ``prune_failures`` is the total the build status keys on
+    (``PRUNE_FAILURES=N`` -> success→partial): the failed deletes PLUS one per
+    class that could not be listed this run (v0.2.107 CG-2). A sweep that
+    could not read its class deleted nothing and proved nothing, so the run
+    must not read as a clean success - the stale rows it could not see stay
+    owed. ``prune_failure_collections`` keeps naming only the classes with
+    failed DELETES (the remedy prints a drop command for those and must not
+    for a class that merely could not be listed);
+    ``listing_undeterminable`` maps the unlisted classes to the call site.
+    """
+    unlisted = undeterminable_classes()
+    return {
+        "prune_failures": int(getattr(holder, "_prune_failures", 0)) + len(unlisted),
+        "prune_failure_collections": dict(
+            getattr(holder, "_prune_failure_collections", None) or {}),
+        "listing_undeterminable": unlisted,
+    }
+
+
 #: The default in the remedy's ``${WEAVIATE_URL:-...}`` expansion (mirrors the
 #: pre-v0.2.103 hard-coded line).
 PRUNE_REMEDY_URL_DEFAULT = "http://localhost:8081"
@@ -460,8 +607,18 @@ def format_prune_remedy_lines(
         f"/v1/schema/{n}\"   # then re-run analysis"
         for n in names
     ]
-    unattributed = max(0, int(total_failures) - sum(per_coll.values()))
-    if unattributed or not names:
+    # v0.2.107 (CG-2): a class that could not be LISTED is part of the total
+    # (the run is partial) but gets no drop command - nothing shows its rows
+    # are broken, only that this run could not read them.
+    unlisted = undeterminable_classes()
+    lines += [
+        f"   # {n}: its rows could not be listed this run ({site}) - nothing "
+        "was deleted there; do NOT drop it, re-run the analysis"
+        for n, site in sorted(unlisted.items())
+    ]
+    unattributed = max(
+        0, int(total_failures) - sum(per_coll.values()) - len(unlisted))
+    if unattributed or not (names or unlisted):
         # R12-F6: failures no producer could attribute keep the placeholder
         # (with their count) rather than vanishing from the remedy.
         line = (

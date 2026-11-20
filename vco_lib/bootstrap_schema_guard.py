@@ -140,6 +140,7 @@ def entry(owners: list, *, weaviate_url: str):
         for d in sorted(items, key=lambda x: x["collection"]):
             rows = d["object_count"] if d["object_count"] is not None else "an unknown number of"
             kind = {"copy": "lossless: vectors preserved",
+                    "add_slots": "in place: nothing dropped or copied",
                     "rebuild": "drop + re-embed"}.get(d["migrate_action"], "additive")
             lines.append(f"  - `{d['collection']}` ({rows} objects): {d['reason']} → "
                          f"**{d['migrate_action']}** ({kind})")

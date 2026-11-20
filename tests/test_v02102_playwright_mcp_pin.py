@@ -279,6 +279,19 @@ class PrecacheTests(_Machine):
         self.assertEqual(outcome, "ok")
         self.assertEqual(report.entries, [])
 
+    def test_a_converged_install_runs_no_npx_at_all(self) -> None:
+        # Both the pinned package and its browser revision are on disk: the
+        # registry round trip and the installer would change nothing.
+        _npx_pkg(self.cache)
+        _install_browser(self.registry)
+        run, calls = self._runner()
+        report = DeferralReport()
+        outcome, events = self._precache(run, report)
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(calls, [])
+        self.assertEqual(report.entries, [])
+        self.assertIn("ok", [e[1] for e in events])
+
     def test_fetch_timeout_defers_and_does_not_raise(self) -> None:
         run, calls = self._runner(fetch_exc=subprocess.TimeoutExpired("npx", 900))
         report = DeferralReport()

@@ -353,11 +353,15 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_list_classes", return_value=[]), \
              mock.patch.object(project_init, "_create_class") as cmock, \
+             mock.patch.object(project_init, "_fetch_schema", return_value=None), \
+             mock.patch.object(project_init, "_count_objects", return_value=42), \
              mock.patch.object(project_init, "_copy_collection_with_vectors", return_value=42) as copmock, \
              mock.patch.object(project_init, "_delete_class") as dmock:
             result = project_init.migrate_collections(
                 self.args, dry_run=False, schema_fetcher=fetcher,
             )
+        # v0.2.107: the swap is count-gated (no pre-existing staging; source,
+        # staging and final counts all read 42 through the ONE count helper).
         # Sequence per copy action: create staging, copy old→staging,
         # delete old, create new, copy staging→new, delete staging.
         # 2 _create_class calls + 2 _copy + 2 _delete for the "copy" action.

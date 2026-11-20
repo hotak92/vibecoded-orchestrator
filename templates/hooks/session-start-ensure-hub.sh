@@ -2,6 +2,8 @@
 # Parity: kept in step with session-start-ensure-hub.ps1 (its UTF-8 BOM serves Windows
 # PowerShell 5.1 only; every behaviour must match the .ps1 sibling).
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # SessionStart hook: ensure VCO's detached services are running — vct-hub
@@ -128,7 +130,7 @@ fi
 # Reports (v0.2.104). This hook is registered ASYNC, and an async hook's plain
 # stdout is NOT handed to the session: Claude Code delivers only the JSON
 # `additionalContext` of an async hook, on the next turn (vendor hooks doc,
-# "How async hooks execute" — the same channel stop-codegraph-drain uses). A
+# "How async hooks execute"). A
 # hub that could not be found or started was therefore reported to nobody
 # (owner 2026-10-22: after a reboot the hub stayed down and a lane failed on
 # "no key found for vendor"). Every leg's report is collected here and
@@ -245,10 +247,12 @@ rm -f "$__vco_gw_err"
 #     applies to its window config BEFORE any window exists. Nothing is
 #     mapped, activated or destroyed: that sequence as a side effect is what
 #     aborted mutter and killed a whole desktop session on 2026-09-09.
-#   * NO SECOND INSTANCE — it only spawns when a process scan finds nothing,
-#     and the launcher's single-instance plugin refuses a duplicate that races
-#     it (and, seeing the flag in the duplicate's argv, does not take focus
-#     either).
+#   * NO SECOND INSTANCE — the process scan and the spawn run under one
+#     cross-process lock (vco_lib.ensure_lock, shared with the hub and gateway
+#     legs), so this hook and the folderOpen task firing together spawn ONE
+#     launcher; and a duplicate that gets through anyway exits at the
+#     launcher's per-user instance lock before any start-up work (with the
+#     flag in its argv it does not take focus either).
 #   * CHEAP — a launcher already running costs one `pgrep` and stops there.
 #   * SWITCHABLE — `launcher.session_autostart` in the launcher's Preferences →
 #     Startup, default ON. `VCT_DISABLE_LAUNCHER_AUTOSTART=1` is the env kill

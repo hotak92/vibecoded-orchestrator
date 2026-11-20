@@ -107,7 +107,10 @@ def _env(tmp_path, monkeypatch):
 
 def _emitted_nodes(captured: list) -> list:
     assert captured, "expected a retrieval event to be posted"
-    payload = json.loads(captured[0]["payload_json"])
+    # A-014: the stored vectors are compact strings; read them as the trainer does.
+    from vco_lib.rl_vector_codec import decode_event_vectors
+
+    payload = decode_event_vectors(json.loads(captured[0]["payload_json"]))
     return payload.get("nodes", [])
 
 
@@ -190,7 +193,8 @@ def test_mcp_path_with_vector_is_noop(_env, monkeypatch):
     )
     assert ok is True
     nodes = _emitted_nodes(captured)
-    assert nodes[0].get("emb") == [0.9] * 8, "existing vector must be preserved"
+    # Half-float storage (A-014): 0.9 comes back within its precision.
+    assert nodes[0].get("emb") == pytest.approx([0.9] * 8, abs=1e-3), "existing vector must be preserved"
     assert not fake.calls, "recovery must NOT re-embed a node that already has n_emb"
 
 

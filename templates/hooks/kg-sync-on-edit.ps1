@@ -21,11 +21,8 @@ $PSScriptRootLocal = $PSScriptRoot
 $LibDir = Join-Path $PSScriptRootLocal "_lib"
 
 # (b) Scrub sensitive env BEFORE spawning any subprocess.
-$ScrubLib = Join-Path $LibDir "scrub-env.ps1"
-if (Test-Path $ScrubLib) {
-    . $ScrubLib
-    Invoke-VctScrubSecretEnv
-} else {
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
     foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
         if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
     }
@@ -33,11 +30,12 @@ if (Test-Path $ScrubLib) {
 
 # (a) Guard.
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # Read the untrusted JSON payload from stdin.
 $HookStdin = ""
 try {
-    $HookStdin = [Console]::In.ReadToEnd()
+    $HookStdin = Read-VcoHookStdin
 } catch {
     exit 0
 }

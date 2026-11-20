@@ -137,8 +137,8 @@ expect 1+ results with `path:` and `name:` fields.
 
 **If red** (no results): bootstrap once with
 `.claude/scripts/code-graph-analyze . --project "<name>"`. Incremental
-updates happen via the `code-graph-incremental` PostToolUse hook on
-every file edit.
+updates happen when the main checkout's HEAD moves (the HEAD catch-up the
+`Stop`/`SessionStart` hook `stop-codegraph-drain` spawns).
 
 ---
 

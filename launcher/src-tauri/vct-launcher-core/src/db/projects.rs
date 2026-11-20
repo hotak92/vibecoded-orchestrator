@@ -9,6 +9,26 @@ use super::models::{ProjectHost, ProjectRow};
 use super::slug::{slugify, unique_slug};
 use super::Db;
 
+/// `Err` when `rl_events` still has a foreign key to `projects` (see
+/// [`Db::delete_project`]): migration 053 removes it on every launcher.db
+/// whose clause reads as migration 025 wrote it.
+fn refuse_if_rl_events_cascade(conn: &rusqlite::Connection) -> Result<(), String> {
+    let fks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('rl_events') WHERE \"table\" = 'projects'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("delete: read rl_events foreign keys: {}", e))?;
+    if fks > 0 {
+        return Err("delete refused: rl_events still has a foreign key to projects (launcher.db \
+                    migration 053 did not remove it), so removing the project would delete \
+                    its RL training events too"
+            .to_string());
+    }
+    Ok(())
+}
+
 impl Db {
     /// Generate a unique slug for the given project name. Pure helper —
     /// does NOT modify any rows. Caller passes the result to `insert_project`.
@@ -218,12 +238,89 @@ impl Db {
         Ok(())
     }
 
+    /// Delete the project row. Its rows in the per-project tables go with it
+    /// (their `ON DELETE CASCADE`); its RL training events STAY (audit A-022,
+    /// owner ruling): since migration 053 `rl_events` has no foreign key to
+    /// `projects`, so the rows keep their project_id and project_name and are
+    /// still found by that id. Use [`Self::delete_project_and_rl_events`] when
+    /// the user asked for the events to go too.
+    ///
+    /// Refuses (and deletes nothing) when `rl_events` still carries a foreign
+    /// key to `projects` — migration 053 found the clause in an unexpected
+    /// form and left it — because the delete would then remove every event
+    /// of the project the caller meant to keep.
     pub fn delete_project(&self, id: &str) -> Result<(), String> {
         let guard = self.lock();
+        refuse_if_rl_events_cascade(&guard)?;
         guard
             .execute("DELETE FROM projects WHERE id = ?1", params![id])
             .map_err(|e| format!("delete: {}", e))?;
         Ok(())
+    }
+
+    /// The refusal [`Self::delete_project`] makes, on its own: `Err` (same
+    /// message) while `rl_events` still has its foreign key to `projects`.
+    /// The unregister asks it FIRST, before it purges files or drops
+    /// collections, so a refusal leaves the project fully registered and
+    /// untouched (wave-2 check L-3); `delete_project` keeps its own check
+    /// for every other caller.
+    pub fn refuse_if_project_delete_cascades_rl_events(&self) -> Result<(), String> {
+        refuse_if_rl_events_cascade(&self.lock())
+    }
+
+    /// How many RL training events carry this project_id — what the unregister
+    /// panel names ("Also delete this project's N RL training events").
+    /// Counted on the `(project_id, ts)` index; payloads are not read.
+    pub fn count_project_rl_events(&self, project_id: &str) -> Result<u64, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT COUNT(*) FROM rl_events WHERE project_id = ?1",
+                params![project_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n.max(0) as u64)
+            .map_err(|e| format!("count project rl_events: {}", e))
+    }
+
+    /// Delete at most `limit` of this project's RL training events, in one
+    /// short transaction, and return how many went. The unregister calls it
+    /// in a loop, releasing the connection between batches, so deleting a
+    /// large corpus never holds the launcher's one DB connection for long.
+    /// 0 = none left.
+    pub fn delete_project_rl_events_batch(&self, project_id: &str, limit: usize) -> Result<u64, String> {
+        let limit = limit.max(1) as i64;
+        let guard = self.lock();
+        guard
+            .execute(
+                "DELETE FROM rl_events WHERE id IN (
+                     SELECT id FROM rl_events WHERE project_id = ?1 LIMIT ?2
+                 )",
+                params![project_id, limit],
+            )
+            .map(|n| n as u64)
+            .map_err(|e| format!("delete project rl_events batch: {}", e))
+    }
+
+    /// Delete the project row AND whatever RL training events of it are still
+    /// there, in one transaction. The caller has already removed the bulk with
+    /// [`Self::delete_project_rl_events_batch`]; what is left here is what the
+    /// hub wrote since the last batch, so this transaction stays short. Once
+    /// the row is gone the writer refuses the id (`insert_rl_event`), so no
+    /// event of the project can arrive afterwards. Returns the events deleted
+    /// in this last step.
+    pub fn delete_project_and_rl_events(&self, id: &str) -> Result<u64, String> {
+        let mut guard = self.lock();
+        let tx = guard
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("delete: begin: {}", e))?;
+        let events = tx
+            .execute("DELETE FROM rl_events WHERE project_id = ?1", params![id])
+            .map_err(|e| format!("delete project rl_events: {}", e))? as u64;
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![id])
+            .map_err(|e| format!("delete: {}", e))?;
+        tx.commit().map_err(|e| format!("delete: commit: {}", e))?;
+        Ok(events)
     }
 
     // ─── folder_missing_at_last_boot (migration 030, v0.2.49 Phase 6 S-4) ─
@@ -818,7 +915,9 @@ impl Db {
                          status = 'pending',
                          started_at = excluded.started_at,
                          finished_at = NULL,
-                         error_message = NULL",
+                         error_message = NULL,
+                         pending_mode = NULL,
+                         pending_requeues = 0",
                     params![project_id, now],
                 ) {
                     Ok(_) => report.codegraph_enqueued = true,
@@ -2007,4 +2106,139 @@ mod move_tests {
         assert_eq!(live[0].id, "mv2");
     }
 
+}
+
+// ─── A-022: a project's RL training events outlive its delete ─────────────
+//
+// Default: `delete_project` keeps them (named, still found by the old id).
+// Explicit: `delete_project_rl_events_batch` + `delete_project_and_rl_events`
+// remove them in bounded batches. Each destructive branch is tested for both
+// the act and the leave-alone.
+#[cfg(test)]
+mod rl_events_on_delete_tests {
+    use super::*;
+
+    fn seed(db: &Db, id: &str, name: &str) {
+        db.insert_project(id, name, &format!("/w/{id}"), ProjectHost::Base, id)
+            .expect("insert project");
+    }
+
+    fn event(db: &Db, pid: Option<&str>, name: Option<&str>, task: &str) -> Result<i64, String> {
+        db.insert_rl_event("retrieval", 3, 1, pid, name, task, None, None, None, None, "{}")
+    }
+
+    fn rows(db: &Db, pid: &str) -> Vec<(String, Option<String>)> {
+        let g = db.lock();
+        let mut st = g
+            .prepare("SELECT task_id, project_name FROM rl_events WHERE project_id = ?1 ORDER BY id")
+            .unwrap();
+        st.query_map(params![pid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn delete_project_keeps_its_rl_events_with_the_project_name() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", "Alpha");
+        event(&db, Some("p1"), None, "t-unnamed").unwrap();
+        event(&db, Some("p1"), Some("writer-name"), "t-named").unwrap();
+        assert_eq!(db.count_project_rl_events("p1").unwrap(), 2);
+
+        db.delete_project("p1").unwrap();
+
+        assert!(db.get_project("p1").unwrap().is_none(), "the row is gone");
+        assert_eq!(
+            rows(&db, "p1"),
+            vec![
+                ("t-unnamed".to_string(), Some("Alpha".to_string())),
+                ("t-named".to_string(), Some("writer-name".to_string())),
+            ],
+            "every event stays, named (the writer filled the unnamed one)"
+        );
+    }
+
+    /// The hub's 422 `unknown_project_id` contract survives the FK removal:
+    /// an unknown id is refused with "FOREIGN KEY" in the error, and nothing
+    /// is written — before registration and after an unregister alike.
+    #[test]
+    fn insert_refuses_an_unregistered_project_id() {
+        let db = Db::open_in_memory().unwrap();
+        let e = event(&db, Some("ghost"), Some("x"), "t1").unwrap_err();
+        assert!(e.contains("FOREIGN KEY"), "{e}");
+        assert_eq!(db.count_project_rl_events("ghost").unwrap(), 0);
+
+        seed(&db, "p1", "Alpha");
+        event(&db, Some("p1"), None, "t2").unwrap();
+        db.delete_project("p1").unwrap();
+        let e = event(&db, Some("p1"), None, "t3").unwrap_err();
+        assert!(e.contains("FOREIGN KEY"), "{e}");
+        assert_eq!(db.count_project_rl_events("p1").unwrap(), 1, "only the pre-delete event");
+        // Free-tier rows (no project id) still land.
+        event(&db, None, Some("slug"), "t4").unwrap();
+    }
+
+    #[test]
+    fn batched_delete_removes_only_that_projects_events_in_bounded_batches() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", "Alpha");
+        seed(&db, "p2", "Beta");
+        for i in 0..7 {
+            event(&db, Some("p1"), None, &format!("a{i}")).unwrap();
+        }
+        event(&db, Some("p2"), None, "b0").unwrap();
+        event(&db, None, Some("free"), "f0").unwrap();
+
+        let mut batches = Vec::new();
+        loop {
+            let n = db.delete_project_rl_events_batch("p1", 3).unwrap();
+            if n == 0 {
+                break;
+            }
+            batches.push(n);
+        }
+        assert_eq!(batches, vec![3, 3, 1], "never more than the batch size");
+        assert_eq!(db.count_project_rl_events("p1").unwrap(), 0);
+        assert!(db.get_project("p1").unwrap().is_some(), "batches leave the row");
+
+        // A straggler written after the last batch goes with the row.
+        event(&db, Some("p1"), None, "late").unwrap();
+        assert_eq!(db.delete_project_and_rl_events("p1").unwrap(), 1);
+        assert!(db.get_project("p1").unwrap().is_none());
+        assert_eq!(db.count_project_rl_events("p1").unwrap(), 0);
+
+        // Leave-alone: the other project's and the free-tier events stay.
+        assert_eq!(db.count_project_rl_events("p2").unwrap(), 1);
+        let free: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM rl_events WHERE project_id IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(free, 1);
+    }
+
+    /// If the cascade FK is still on rl_events (migration 053 did not find
+    /// the clause), the keep-by-default delete refuses instead of deleting
+    /// the events with the row.
+    #[test]
+    fn delete_project_refuses_while_rl_events_would_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", "Alpha");
+        event(&db, Some("p1"), None, "t1").unwrap();
+        db.lock()
+            .execute_batch(
+                "PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = replace(sql,
+                   'CONSTRAINT rl_events_outlive_their_project CHECK (1)',
+                   'FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE')
+                  WHERE type = 'table' AND name = 'rl_events';
+                 PRAGMA writable_schema = RESET;",
+            )
+            .unwrap();
+
+        let e = db.delete_project("p1").unwrap_err();
+        assert!(e.contains("migration 053"), "{e}");
+        assert!(db.get_project("p1").unwrap().is_some(), "nothing deleted");
+        assert_eq!(db.count_project_rl_events("p1").unwrap(), 1);
+    }
 }

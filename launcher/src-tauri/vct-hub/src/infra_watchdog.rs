@@ -27,6 +27,11 @@
 //! deliberately paused or adopted it, and only when the user's global
 //! auto-restart toggle is still enabled.
 //!
+//! The same tick also runs [`crate::mcp_liveness`] (v0.2.107): it ends a VCO
+//! stdio MCP server that is alive with a stale heartbeat, so its client
+//! (Claude Code) sees EOF and starts a fresh one. It is part of this tick —
+//! one scheduler — and follows the same opt-out and auto-restart toggle.
+//!
 //! ## Guard rails (the watchdog must never fight a deliberate decision)
 //!
 //! A tick is SKIPPED entirely when the user disabled auto-restart
@@ -1366,6 +1371,11 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
     // `watchdog_gave_up` row stays true until each one is seen running.
     let mut gave_up: BTreeMap<String, GaveUp> = BTreeMap::new();
 
+    // v0.2.107: heartbeat files a previous tick found stale (see
+    // `crate::mcp_liveness`), kept across ticks for its time-based
+    // confirmation (`CONFIRM_SECS`, whatever this loop's interval).
+    let mut mcp_suspects: crate::mcp_liveness::Suspects = HashMap::new();
+
     let base = config.interval.as_secs().max(1);
 
     loop {
@@ -1374,10 +1384,15 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
         // CONCERN-4: honor the user's auto-restart toggle. When disabled,
         // skip the whole tick (no probes, no restarts) so the hub watchdog
         // and the launcher's own watcher are governed by ONE switch and
-        // never race with different give-up budgets.
+        // never race with different give-up budgets. The same switch covers
+        // ending hung MCP servers below: it is the user's "heal" toggle.
         if !watcher_enabled(&db) {
             continue;
         }
+
+        // Before the container tick, which returns early when no container
+        // runtime is reachable: a hung MCP server needs no runtime to end.
+        mcp_suspects = crate::mcp_liveness::sweep_tick(mcp_suspects).await;
 
         // One tick is fully soft-failed inside (CONCERN-6): every DB read
         // the tick performs goes through a poison-TOLERANT accessor

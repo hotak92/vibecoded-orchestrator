@@ -620,7 +620,8 @@ class ExitZeroIsNotProofTests(unittest.TestCase):
                     / "analyze_code_graph.py").read_text(encoding="utf-8")
         self.assertIn(
             '_deferral_op("record_successful_walk", deferral_root, '
-            'args.force_recreate, bool(_stamped))', analyzer,
+            'args.force_recreate, bool(_stamped), '
+            'None if args.as_extra_path else repo_path)', analyzer,
             "the analyzer must CALL its clear on the success path "
             "(v0.2.95 F1: composed with the chunker-resync half-stamp under "
             "`record_successful_walk`, which performs the same clear)",
@@ -840,7 +841,10 @@ class DriverHardeningTests(unittest.TestCase):
                 folder, condition_ids=[KG_CID],
                 backend_probe=lambda f, k: True, runner=runner,
             )
-        self.assertEqual([r.status for r in results], [deferral_retry.SKIPPED])
+        # v0.2.107: QUEUED — the work stays in the machine queue and no
+        # attempt is consumed (an already-running pre-0.2.107 driver is
+        # harmless: the worker waits for it instead of running beside it).
+        self.assertEqual([r.status for r in results], [deferral_retry.QUEUED])
         self.assertIn("already running", results[0].detail)
         self.assertEqual(runner.calls, [], "nothing may be spawned")
 
@@ -910,6 +914,46 @@ class SessionStartTriggerTests(unittest.TestCase):
                 )
                 spawn.assert_called_once()
 
+    def test_no_driver_is_spawned_when_every_owed_condition_is_capped(self):
+        """A driver whose every condition is at the attempt cap only logs
+        "attempt cap reached" and exits — one interpreter start and one log
+        file per session start, forever. The owed list is still returned (the
+        hook prints it); only the pointless spawn is skipped. One condition
+        below the cap is enough to spawn."""
+        with TemporaryDirectory() as td:
+            folder = Path(td)
+            capped = {KG_CID: deferral_retry.MAX_ATTEMPTS, "other_cid": 99}
+            with mock.patch.object(deferral_retry, "owed_condition_ids",
+                                   return_value=[KG_CID, "other_cid"]), \
+                 mock.patch.object(deferral_retry, "attempt_count",
+                                   side_effect=lambda _f, cid: capped[cid]), \
+                 mock.patch.object(deferral_retry, "spawn_detached") as spawn:
+                self.assertEqual(
+                    deferral_retry.session_start_owed_check(folder),
+                    [KG_CID, "other_cid"],
+                )
+                spawn.assert_not_called()
+
+            capped["other_cid"] = deferral_retry.MAX_ATTEMPTS - 1
+            with mock.patch.object(deferral_retry, "owed_condition_ids",
+                                   return_value=[KG_CID, "other_cid"]), \
+                 mock.patch.object(deferral_retry, "attempt_count",
+                                   side_effect=lambda _f, cid: capped[cid]), \
+                 mock.patch.object(deferral_retry, "spawn_detached") as spawn:
+                deferral_retry.session_start_owed_check(folder)
+                spawn.assert_called_once()
+
+    def test_an_unreadable_attempt_trail_still_spawns(self):
+        """Could-not-count is not "capped": the driver decides for itself."""
+        with TemporaryDirectory() as td:
+            with mock.patch.object(deferral_retry, "owed_condition_ids",
+                                   return_value=[KG_CID]), \
+                 mock.patch.object(deferral_retry, "attempt_count",
+                                   side_effect=RuntimeError("boom")), \
+                 mock.patch.object(deferral_retry, "spawn_detached") as spawn:
+                deferral_retry.session_start_owed_check(Path(td))
+                spawn.assert_called_once()
+
     def test_a_failed_spawn_never_raises_into_the_hook(self):
         with TemporaryDirectory() as td:
             with mock.patch.object(deferral_retry, "owed_condition_ids",
@@ -933,11 +977,14 @@ class SessionStartTriggerTests(unittest.TestCase):
                 captured["kwargs"] = kwargs
 
         with TemporaryDirectory() as td:
-            with mock.patch("subprocess.Popen", _FakePopen):
+            with mock.patch("subprocess.Popen", _FakePopen), \
+                 mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(Path(td) / "state")}):
                 ok = deferral_retry.spawn_detached(Path(td), python="/py")
         self.assertTrue(ok)
+        # v0.2.107: the session start queues the project and starts the
+        # machine's ONE owed-work worker — never a per-project driver.
         self.assertEqual(
-            captured["argv"][:4], ["/py", "-m", "vco_lib.deferral_retry", "--folder"],
+            captured["argv"][:4], ["/py", "-m", "vco_lib.owed_work", "worker"],
         )
         if os.name == "posix":
             self.assertTrue(captured["kwargs"]["start_new_session"])

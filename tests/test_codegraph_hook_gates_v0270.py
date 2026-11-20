@@ -200,33 +200,23 @@ def test_pretooluse_has_read_and_grep_codegraph_branches() -> None:
     )
 
 
-def test_post_file_edit_resync_fires_on_code_edit() -> None:
-    """Surface 3 (resync): v0.2.73 (FIX-B) moved the per-edit 'code' debounce to
-    the END-OF-TURN batched drain. post-file-edit.sh now only APPENDS each code
-    edit to the drain queue; the drain (stop-codegraph-drain.sh) resolves the
-    code_graph_collection_prefix per canonical root and runs the analyzer batch.
-    """
+def test_code_edits_reach_the_graph_only_through_their_commit() -> None:
+    """Surface 3 (resync), v0.2.107 CG-3: an edit queues NOTHING for the code
+    graph — post-file-edit still delegates to the ONE routing home (KG/docs
+    sync + the edit reminder), and the Stop/SessionStart hook spawns only the
+    HEAD catch-up, which runs the analyzer over a commit range. (Behavioural
+    proof: tests/test_v02107_cg3_committed_graph.py.)"""
     pfe = (HOOKS / "post-file-edit.sh").read_text(encoding="utf-8")
-    # v0.2.95 (lane F10): the append moved into the ONE routing home that
-    # post-file-edit.sh and post-bash-file-sh both call, so a CLI write reaches
-    # the drain queue too. The hook must still delegate; the lib must still
-    # append. (The behavioural end-to-end proof lives in
-    # tests/test_v0295_bash_write_sync.py.)
     assert "vco_route_touched_path" in pfe, (
         "post-file-edit.sh must delegate routing to _lib/route-touched-path.sh"
     )
     route_lib = (HOOKS / "_lib" / "route-touched-path.sh").read_text(encoding="utf-8")
-    assert "codegraph_drain_" in route_lib, (
-        "the routing home must append code edits to the codegraph drain queue"
+    assert "codegraph_drain_" not in route_lib, (
+        "the routing home must not append code edits to a code-graph queue"
     )
-    # The DRAIN now owns the prefix resolution for the code-graph write target.
     drain = (HOOKS / "stop-codegraph-drain.sh").read_text(encoding="utf-8")
-    assert "code_graph_collection_prefix" in drain, (
-        "stop-codegraph-drain.sh must resolve the codegraph prefix for the batch"
-    )
-    assert "--only-files-from" in drain, (
-        "the drain must run the analyzer in batched multi-file mode"
-    )
+    assert "vco_lib.codegraph_head_catchup" in drain
+    assert "--only-files-from" not in drain, "the hook runs no analyzer batch itself"
 
 
 # --------------------------------------------------------------------------

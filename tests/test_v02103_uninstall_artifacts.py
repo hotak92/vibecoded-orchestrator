@@ -385,3 +385,72 @@ def test_a_vco_file_behind_a_junction_is_reported_left_not_dropped(tmp_path, mon
     plan = ua.build_plan(os_name="Linux", home=tmp_path / "home", vct_root=root, env={})
     assert any(junction == p or junction in p.parents for p, _why in plan.keep)
     assert "[skip]" not in "\n".join(ua.plan_lines(plan))
+
+
+# ── v0.2.107 wave-2 check L-7: the launcher instance lock + MCP heartbeats ──
+
+
+def test_launcher_instance_names_match_the_rust_launcher():
+    """The names are mirrored from the Rust launcher (it takes the lock before
+    any interpreter runs); this pins them to ``instance_lock.rs``."""
+    import re
+
+    src = (REPO / "launcher" / "src-tauri" / "src" / "instance_lock.rs").read_text(encoding="utf-8")
+    found = [re.search(rf'const {name}: &str = "([^"]+)";', src)
+             for name in ("LOCK_BASENAME", "READY_BASENAME")]
+    assert all(found), "instance_lock.rs no longer declares both basenames"
+    rust = tuple(m.group(1) for m in found if m)
+    assert rust == ua.LAUNCHER_INSTANCE_FILES
+
+
+def test_heartbeat_records_and_launcher_lock_are_removed_foreign_files_kept(tmp_path, monkeypatch):
+    """ACT + LEAVE-ALONE: the MCP heartbeat records (at the path the writer
+    uses) and the launcher's instance lock + ready marker go; a foreign file
+    in run/mcp stays, and so does the folder holding it."""
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path / "vct"))
+    from vco_lib import mcp_stdio_lifetime as lt
+    from vco_lib import paths
+
+    root = paths.vct_root_dir()
+    beats = lt.heartbeat_dir()
+    assert beats == lt.heartbeat_dir(root)
+    beats.mkdir(parents=True)
+    records = [beats / "101.json", beats / "202.json"]
+    for r in records:
+        r.write_text("{}")
+    foreign = beats / "notes.txt"
+    foreign.write_text("user's own file")
+    (root / "state").mkdir(parents=True)
+    locks = [root / "state" / n for n in ua.LAUNCHER_INSTANCE_FILES]
+    for f in locks:
+        f.write_text("")
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "h", vct_root=root, env={})
+    planned = {r.path for r in plan.remove}
+    assert set(records + locks) <= planned
+    assert foreign not in planned
+    ua.execute(plan, hub_running=lambda: False)
+    assert not any(p.exists() for p in records + locks)
+    assert foreign.is_file() and beats.is_dir()
+
+
+def test_an_emptied_heartbeat_dir_and_its_run_parent_are_pruned(tmp_path):
+    root = tmp_path / "vct"
+    beats = root / "run" / "mcp"
+    beats.mkdir(parents=True)
+    (beats / "7.json").write_text("{}")
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "h", vct_root=root, env={})
+    ua.execute(plan, hub_running=lambda: False)
+    assert not (root / "run").exists()
+
+
+def test_a_heartbeat_dir_behind_a_junction_is_reported_not_followed(tmp_path, monkeypatch):
+    root = tmp_path / "vct"
+    beats = root / "run" / "mcp"
+    beats.mkdir(parents=True)
+    (beats / "7.json").write_text("{}")
+    junction = root / "run"
+    real = ua._is_reparse
+    monkeypatch.setattr(ua, "_is_reparse", lambda p: p == junction or real(p))
+    plan = ua.build_plan(os_name="Linux", home=tmp_path / "h", vct_root=root, env={})
+    assert not [r.path for r in plan.remove if junction in r.path.parents]
+    assert any(p == beats for p, _why in plan.keep)

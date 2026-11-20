@@ -34,6 +34,8 @@
 
 # Scrub sensitive env vars before any subprocess spawning
 # (list MUST MATCH _lib/scrub-env.sh; enforced by the scrub parity gate).
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
@@ -82,9 +84,9 @@ AGENT_ID="$PARSED"
 # WorktreeCreate runs before SubagentStart) is reconciled from that
 # worktree's git state, so the shared-tree hash snapshot is neither needed
 # nor its evidence: skip it. That removes the whole synchronous walk (up to
-# 50 000 files) from every isolated launch. The hook carries no explicit
-# registered timeout any more (harness default), so a slow walk for a
-# shared-tree agent finishes instead of being killed. MUST MATCH the .ps1.
+# 50 000 files) from every isolated launch. The hook's registered timeout is
+# 600 s (the harness default, stated explicitly since v0.2.107), so a slow
+# walk for a shared-tree agent finishes instead of being killed. MUST MATCH the .ps1.
 _SKIP_SNAPSHOT=0
 if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     # shellcheck source=_lib/worktree-records.sh disable=SC1091

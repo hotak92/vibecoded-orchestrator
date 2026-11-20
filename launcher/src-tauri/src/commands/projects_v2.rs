@@ -14,7 +14,6 @@ use crate::commands::installer::{detect_system, find_local_repo_root};
 use crate::commands::kg_summary;
 use crate::commands::kg_sync;
 use crate::commands::project_env_settings;
-use crate::db::code_graph_builds::status as build_status;
 use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
@@ -142,6 +141,19 @@ pub struct UpdateSummary {
     /// `kg_docs_content_changed`.
     #[serde(default)]
     pub kg_or_docs_content_changed: bool,
+    /// v0.2.107 (A-015): the changed paths the KG sync ingests, as the
+    /// envelope names them (`kg_content_changed_paths`). Empty for an older
+    /// envelope or when nothing the sync reads changed. Feeds the "why was a
+    /// sync queued" notice.
+    #[serde(default)]
+    pub kg_content_changed_paths: Vec<String>,
+    /// v0.2.107 (CGWRITE-03): which side walks the code graph after this
+    /// update, as the envelope says (`change_detect::envelope_codegraph_walk`).
+    #[serde(default)]
+    pub codegraph_walk: BundleCodegraphWalk,
+    /// Reason text for an owed walk (the rung that owes it), when known.
+    #[serde(default)]
+    pub codegraph_walk_reason: Option<String>,
 }
 
 impl UpdateSummary {
@@ -169,6 +181,7 @@ impl UpdateSummary {
         // nodes, which are the user's data and kept BY DESIGN — not "your edits
         // kept (backup failed)". The engine names them in `knowledge_kept` (the
         // knowledge/code split has one home, Python's `_is_knowledge_dest`).
+        let codegraph_walk = envelope_codegraph_walk(v);
         let knowledge_kept = v
             .get("knowledge_kept")
             .and_then(|x| x.as_array())
@@ -191,7 +204,12 @@ impl UpdateSummary {
                 .unwrap_or(0),
             // v0.2.71 Piece 5b: the inspector is conservative on an
             // unparseable/unexpected `actions` shape (returns true → spawn).
-            kg_or_docs_content_changed: envelope_kg_or_docs_content_changed(v),
+            // v0.2.107 (A-015): the envelope's own statement wins when it
+            // carries one; the path rule is the old-envelope fallback.
+            kg_or_docs_content_changed: envelope_kg_content_changed(v),
+            kg_content_changed_paths: envelope_kg_content_changed_paths(v),
+            codegraph_walk: codegraph_walk.0,
+            codegraph_walk_reason: codegraph_walk.1,
         }
     }
 
@@ -813,6 +831,10 @@ pub(crate) fn create_setup_phases(
                 // always spawns the first-time index). Pass `true` to document
                 // intent — a fresh project's pre-existing KG/docs must be synced.
                 /* kg_or_docs_content_changed */ true,
+                // No update envelope on create; its notices are not shown
+                // (a create reports through the setup banner).
+                None,
+                &mut Vec::new(),
             )
             .await;
             for w in post {
@@ -855,7 +877,8 @@ pub(crate) fn create_setup_phases(
 /// forensic trail from prior race-condition fixes:
 ///   1. populate_project_state_from_filesystem (post-bundle re-walk)
 ///   2. seed_enabled_rows_for_new_project (global modules → this project)
-///   3. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
+///   3. codegraph::spawn_build — needs bundle's analyzer wrapper (v0.2.107:
+///      only the pass `decide_post_bundle_codegraph_pass` decided, if any)
 ///   4. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
 ///   5. kg_summary::spawn_initial_summary — needs bundle's summary script
 ///
@@ -872,9 +895,17 @@ pub(crate) fn create_setup_phases(
 ///
 /// **`is_initial_create`** discriminator: on first create, no
 /// pre-existing per-project code-graph rows can be stale, so the
-/// codegraph spawn passes `prune_stale=false`. On update, prior rows
-/// may reference files the user deleted between create and update, so
-/// the spawn passes `prune_stale=true`.
+/// codegraph spawn is a full pass with `prune_stale=false`. On update
+/// (v0.2.107) the pass is DECIDED, not assumed: nothing when HEAD equals
+/// the recorded commit and nothing is owed; `--incremental --since-commit`
+/// when HEAD moved (deleted files' rows go through the git prune); one
+/// full pass with `--prune-stale` (plus `--force-rewalk` when a forced walk
+/// is owed) otherwise; and nothing when the bundle step's own driver walks.
+///
+/// **`bundle` / `notices`** (v0.2.107): the update envelope's facts
+/// (`UpdateSummary::codegraph_walk`, `kg_content_changed_paths`) and the
+/// channel the "what was queued and why, or that nothing was needed" lines
+/// ride to the toast and the Update-all report. `None` on create.
 ///
 /// **`kg_or_docs_content_changed`** (v0.2.71 Piece 5b): gates step 5
 /// (kg-sync spawn) on UPDATE. On create it is ignored (a fresh project's
@@ -917,6 +948,8 @@ pub(crate) async fn apply_post_bundle_steps(
     db: &Db,
     is_initial_create: bool,
     kg_or_docs_content_changed: bool,
+    bundle: Option<&UpdateSummary>,
+    notices: &mut Vec<String>,
 ) -> Vec<String> {
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
     // launcher.db, instead of `no such table` from the stand-in connection.
@@ -1082,37 +1115,78 @@ pub(crate) async fn apply_post_bundle_steps(
         spawn_root_identity_sweep(app, db, project_id, project_name);
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let prune_stale = !is_initial_create;
+    // v0.2.107 (UPDATE-ALL, A-016 / CGWRITE-03): DECIDE before queueing. Was:
+    // every update queued a full pass with prune, unconditionally, beside the
+    // Python step's own detached walk. Now ONE decision —
+    // `codegraph::decide_post_bundle_codegraph_pass` — reads the envelope's
+    // walk facts (driver already walking / forced walk handed to us), the last
+    // build row, the recorded commit and HEAD, and starts at most one pass:
+    // none, incremental since the recorded commit, or one full (forced) walk.
     // Root-update: skip both the pending-row insert and the spawn (no
     // dangling PENDING pill in the GUI for a build that will never run).
     if !is_orchestrator_root_update {
-        if let Err(e) = db.upsert_code_graph_build(
-            project_id,
-            build_status::PENDING,
-            Some(now),
-            None,
-            None,
-            0,
-            None,
-            false,
-            None,
-            None,
-        ) {
-            tracing::warn!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
+        let (walk, walk_reason) = bundle
+            .map(|b| (b.codegraph_walk.clone(), b.codegraph_walk_reason.clone()))
+            .unwrap_or_default();
+        let last_build = codegraph::classify_last_build(
+            db.get_code_graph_build(project_id).ok().flatten().as_ref(),
+            now,
+            kg_sync::heartbeat_stale_secs(),
+        );
+        let recorded_commit = db
+            .get_project_codegraph_binding(project_id)
+            .ok()
+            .flatten()
+            .and_then(|b| b.last_analyzed_commit);
+        // git is asked only when the cheap legs leave the decision open.
+        let git = if is_initial_create
+            || walk != BundleCodegraphWalk::NotOwed
+            || !matches!(last_build, codegraph::LastBuild::Completed)
+        {
+            codegraph::GitFacts::default()
         } else {
-            codegraph::spawn_initial_build(
-                app.clone(),
-                project_id.to_string(),
-                project_name.to_string(),
-                folder_path_str.clone(),
-                // First-time builds for a freshly-created project: no
-                // pre-existing per-project code-graph rows can possibly
-                // be stale, so --prune-stale is a no-op here. Pass false
-                // explicitly to avoid the iterator-then-delete pass.
-                // Re-builds (update path) set this to `true` to reap
-                // rows referencing files the user deleted post-create.
-                prune_stale,
-            );
+            codegraph::probe_git_facts(folder, recorded_commit.as_deref()).await
+        };
+        let pass = codegraph::decide_post_bundle_codegraph_pass(
+            is_initial_create,
+            &walk,
+            walk_reason.as_deref(),
+            &last_build,
+            recorded_commit.as_deref(),
+            &git,
+        );
+        tracing::info!("[vct] code-graph decision for {}: {:?}", project_id, pass);
+        if !is_initial_create {
+            notices.push(codegraph::codegraph_pass_notice(&pass));
+        }
+        if let codegraph::CodegraphPass::Run { mode, .. } = pass {
+            // v0.2.107 (U-1): an UPDATE's decided shape is stored with the
+            // pending row, so a launcher restart before the pass finishes
+            // resumes it with that shape (a forced walk keeps --force-rewalk)
+            // instead of a plain full pass. A first create stores none: its
+            // resume (and its crash handling) stay as they were.
+            let stored_mode =
+                (!is_initial_create).then(|| codegraph::encode_pending_mode(&mode));
+            if let Err(e) =
+                db.queue_code_graph_build_with_mode(project_id, now, stored_mode.as_deref())
+            {
+                tracing::warn!(
+                    "[vct] warning: could not queue code-graph build for {}: {}",
+                    project_id, e
+                );
+            } else {
+                // First create: `Full { prune_stale: false }` — no row can be
+                // stale yet. Update: whatever the decision chose (a full pass
+                // reaps rows of deleted files with --prune-stale; an
+                // incremental pass removes them through --since-commit).
+                codegraph::spawn_build(
+                    app.clone(),
+                    project_id.to_string(),
+                    project_name.to_string(),
+                    folder_path_str.clone(),
+                    mode,
+                );
+            }
         }
     }
 
@@ -1232,6 +1306,14 @@ pub(crate) async fn apply_post_bundle_steps(
     if let Some(msg) = kg_sync_decision_warning(&kg_decision) {
         tracing::warn!("[vct] {} ({})", msg, project_id);
         warnings.push(msg);
+    }
+    // v0.2.107 (UPDATE-ALL): the update's notices say what was queued and why,
+    // or that nothing was needed (one line; a warned decision has no notice).
+    if !is_initial_create {
+        let paths = bundle.map(|b| b.kg_content_changed_paths.as_slice()).unwrap_or(&[]);
+        if let Some(line) = kg_sync_decision_notice(&kg_decision, paths) {
+            notices.push(line);
+        }
     }
     if let KgSyncDecision::Spawn(reason) = &kg_decision {
         match reason {
@@ -1950,6 +2032,13 @@ async fn run_install_bundle_core(
     cmd.args(&argv)
         .current_dir(&vco_lib_root)
         .stdin(std::process::Stdio::null());
+    // v0.2.107 (UPDATE-ALL, CGWRITE-03): ONE walk per project. When this
+    // launcher's post-bundle step will run the project's code-graph build, the
+    // Python step hands an owed forced walk to it instead of spawning its own
+    // detached driver (`codegraph_extractor_generation.WALK_OWNER_ENV`).
+    if launcher_owns_codegraph_walk(mode, folder, &vco_lib_root) {
+        cmd.env(CODEGRAPH_WALK_OWNER_ENV, CODEGRAPH_WALK_OWNER_LAUNCHER);
+    }
 
     #[cfg(windows)]
     {
@@ -2030,6 +2119,25 @@ async fn run_install_bundle_core(
         }
     }
     (warnings, summary)
+}
+
+/// Env var + value that hand an owed code-graph walk from the Python bundle
+/// step to this launcher. MUST MATCH `WALK_OWNER_ENV` / `WALK_OWNER_LAUNCHER`
+/// in `vco_lib/codegraph_extractor_generation.py`.
+pub(crate) const CODEGRAPH_WALK_OWNER_ENV: &str = "VCT_CODEGRAPH_WALK_OWNER";
+pub(crate) const CODEGRAPH_WALK_OWNER_LAUNCHER: &str = "launcher";
+
+/// PURE: does this launcher run the post-bundle code-graph build of `folder`?
+/// Update mode only (a create builds anyway; a re-added project whose old
+/// graph is owed a forced walk keeps today's Python driver), and never the
+/// orchestrator root (install.py's resync owns its walk — the same
+/// `is_orchestrator_root_folder` test `apply_post_bundle_steps` applies).
+pub(crate) fn launcher_owns_codegraph_walk(
+    mode: BundleMode,
+    folder: &Path,
+    orchestrator_root: &Path,
+) -> bool {
+    mode == BundleMode::Update && !is_orchestrator_root_folder(folder, orchestrator_root)
 }
 
 /// PR 4 (2026-05-01): subprocess-call vco_lib.project_init install-bundle.
@@ -2462,12 +2570,13 @@ pub(crate) async fn run_migrate_dry_run(
                 // must match _emit_migrate_required_deferral why_deferred
                 // (vco_lib/project_init.py) — cross-language mirror. Keep the
                 // framing identical: ONLY lossy `rebuild` is consent-gated here
-                // (it re-embeds every object). The additive-`copy` clause is
+                // (it re-embeds every object). The additive clause is
                 // appended ONLY when additive drift was actually auto-applied
                 // this run (rebuild-only plans have none to apply).
                 let additive_clause = if auto_apply_additive {
-                    " Additive `copy` migrations are lossless and were applied \
-                     automatically."
+                    " Additive migrations (named-vector slots added in place, \
+                     new properties, copies with vectors) are lossless and were \
+                     applied automatically."
                 } else {
                     ""
                 };
@@ -3169,9 +3278,10 @@ pub async fn update_project_v2(
     //     manifest) as a fresh v0.2.52 create of the same name + folder
     //     contents.
     //
-    //     `is_initial_create=false` → codegraph spawn passes
-    //     `prune_stale=true` to reap rows for files the user deleted
-    //     between create and update (audit AF-6).
+    //     `is_initial_create=false` → the code-graph pass is decided
+    //     (v0.2.107): none / incremental since the recorded commit / one
+    //     full pass with `prune_stale=true` (audit AF-6) — see
+    //     `codegraph::decide_post_bundle_codegraph_pass`.
     //
     //     ORDER MATTERS: this MUST run AFTER `apply_project_env_via_python`
     //     above (so the codegraph + kg-sync background tasks read the
@@ -3190,7 +3300,13 @@ pub async fn update_project_v2(
         // v0.2.71 Piece 5b: gate the kg-sync re-embed on whether this bundle
         // update actually wrote knowledge/** or docs/** content. A settings-
         // only update (the field-reported case) → `false` → no full re-embed.
+        // v0.2.107 (A-015): read from the envelope's own `kg_content_changed`
+        // statement (a README/sidecar change is no longer "content").
         summary.kg_or_docs_content_changed,
+        // v0.2.107 (UPDATE-ALL): the envelope's code-graph walk facts, and
+        // the notices channel the "queued and why" lines ride on.
+        Some(&summary),
+        &mut notices,
     )
     .await;
     for w in post_bundle_warnings {
@@ -3520,6 +3636,10 @@ pub async fn update_all_projects(
     let _single_flight = crate::commands::single_flight::begin_or_refuse(
         crate::commands::single_flight::OP_UPDATE_ALL_PROJECTS,
     )?;
+    // v0.2.107 (UPDATER-07): never during an orchestrator update (it stops the
+    // hub every project update and its index jobs rely on); while this runs,
+    // an orchestrator update is refused in turn.
+    let _update_exclusion = crate::commands::embed_admission::begin_update_all_exclusion()?;
     let opts = opts.unwrap_or_default();
     let projects = db.list_projects()?;
 
@@ -4823,6 +4943,16 @@ pub struct UnregisterOptions {
     /// default, and the GUI offers this only as the second action of that
     /// stop.
     pub leave_unremovable: bool,
+
+    /// Audit A-022 (owner ruling): also delete the project's RL training
+    /// events. Default false: an unregister KEEPS them — the rows stay in
+    /// launcher.db with their project_id and project_name (migration 053),
+    /// so they remain attributable and usable for training. When true they
+    /// are deleted in bounded batches before the project row goes
+    /// ([`RL_EVENTS_DELETE_BATCH`]); the settings page's "Also delete this
+    /// project's N RL training events" checkbox is the only surface that
+    /// sends it.
+    pub delete_rl_events: bool,
 }
 
 impl Default for UnregisterOptions {
@@ -4830,9 +4960,20 @@ impl Default for UnregisterOptions {
     /// `launcher/src/lib/unregister-escape.ts` (what every GUI unregister
     /// sends explicitly).
     fn default() -> Self {
-        Self { purge_launcher_files: true, purge_collections: false, leave_unremovable: false }
+        Self {
+            purge_launcher_files: true,
+            purge_collections: false,
+            leave_unremovable: false,
+            delete_rl_events: false,
+        }
     }
 }
+
+/// How many RL training events one delete batch removes (A-022). Each batch
+/// is its own short transaction on the launcher's single DB connection, which
+/// is released between batches, so the GUI and the hub keep working while a
+/// large corpus (hundreds of thousands of rows, ~150 KB each) is deleted.
+pub(crate) const RL_EVENTS_DELETE_BATCH: usize = 500;
 
 /// Per-call report from `delete_project_v2`. Consumed by the launcher
 /// UI's "Unregister project" toast for a one-line summary plus a
@@ -4876,6 +5017,12 @@ pub struct UnregisterReport {
     /// Names of dropped Weaviate collections (only populated when
     /// `purge_collections: true` and the drop succeeded).
     pub collections_dropped: Vec<String>,
+    /// RL training events of this project left in launcher.db (A-022): every
+    /// one of them unless `delete_rl_events` was set. They keep the project's
+    /// id and name.
+    pub rl_events_kept: u64,
+    /// RL training events deleted because `delete_rl_events` was set.
+    pub rl_events_deleted: u64,
     /// `KEY in <file>` for every value VCO wrote and could not remove, left
     /// in place by "Unregister anyway" (`leave_unremovable`). Names only.
     pub left_in_place: Vec<String>,
@@ -5551,6 +5698,15 @@ pub async fn delete_project_v2(
     unregister_project(db.inner(), &id, options.unwrap_or_default()).await
 }
 
+/// A-022: how many RL training events this project has — the number the
+/// unregister panel names next to "Also delete this project's N RL training
+/// events". Counted on an index (payloads are not read).
+#[command]
+pub async fn count_project_rl_events(id: String, db: State<'_, Db>) -> Result<u64, String> {
+    db.ensure_live()?;
+    db.count_project_rl_events(&id)
+}
+
 /// v0.2.106: the ONE implementation of "Remove from VCO", shared by the GUI
 /// command above and the terminal command `vct-launcher --remove-project`
 /// (`lib.rs::handle_remove_project_cli`). The two surfaces differ only in how
@@ -5572,6 +5728,16 @@ pub(crate) async fn unregister_project(
     let row = db
         .get_project(&id)?
         .ok_or_else(|| format!("project {} not found", id))?;
+
+    // Wave-2 check L-3: the row delete below refuses while `rl_events` still
+    // has its foreign key to `projects` (migration 053 did not apply) — the
+    // delete would cascade the events the user chose to keep. Ask that FIRST,
+    // so a refusal leaves the project registered with its files, collections,
+    // secrets state and grants untouched. With "delete the events too" the
+    // cascade removes nothing the user wants, so there is nothing to refuse.
+    if !opts.delete_rl_events {
+        db.refuse_if_project_delete_cascades_rl_events()?;
+    }
 
     let mut report = UnregisterReport {
         project_id: row.id.clone(),
@@ -5715,6 +5881,43 @@ pub(crate) async fn unregister_project(
         }
     };
 
+    // Step 2.9 (A-022): the project's RL training events. Kept by default —
+    // the row delete below no longer reaches rl_events (migration 053), so
+    // they stay with their project_id and project_name. Deleted only when
+    // the user ticked "Also delete this project's N RL training events": in
+    // bounded batches, each its own short transaction, yielding between
+    // batches so the launcher's one DB connection is never held for long.
+    // A batch that fails STOPS the unregister before the row goes — the
+    // project stays registered, so the user can run it again and the events
+    // they asked to delete never outlive the only GUI that can delete them.
+    if opts.delete_rl_events {
+        loop {
+            let n = db
+                .delete_project_rl_events_batch(&id, RL_EVENTS_DELETE_BATCH)
+                .map_err(|e| {
+                    format!(
+                        "Unregister did not finish: deleting this project's RL training events \
+                         failed after {} were deleted ({}). The project is still registered; \
+                         run the unregister again to finish.",
+                        report.rl_events_deleted, e
+                    )
+                })?;
+            if n == 0 {
+                break;
+            }
+            report.rl_events_deleted += n;
+            tokio::task::yield_now().await;
+        }
+    } else {
+        match db.count_project_rl_events(&id) {
+            Ok(n) => report.rl_events_kept = n,
+            Err(e) => report.warnings.push(format!(
+                "could not count this project's RL training events ({}); they are kept",
+                e
+            )),
+        }
+    }
+
     // Step 3 (always): audit + DB delete + change log.
     db.audit(
         "project_delete",
@@ -5728,10 +5931,17 @@ pub(crate) async fn unregister_project(
             "files_kept_modified_count": report.files_kept_modified.len(),
             "keys_purged_from_env_count": report.keys_purged_from_env.len(),
             "collections_dropped_count": report.collections_dropped.len(),
+            "delete_rl_events": opts.delete_rl_events,
+            "rl_events_kept": report.rl_events_kept,
+            "rl_events_deleted_before_row": report.rl_events_deleted,
             "warnings_count": report.warnings.len(),
         }),
     )?;
-    db.delete_project(&id)?;
+    if opts.delete_rl_events {
+        report.rl_events_deleted += db.delete_project_and_rl_events(&id)?;
+    } else {
+        db.delete_project(&id)?;
+    }
     let _ = db.log_change("projects", "delete", Some(&id), Some(&id));
 
     // v0.2.49 Step F MF4: now that the project's own rows are gone
@@ -9551,7 +9761,7 @@ export MY_HELPER_TOKEN=\"keep-me\"
 
         // Simulate `delete_project_v2` with purge_launcher_files=false:
         // the helpers are never invoked. Verify state unchanged.
-        let opts = UnregisterOptions { purge_launcher_files: false, purge_collections: false, leave_unremovable: false };
+        let opts = UnregisterOptions { purge_launcher_files: false, purge_collections: false, leave_unremovable: false, delete_rl_events: false };
         assert!(!opts.purge_launcher_files);
 
         // (Don't call helpers.) State must be intact.
@@ -10119,6 +10329,152 @@ SHARED_KG_OPT_OUT=false\n"),
     //     `update_project_v2` (which returns Err early before any
     //     subprocess), exercising the per-row "failed" + stop_on_error
     //     fan-out semantics.
+
+    // ─── A-022: unregister keeps the RL training events by default ───────
+
+    /// A project registered in an in-memory DB whose folder does not exist,
+    /// with `n` RL events; and one other project with one event.
+    fn seed_unregister_rl(db: &Db, n: usize) {
+        for (id, name) in [("p_rl", "Alpha"), ("p_other", "Beta")] {
+            db.insert_project(
+                id,
+                name,
+                &format!("/nonexistent/unregister-rl/{}/never/exists", id),
+                ProjectHost::Base,
+                id,
+            )
+            .unwrap();
+        }
+        for i in 0..n {
+            db.insert_rl_event("retrieval", 3, i as i64, Some("p_rl"), None, &format!("t{i}"), None, None, None, None, "{}")
+                .unwrap();
+        }
+        db.insert_rl_event("retrieval", 3, 0, Some("p_other"), None, "o0", None, None, None, None, "{}")
+            .unwrap();
+    }
+
+    /// No file purge (nothing outside the DB is touched by these tests).
+    fn rl_only_opts(delete_rl_events: bool) -> UnregisterOptions {
+        UnregisterOptions { purge_launcher_files: false, delete_rl_events, ..Default::default() }
+    }
+
+    /// Leave-alone: the default unregister removes the project and keeps
+    /// every one of its RL events, named, and the report says how many.
+    #[tokio::test]
+    async fn unregister_keeps_the_projects_rl_events_by_default() {
+        let db = Db::open_in_memory().unwrap();
+        seed_unregister_rl(&db, 5);
+        assert!(!UnregisterOptions::default().delete_rl_events, "keep is the default");
+
+        let report = unregister_project(&db, "p_rl", rl_only_opts(false)).await.unwrap();
+
+        assert!(db.get_project("p_rl").unwrap().is_none(), "unregistered");
+        assert_eq!(report.rl_events_kept, 5);
+        assert_eq!(report.rl_events_deleted, 0);
+        assert_eq!(db.count_project_rl_events("p_rl").unwrap(), 5, "events kept");
+        let named: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM rl_events WHERE project_id = 'p_rl' AND project_name = 'Alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(named, 5, "every kept event carries the project's name");
+    }
+
+    /// Act: with the checkbox, every event goes — across several batches —
+    /// and the other project's event stays.
+    #[tokio::test]
+    async fn unregister_with_delete_rl_events_deletes_them_in_batches() {
+        let db = Db::open_in_memory().unwrap();
+        let n = RL_EVENTS_DELETE_BATCH * 2 + 7;
+        seed_unregister_rl(&db, n);
+
+        let report = unregister_project(&db, "p_rl", rl_only_opts(true)).await.unwrap();
+
+        assert!(db.get_project("p_rl").unwrap().is_none(), "unregistered");
+        assert_eq!(report.rl_events_deleted, n as u64);
+        assert_eq!(report.rl_events_kept, 0);
+        assert_eq!(db.count_project_rl_events("p_rl").unwrap(), 0);
+        assert_eq!(db.count_project_rl_events("p_other").unwrap(), 1, "other project untouched");
+    }
+
+    /// Put back the pre-053 foreign key `rl_events.project_id -> projects`
+    /// (what a DB looks like when migration 053 did not find the clause).
+    fn restore_rl_events_cascade(db: &Db) {
+        db.lock()
+            .execute_batch(
+                "DROP TABLE rl_events;
+                 CREATE TABLE rl_events (
+                     id INTEGER PRIMARY KEY,
+                     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+    }
+
+    fn audit_rows(db: &Db, operation: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE operation = ?1",
+                rusqlite::params![operation],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Leave-alone (wave-2 check L-3): with the cascade still in place the
+    /// unregister refuses BEFORE any step — the files stay, the secret grants
+    /// stay, no delete is audited, the project stays registered.
+    #[tokio::test]
+    async fn unregister_refuses_before_any_step_while_rl_events_would_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        db.insert_project("p_fk", "Alpha", &folder.path().to_string_lossy(), ProjectHost::Base, "p_fk")
+            .unwrap();
+        let env_file = folder.path().join(".claude").join("env");
+        std::fs::create_dir_all(env_file.parent().unwrap()).unwrap();
+        std::fs::write(&env_file, "KG_COLLECTION=Alpha_KnowledgeGraph\n").unwrap();
+        assert!(db.insert_secret_grant("per_project", "p_fk", "u", "K", "p_other", None, None).unwrap());
+        restore_rl_events_cascade(&db);
+
+        let opts = UnregisterOptions { delete_rl_events: false, ..Default::default() };
+        assert!(opts.purge_launcher_files, "the default purges files: the refusal must come first");
+        let err = unregister_project(&db, "p_fk", opts).await.unwrap_err();
+
+        assert!(err.contains("delete refused") && err.contains("053"), "{err}");
+        assert!(db.get_project("p_fk").unwrap().is_some(), "still registered");
+        assert_eq!(
+            std::fs::read_to_string(&env_file).unwrap(),
+            "KG_COLLECTION=Alpha_KnowledgeGraph\n",
+            "no file purged"
+        );
+        assert!(db.has_secret_grant("per_project", "p_fk", "u", "K", "p_other").unwrap(), "grants kept");
+        assert_eq!(audit_rows(&db, "project_delete"), 0, "nothing audited as deleted");
+    }
+
+    /// Act (wave-2 check L-3): asking for the events to go too, the cascade
+    /// removes nothing the user wants kept, so the unregister proceeds.
+    #[tokio::test]
+    async fn unregister_deleting_the_events_too_is_not_refused_by_the_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        seed_unregister_rl(&db, 0);
+        restore_rl_events_cascade(&db);
+        unregister_project(&db, "p_rl", rl_only_opts(true)).await.unwrap();
+        assert!(db.get_project("p_rl").unwrap().is_none(), "unregistered");
+    }
+
+    /// The checkbox travels as `deleteRlEvents` and is absent = false on
+    /// every path (`null`, `{}`, the REMOVE flow's JSON).
+    #[test]
+    fn delete_rl_events_option_defaults_off_and_parses_camel_case() {
+        let empty: UnregisterOptions = serde_json::from_str("{}").unwrap();
+        assert!(!empty.delete_rl_events);
+        let on: UnregisterOptions = serde_json::from_str(r#"{"deleteRlEvents":true}"#).unwrap();
+        assert!(on.delete_rl_events);
+        assert!(!crate::remove_project_cli::remove_flow_options().delete_rl_events);
+    }
 
     /// `update_all_projects` over an empty project list returns an empty
     /// report with all counters at 0. Not an error — the GUI's "Update
@@ -11497,4 +11853,87 @@ mod standby_tests {
         assert_typed_standby(&apply_project_env_via_python("p1", tmp.path(), &db).unwrap_err());
     }
 
+}
+
+#[cfg(test)]
+mod v02107_update_all_gating_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A-015 through the ONE tally the launcher uses: the README-only envelope
+    /// of v0.2.106 no longer reports KG content; a real node does, and names it.
+    #[test]
+    fn the_tally_reads_the_envelopes_own_kg_statement() {
+        let readme_only = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+            "kg_content_changed": false,
+            "kg_content_changed_paths": [],
+        }));
+        assert!(!readme_only.kg_or_docs_content_changed);
+        assert!(!should_spawn_kg_sync_on_bundle(false, readme_only.kg_or_docs_content_changed));
+
+        let node = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {"create": ["knowledge/concepts/n.md"]},
+            "kg_content_changed": true,
+            "kg_content_changed_paths": ["knowledge/concepts/n.md"],
+        }));
+        assert!(node.kg_or_docs_content_changed);
+        assert_eq!(node.kg_content_changed_paths, vec!["knowledge/concepts/n.md"]);
+    }
+
+    /// New launcher reading an OLD envelope (no key): the v0.2.71 path rule.
+    #[test]
+    fn an_old_envelope_keeps_the_path_rule() {
+        let old = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+        }));
+        assert!(old.kg_or_docs_content_changed, "no statement → conservative path rule");
+        assert_eq!(old.codegraph_walk, BundleCodegraphWalk::NotOwed);
+    }
+
+    /// OLD launcher reading a NEW envelope: its reader only ever looked at
+    /// `actions` (a `serde_json::Value`, no typed struct, so no
+    /// `deny_unknown_fields`), and the new keys change no field it reads —
+    /// its verdict on the new envelope equals its verdict without them.
+    #[test]
+    fn the_new_keys_change_nothing_the_old_reader_reads() {
+        let with_keys = json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+            "kg_content_changed": false,
+            "kg_content_changed_paths": [],
+            "extractor_reindex": {"status": "handed_off"},
+            "codegraph_audits": {"status": "launched"},
+        });
+        let without = json!({
+            "actions": {"overwrite": ["knowledge/.node_embeddings.README.txt"]},
+        });
+        assert_eq!(
+            envelope_kg_or_docs_content_changed(&with_keys),
+            envelope_kg_or_docs_content_changed(&without)
+        );
+    }
+
+    #[test]
+    fn the_tally_carries_the_codegraph_walk_facts() {
+        let forced = UpdateSummary::from_bundle_envelope(&json!({
+            "actions": {},
+            "extractor_reindex": {"status": "handed_off", "reason_text": "rung 0.2.107"},
+        }));
+        assert_eq!(forced.codegraph_walk, BundleCodegraphWalk::Forced);
+        assert_eq!(forced.codegraph_walk_reason.as_deref(), Some("rung 0.2.107"));
+    }
+
+    /// The env hand-off is set exactly when this launcher builds the project.
+    #[test]
+    fn the_walk_is_handed_to_the_launcher_only_for_updated_non_root_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        assert!(launcher_owns_codegraph_walk(BundleMode::Update, project.path(), root.path()));
+        assert!(!launcher_owns_codegraph_walk(BundleMode::Update, root.path(), root.path()));
+        assert!(!launcher_owns_codegraph_walk(
+            BundleMode::Create { safe_add: false },
+            project.path(),
+            root.path()
+        ));
+    }
 }

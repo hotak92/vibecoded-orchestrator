@@ -356,6 +356,171 @@ pub fn process_start_token(pid: u32) -> Option<String> {
     }
 }
 
+/// [`start_token_verdict`] outcomes — the Rust names of
+/// `vco_lib/deferral_probes.py`'s `IDENTITY_SAME` / `IDENTITY_REUSED`, with
+/// its `IDENTITY_BAND` and `IDENTITY_UNKNOWN` folded into `Unknown` (both
+/// mean "cannot tell", and every caller here treats them alike).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartTokenVerdict {
+    /// The same process instance.
+    Same,
+    /// The pid now names a DIFFERENT process (it was reused).
+    Reused,
+    /// No comparison possible, or a `wall:` gap in the "cannot tell" band.
+    Unknown,
+}
+
+/// A `wall:` start-token gap of at least this many seconds names a
+/// different process. MUST MATCH `vco_lib/deferral_probes.py`
+/// `_WALL_REUSED_MIN_DELTA_S`.
+pub const WALL_REUSED_MIN_DELTA_SECS: f64 = 3.0;
+
+/// Compare a recorded [`process_start_token`] with the current one.
+///
+/// MUST MATCH `vco_lib/deferral_probes.py::process_identity_verdict` (the
+/// Python home of the rule): `proc:` tokens compare exactly; `wall:` tokens
+/// are the same process within 1 s (the Rust writer truncates to whole
+/// seconds, the Python one keeps milliseconds), a different one from
+/// [`WALL_REUSED_MIN_DELTA_SECS`], and "cannot tell" in between. Mixed kinds,
+/// a missing side or a malformed value are `Unknown`.
+pub fn start_token_verdict(recorded: Option<&str>, current: Option<&str>) -> StartTokenVerdict {
+    let (Some(rec), Some(cur)) = (recorded, current) else {
+        return StartTokenVerdict::Unknown;
+    };
+    let (Some((rec_kind, rec_val)), Some((cur_kind, cur_val))) =
+        (rec.split_once(':'), cur.split_once(':'))
+    else {
+        return StartTokenVerdict::Unknown;
+    };
+    if rec_kind != cur_kind {
+        return StartTokenVerdict::Unknown;
+    }
+    if rec_kind == "proc" {
+        return if rec_val == cur_val {
+            StartTokenVerdict::Same
+        } else {
+            StartTokenVerdict::Reused
+        };
+    }
+    let (Ok(a), Ok(b)) = (rec_val.parse::<f64>(), cur_val.parse::<f64>()) else {
+        return StartTokenVerdict::Unknown;
+    };
+    let delta = (a - b).abs();
+    if delta <= 1.0 {
+        StartTokenVerdict::Same
+    } else if delta < WALL_REUSED_MIN_DELTA_SECS {
+        StartTokenVerdict::Unknown
+    } else {
+        StartTokenVerdict::Reused
+    }
+}
+
+/// The command line of `pid`, or `None` when it cannot be read (gone, no
+/// permission, sentinel pid) or is empty (a zombie, a kernel thread).
+///
+/// Linux reads `/proc/<pid>/cmdline` directly; macOS and Windows go through
+/// `sysinfo`'s process table (the same crate [`kill_descendants`] uses).
+pub fn process_cmdline(pid: u32) -> Option<Vec<String>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let args: Vec<String> = {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let args: Vec<String> = {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let target = Pid::from_u32(pid);
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[target]),
+            true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        sys.process(target)?
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    if args.is_empty() {
+        None
+    } else {
+        Some(args)
+    }
+}
+
+/// End the process `pid` that was identified by `start_token`: a graceful
+/// signal first (SIGTERM; `TerminateProcess` on Windows, which has no
+/// graceful signal), then a hard kill after `grace` — but only if the pid
+/// still names that same process ([`start_token_verdict`] `Same`), so a pid
+/// recycled during the grace is never touched. Returns whether the process
+/// is gone afterwards. Best effort: never panics.
+///
+/// The CALLER verifies identity before calling (see
+/// `vct-hub/src/mcp_liveness.rs`); this re-checks it before each signal.
+pub fn terminate_verified(pid: u32, start_token: &str, grace: std::time::Duration) -> bool {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    if pid == 0 || pid > i32::MAX as u32 || pid == std::process::id() {
+        return false;
+    }
+    let same = || {
+        start_token_verdict(Some(start_token), process_start_token(pid).as_deref())
+            == StartTokenVerdict::Same
+    };
+    // A process that has exited but is not yet reaped by its parent (a
+    // zombie, Linux `State: Z`) counts as gone: it holds no pipe any more.
+    let gone = || {
+        if !pid_is_alive(pid) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some((_, tail)) = raw.rsplit_once(')') {
+                return tail.split_whitespace().next() == Some("Z");
+            }
+        }
+        false
+    };
+    let target = Pid::from_u32(pid);
+    let signal = |hard: bool| -> bool {
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+        let Some(proc) = sys.process(target) else {
+            return false;
+        };
+        if hard {
+            return proc.kill();
+        }
+        match proc.kill_with(sysinfo::Signal::Term) {
+            Some(ok) => ok,
+            None => proc.kill(),
+        }
+    };
+    if !same() {
+        return gone();
+    }
+    signal(false);
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if gone() || !same() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if same() && !gone() {
+        signal(true);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    gone() || !same()
+}
+
 /// Why [`output_bounded`] produced no [`std::process::Output`].
 #[derive(Debug)]
 pub enum BoundedError {
@@ -780,6 +945,52 @@ mod tests {
         assert!(a.starts_with("proc:") || a.starts_with("wall:"), "{a}");
         assert_eq!(process_start_token(0), None);
         assert_eq!(process_start_token(u32::MAX), None);
+    }
+
+    /// Mirror of `vco_lib/deferral_probes.py::process_identity_verdict`
+    /// (`tests/test_v02107_mcp_watchdog.py` pins the Python side of the same
+    /// table).
+    #[test]
+    fn start_token_verdict_matches_the_python_rule() {
+        use StartTokenVerdict::*;
+        let v = |a: Option<&str>, b: Option<&str>| start_token_verdict(a, b);
+        assert_eq!(v(Some("proc:10"), Some("proc:10")), Same);
+        assert_eq!(v(Some("proc:10"), Some("proc:11")), Reused);
+        assert_eq!(v(Some("wall:100.000"), Some("wall:100.900")), Same);
+        assert_eq!(v(Some("wall:100.000"), Some("wall:102.000")), Unknown);
+        assert_eq!(v(Some("wall:100.000"), Some("wall:103.000")), Reused);
+        assert_eq!(v(Some("proc:10"), Some("wall:10.000")), Unknown);
+        assert_eq!(v(None, Some("proc:10")), Unknown);
+        assert_eq!(v(Some("proc:10"), None), Unknown);
+        assert_eq!(v(Some("garbage"), Some("proc:10")), Unknown);
+        assert_eq!(v(Some("wall:x"), Some("wall:1.0")), Unknown);
+    }
+
+    #[test]
+    fn own_cmdline_is_readable_and_sentinels_are_not() {
+        let args = process_cmdline(std::process::id()).expect("own cmdline");
+        assert!(!args.is_empty());
+        assert_eq!(process_cmdline(0), None);
+        assert_eq!(process_cmdline(u32::MAX), None);
+    }
+
+    #[test]
+    fn terminate_verified_refuses_self_sentinels_and_a_wrong_token() {
+        let grace = std::time::Duration::from_millis(10);
+        assert!(!terminate_verified(0, "proc:1", grace));
+        assert!(!terminate_verified(std::process::id(), "proc:1", grace));
+        // A token that does not name the live process: never signalled,
+        // and it is reported as still present.
+        #[cfg(unix)]
+        {
+            let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let pid = child.id();
+            assert!(!terminate_verified(pid, "proc:1", grace));
+            assert!(child.try_wait().unwrap().is_none(), "a mismatched token must not signal");
+            let tok = process_start_token(pid).unwrap();
+            assert!(terminate_verified(pid, &tok, std::time::Duration::from_secs(5)));
+            let _ = child.wait();
+        }
     }
 
     /// The `/proc/<pid>/stat` index matches the Python twin's

@@ -30,6 +30,7 @@
 --
 -- FK semantics:
 --   * project_id → projects.id ON DELETE CASCADE. Rows die with project.
+--     (History: migration 053 removed the CASCADE — events outlive their project.)
 --   * project_id is NULLABLE for free-tier rows: free-tier installs may
 --     not have an orchestrator project registered yet (rl_events still
 --     accumulate; project_name carries the workspace-folder slug for

@@ -191,6 +191,22 @@ keeps that container running on its current image instead of letting compose \
 remove it with nothing to replace it. Added to the install run's report, so a \
 run whose pull succeeds does not re-emit it (owned/drop-when-absent)."""
 
+[conditions.service_image_no_disk_space]
+class = "action_required"
+owner = "vco_lib.compose_image_prepull"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.107 (A-021). Before step 5 pulls the pinned image of a service it \
+is about to force-recreate, `compose_image_prepull.split_no_space` compares the \
+free space where the container engine stores images (its graph root on a native \
+engine, the host folder of the VM disk under Docker Desktop / podman machine) \
+with an estimate of the pull (the installed image of the same repository x 1.5 \
++ the doctor's free-space floor). When it does not fit, the service keeps \
+running on its current image and this row names both numbers and the drive to \
+free. action_required: only the user can free the space. Added to the install \
+run's report, so the next update re-checks and a run whose pull fits does not \
+re-emit it (owned/drop-when-absent)."""
+
 [conditions.weaviate_vector_index_update_failed]
 class = "auto_retryable"
 owner = "vco_lib.weaviate_vector_index"
@@ -366,7 +382,7 @@ owner = "vco_lib.service_reconcile"
 clear_probe = "probe:py:adopted_service_config_drift_persists"
 emit_surfaces = ["ledger"]
 dismiss_key = ["service", "drift_keys"]
-notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). v0.2.104: or on an image OLDER than the one VCO's compose pins (key `image`; e.g. an Ollama too old for the summary-tier models). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2). The probe inspects only the adopted rows' own containers, so an unrelated container vanishing mid-probe no longer leaves it undetermined."""
+notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). v0.2.104: or on an image OLDER than the one VCO's compose pins (key `image`; e.g. an Ollama too old for the summary-tier models). v0.2.107: only a FOREIGN container can carry this now — a container this install's own compose created, on the installer's data mount, is recorded as VCO-managed on the next update (service_reconcile.reclassify_own) and moved to the pinned image (vco_lib.container_upgrade). True of the machine while it lasts; VCO never recreates a container it did not create. The one setting VCO applies to such a container in place is Weaviate's memory limit (weaviate_memory.ensure_foreign_limit, at every ensure-containers). The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2). The probe inspects only the adopted rows' own containers, so an unrelated container vanishing mid-probe no longer leaves it undetermined."""
 
 [conditions.service_adopted_without_prompt]
 class = "informational_record"
@@ -1011,12 +1027,35 @@ dismiss_key = ["classes"]
 notes = """v0.2.106. Classes are in the Weaviate schema but their index is gone ("non-existing index") — the footprint of the 1.37 orphan drop. The repair (snapshot first, then drop + bootstrap-collections + kg-sync) is destructive and ordered, so it is printed, never run. Clears once every class has its index."""
 
 [conditions.weaviate_container_uncapped]
-class = "action_required"
+class = "environmental"
 owner = "vco_lib.doctor (probe + entry in vco_lib.weaviate_raft_guard)"
 clear_probe = "probe:py:weaviate_container_still_uncapped"
 emit_surfaces = ["ledger"]
 dismiss_key = ["container"]
-notes = """v0.2.106 (an OOM on a maintainer machine: an adopted Weaviate with no memory limit reached 30 GB RSS). VCO sizes VCT_WEAVIATE_MEM_LIMIT only for the containers it creates; an adopted one keeps its own limit. The remedy caps it in place (`<runtime> update --memory`), never by an automatic recreate. Clears once the container has a limit."""
+notes = """v0.2.106 (an OOM on a maintainer machine: an adopted Weaviate with no memory limit reached 30 GB RSS). v0.2.107 (owner rulings 2026-11-13 / 2026-11-17): VCO's own container gets the limit from its compose (VCT_WEAVIATE_MEM_LIMIT, sized from min(host, container-engine memory)); a container VCO did not create gets the same limit IN PLACE (`<runtime> update --memory`, never a recreate) at every update and every ensure-containers, because an in-place limit does not survive a restart on podman 4.9. So this entry is now a description of the machine, not a to-do: it is listed only while the container still runs uncapped — the user switched the in-place limit off (VCO_WEAVIATE_FOREIGN_LIMIT=off, or VCT_WEAVIATE_MEM_LIMIT=0), the engine refused the update, or no limit has been sized yet. Clears once the container has a limit."""
+
+[conditions.container_upgrade_refused]
+class = "action_required"
+owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "container"]
+notes = """v0.2.107 (owner ruling "recreate it to get latest"; only the pinned Weaviate is supported). VCO's own Weaviate container runs an image other than the pinned one and the protected move was NOT made: a class count or the free space could not be read, the copy of the data does not fit (the entry names the data size and the free space), the raft snapshot was refused, or an earlier attempt failed and is not repeated by itself. Nothing was removed; the old container runs as before and step 5 leaves it alone. Re-detected by every update that still cannot move it; the run that moves it drops the entry."""
+
+[conditions.container_upgrade_rolled_back]
+class = "action_required"
+owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "container"]
+notes = """v0.2.107. The move of VCO's own Weaviate to the pinned image failed its check after the recreate (compose failed, the new version did not become ready, wrong image or mount, a class without its index, or an object count that differs). The new container was removed, the data volume restored from the copy taken before the first start of the new version, and the old image started on it again (severity critical when that restore did not finish). The failed attempt is recorded in <vct_root>/state/container-upgrade.json, so later updates raise container_upgrade_refused instead of trying again, until `python -m vco_lib.container_upgrade retry --service weaviate`. One-shot here: the run that rolled back emits it."""
+
+[conditions.container_upgrade_backup_kept]
+class = "informational_record"
+owner = "vco_lib.container_upgrade (emitted through vco_lib.service_reconcile in install.py step 5b)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.107. Record of a verified move of VCO's own Weaviate to the pinned image: names the backup volume holding the data as it was before the move and the command that frees it. VCO never deletes that copy itself. The volume's name is kept in <vct_root>/state/container-upgrade.json ("backups"), and every later update re-emits this entry while `<runtime> volume inspect` still finds the volume (container_upgrade.kept_backup_entries, audit C-2); once the user removed it, the record and the entry are dropped. A volume that cannot be checked keeps both."""
 
 [conditions.code_embed_image_stale]
 class = "action_required"
@@ -1506,10 +1545,12 @@ retrieval forever). Emitted at the end of ANY sync run shape (`--all`, \
 naming the failure count. `auto_retryable` with a REAL retry_action — \
 the SAME handler `kg_sync_no_embedding_backend` uses (`retry:py:kg_seed` \
 re-runs `sync_knowledge_graph.py --all` with the project root pinned, \
-content-hash gated so the retry re-embeds only what never landed). The \
+content-hash gated so the retry re-embeds only what never landed) — but \
+since v0.2.107 it first tries the NARROW re-sync of the recorded failed \
+paths and falls back to `--all` (see the v0.2.107 note below). The \
 paired clear is NARROW by design (decision #12 shape): only the end of a \
 FULLY successful `--all` tree sync resolves it — a clean file-list or \
-docs-only run proves nothing about the nodes an earlier run failed on."""
+docs-only run proves nothing about the nodes an earlier run failed on. v0.2.107 (A-003): the failing run records the failed paths beside the entry (`vco_lib.owed_work.record_sync_failures`), the retry re-syncs only those, and a clean file-list run covering every one of them is a second paired clear; an entry with no record for itself (the install-enqueued whole-tree seed) still gets `--all`, and so does a record longer than 200 paths or 24 000 characters of arguments (a Windows command line is capped at 32 767)."""
 
 [conditions.kg_sync_shared_pending]
 class = "auto_retryable"
@@ -1571,7 +1612,7 @@ EXISTING `retry:py:kg_seed` handler: `kg-sync --all` backfills before its walk \
 one probe embed, then the UPDATE-only slot enrichment with the secondary's own \
 model; rows it refuses whole are re-laid by the walk for every model) and its \
 paired clear (`kg_secondary_backfill.after_walk`) resolves the row once every \
-configured secondary is stamped on every collection — or none is configured."""
+configured secondary is stamped on every collection — or none is configured. v0.2.107 (A-003): the owed-work worker runs the backfill alone (`python -m vco_lib.owed_work backfill`, rows missing the vector only); `--all` only when rows the secondary refuses whole remain."""
 
 [conditions.embed_self_heal_failed]
 class = "action_required"
@@ -1751,7 +1792,7 @@ saved incrementally after each node. `retry_action` reuses the EXISTING \
 `retry:py:kg_seed` handler rather than declaring a new one: that handler \
 re-runs `sync_knowledge_graph.py --all`, which re-runs this refresh — the \
 retry is real and already wired, so no HANDLERS edit is claimed. Cleared by \
-the paired `_clear_node_formats_deferral` on a refresh that exits 0."""
+the paired `_clear_node_formats_deferral` on a refresh that exits 0. v0.2.107 (A-003): the owed-work worker narrows this retry to `sync_knowledge_graph.py --refresh-node-formats` (the refresh alone, no tree walk); a whole-tree job owed in the same project absorbs it."""
 
 [conditions.kg_node_formats_backend_unavailable]
 class = "environmental"
@@ -1906,7 +1947,15 @@ re-emits and the old stamps no longer match. v0.2.106: the update STARTS both \
 halves itself — `vco_lib.chunker_revision.kg_rechunk_owed` makes the launcher's \
 `kg-sync --check-drift` probe (`rechunk_owed`) and install.py's root seed run \
 the KG pass, and the extractor-generation rung re-walks the code graph — and \
-the printed code-graph remedy is the non-destructive `--force-rewalk`."""
+the printed code-graph remedy is the non-destructive `--force-rewalk`. \
+v0.2.107: the code-graph half is recorded in the WALKED project (the analyzer \
+passed the ledger root, which is `$VCT_ORCHESTRATOR_ROOT` in every \
+session-spawned walk, so no project but the root could ever clear); a project \
+whose forced walk had already completed is healed without a new walk — the \
+probe accepts `chunker_revision.completed_walk_evidence` for that half, and \
+`chunker_revision.heal_stuck_resync` records it and resolves the row at \
+session start. The KG sync's per-node gate stops once the KG half is recorded \
+(`chunker_revision.kg_half_recorded`), whether or not the row is still there."""
 
 [conditions.project_bundles_stale]
 class = "action_required"

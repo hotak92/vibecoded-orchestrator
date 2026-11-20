@@ -291,6 +291,25 @@ pub(crate) fn stop_hub_and_rename_binaries_aside(
     })
 }
 
+/// UPDATER-02 (v0.2.107): the other half of [`stop_hub_and_rename_binaries_aside`]
+/// on the success path — once the git operation is over, every canonical path
+/// the rename emptied and the git operation did not write gets its binary
+/// back (a copy of the `.old-<pid>` backup), BEFORE install.py runs. Without
+/// it the install had no `vct-launcher.exe` and no `vct-hub.exe` for the whole
+/// install.py run whenever the pulled commits did not change the binaries.
+/// A path the pull wrote is left alone ([`decide_refill`]). The failure legs
+/// keep using the abort tail, which renames the backup back itself.
+///
+/// [`decide_refill`]: crate::services::binary_freshness::decide_refill
+pub(crate) fn refill_canonical_binaries(renames: &PrePullRenames) {
+    for backup in [renames.hub.as_deref(), renames.launcher.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = crate::services::binary_freshness::refill_canonical_from_backup(backup);
+    }
+}
+
 
 /// The one read-only refusal the hub stop can produce, run BEFORE the
 /// kill-sweep so it costs nothing: `<vct_root>/hub.pid` exists but cannot be

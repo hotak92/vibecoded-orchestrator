@@ -7,27 +7,27 @@
 # Copyright (c) 2026 VibeCoded Tools
 #
 # subagent-stop-reconcile.sh — SubagentStop hook that reconciles a
-# subagent's filesystem changes back into the project's KG / code-graph
+# subagent's filesystem changes back into the project's KG
 # / credential-scan / nudge-counter state. Also writes a JSONL audit
 # row to .claude/logs/subagent-reconciliation.jsonl (the V52-L.2
 # logging-only baseline — preserved exactly).
 #
 # V52-L.1 (v0.2.52): belt-and-suspenders reconciler. Side effects:
 #   1. JSONL audit log (V52-L.2 baseline; format unchanged). FOREGROUND.
-#   1b. Reap the agent's worktree when it is provably unchanged.
+#   1b. Mark the agent's provably unchanged worktree a reap candidate (never
+#       removed here: session-worktree-reap removes it after 7 idle days, and
+#       a kept one once its commits are merged into the main checkout).
 #   2. KG/docs sync — every changed `knowledge/**` / `docs/**.md` file goes
 #      through `_lib/route-touched-path.sh`, the ONE home for "a file was
 #      touched" (access-matrix gate + per-file debounce + detached runner
 #      with no timeout). v0.2.102 W6-C2 (census L1): it ran
 #      `timeout 30 kg-sync` (and a `sleep 30 && kill -9` fallback) inline,
 #      killing slow-but-working syncs and bypassing the access matrix.
-#   3. Code-graph drain enqueue — for any modified code file, apply the
-#      FIX-A' worktree gate (drop edits in ephemeral/unregistered
-#      worktrees) and append the gated-IN paths to the SESSION-AGNOSTIC
-#      drain queue `.claude/state/codegraph_drain_shared.txt` that the
-#      Stop-hook batched drain (stop-codegraph-drain.{sh,ps1}) consumes.
-#      We never run analyze synchronously and we never write the old orphan
-#      code-graph-queue.jsonl (nothing ever drained it — v0.2.73 HIGH-2).
+#   3. (retired in v0.2.107, CG-3) Code files are NOT queued for the code
+#      graph: it follows the COMMITTED state of the main checkout, so a
+#      subagent's code edits reach it through the commit (or the merge of
+#      its worktree branch) that moves the main checkout's HEAD —
+#      stop-codegraph-drain → vco_lib.codegraph_head_catchup.
 #   4. Credential scan — run the shared `_lib/credscan.sh` scanner on
 #      every modified file. On hit, append an entry to
 #      `.claude/logs/credential_alerts.jsonl` (post-tool-security's schema)
@@ -92,6 +92,8 @@
 # user.
 
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
@@ -112,27 +114,12 @@ if [ -f "$SCRIPT_DIR/_lib/credscan.sh" ]; then
     # shellcheck source=_lib/credscan.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/credscan.sh"
 fi
-# v0.2.73 HIGH-2: the canonical-root resolver + FIX-A' worktree gate — the SAME
-# shared libs the per-edit code-graph hook and the Stop drain use (mirror-don't-
-# fork). Optional sourcing; when absent the Step-3 enqueue falls back to
-# CONSERVATIVE (enqueue-all — never silently lose a real project's edits).
-if [ -f "$SCRIPT_DIR/_lib/canonical-repo-root.sh" ]; then
-    # shellcheck source=_lib/canonical-repo-root.sh disable=SC1091
-    . "$SCRIPT_DIR/_lib/canonical-repo-root.sh"
-fi
-if [ -f "$SCRIPT_DIR/_lib/worktree-gate.sh" ]; then
-    # shellcheck source=_lib/worktree-gate.sh disable=SC1091
-    . "$SCRIPT_DIR/_lib/worktree-gate.sh"
-fi
 
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 LOG_DIR="$PROJECT_ROOT/.claude/logs"
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 LOG_FILE="$LOG_DIR/subagent-reconciliation.jsonl"
 ALERT_LOG="$LOG_DIR/credential_alerts.jsonl"
-# v0.2.73 HIGH-2: the session-agnostic drain queue the Stop-hook batched drain
-# consumes (replaces the orphan code-graph-queue.jsonl that nothing drained).
-CG_DRAIN_SHARED="$STATE_DIR/codegraph_drain_shared.txt"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -379,40 +366,36 @@ if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     fi
 fi
 
-# Step 1b (v0.2.102 W6-Q follow-up): reap the agent's worktree when it is
-# provably unchanged. worktree-guard creates every isolated agent's worktree,
-# and for a hook-created worktree the harness neither removes it nor runs
-# WorktreeRemove when a subagent finishes
-# (https://code.claude.com/docs/en/hooks#worktreeremove) — so without this
-# step every launch left one behind. The decision (and every condition that
-# keeps a worktree) lives in _lib/worktree-records.sh :: wtrec_reap. A kept
-# worktree is logged with its path and reason to
-# .claude/logs/worktree-guard.jsonl and named on stderr. Runs before the
-# snapshot reconciler's early exits so it never depends on them; never
-# blocks (SubagentStop context would keep the subagent running). A kept
-# worktree's notice is sent to the parent ONCE per path per session (v0.2.105:
-# an interim stop, with the agent waiting on its own background work, is not
-# distinguishable in the payload from a final one), and it says so.
+# Step 1b (v0.2.102 W6-Q follow-up; v0.2.107 REAP-INTERIM): decide the agent's
+# worktree, but NEVER remove it here. worktree-guard creates every isolated
+# agent's worktree, and for a hook-created worktree the harness neither
+# removes it nor runs WorktreeRemove when a subagent finishes
+# (https://code.claude.com/docs/en/hooks#worktreeremove), so VCO reaps the
+# unchanged ones itself. SubagentStop also fires on an INTERIM stop (the agent
+# waits on its own background work or a lock and resumes later) and the
+# payload cannot tell interim from final, so removing here lost paused agents
+# (SendMessage: "its worktree no longer exists"). A provably unchanged
+# worktree is therefore only marked a reap CANDIDATE; session-worktree-reap
+# removes it at a SessionStart once it has been idle for 7 days (a kept one
+# once its commits are merged into the main checkout's branch), after
+# checking every condition again. The decision (and every
+# condition that keeps a worktree) lives in _lib/worktree-records.sh ::
+# wtrec_reap. Every decision is logged to .claude/logs/worktree-guard.jsonl;
+# a kept worktree is also named on stderr. Runs before the snapshot
+# reconciler's early exits so it never depends on them; never blocks
+# (SubagentStop context would keep the subagent running). A kept worktree's
+# notice is sent to the parent ONCE per path per session (v0.2.105), and it
+# says the agent may still be running.
 if [ -n "$AGENT_ID" ] && [ -f "$SCRIPT_DIR/_lib/worktree-records.sh" ]; then
     # shellcheck source=_lib/worktree-records.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/worktree-records.sh"
-    REAP="$(wtrec_reap "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
+    REAP="$(wtrec_reap "$PROJECT_ROOT" "$AGENT_ID" "$SESSION_ID" "$TRANSCRIPT_PATH" 2>/dev/null || true)"
     if [ -n "$REAP" ]; then
         REAP_DECISION="$(printf '%s' "$REAP" | cut -f1)"
         REAP_REASON="$(printf '%s' "$REAP" | cut -f2)"
         REAP_PATH="$(printf '%s' "$REAP" | cut -f3-)"
-        AGENT_ID_FOR_PY="$AGENT_ID" DEC_FOR_PY="$REAP_DECISION" REASON_FOR_PY="$REAP_REASON" \
-        PATH_FOR_PY="$REAP_PATH" OUT_FOR_PY="$LOG_DIR/worktree-guard.jsonl" "$PY" -c '
-import json, os
-from datetime import datetime, timezone
-e = os.environ
-row = {"timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-       "hook": "subagent-stop-reconcile", "decision": "reap_" + e["DEC_FOR_PY"],
-       "reason": e["REASON_FOR_PY"], "agent_id": e["AGENT_ID_FOR_PY"],
-       "resolved_path": e["PATH_FOR_PY"]}
-with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
-    fh.write(json.dumps(row) + "\n")
-' 2>/dev/null || true
+        wtrec_log_reap "$LOG_DIR/worktree-guard.jsonl" subagent-stop-reconcile "$AGENT_ID" \
+            "$REAP_DECISION" "$REAP_REASON" "$REAP_PATH"
         if [ "$REAP_DECISION" = "kept" ]; then
             # v0.2.105: an interim SubagentStop (the agent is waiting on its
             # own background work and will resume) is indistinguishable from a
@@ -422,10 +405,10 @@ with open(e["OUT_FOR_PY"], "a", encoding="utf-8") as fh:
             # #subagentstop-input). So tell the parent ONCE per worktree path
             # per session (_lib/worktree-records.sh :: wtrec_kept_alert_once),
             # and say plainly that the agent may still be running. In the
-            # ordinary sequence the second stop of one launch is already
-            # suppressed by wtrec_reap's PRE-EXISTING `already_handled` gate;
-            # the marker covers the rewritten-record case and the detached-job
-            # race.
+            # ordinary sequence the second stop of one launch whose worktree
+            # was kept is already suppressed by wtrec_reap's PRE-EXISTING
+            # `already_handled` gate; the marker covers the rewritten-record
+            # case and the detached-job race.
             KEPT_REC="$(wtrec_find "$PROJECT_ROOT" "$AGENT_ID" 2>/dev/null || true)"
             if [ -z "$KEPT_REC" ] || wtrec_kept_alert_once "$KEPT_REC" "$SESSION_ID" "$REAP_PATH"; then
                 KEPT_HEAD="$(_reconcile_head_desc "$REAP_PATH")"
@@ -491,12 +474,7 @@ fi
 FILE_COUNT=0
 TOTAL_BYTES=0
 KG_FILES=()     # absolute; shared tree only (knowledge/** and docs/**.md)
-CODE_FILES=()   # project-relative; shared tree only
 ALL_FILES=()    # absolute; every changed file (credential scan)
-
-# Code-file extension set (mirrors snapshot.sh's _SNAPSHOT_CODE_EXTS_DEFAULT).
-# Used here to classify which queue/sync path each modified file lands in.
-_CODE_EXT_RE='\.(py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql)$'
 
 while IFS= read -r abs; do
     [ -z "$abs" ] && continue
@@ -509,19 +487,15 @@ while IFS= read -r abs; do
         TOTAL_BYTES=$((TOTAL_BYTES + ${sz:-0}))
     fi
     ALL_FILES+=("$abs")
-    # Indexing happens for SHARED-TREE files only: a worktree agent's files
-    # reach the KG / code graph when its work is merged (and the FIX-A' gate
-    # drops ephemeral-worktree edits anyway).
+    # KG/docs sync happens for SHARED-TREE files only: a worktree agent's
+    # files reach the KG when its work is merged.
     [ "$ATTRIBUTION" = "agent_worktree" ] && continue
     rel="${abs#"$PROJECT_ROOT"/}"
-    # Classify: knowledge/** or docs/**.md → KG/docs sync, code-extension →
-    # code-graph queue. Regex rather than case-glob so the rule is consistent
-    # regardless of bash globstar setting.
+    # Classify: knowledge/** or docs/**.md → KG/docs sync. Regex rather than
+    # case-glob so the rule is consistent regardless of bash globstar setting.
+    # Code files are not routed (Step 3 retired in v0.2.107, CG-3).
     if printf '%s' "$rel" | grep -qE '^knowledge/.*\.md$|^docs/.*\.md$'; then
         KG_FILES+=("$abs")
-    fi
-    if printf '%s' "$rel" | grep -qE "$_CODE_EXT_RE"; then
-        CODE_FILES+=("$rel")
     fi
 done <<CHANGEDEOF
 $CHANGED_ABS
@@ -567,84 +541,6 @@ if [ "${#KG_FILES[@]}" -gt 0 ]; then
         # record it where the reconciliation is recorded.
         printf '{"event":"kg_sync_skipped","reason":"_lib/route-touched-path.sh missing","agent_id":"%s"}\n' \
             "$(printf '%s' "$AGENT_ID" | tr -c 'a-zA-Z0-9_-' '_')" >> "$FILES_LOG" 2>/dev/null || true
-    fi
-fi
-
-# -------------------- Step 3: Code-graph drain enqueue --------------------
-# Route modified code files into the SAME batched, worktree-gated path the
-# main-session Stop drain (stop-codegraph-drain.{sh,ps1}) consumes — NOT the
-# old orphan code-graph-queue.jsonl (nothing ever drained it, so subagent code
-# edits never reached the code graph AND that file grew unbounded — v0.2.73
-# I/O-audit HIGH-2).
-#
-# We apply the FIX-A' worktree gate here so an EPHEMERAL/unregistered worktree
-# edit (the exact multi-agent-worktree churn v0.2.73 kills) is DROPPED — the
-# main session re-indexes the merged result. A gated-IN file is appended
-# (newline-delimited, ABSOLUTE path — matching the drain's format + how
-# post-file-edit.sh stores paths) to the session-agnostic shared drain queue.
-#
-# Performance: the gate's registered-project probe shells out to
-# vct_project_config.sh once per DISTINCT canonical root (not per file), so a
-# subagent touching many files under one repo pays ONE probe. We NEVER run the
-# analyzer synchronously (embedding-model init is 5-30s, over the <10s
-# budget); we only ENQUEUE. Soft-fail throughout.
-if [ "${#CODE_FILES[@]}" -gt 0 ]; then
-    # Per-canonical-root gate cache: canon-root -> "SKIP" | "INDEX". Resolve +
-    # gate ONCE per distinct canonical root; reuse the verdict for every file
-    # sharing that root. (Associative arrays need bash 4+; fall back to a
-    # linear pair-list scan for bash 3.2 / macOS system bash.)
-    _CG_GATE_ROOTS=()   # parallel arrays: root[i] -> verdict[i]
-    _CG_GATE_VERDICTS=()
-    _cg_gate_lookup() {
-        # $1 = canonical root; echoes cached verdict or empty if unseen.
-        _i=0
-        while [ "$_i" -lt "${#_CG_GATE_ROOTS[@]}" ]; do
-            if [ "${_CG_GATE_ROOTS[$_i]}" = "$1" ]; then
-                printf '%s' "${_CG_GATE_VERDICTS[$_i]}"; return 0
-            fi
-            _i=$((_i + 1))
-        done
-        printf ''
-    }
-
-    _CG_ENQUEUE=()
-    for _rel in "${CODE_FILES[@]}"; do
-        [ -n "$_rel" ] || continue
-        _abs="$PROJECT_ROOT/$_rel"
-
-        # Resolve the canonical MAIN root for this file. When the resolver lib
-        # is absent or resolution fails, _canon stays empty → the gate treats
-        # it as "not a worktree" (INDEX) — conservative (never drop on doubt).
-        _canon=""
-        if command -v _canonical_repo_root >/dev/null 2>&1; then
-            _canon="$(_canonical_repo_root "$_abs" 2>/dev/null)" || _canon=""
-        fi
-
-        # Cached gate verdict for this canonical root?
-        _verdict="$(_cg_gate_lookup "$_canon")"
-        if [ -z "$_verdict" ]; then
-            # Compute once for this root. REPO_PATH = PROJECT_ROOT (the on-disk
-            # session root); the gate compares it against the canonical root.
-            # SKIP only on a definitive "ephemeral/unregistered worktree";
-            # INDEX otherwise (incl. main tree, registered worktree, no gate).
-            if command -v _worktree_gate_should_skip >/dev/null 2>&1 \
-                && _worktree_gate_should_skip "$_abs" "$PROJECT_ROOT" "$_canon"; then
-                _verdict="SKIP"
-            else
-                _verdict="INDEX"
-            fi
-            _CG_GATE_ROOTS+=("$_canon")
-            _CG_GATE_VERDICTS+=("$_verdict")
-        fi
-
-        [ "$_verdict" = "INDEX" ] && _CG_ENQUEUE+=("$_abs")
-    done
-
-    # Append the gated-IN absolute paths to the session-agnostic shared drain
-    # queue. Plain newline-delimited append (the drain reads paths, one per
-    # line) — matches post-file-edit.sh's convention. Soft-fail on any error.
-    if [ "${#_CG_ENQUEUE[@]}" -gt 0 ]; then
-        printf '%s\n' "${_CG_ENQUEUE[@]}" >> "$CG_DRAIN_SHARED" 2>/dev/null || true
     fi
 fi
 

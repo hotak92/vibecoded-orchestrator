@@ -212,6 +212,16 @@ export interface UpdateSummary {
    *  now diffs the two declarations so a third instance fails a test instead
    *  of shipping. */
   kg_or_docs_content_changed: boolean;
+  /** v0.2.107 (A-015): the changed paths the KG sync ingests, as the bundle
+   *  envelope names them. Empty when nothing the sync reads changed (or for an
+   *  older envelope). The "why was a sync queued" line arrives in `notices`. */
+  kg_content_changed_paths: string[];
+  /** v0.2.107 (CGWRITE-03): which side walks the code graph after this update
+   *  — `background` (the bundle step's detached driver), `forced` (an owed
+   *  full re-walk the launcher's build runs) or `not_owed`. */
+  codegraph_walk: 'not_owed' | 'background' | 'forced';
+  /** Reason text of an owed walk, when known. */
+  codegraph_walk_reason: string | null;
 }
 
 /**
@@ -310,6 +320,10 @@ export interface UnregisterOptions {
    *  "Unregister anyway — leave these values". Only ever sent as the SECOND
    *  action of that stop (`$lib/unregister-escape`). */
   leaveUnremovable?: boolean;
+  /** Audit A-022: also delete the project's RL training events (deleted in
+   *  bounded batches before the row goes). Default false — they are kept,
+   *  with the project's id and name. Only the settings page sends it. */
+  deleteRlEvents?: boolean;
 }
 
 /**
@@ -335,6 +349,12 @@ export interface UnregisterReport {
   settingsEntriesRemoved: string[];
   keysPurgedFromEnv: string[];
   collectionsDropped: string[];
+  /** A-022: RL training events left in launcher.db (all of them unless
+   *  `deleteRlEvents` was set). Optional: a report from an older backend
+   *  has no such field. */
+  rlEventsKept?: number;
+  /** A-022: RL training events deleted because `deleteRlEvents` was set. */
+  rlEventsDeleted?: number;
   warnings: string[];
   /** `KEY in <file>` for each value left in place by "Unregister anyway". */
   leftInPlace: string[];

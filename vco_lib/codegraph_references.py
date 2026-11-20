@@ -333,11 +333,11 @@ def add_missing_reference_edges(
     it also drops edges whose source line was deleted, and it would collapse
     the beacons already stored. It is deliberately NOT used here:
 
-    * The analyzer's desired set is derived from caches filled by
-      ``_populate_caches_from_weaviate``, whose whole-collection scan
-      SOFT-FAILS (``except Exception: print(warning)``). A partial scan yields
-      a partial desired set, and ``replace`` would then DELETE real edges it
-      merely failed to see. Per CLAUDE.md's "conservative defaults on
+    * The analyzer's desired set is derived from caches its loaders fill. A
+      failed load now skips the whole pass (v0.2.107, A-011), but a scoped
+      run's caches hold only the changed files and the names they use, and a
+      lazy name lookup can still fail mid-pass; ``replace`` would then DELETE
+      real edges it merely failed to see. Per CLAUDE.md's "conservative defaults on
       best-effort paths", an operation that cannot positively confirm its
       precondition must do nothing rather than guess. Add-if-absent cannot
       lose an edge; replace can.

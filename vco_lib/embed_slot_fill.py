@@ -20,7 +20,8 @@ both stores, so it lives here once:
 * :func:`scan_slot_counts` — the objective completeness measure: a cursor scan
   counting, per slot, the objects that hold a vector there;
 * :func:`ensure_slot` — check or make (additively) a set of classes declare a
-  slot (:func:`vco_lib.weaviate_schema.add_named_vector_slot`, vector-preserving);
+  slot (:func:`vco_lib.weaviate_schema.add_named_vector_slot`: added in place,
+  no class is dropped, recreated or copied);
 * :func:`same_model` — "do two model ids embed into the same vector space?".
 
 Every reader soft-fails to "no verdict" (``None`` / ``{}`` / ``0``) — never a
@@ -28,8 +29,10 @@ guess. Callers decide what an absent verdict means.
 """
 from __future__ import annotations
 
-import json
 from typing import Any, Callable, Iterable, Mapping, Optional
+
+from vco_lib.codegraph_cursor import iter_class
+from vco_lib.kg_vector_slot import collection_vector_slots
 
 
 def declared_slots(name: str, weaviate_url: Optional[str]) -> Optional[set]:
@@ -57,16 +60,17 @@ def sample_slot_population(
     (:func:`vco_lib.kg_embed_model.record_from_live`) follows a MAJORITY slot,
     so a handful of objects rewritten target-only cannot empty the answer
     (W6-J, review F1)."""
-    from vco_lib import weaviate_helpers as _wh
+    from vco_lib.codegraph_cursor import CursorUndeterminable, rest_first_page
 
-    base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
-    status, body = _wh.http_request(
-        "GET", f"{base}/v1/objects?class={name}&limit={int(limit)}&include=vector",
-        timeout=10.0,
-    )
-    if status != 200:
+    try:
+        # v0.2.107 (CG-2): from the nil-uuid cursor - a cursorless sample read
+        # returned nothing on a populated class.
+        objs = rest_first_page(
+            name, "embed_slot_fill.sample_slot_population", limit=limit,
+            include_vector=True, weaviate_url=weaviate_url,
+        )
+    except CursorUndeterminable:
         return {}, 0
-    objs = json.loads(body.decode("utf-8")).get("objects") or []
     population: "dict[str, tuple[int, int]]" = {}
     for obj in objs:
         vectors = obj.get("vectors") or {}
@@ -88,19 +92,17 @@ def sample_common_vectors(name: str, weaviate_url: Optional[str], limit: int) ->
 
 
 def object_count(name: str, weaviate_url: Optional[str]) -> int:
-    """Objects in ``name`` (GraphQL aggregate); 0 when it cannot be asked."""
+    """Objects in ``name``, read through the ONE count helper
+    (:func:`vco_lib.weaviate_helpers.http_count_objects`); a class the schema
+    endpoint reports absent counts 0. Raises ``RuntimeError`` when the count
+    cannot be read - never a made-up 0 (v0.2.107: a non-200 used to read 0).
+    Every caller wraps this for a display line or a size hint."""
     from vco_lib import weaviate_helpers as _wh
 
-    base = (weaviate_url or _wh.weaviate_url_default()).rstrip("/")
-    status, body = _wh.http_request(
-        "POST", f"{base}/v1/graphql",
-        body={"query": f"{{ Aggregate {{ {name} {{ meta {{ count }} }} }} }}"},
-        timeout=10.0,
-    )
-    if status != 200:
-        return 0
-    data = json.loads(body.decode("utf-8"))
-    return int(data["data"]["Aggregate"][name][0]["meta"]["count"])
+    count = _wh.http_count_objects(name, weaviate_url, absent_is_zero=True)
+    if count is None:
+        raise RuntimeError(f"object count of {name} could not be read")
+    return count
 
 
 def _default_client():
@@ -116,9 +118,11 @@ def scan_slot_counts(
     """``({slot: filled}, total)`` across ``collections`` (missing classes are
     skipped): per slot, the objects holding a vector there, vs all objects.
 
-    Weaviate cannot filter on "vector missing", so this is a cursor scan with
-    vectors (the client's iterator takes no per-slot selection). ``None`` when
-    Weaviate cannot be asked — never a guess."""
+    Weaviate cannot filter on "vector missing", so this is a cursor scan
+    (:func:`vco_lib.codegraph_cursor.iter_class`) that reads no property and
+    only the wanted slots' vectors (v0.2.107: it used to read every vector of
+    every row). ``None`` when Weaviate cannot be asked or a class could not be
+    listed — never a guess."""
     wanted = list(dict.fromkeys(slots))
     client = None
     try:
@@ -129,7 +133,15 @@ def scan_slot_counts(
             if not client.collections.exists(name):
                 continue
             coll = client.collections.get(name)
-            for obj in coll.iterator(include_vector=True, return_properties=[]):
+            # Only slots the class declares can be asked for by name; an
+            # unreadable config (or a class with one unnamed vector) keeps the
+            # all-vectors read.
+            have = collection_vector_slots(coll)
+            ask: Any = [s for s in wanted if s in have] if have else True
+            for obj in iter_class(
+                coll, "embed_slot_fill.scan_slot_counts",
+                return_properties=[], include_vector=ask,
+            ):
                 total += 1
                 vec = obj.vector
                 if not isinstance(vec, dict):
@@ -157,9 +169,12 @@ def ensure_slot(
     """Check (``add=False``) or make (``add=True``) every EXISTING class in
     ``collections`` declare ``slot``. Returns an error message, or None.
 
-    The add is the additive, vector-preserving slot-add
-    (:func:`vco_lib.weaviate_schema.add_named_vector_slot`); it never drops
-    data. An unreachable Weaviate gives no verdict (the caller's own connect
+    The add is the in-place slot-add
+    (:func:`vco_lib.weaviate_schema.add_named_vector_slot`: one schema PUT on
+    the live class). It never drops, recreates or copies a class - true since
+    v0.2.107; until then it was a drop + recreate + double copy. A Weaviate
+    that cannot add the slot in place makes this return an error that says to
+    update Weaviate. An unreachable Weaviate gives no verdict (the caller's own connect
     reports it); a class that does not exist yet needs no slot."""
     from vco_lib.weaviate_schema import AddSlotResult, NamedVectorSlot
 

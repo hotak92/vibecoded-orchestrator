@@ -7,6 +7,258 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.107] - 2026-11-20
+
+### Added
+
+- **A lane worktree is removed once its work is merged.** A worktree VCO created for an isolated subagent that is KEPT
+  because it has commits is removed at the next session start once those commits are merged into the main checkout's
+  current branch and it has nothing uncommitted or untracked (ignored files such as build output do not count). The
+  branch VCO created for it is removed too, with `git branch -d`, and only after the worktree removal succeeded. Any
+  doubt keeps the worktree, and the reason is logged to `.claude/logs/worktree-guard.jsonl`: a `git worktree lock`, a
+  process working inside it, a failing git command, a detached main checkout, or a record that does not match the
+  worktree. Worktrees of the session that is starting, adopted (`--existing-path`) worktrees and worktrees VCO did
+  not create are never touched. On Windows, where VCO cannot see which folder a process works in, the same rules rely
+  on Windows' own lock: the folder is first renamed aside and straight back, which Windows refuses while a process
+  works in it or holds a file in it open (nothing is deleted), and only then the plain `git worktree remove` (never
+  `--force`) runs. A refusal at either step keeps the worktree, its branch and its record, and the next session start
+  tries again.
+- **The hub ends a weaviate-kg server that is still running but no longer serving.** Each VCO stdio MCP server keeps
+  a heartbeat file in `~/.vct/run/mcp/` (refreshed every 30 s while its event loop runs; a long tool call keeps it
+  beating). When a heartbeat has been stale for 10 minutes and is still unchanged 75 seconds later, whatever the
+  watchdog interval, and the pid, process start time and command line still name that server, the hub terminates it
+  and logs one line; Claude Code starts a fresh server on the next call. A process whose pid was reused is never
+  signalled. The "Restart stopped services automatically" preference and `VCT_HUB_INFRA_WATCHDOG=0` turn it off
+  together with the infra watchdog. The uninstaller removes the heartbeat records.
+
+### Changed
+
+- **The code graph follows the commits of the main checkout, never an edit.** An Edit or Write no longer queues code
+  for re-indexing; edits in git worktrees (lanes) are never indexed and arrive when merged, and uncommitted edits are
+  indexed with the commit that carries them. The HEAD catch-up is the one writer, one analyzer run per HEAD move, and
+  now also runs at session start (`startup` and `resume`), so a pull made outside a session is picked up. A project
+  folder inside a larger git repository (a monorepo sub-project, a folder under a home-directory repository) is
+  followed like any main checkout; only a real linked worktree is skipped. A project that is not a git repository is
+  updated by Re-analyze. The catch-up, the extra-folder check and the path reconciliation share one lock per
+  checkout, which is broken only when its holder is provably gone (its pid is dead, or was reused by another process
+  start). The per-edit drain queue, the worktree gate, `code-graph-incremental.{sh,ps1}`, `--canonical-source` and
+  `codegraph_extras_refresh --queued` are retired; leftover queue files are removed automatically, and the
+  `VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS` knob is gone with the drain. The launcher's Codegraph tab says the graph
+  follows the main checkout's commits.
+- **A code-graph resync after an embedding-revision change re-extracts only the files that own outdated rows.** The
+  background resync used to walk the whole project; it now runs one scoped analyzer run over those files. Files with
+  uncommitted changes, untracked files and files in a linked worktree are left for their commit. When the outdated
+  rows cannot be counted or listed, nothing is changed or deleted and the resync stays pending in
+  `UPDATE_DEFERRED.md`. An extractor change or a code-model fill still walks the whole project. The resync log prints
+  `revision heal: verdict=… owed_rows=… files=… held: …`.
+- **RL training rows in `launcher.db` are about a third of their former size.** Every stored vector is a compact
+  half-float string (`f16:` + base64) instead of decimal JSON numbers (a 1024-dimension vector: 8,592 bytes before,
+  2,738 after), at the precision the trainer keeps anyway. The trainer, the training export and the trainability
+  check read both forms, so older rows still train.
+
+### Fixed
+
+- **An isolated subagent's worktree is no longer removed while the agent is only paused.** SubagentStop also fires
+  when an agent ends its turn to wait on its own background work or a lock, and VCO removed an unchanged worktree right
+  then, so the agent could not be resumed ("its worktree no longer exists"). SubagentStop now only marks the worktree;
+  the new `session-worktree-reap` hook, run at every session start, removes an unchanged one after it has been idle for
+  7 days - not when its chat ends, because the chat may still be resumed - and only if it is still unchanged.
+- **A second launcher no longer runs the start-up work.** Two launchers started at the same time (for example at login
+  on Windows) both used to open the launcher database, seed, auto-start the container engine and start the hub, and
+  quitting one with "Quit and stop services" stopped the services under the other. The launcher now takes a per-user
+  instance lock (`~/.vct/state/launcher-instance.lock`) before anything else: a second copy exits at once, and
+  launching the app again brings the running launcher's window to the front. The uninstaller removes the lock files.
+- **The session-start hook and the VS Code folder-open task no longer start the hub, the model gateway or the
+  launcher twice when they fire together.** The "is it running? then start it" step runs under one per-user lock
+  (`~/.vct/state/ensure-<service>.lock`), so one of them starts the service and the other finds it running.
+- **Unregistering a project no longer deletes its RL training events.** They stay in the launcher database with the
+  project's name and id and can still be exported for training. The settings page's Unregister panel has a new
+  checkbox, unticked by default, "Also delete this project's N RL training events", which deletes them in batches. The
+  unregister summary, the Remove dialog and `vct-launcher --remove-project` / `vct-cli project delete` say how many
+  events are kept. launcher.db migration 053 removes the `rl_events` → `projects` cascade without rebuilding the table
+  (no extra disk space, no long boot) and fills in a missing `project_name` on existing events. If that cascade is
+  still present, unregister refuses before it touches anything, so the project stays registered with its files,
+  collections, secrets and grants.
+- **Windows: an orchestrator update no longer leaves `vct-launcher.exe` and `vct-hub.exe` missing while install.py
+  runs.** Right after the git step the launcher puts back every binary the pull did not replace, and if the launcher
+  dies before that, the next launcher start, the next Claude Code session or `start-launcher.bat` restores the binary
+  from the `.old-<pid>` file the update left next to it (previously the launcher's start-up deleted that file, and
+  `start-launcher.bat` told you to build the launcher by hand).
+- **An update no longer downloads a new service image (Weaviate, Ollama) that does not fit on the drive the container
+  engine stores images on** (under Docker Desktop: the drive holding its disk image). The estimate is about 1.5× the
+  installed image's size plus the `VCT_DISK_SPACE_MIN_FREE_GB` floor. When it does not fit, the service keeps running
+  on its current image and `UPDATE_DEFERRED.md` gets a `service_image_no_disk_space` entry naming the space needed,
+  the space free and the drive to clean up; every update checks again.
+- **The turn-end citation drain no longer runs at every Stop, SubagentStop and SessionEnd regardless of work.** The
+  hook starts it only when the session has a staged citation (its own, one staged without a session, or, when a chat
+  ends, one a drain is still scoring), and at most one drain per transcript runs at a time: a turn that ends while one
+  runs leaves a rerun request and the running drain runs once more.
+- **A citation drain reads only the transcript bytes appended since the previous drain** (a per-transcript index under
+  `.claude/state/rl_drain/`, rebuilt from the start when the transcript was truncated or replaced) and reads an answer
+  window's text only when it reaches the citation gate. On a 1 GB synthetic transcript a drain went from 241 MB /
+  3.7 CPU-s to 110 MB / 0.5 CPU-s; the citations it computes are unchanged.
+- **Ended-session markers in `.claude/state/rl_pending/` no longer pile up.** A marker is cleared once the session's
+  transcript is gone, and a SessionEnd drain that left nothing to finalize keeps none.
+- **The hooks' background cache warmer no longer writes RL retrieval events for results nobody has seen.** The events
+  are held with the cached result and written, under the viewing session, when a later hook shows it.
+- **The RL retention prune keeps up, and a new `launcher.db` shrinks after it.** The prune verifies each archive by
+  row count and SHA-256 before it deletes, and one prune now runs up to 20 batches
+  (`RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS`), so it keeps up with tens of thousands of rows a day. A `launcher.db`
+  created from this version on hands freed pages back to the disk after each prune; an existing one keeps its size
+  until one full `VACUUM`.
+- **RL fine-tune and retrain reads page through their whole event window.** They used to receive one response of up
+  to 1.5 GB holding only the newest rows of the window; they now page newest-first in pages of at most 32 MiB. A
+  training load keeps the newest 10,000 rows of its window, which is what it effectively read before.
+- **A VCO stdio MCP server (weaviate-kg) can no longer stay alive after it began to shut down.** Every shutdown path
+  (client gone, stdin closed, the env-reload SIGHUP) now ends the process within 15 s even when something blocks the
+  exit. Before, a server could hang for days with `/mcp` still showing "connected" while every KG tool call of that
+  chat, and of its subagents, hung.
+- **Rows of deleted code are removed from the code graph once a day.** A path-existence check deletes code-graph rows
+  whose file is gone from the project folder and is no longer in HEAD's tree; a committed file missing only from your
+  working tree keeps its rows until the commit that deletes it is caught up. It deletes nothing when the project
+  folder is missing or empty, when every indexed path is missing, or when git cannot read HEAD.
+- **A small code-graph update no longer loads the whole graph.** A scoped run reads only the rows of its files and the
+  names they use, and keeps the caller counts of the functions it rewrites; a failed load skips the cross-reference
+  pass instead of re-adding every edge.
+- **A skipped forced code-graph re-walk stays owed.** A manifest version no longer marks the extractor re-walk done.
+- **The code-graph catch-up sees insert errors, and walk logs show what a run cost.** The catch-up asks the analyzer
+  for its final report, so a partial index is no longer recorded as current; the catch-up and extra-folder logs
+  carry the walk tally (embeds, stamped, skipped and written rows, cross-reference reads, start and end time).
+- **A code-graph walk replaces a file's rows only after the new ones are written.** A file listed for the revision heal
+  that disappeared before the analyzer read it keeps its rows, and when an entity shrinks to fewer chunks its surplus
+  chunk rows are removed only after every write of that file succeeded.
+- **Re-enabling a hook that a Stop disable had also kept off SessionEnd or SubagentStop puts it back into the shipped
+  group** beside that event's other VCO hook, as a fresh install has it. It is no longer restored as a second group,
+  which the next update would fold.
+- **Every shipped hook registration states its timeout.** Six registrations (`pre-compact-save`, `agent-alerts-deliver`
+  on two events, `subagent-start-kg-inject`, `subagent-stop-reconcile`, `worktree-guard`) had none and ran on Claude
+  Code's default. They now state 600 s, which is that default: the bound is unchanged, now written down. A project
+  that already has these registrations keeps them as they are.
+- **Every hook clears secrets from one list.** The list of secret environment variables a hook clears before it starts
+  anything was copied into every hook, while `.claude/hooks/_lib/scrub-env.sh` described itself as the single source
+  and no bash hook read it. Every hook, bash and PowerShell, now loads `_lib/scrub-env.{sh,ps1}` and clears the names
+  listed there; its own copy of the list runs only when that file is missing.
+- **Windows hooks read their input as UTF-8.** Claude Code sends a hook its input as UTF-8, but the PowerShell hooks
+  decoded it in the console code page (850, 437, ...), so a path with a non-ASCII character reached them mangled: an
+  unread file was overwritten without the Build Anchor block, the pre-edit backup and the credential scan looked at a
+  file that does not exist, the command lean-ctx runs was rewritten into different bytes, and the kill guard changed
+  the text of the command it wrapped. Every hook now reads its input through one helper
+  (`.claude/hooks/_lib/hook-stdin.ps1`) that decodes it as UTF-8 and writes its output, and what it pipes to Python, in
+  UTF-8 as well. A user whose Windows account name has an accent had all of this on every project.
+- **Windows hooks no longer compile C# on every fire.** The stderr cap that most PowerShell hooks load (among them
+  the one that runs on every tool call) built its writer with `Add-Type`, so each fire started `csc.exe` and
+  `cvtres.exe` and wrote a temporary DLL for Defender to scan (about 150 ms per fire under Windows PowerShell 5.1,
+  310 ms under PowerShell 7). The writer is now a PowerShell class, defined in-process with no compiler; the cap,
+  its 1 MB default and `STDERR_CAP_DISABLE` behave as before.
+- **A count that cannot be read never authorises a delete.** Four copies of the Weaviate object count read an
+  error-shaped reply (HTTP 200 with an `errors` array and a null class field: a shard not ready, memory pressure, a
+  timeout inside the server) as "0 objects", and 0 was the licence to drop. There is now one count
+  (`vco_lib.weaviate_helpers.http_count_objects`) that returns "unknown" for anything but an integer count from the
+  server, and every caller that deletes, drops, verifies a copy, recovers a staging class or stamps a collection as
+  new leaves the data alone on "unknown": the automatic drop of empty legacy code-graph classes, the rename
+  verification and `drop-retired`, the staging recovery (it counted by listing the class, and a listing that ended
+  early read a populated class as empty), and the
+  migration runner's "born at the current version" stamp.
+- **Adding a named-vector slot no longer drops and re-copies the collection.** Selecting an embedding model, install
+  step 7d and every bundle update added a missing vector slot by creating a staging class, copying every object into
+  it, dropping the live class and copying everything back - and the only check compared two numbers the copier itself
+  produced, so a listing that returned nothing emptied the class and reported success. The slot is now added in place
+  with one schema update: nothing is dropped, copied or re-embedded. This needs the Weaviate version VCO ships; an
+  older server gets a refusal that says to update Weaviate, never a drop. The staging swap remains only for the two
+  settings Weaviate cannot change on a live collection (`indexNullState`, the vector index type) and now drops the
+  live class only after the staging copy matches an object count read from the server first; it refuses a staging
+  class it did not create.
+- **`--prune-stale` deletes nothing after a walk that is no evidence.** A walk that discovered no file (an empty mount
+  point, a checkout of an empty branch), whose root is missing, or that was scoped to named files now prunes nothing
+  and says why; an extra code folder that yielded no file keeps its rows while the other roots are pruned. A file
+  whose module row was written and whose entity writes then failed (embedding backend down) keeps its old entity
+  rows instead of losing them at the end of the walk.
+
+- **Owed background work no longer starts all at once, and no longer as full re-syncs.** A KG seed, secondary-vector
+  backfill or code-graph walk skipped while a backend was down used to be retried by one detached driver per project
+  per session start, with no check that Weaviate was ready and one whole-tree `kg-sync --all` per owed condition, so
+  after a crash every open project fired its driver together against a Weaviate still loading - which crashed it
+  again. Session starts now put the project in one machine-wide queue (`vco_lib.owed_work`) served by ONE worker.
+  The worker runs a job only once Weaviate has answered ready for 30 s, one job per free slot of the same pool the
+  code-graph resync drivers use (sized from the RAM), and exits when nothing can run, leaving the queue on disk for
+  the next session start or prompt; while Weaviate is not ready no retry attempt is consumed. Conditions that need
+  the same work run it once; a secondary backfill embeds only the rows missing the vector, a sync failure re-syncs
+  only the files that failed, the node-format refresh runs alone, and `--all` runs only when a whole tree is owed.
+  A retry attempt is excused only when Weaviate provably failed during it (it answered "not ready" afterwards or its
+  container restarted), at most three times per episode; a worker that died still counts. Job logs are named
+  `owed-work-<project>-<pid>-<time>.log`. Preferences → Services shows the queue.
+
+- **Code-graph reads are bounded.** Every code-graph read names the properties it needs and resolved links carry only
+  the fields their readers use; a reply-too-large error is logged once with the collection and call site and returns
+  no result instead of being retried. A class without `project_source` now fails with the additive-migration hint
+  instead of running an unscoped callers read.
+- **A listing that returns nothing is "empty" only when the class count agrees.** Class listings go through one
+  cursor; when a listing returns no rows and the count says there are some, the sweep, prune, purge, copy or
+  convergence decision stops, deletes and clears nothing, and the run ends PARTIAL.
+- **A whole-repo code-graph walk over an empty or missing folder (an unmounted drive) no longer deletes that
+  folder's rows.** The deleted-file sweep counts a file as deleted only when the folder still holds other entries.
+- **`migrate_to_new_embeddings.py` and the MCP `migrate_embeddings` function add missing named vectors in place.** A
+  legacy single-vector class is rebuilt only when the rows read match Weaviate's count, and every object keeps its
+  id. The automatic drop of empty legacy code-graph classes now re-checks the project bindings at run time, like the
+  manual drop command.
+- **A full KG sync no longer re-embeds the same nodes on every pass while the chunker re-sync entry is pending.** The
+  entry now clears on every project (a completed forced code-graph walk records its half in the project it walked,
+  and projects already stuck clear at the next session start or update); a knowledge node without a title is a named
+  skip, not a failed summary refresh; and `external_links` is no longer added twice in one schema pass.
+- **A vendor's server-side tool blocks no longer break the next route.** Blocks and other block types the next route
+  cannot accept are converted to text notes (the note keeps the URL) at all four seams of the gateway, and the
+  vendor-bound request is sanitised too. On the Anthropic-bound route a block is converted only on positive vendor
+  evidence, and user-role blocks never. `vco fix-transcript` repairs request-blob rows and reports conversion counts.
+- **Hook injections cost far fewer Weaviate requests.** At most two routers query Weaviate at once machine-wide (a
+  router with no free slot waits up to 5 s, then skips its injection for that call); the code-graph leg is cached per
+  symbol, while the knowledge-graph leg is cached per turn (a new turn re-queries, so results follow that turn's
+  conversation and the current knowledge graph); an identical re-Read in the same turn with nothing new returns before
+  any query; a lookup that finished empty is cached for 300 s and a timeout or error never is (a failed lookup is re-run
+  by a detached warmer, whose lookups are bounded by `VCO_WARM_LEG_TIMEOUT_S`); citation context is staged only for
+  results actually shown; neighbour chunks appear on hook surfaces only at the full-render score; when any hook finds
+  Weaviate unreachable every hook skips its queries for the next 30 s; and the cache is cleaned past its first 200
+  entries.
+- **Update all decides each project's index work, and says why.** After a bundle update, a KG sync is queued only when
+  a knowledge node the sync ingests changed (or the store is missing nodes), and a code-graph pass only when HEAD
+  moved since the last build (incremental) or a full re-walk is owed - one walk per project, handed between the
+  schedulers through `VCT_CODEGRAPH_WALK_OWNER`. Update all and an orchestrator update exclude each other, and every
+  project gets its own notice. A code-graph pass queued by a bundle update keeps its decided shape across a launcher
+  restart: an owed forced re-walk resumes with `--force-rewalk`, and an incremental pass keeps its since-commit while
+  that is still an ancestor of HEAD (launcher.db migration 052, `code_graph_builds.pending_mode` and
+  `pending_requeues`; at most three boot requeues, then the row fails with Retry).
+- **Index jobs refuse only the start of an orchestrator update or a hardware reconfiguration.** Continuing, resuming,
+  aborting or re-applying an update already under way is never refused for code-graph or knowledge-graph jobs, and the
+  refusal names the action and says it can start when the jobs finish. When the launcher cannot run git, a bundle update
+  queues a full code-graph pass instead of treating the project as having no git HEAD; the bundle's knowledge-change
+  statement counts Markdown files under dot-prefixed folders, as the sync does; and rows left at embed revision 0 by a
+  failed embed are healed by the next incremental pass (the next commit the code graph catches up), not by every bundle
+  update.
+- **An update moves Weaviate to the pinned image only through a protected, verified move.** A Weaviate container this
+  install's compose created, on the installer's data mount, is recorded as VCO-managed and moved through
+  `vco_lib.container_upgrade`: every class counted, a raft snapshot by the old image, a free-space check and a copy of
+  the data to a `vco-weaviate-backup-<stamp>` volume, recreate, verify (image, mount, every index, no class lost an
+  object; objects written during the move are reported, not a failure), and a rollback to the old image on the
+  restored copy on any failure. A failed move is not retried until
+  `python -m vco_lib.container_upgrade retry --service weaviate`; `VCO_CONTAINER_UPGRADE=off|dry-run` keeps or plans.
+  No other path changes a Weaviate's version: session hooks, the launcher's Services actions, the port move, the
+  volume migration and install step 5 refuse such a recreate (a stuck container is started by name instead), and
+  `service_endpoints hand-to-vco --service weaviate` takes a foreign Weaviate over on its own version, then makes the
+  same protected move. The backup volume stays reported in `UPDATE_DEFERRED.md` while it exists, with the command to
+  delete it; VCO never deletes it. A Weaviate VCO did not create is never recreated: it gets the memory limit in
+  place (40 % of the smaller of host and container-engine memory), re-applied at every session start.
+- **The owed-work queue is safer to leave running.** A narrow sync-failure retry falls back to `--all` above 200
+  paths / 24,000 characters; a spawn that cannot start counts as a failed attempt, not a dead worker; the worker
+  stands down during an orchestrator update; code-graph resync drivers share the owed-work pool and its RAM-sized
+  slot count (`VCO_RESYNC_DRIVER_SLOTS` still overrides it); and `python -m vco_lib.owed_work
+  status|ensure|enqueue|worker` is documented.
+- **Smaller fixes.** The hub is revived once per outage under a file lock and the starter is reaped; no retry driver
+  starts when every owed condition is at the cap; the Playwright pre-cache is skipped when the pinned package and
+  browser are already present; first-boot rebind notes are not printed as failures; no drop command is printed for a
+  case-only sibling class; the launcher's "pause while hidden" timers work again; the work-unit counter credits a
+  tool call by its block id; the analyzer retries a 503 from the code-embedding service; a settings-change reload
+  (SIGHUP) ends the MCP server instead of leaving it hung; and the MCP server's Weaviate connect no longer asks
+  pypi.org for the client version.
+
 ## [0.2.106] - 2026-11-12
 
 ### Added
@@ -14517,7 +14769,11 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.103...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...HEAD
+[0.2.107]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.106...v0.2.107
+[0.2.106]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.105...v0.2.106
+[0.2.105]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.104...v0.2.105
+[0.2.104]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.103...v0.2.104
 [0.2.103]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.102...v0.2.103
 [0.2.102]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.101...v0.2.102
 [0.2.101]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.100...v0.2.101

@@ -563,8 +563,8 @@ class TestLegWarmer:
             str(a) for a in captured["kg"]["argv"])
 
     def test_warm_legs_mode_caches_result(self, tmp_path: Path) -> None:
-        """The --warm-legs child runs the specced producer and writes the
-        cache; an empty producer output is NEVER cached (§9)."""
+        """The --warm-legs child writes non-empty output and caches a
+        finished-empty answer with the explicit sentinel (v0.2.107)."""
         import hook_context_router as hcr
 
         stub = _stub_producer(tmp_path, "kg_warm2.py", _KG_BLOCK)
@@ -595,8 +595,9 @@ class TestLegWarmer:
             timeout=120, cwd=str(tmp_path), env=child_env(
                 CLAUDE_PROJECT_DIR=str(tmp_path)))
         assert r2.returncode == 0, r2.stderr
-        assert not (tmp_path / ".claude" / "state" / "query_cache" /
-                    key2).exists(), "an empty leg result was cached"
+        assert (tmp_path / ".claude" / "state" / "query_cache" /
+                key2).exists(), "a finished-empty leg gets the 300 s sentinel"
+        assert hcr.cache_get(str(tmp_path), key2) == ""
 
     def test_slow_leg_detached_then_next_call_hits(self, tmp_path: Path) -> None:
         """End to end: a producer slower than the leg deadline yields no

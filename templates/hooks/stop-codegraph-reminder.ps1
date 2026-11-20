@@ -14,10 +14,14 @@
 #
 # Plain ASCII only (no em-dash, no BOM needed).
 
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 if (Test-Path "$PSScriptRoot/_lib/stderr-cap.ps1") { . "$PSScriptRoot/_lib/stderr-cap.ps1" }
 if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") { . "$PSScriptRoot/_lib/emit-context.ps1" }
@@ -30,7 +34,7 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
 }
 
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 
 $SessionId = ""
 try {

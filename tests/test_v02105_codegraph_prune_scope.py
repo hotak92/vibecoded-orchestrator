@@ -421,6 +421,9 @@ def test_extra_rows_survive_the_remedy_and_a_primary_prune(
         scope_mod, "project_has_registered_extras", lambda root: True)
     monkeypatch.setattr(analyzer_mod, "_clear_after_reaping",
                         lambda analyzer: None)
+    # v0.2.107: the prune refuses a walked root that is not a directory; this
+    # test's roots are name-only fixtures.
+    monkeypatch.setattr("vco_lib.codegraph_prune.os.path.isdir", lambda p: True)
     capsys.readouterr()
     a._prune_stale_objects()
     assert functions.deleted == ["f-stale"], (

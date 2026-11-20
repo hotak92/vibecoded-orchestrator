@@ -144,8 +144,10 @@
   .rows { list-style: none; padding: 0; margin: 0; }
   .rows li { padding: 0.25rem 0; }
   .key { font-weight: 600; margin: 0 0.5rem; }
-  .source { color: var(--muted, #888); font-size: 0.85em; }
-  .badge { background: var(--accent-soft, #eef); padding: 0.1rem 0.4rem; border-radius: 0.2rem; font-size: 0.8em; margin-left: 0.5rem; }
+  /* `--muted` and `--accent-soft` are defined nowhere either: the badge
+     painted #eef behind the page's near-white text. */
+  .source { color: var(--color-mid); font-size: 0.85em; }
+  .badge { background: rgba(var(--color-purple-rgb), 0.18); padding: 0.1rem 0.4rem; border-radius: 0.2rem; font-size: 0.8em; margin-left: 0.5rem; }
   /* v0.2.91 F-15: `--danger` and `--success` are defined NOWHERE in
      app.css, so these always painted their inline fallbacks — #c00 dark red
      and #060 dark green, hues that appear in no other surface of a

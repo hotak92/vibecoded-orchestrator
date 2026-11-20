@@ -11,15 +11,14 @@ it on the three code paths a proxy has.
   ============  ==========================================================
   path          what happens here
   ============  ==========================================================
-  vendor        ``server_tool_use`` / ``tool_use`` ids are normalised so the
-  RESPONSE      bytes that land in the CLIENT'S transcript already satisfy
-                Anthropic's validator, and a ``server_tool_use`` naming a
-                tool Anthropic cannot represent is stripped with its result.
-                Fixing it here is what makes the session survivable: a
-                transcript is append-only, so a poisoned turn is re-sent by
-                every later request until the session is abandoned.
-  vendor        the vendor is handed back its OWN ids, from the bounded map
-  REQUEST       recorded on the way out — the gateway's rewriting is not the
+  vendor        server-side tool calls/results and unknown block types become
+  RESPONSE      readable text notes before they can enter the client's
+                transcript. Native Anthropic-minted pairs stay untouched, and
+                ordinary ``tool_use`` blocks keep their ids. A transcript must
+                remain replayable when the next turn switches route.
+  vendor        inherited server-only blocks become text notes; then the
+  REQUEST       vendor is handed back its OWN ids, from the bounded map
+                recorded on the way out — the gateway's rewriting is not the
                 vendor's business, and a vendor that keys anything off its
                 ids must not see ours.
   Anthropic     an OLDER session, poisoned before this code shipped, still
@@ -55,6 +54,7 @@ from vco_lib.transcript_repair import (
     restore_ids,
     thinking_enabled,
     unmark_thinking_signatures,
+    vendor_tool_note,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,6 +168,11 @@ def normalise_vendor_response(
 ) -> tuple[Any, RepairStats]:
     """Rewrite a vendor's buffered ``/v1/messages`` response in place-by-copy.
 
+    ``convert_server_tools=True``: a non-Anthropic server-side call and its
+    result become text notes before the response reaches the client. The note
+    retains the call input and result text, so switching models cannot replay
+    a route-only block type into a 400. Native Anthropic-minted pairs survive.
+
     ``mark_thinking=True``: a ``thinking`` block's signature is prefixed with
     the gateway marker on the way out, so the signature the CLIENT stores is
     unambiguously vendor-origin and a later first-party request can strip the
@@ -181,7 +186,10 @@ def normalise_vendor_response(
     if not isinstance(payload, dict):
         return payload, RepairStats()
     repairer = TranscriptRepairer(
-        id_map=id_map, strip_nonportable=True, mark_thinking=True,
+        id_map=id_map,
+        strip_nonportable=True,
+        mark_thinking=True,
+        convert_server_tools=True,
     )
     # A Messages response IS the assistant turn, so the role is not in doubt
     # — and it decides whether a ``tool_result`` block may stay.
@@ -241,6 +249,28 @@ def sanitise_for_anthropic(payload: Any) -> tuple[Any, RepairStats]:
     if drop_thinking:
         patched.pop("thinking", None)
         repairer.stats.thinking_param_dropped = True
+    return patched, repairer.stats
+
+
+def sanitise_for_vendor(payload: Any) -> tuple[Any, RepairStats]:
+    """Make inherited history portable before sending it to any vendor.
+
+    Vendor-origin server-side calls and unknown block types become readable
+    text notes. Anthropic-minted server-tool and MCP pairs remain byte-
+    identical: the gateway cannot distinguish a future native block from an
+    old one, and the compatibility contract explicitly preserves them.
+    Ordinary tool inputs are never traversed or rewritten.
+    """
+    if not isinstance(payload, dict):
+        return payload, RepairStats()
+    repairer = TranscriptRepairer(
+        id_map=None, strip_nonportable=False, convert_server_tools=True,
+    )
+    messages, changed = repairer.repair_messages(payload.get("messages"))
+    if not changed:
+        return payload, repairer.stats
+    patched = dict(payload)
+    patched["messages"] = messages
     return patched, repairer.stats
 
 
@@ -401,11 +431,23 @@ class SseIdRewriter:
         message_start_usage: Optional[int] = None,
     ) -> None:
         self._repairer = TranscriptRepairer(
-            id_map=id_map, strip_nonportable=strip_nonportable,
+            id_map=id_map,
+            strip_nonportable=strip_nonportable,
+            convert_server_tools=True,
         )
         self._buffer = b""
         self._index_map: dict[int, int] = {}
         self._dropped_indexes: set[int] = set()
+        #: Vendor tool-use blocks whose input JSON arrives in deltas. Their
+        #: visible text note is emitted at content_block_stop, when the URL or
+        #: query is complete.
+        self._converting: dict[int, dict] = {}
+        #: Original indexes of blocks converted to a text note WHOLE at
+        #: ``content_block_start`` (start + one ``text_delta``). Their own
+        #: later deltas belong to the original type, not to a text block, so
+        #: they are suppressed; the ``content_block_stop`` still closes the
+        #: text block.
+        self._converted_at_start: set[int] = set()
         self._next_index = 0
         self._passthrough = False
         #: Block indexes whose ``signature_delta`` has already been marked
@@ -449,7 +491,7 @@ class SseIdRewriter:
         out = bytearray()
         frames, self._buffer = split_sse_frames(self._buffer, final=final)
         for event, separator in frames:
-            rewritten = self._rewrite_event(event)
+            rewritten = self._rewrite_event(event, separator)
             # A suppressed event takes its separator with it: emitting the
             # blank line alone would put a stray empty event on the wire.
             # The ORIGINAL separator is re-emitted, so a CRLF stream stays
@@ -495,7 +537,7 @@ class SseIdRewriter:
         return bytes(out) + tail
 
     # ── one event ────────────────────────────────────────────────────────
-    def _rewrite_event(self, raw: bytes) -> bytes:
+    def _rewrite_event(self, raw: bytes, separator: bytes) -> bytes:
         # keepends: every line carries its OWN terminator, so an untouched
         # line is re-emitted byte for byte and a rewritten one keeps the
         # ending its neighbours use. splitlines also splits on a lone CR,
@@ -523,6 +565,20 @@ class SseIdRewriter:
             return raw
         if verdict is None:
             return b""  # suppressed; the caller drops the separator too
+        if isinstance(verdict, list):
+            frames = []
+            for event_name, event_payload in verdict:
+                event_lines = list(lines)
+                for i, line in enumerate(event_lines):
+                    if _without_eol(line).startswith(b"event:"):
+                        event_lines[i] = (
+                            b"event: " + event_name.encode("ascii") + _line_eol(line)
+                        )
+                        break
+                frames.append(
+                    self._reserialise(event_lines, data_positions, event_payload),
+                )
+            return separator.join(frames)
         return self._reserialise(lines, data_positions, verdict)
 
     @staticmethod
@@ -585,7 +641,17 @@ class SseIdRewriter:
         branch strips it back off before forwarding.
         """
         original_index = payload.get("index")
-        if isinstance(original_index, int) and original_index in self._dropped_indexes:
+        if isinstance(original_index, int) and original_index in self._converting:
+            delta = payload.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
+                partial = delta.get("partial_json")
+                if isinstance(partial, str):
+                    self._converting[original_index]["json"].append(partial)
+            return None
+        if isinstance(original_index, int) and (
+            original_index in self._dropped_indexes
+            or original_index in self._converted_at_start
+        ):
             return None
         patched: Optional[dict] = None
         if isinstance(original_index, int):
@@ -712,6 +778,34 @@ class SseIdRewriter:
         patched["content_block"] = repaired[0]
         if isinstance(original_index, int):
             patched["index"] = out_index
+        if (
+            changed
+            and isinstance(block, dict)
+            and block.get("type") != "text"
+            and isinstance(repaired[0], dict)
+            and repaired[0].get("type") == "text"
+        ):
+            note = repaired[0].get("text", "")
+            patched["content_block"] = {"type": "text", "text": ""}
+            if (
+                block.get("type") in ("mcp_tool_use", "server_tool_use")
+                and isinstance(original_index, int)
+            ):
+                self._converting[original_index] = {
+                    "block": block,
+                    "json": [],
+                }
+                return patched
+            if isinstance(original_index, int):
+                self._converted_at_start.add(original_index)
+            return [
+                ("content_block_start", patched),
+                ("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": patched.get("index", original_index),
+                    "delta": {"type": "text_delta", "text": note},
+                }),
+            ]
         return patched
 
     def _on_indexed(self, payload: dict) -> Any:
@@ -721,11 +815,30 @@ class SseIdRewriter:
         if original_index in self._dropped_indexes:
             return None
         mapped = self._index_map.get(original_index, original_index)
-        if mapped == original_index:
-            return _UNCHANGED
-        patched = dict(payload)
-        patched["index"] = mapped
-        return patched
+        patched = payload
+        if mapped != original_index:
+            patched = dict(payload)
+            patched["index"] = mapped
+        converting = self._converting.pop(original_index, None)
+        if converting is None:
+            return _UNCHANGED if patched is payload else patched
+        block = dict(converting["block"])
+        parts = converting["json"]
+        if parts:
+            raw_input = "".join(parts)
+            try:
+                block["input"] = json.loads(raw_input)
+            except ValueError:
+                block["input"] = raw_input
+        note = vendor_tool_note(block)["text"]
+        return [
+            ("content_block_delta", {
+                "type": "content_block_delta",
+                "index": mapped,
+                "delta": {"type": "text_delta", "text": note},
+            }),
+            ("content_block_stop", patched),
+        ]
 
 
 __all__ = [
@@ -742,6 +855,7 @@ __all__ = [
     "normalise_vendor_response",
     "restore_vendor_ids",
     "sanitise_for_anthropic",
+    "sanitise_for_vendor",
     "split_sse_frames",
     # Re-exported from the SSOT so server.py imports every request/response
     # rewrite seam from this one adapter: the vendor branch strips the

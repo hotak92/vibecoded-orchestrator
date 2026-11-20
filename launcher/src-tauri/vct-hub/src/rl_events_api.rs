@@ -182,9 +182,12 @@ async fn post_event(
         Ok(id) => (StatusCode::OK, Json(PostEventResponse { ok: true, id })).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "[vct-hub] post_rl_event insert failed");
-            // v0.2.102 (W3R-9 follow-up): an FK failure with a non-null
-            // project_id means the referenced project row is gone (deleted /
-            // re-registered) — the writer's CACHED identity is stale. Answer
+            // v0.2.102 (W3R-9 follow-up): with a non-null project_id, the
+            // "FOREIGN KEY" text is `Db::insert_rl_event`'s
+            // UNKNOWN_PROJECT_ID_ERROR (since migration 053 the insert itself
+            // refuses a project_id that names no registered project): the
+            // project row is gone (deleted / re-registered) — the writer's
+            // CACHED identity is stale. Answer
             // 422 with a machine-readable code so the writer drops the cached
             // identity and re-resolves, instead of losing events as generic
             // 500s for the rest of the identity-cache TTL.
@@ -216,6 +219,13 @@ async fn post_event(
 
 // ─── GET /api/v1/rl/events ─────────────────────────────────────────────
 
+/// MCPREAD-05 (v0.2.107): a GET page ends once the `payload_json` bytes it
+/// carries reach this many (at least one row is always returned). With rows
+/// of 50–150 KB a 10,000-row page used to be 0.5–1.5 GB of JSON, built here
+/// and parsed by the trainer container in one piece. Shared by this route and
+/// the module-scoped one (`module_db_api.rs`), the trainer's read path.
+pub const RL_EVENTS_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct ListEventsQuery {
     pub project_id: Option<String>,
@@ -223,6 +233,13 @@ pub struct ListEventsQuery {
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
     pub limit: Option<u32>,
+    /// Keyset cursor (MCPREAD-05): the `ts_ms` and `id` of the last row of the
+    /// previous page. Both or neither; only rows older in `(ts, id)` order
+    /// follow.
+    #[serde(default)]
+    pub before_ts: Option<i64>,
+    #[serde(default)]
+    pub before_id: Option<i64>,
     /// RL-14 (v0.2.75): quarantined rows are EXCLUDED by default — this GET
     /// is the offline trainer's read path and poisoned rows must never
     /// re-enter the corpus silently. Inspection surfaces opt in explicitly.
@@ -276,12 +293,18 @@ async fn list_events(
     Query(q): Query<ListEventsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(500).min(10_000);
-    match h.0.list_rl_events(
+    let before = match (q.before_ts, q.before_id) {
+        (Some(t), Some(i)) => Some((t, i)),
+        _ => None,
+    };
+    match h.0.list_rl_events_page(
         q.project_id.as_deref(),
         q.event_type.as_deref(),
         q.since_ms,
         q.until_ms,
+        before,
         limit,
+        Some(RL_EVENTS_PAGE_MAX_BYTES),
         q.include_quarantined.unwrap_or(false),
     ) {
         Ok(rows) => {
@@ -392,14 +415,16 @@ pub struct PruneEventsResponse {
 /// `prune_rl_events` itself (a pass that deleted nothing discards its own
 /// sidecar) and is the one that holds for a prune issued by a DIFFERENT
 /// process, which no in-process mutex can reach.
-static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+///
+/// A std mutex taken INSIDE the blocking task (A-014): a pass runs several
+/// batches on the blocking pool, and a caller that hangs up mid-pass drops
+/// the handler but not the task — the lock must live as long as the pass.
+static PRUNE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 async fn prune_events(
     State(h): State<LauncherDbHandle>,
     Json(body): Json<PruneEventsBody>,
 ) -> impl IntoResponse {
-    // Held for the whole archive-then-delete pass, released at end of handler.
-    let _serialize = PRUNE_LOCK.lock().await;
     // R1 (v0.2.91): the prune is ARCHIVE-THEN-DELETE. The archive directory is
     // resolved HERE, hub-side (`$RL_EVENTS_ARCHIVE_DIR`, else
     // `<VCT_STATE_DIR or ~/.vct>/rl_archive`) and NOT taken from the request
@@ -408,12 +433,23 @@ async fn prune_events(
     // caller remembering to name an archive. A failed archive makes
     // `prune_rl_events` return Err → this handler 500s and NOTHING is deleted.
     let archive_dir = vct_launcher_core::db::rl_events::rl_archive_dir();
-    match h.0.prune_rl_events(
-        body.cutoff_ms,
-        body.max_rows,
-        body.project_id.as_deref(),
-        &archive_dir,
-    ) {
+    // A-014 (v0.2.107): one request runs a whole retention PASS — batch after
+    // batch, each archive-verified before its delete — on the blocking pool,
+    // so a long pass never stalls the hub's async workers.
+    let db = h.0.clone();
+    let pass = tokio::task::spawn_blocking(move || {
+        let _serialize = PRUNE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        db.prune_rl_events_pass(
+            body.cutoff_ms,
+            body.max_rows,
+            body.project_id.as_deref(),
+            &archive_dir,
+            vct_launcher_core::db::rl_events::prune_max_batches_per_pass(),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("prune task: {}", e)));
+    match pass {
         Ok(deleted) => (
             StatusCode::OK,
             Json(PruneEventsResponse { ok: true, deleted }),

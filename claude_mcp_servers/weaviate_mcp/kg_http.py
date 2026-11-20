@@ -41,6 +41,11 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
+# v0.2.107 (A-063): the machine-wide "endpoint down" marker this client sets
+# on a refused/unreachable connection and clears on a ready probe; its one
+# home is vco_lib.endpoint_down (the hook router checks it there).
+from vco_lib.endpoint_down import clear_endpoint_down, mark_endpoint_down
+
 
 class WeaviateUnreachable(Exception):
     """Raised when Weaviate is not reachable (HTTP refused / gRPC down).
@@ -55,7 +60,14 @@ class WeaviateUnreachable(Exception):
 
 
 class WeaviateHttpQueryError(Exception):
-    """A GraphQL/REST read failed (HTTP error or GraphQL ``errors``)."""
+    """A GraphQL/REST read failed (HTTP error or GraphQL ``errors``).
+
+    ``status`` is the HTTP status when the failure was an HTTP error, else
+    ``None`` (a GraphQL ``errors`` payload)."""
+
+    def __init__(self, msg: str, status: "Optional[int]" = None) -> None:
+        super().__init__(msg)
+        self.status = status
 
 
 #: Init / query timeouts — the weaviate-client v4 defaults (``Timeout(init=2,
@@ -451,6 +463,18 @@ class _Collections:
             self._cache[name] = HttpCollection(self._client, name)
         return self._cache[name]
 
+    def exists(self, name: str) -> bool:
+        """v4's ``collections.exists``: False only on a 404 for the class
+        schema; any other failure propagates (an unreachable or failing
+        Weaviate is not evidence that the collection is absent)."""
+        try:
+            self._client._get_json(f"/v1/schema/{name}")
+        except WeaviateHttpQueryError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
 
 class HttpWeaviateClient:
     """Read-only Weaviate client over plain HTTP (GraphQL + schema REST).
@@ -469,15 +493,18 @@ class HttpWeaviateClient:
                                         timeout=init_timeout) as resp:
                 status = resp.status
         except (urllib.error.URLError, OSError, ValueError) as exc:
+            mark_endpoint_down(self.base_url)
             raise WeaviateUnreachable(
                 f"Connection to Weaviate failed. Details: {exc}",
                 f"Is Weaviate running and reachable at {self.base_url}?",
             ) from exc
         if status != 200:
+            mark_endpoint_down(self.base_url)
             raise WeaviateUnreachable(
                 f"Weaviate at {self.base_url} is not ready (HTTP {status})",
                 f"Weaviate at {self.base_url} answered but is not ready yet; retry shortly.",
             )
+        clear_endpoint_down(self.base_url)
 
     def _request(self, path: str, body: "Optional[dict]" = None) -> dict:
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -490,7 +517,15 @@ class HttpWeaviateClient:
             with urllib.request.urlopen(req, timeout=self._query_timeout) as resp:
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as exc:
-            raise WeaviateHttpQueryError(f"HTTP {exc.code} on {path}") from exc
+            raise WeaviateHttpQueryError(f"HTTP {exc.code} on {path}", status=exc.code) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            # A refused/unreachable connection marks the endpoint down for
+            # every hook (A-063); a slow query (timeout) does not — the
+            # server is up. The original exception propagates unchanged.
+            reason = getattr(exc, "reason", exc)
+            if not isinstance(reason, TimeoutError):
+                mark_endpoint_down(self.base_url)
+            raise
 
     def _get_json(self, path: str) -> dict:
         return self._request(path)

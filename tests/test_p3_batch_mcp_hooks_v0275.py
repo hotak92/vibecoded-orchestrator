@@ -200,16 +200,18 @@ class TestNew4Semaphore:
 # (session-start-retrieval-health.ps1, kg-sync-on-edit.ps1,
 # session-start-deferral-surface.ps1), so deleting it would break those
 # hooks. The honest resolution: delete ONLY the dead .sh function; keep the
-# live .ps1 one. This test pins that asymmetry.
+# live .ps1 one. v0.2.107 made the promise true instead: the .sh helper is back
+# and every hook on both sides calls its lib (inline list = fallback), so the
+# class below now pins that state.
 
 
-class TestHK2DeadHelperDeleted:
-    def test_sh_helper_function_deleted(self):
+class TestHK2ScrubHelpersLive:
+    def test_sh_helper_function_is_back_with_callers(self):
+        """v0.2.107 superseded the HK-2 deletion: every .sh hook now sources
+        scrub-env.sh and calls the helper (the inline unset is the fallback).
+        The full contract lives in tests/test_v02107_scrub_env_lib_sourced.py."""
         src = SCRUB_SH.read_text(encoding="utf-8")
-        # The DEFINITION `vct_scrub_secret_env() {` must be gone (the name may
-        # still appear in the HK-2 explanatory comment — that's not a def).
-        assert "vct_scrub_secret_env() {" not in src, "dead .sh helper def must be deleted"
-        # The canonical VALUE stays (parity gate reads it).
+        assert "vct_scrub_secret_env() {" in src
         assert "VCT_SCRUB_SECRET_KEYS=" in src
 
     def test_ps1_helper_KEPT_because_it_has_callers(self):
@@ -218,14 +220,11 @@ class TestHK2DeadHelperDeleted:
             "the .ps1 helper has 3 live callers — it must NOT be deleted"
         )
 
-    def test_no_bash_callers_of_deleted_sh_helper(self):
-        """Grep-gate: no .sh hook calls the deleted bash function."""
+    def test_every_bash_hook_calls_the_sh_helper(self):
+        """v0.2.107: the reverse of the HK-2 grep-gate -- every .sh hook calls it."""
         hooks_dir = REPO_ROOT / "templates" / "hooks"
-        for f in hooks_dir.rglob("*.sh"):
-            if f.name == "scrub-env.sh":
-                continue
-            text = f.read_text(encoding="utf-8")
-            assert "vct_scrub_secret_env" not in text, f"{f} calls deleted .sh helper"
+        for f in hooks_dir.glob("*.sh"):
+            assert "vct_scrub_secret_env" in f.read_text(encoding="utf-8"), f
 
     def test_ps1_callers_still_resolve(self):
         """The 3 known .ps1 callers still reference the (retained) function —

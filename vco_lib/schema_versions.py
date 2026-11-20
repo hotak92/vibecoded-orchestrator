@@ -317,7 +317,16 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: audited host-wide write chose it, so existing installs follow the
 #: bundled-weights default; data-only, no table change). Bumped ATOMICALLY
 #: with mig 051's Rust registration.
-LAUNCHER_DB_TABLE_SET_VERSION = 51
+#: 52 = migration 052_code_graph_build_pending_mode.sql (v0.2.107 UPDATE-ALL
+#: fix round, audit U-1 — nullable code_graph_builds.pending_mode: the pass
+#: shape a post-bundle decision queued, so a launcher restart resumes an owed
+#: forced walk WITH --force-rewalk instead of failing it). Bumped ATOMICALLY
+#: with mig 052's Rust registration.
+#: 53 = migration 053_rl_events_outlive_their_project.sql (v0.2.107, audit
+#: A-022 — rl_events loses its ON DELETE CASCADE foreign key to projects, so
+#: an unregister keeps the project's RL training events, named; project_name
+#: back-filled). Bumped ATOMICALLY with mig 053's Rust registration.
+LAUNCHER_DB_TABLE_SET_VERSION = 53
 
 
 # ===========================================================================

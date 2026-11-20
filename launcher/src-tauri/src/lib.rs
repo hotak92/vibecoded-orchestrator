@@ -11,6 +11,7 @@
 mod commands;
 mod hub_launcher;
 mod hub_status;
+mod instance_lock;
 mod installer_engine;
 // Shared read-modify-write primitives for USER-OWNED JSON files (advisory
 // lock + atomic rename + pre-write backup). Extracted from
@@ -671,7 +672,7 @@ pub(crate) fn apply_hidden_start(
 /// race. Hiding the window later (what the `tray_start_minimized` preference
 /// does from `setup`) is NOT equivalent: by then the window exists.
 fn hidden_start_context() -> tauri::Context<tauri::Wry> {
-    let mut context = tauri::generate_context!();
+    let mut context = base_context();
     let args: Vec<String> = std::env::args().collect();
     let hidden = start_hidden_requested(&args);
     let changed = apply_hidden_start(&mut context.config_mut().app.windows, hidden);
@@ -684,6 +685,93 @@ fn hidden_start_context() -> tauri::Context<tauri::Wry> {
         );
     }
     context
+}
+
+/// The ONE expansion of `tauri::generate_context!()` (it embeds the frontend
+/// assets — a second expansion would embed them twice).
+fn base_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+/// v0.2.107 LAUNCH-ONCE: take the per-user instance lock, or leave.
+///
+/// Returns only when THIS process is the launcher (it now holds the lock for
+/// its whole life) or the lock cannot be asked at all (an unwritable state
+/// dir — the single-instance plugin then stays the guard, as before). Every
+/// other outcome ends the process here, before `run()` has opened the
+/// database or started anything. See `instance_lock.rs` for the mechanism.
+fn take_instance_lock_or_exit(argv: &[String]) {
+    use instance_lock::{LockAttempt, Step};
+
+    let root = paths::vct_root_dir();
+    let hidden = start_hidden_requested(argv);
+    let relaunch_child = commands::restart::relaunch_parent_pid(argv).is_some();
+    let started = std::time::Instant::now();
+    loop {
+        let attempt = instance_lock::try_acquire(&root);
+        let (lock, ready) = match &attempt {
+            LockAttempt::Acquired(_) => (Some(true), false),
+            LockAttempt::Unavailable(_) => (None, false),
+            LockAttempt::Busy => (
+                Some(false),
+                instance_lock::holder_ready(&root, vct_launcher_core::process::pid_is_alive),
+            ),
+        };
+        match instance_lock::decide(
+            lock,
+            hidden,
+            relaunch_child,
+            ready,
+            started.elapsed(),
+            instance_lock::HAND_OFF_WAIT,
+        ) {
+            Step::Primary => {
+                match attempt {
+                    LockAttempt::Acquired(file) => instance_lock::hold(file, root),
+                    LockAttempt::Unavailable(why) => tracing::warn!(
+                        "[vct] launcher instance lock unavailable ({}) — starting without \
+                         it; the single-instance plugin still refuses a duplicate",
+                        why
+                    ),
+                    LockAttempt::Busy => {}
+                }
+                return;
+            }
+            Step::Exit => {
+                tracing::info!(
+                    "[vct] another launcher is already running for this user ({}) — \
+                     exiting before start-up",
+                    instance_lock::lock_path(&root).display()
+                );
+                std::process::exit(0);
+            }
+            Step::HandOff => hand_off_to_running_instance(),
+            Step::Wait => std::thread::sleep(instance_lock::HAND_OFF_POLL),
+        }
+    }
+}
+
+/// Hand this (user) launch to the running launcher, then exit.
+///
+/// The hand-off is the single-instance plugin's own (it raises the running
+/// launcher's window), run ALONE: the plugin initialises inside
+/// `Builder::build`, finds the running launcher, passes this argv and exits
+/// the process. Nothing else is built — no window (cleared from the config,
+/// and windows are only created by `App::run`, which is never called), no
+/// tray, no database. If the plugin finds nobody (the holder exited between
+/// our check and now) this process still just exits.
+fn hand_off_to_running_instance() -> ! {
+    let mut context = base_context();
+    context.config_mut().app.windows.clear();
+    context.config_mut().app.tray_icon = None;
+    if let Err(e) = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
+        .build(context)
+    {
+        tracing::warn!("[vct] single-instance hand-off could not run: {}", e);
+    }
+    tracing::info!("[vct] another launcher is already running for this user — exiting");
+    std::process::exit(0);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -715,6 +803,13 @@ pub fn run() {
         {
             commands::restart::wait_for_relaunch_parent_before_lock(parent_pid);
         }
+        // v0.2.107 LAUNCH-ONCE: the per-user instance lock, BEFORE any
+        // start-up work below (the reapers, launcher.db, the root
+        // registration, the backfill, the boot exports — and, from `setup`,
+        // the engine autostart and the hub start). A second launcher exits
+        // here, touching nothing. It comes after the relaunch wait so a
+        // relaunch child finds its parent's lock released.
+        take_instance_lock_or_exit(&argv);
     }
 
     // v0.2.49: reap any stale install.py.lock left behind by a crashed
@@ -847,12 +942,14 @@ pub fn run() {
     let local_config = config::LocalConfig::load();
 
     tauri::Builder::default()
-        // v0.2.21: per-user single-instance enforcement. Register BEFORE
-        // any other plugins so the OS-level lock acquire happens before
-        // we start tearing into state-dir setup. If this is the second
-        // launcher process on the same user, the callback below fires in
-        // the FIRST launcher and the second process exits cleanly without
-        // ever creating a window or touching launcher.db.
+        // v0.2.21: per-user single-instance enforcement, registered BEFORE
+        // any other plugin. Since v0.2.107 it is the SECOND line of defence:
+        // the instance lock taken at the top of `run()`
+        // (`take_instance_lock_or_exit`) is what makes a second launcher
+        // exit without ever creating a window or touching launcher.db — this
+        // plugin only runs after that start-up work, so on its own it could
+        // not. It still owns the focus hand-off: when another launch is
+        // attempted the callback below fires in the FIRST launcher.
         //
         // Callback semantics: invoked in the FIRST launcher's runtime when
         // another launch is attempted. Args are the second process's argv;
@@ -949,6 +1046,12 @@ pub fn run() {
             let _ = commands::restart::LAUNCHER_BOOT_TIME
                 .get_or_init(std::time::SystemTime::now);
 
+            // v0.2.107 LAUNCH-ONCE: the plugins (single-instance included)
+            // initialised in `build`, before this hook runs — so a user
+            // launch waiting in `take_instance_lock_or_exit` may now hand
+            // off to this launcher.
+            instance_lock::mark_ready();
+
             // v0.2.53 M-P0-7: augment PATH for graphical-launch contexts
             // BEFORE any subprocess is spawned by the setup hook (sweep
             // for stale binary siblings, container-runtime probe via
@@ -994,7 +1097,8 @@ pub fn run() {
             // or a failed-to-revert pull on any OS. Per file:
             //   1. Parse the pid suffix.
             //   2. Check whether that PID is still alive.
-            //   3. If dead, delete the file.
+            //   3. If dead: restore a `.old-<pid>` whose canonical binary is
+            //      missing (UPDATER-02), delete everything else.
             // Bounded space cost: ≤1 per release in steady state.
             // Soft-fail throughout — sweep failure must NOT block boot.
             if let Ok(exe) = std::env::current_exe() {
@@ -2921,6 +3025,7 @@ pub fn run() {
             // `flipped` = moved, reconciliation owed. Two different sentences.
             commands::projects_v2::list_live_project_moves_v2,
             commands::projects_v2::delete_project_v2,
+            commands::projects_v2::count_project_rl_events,
             commands::projects_v2::launch_project_in_editor,
             // v0.2.49 Phase 6 S-4 — read-only accessor for the boot
             // folder sanity check's cached verdict. The probe itself
@@ -3608,6 +3713,8 @@ pub fn run() {
             commands::local_summary_model::get_local_summary_model_status,
             commands::local_summary_model::remove_local_summary_model,
             commands::local_summary_model::download_local_summary_model,
+            // v0.2.107 (A-003): Preferences → Services owed-work queue line.
+            commands::owed_work::get_owed_work_status,
             commands::kg_summary::retry_kg_summary,
             // v0.2.96 WP-7b: the GUI "Recheck summary backend now" action
             // (Preferences → KG Summaries) — shells to
@@ -3805,17 +3912,29 @@ pub(crate) use vct_launcher_core::process::pid_is_alive;
 /// `<binary>.pending-<pid>` siblings from the launcher dist
 /// directory. These are left behind by the pre-pull-rename path in
 /// the update pipeline (Windows) or a failed-revert path on any
-/// OS. The PID suffix is parsed; files whose PID is no longer alive
-/// are deleted. Files with malformed names, unparseable PIDs, or
-/// alive PIDs are skipped.
+/// OS. The PID suffix is parsed; files with malformed names,
+/// unparseable PIDs, or alive PIDs are skipped. Per dead-PID file the
+/// pure `binary_freshness::decide_stale_sibling` decides:
+///
+/// * UPDATER-02 (v0.2.107): a `.old-<pid>` whose canonical binary is
+///   MISSING is the only copy of that binary (an update died between the
+///   pre-pull rename and the refill) — it is renamed BACK to the canonical
+///   name, never deleted. When several backups of one binary qualify, the
+///   newest (by mtime) is restored and the older ones are then deleted.
+/// * every other dead-PID sibling is deleted.
 ///
 /// Soft-fail throughout — sweep MUST NOT block launcher boot.
 fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
+    use crate::services::binary_freshness::{decide_stale_sibling, StaleSiblingAction};
+
     let entries = match std::fs::read_dir(dist_dir) {
         Ok(e) => e,
         Err(_) => return, // dist_dir missing or unreadable — skip silently
     };
 
+    // (path, is_old_backup, pid, mtime)
+    let mut candidates: Vec<(std::path::PathBuf, bool, u32, Option<std::time::SystemTime>)> =
+        Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let fname = match path.file_name().and_then(|s| s.to_str()) {
@@ -3825,10 +3944,10 @@ fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
         // Match `*.old-<digits>` or `*.pending-<digits>`. The split is
         // on the LAST dot before the suffix so files like
         // `vct-launcher.exe.old-1234` parse correctly.
-        let pid_str = if let Some((_, p)) = fname.rsplit_once(".old-") {
-            p
+        let (is_old, pid_str) = if let Some((_, p)) = fname.rsplit_once(".old-") {
+            (true, p)
         } else if let Some((_, p)) = fname.rsplit_once(".pending-") {
-            p
+            (false, p)
         } else {
             continue;
         };
@@ -3836,21 +3955,58 @@ fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
             Ok(n) => n,
             Err(_) => continue, // not a PID-suffixed file, leave alone
         };
-        if pid_is_alive(pid) {
-            continue;
-        }
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!(
-                "[vct] boot sweep: could not delete stale sibling {}: {} (will retry next boot)",
-                path.display(),
-                e,
-            );
+        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+        candidates.push((path, is_old, pid, mtime));
+    }
+    // Newest first, so the restore picks the most recent backup of a binary.
+    candidates.sort_by(|a, b| b.3.cmp(&a.3));
+
+    for (path, is_old, pid, _) in candidates {
+        let canonical = if is_old {
+            crate::services::binary_freshness::canonical_path_for_backup(&path)
         } else {
-            tracing::info!(
-                "[vct] boot sweep: removed stale {} (pid {} no longer alive)",
-                path.display(),
-                pid,
-            );
+            None
+        };
+        let canonical_exists = canonical
+            .as_deref()
+            .map(|c| std::fs::symlink_metadata(c).is_ok())
+            .unwrap_or(true);
+        match decide_stale_sibling(is_old && canonical.is_some(), pid_is_alive(pid), canonical_exists) {
+            StaleSiblingAction::Keep => {}
+            StaleSiblingAction::RestoreToCanonical => {
+                // `canonical` is Some on this leg (is_old && canonical.is_some()).
+                let Some(canonical) = canonical else { continue };
+                match std::fs::rename(&path, &canonical) {
+                    Ok(()) => tracing::info!(
+                        "[vct] boot sweep: {} was missing; restored it from {} (an update \
+                         ended before the binary was put back)",
+                        canonical.display(),
+                        path.display(),
+                    ),
+                    Err(e) => tracing::warn!(
+                        "[vct] boot sweep: {} is missing and could not be restored from {}: {} \
+                         (will retry next boot)",
+                        canonical.display(),
+                        path.display(),
+                        e,
+                    ),
+                }
+            }
+            StaleSiblingAction::Delete => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        "[vct] boot sweep: could not delete stale sibling {}: {} (will retry next boot)",
+                        path.display(),
+                        e,
+                    );
+                } else {
+                    tracing::info!(
+                        "[vct] boot sweep: removed stale {} (pid {} no longer alive)",
+                        path.display(),
+                        pid,
+                    );
+                }
+            }
         }
     }
 }
@@ -4133,6 +4289,54 @@ mod boot_sweep_tests {
         );
         assert!(canonical.exists(), "canonical binary MUST be preserved");
         assert!(metadata.exists(), "metadata.json MUST be preserved");
+    }
+
+    /// UPDATER-02 ACT: a dead pid's `.old-<pid>` whose canonical binary is
+    /// missing is renamed BACK (never deleted); with two such backups the
+    /// newest wins and the older one is then deleted.
+    #[test]
+    fn sweep_restores_a_dead_pid_backup_when_the_canonical_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead = i32::MAX as u32;
+        let older = dir.path().join(format!("vct-hub.exe.old-{}", dead - 1));
+        fs::write(&older, "older bytes").unwrap();
+        let t_old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(t_old)
+            .unwrap();
+        let newest = dir.path().join(format!("vct-hub.exe.old-{}", dead));
+        fs::write(&newest, "newest bytes").unwrap();
+
+        sweep_stale_binary_siblings(dir.path());
+
+        let canonical = dir.path().join("vct-hub.exe");
+        assert_eq!(fs::read_to_string(&canonical).unwrap(), "newest bytes");
+        assert!(!newest.exists(), "the restored backup is now the canonical file");
+        assert!(!older.exists(), "the older backup is deleted once the canonical is back");
+    }
+
+    /// UPDATER-02 LEAVE-ALONE: canonical present → the dead backup is deleted
+    /// and the canonical bytes are untouched; a live pid's backup is kept even
+    /// when the canonical is missing (an update in progress owns it).
+    #[test]
+    fn sweep_never_overwrites_a_present_canonical_nor_touches_a_live_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = dir.path().join("vct-launcher.exe");
+        fs::write(&canonical, "current").unwrap();
+        let dead = dir.path().join(format!("vct-launcher.exe.old-{}", i32::MAX as u32));
+        fs::write(&dead, "stale").unwrap();
+        let live = dir.path().join(format!("vct-hub.exe.old-{}", std::process::id()));
+        fs::write(&live, "in-flight").unwrap();
+
+        sweep_stale_binary_siblings(dir.path());
+
+        assert_eq!(fs::read_to_string(&canonical).unwrap(), "current");
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert!(!dir.path().join("vct-hub.exe").exists());
     }
 
     /// `sweep_stale_binary_siblings` is a silent no-op on a missing

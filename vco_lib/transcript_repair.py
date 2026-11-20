@@ -2,9 +2,9 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Anthropic tool-block normalisation — the ONE deterministic rewrite.
 
-Three callers share this module, which is why it lives in ``vco_lib`` (the
+Four callers share this module, which is why it lives in ``vco_lib`` (the
 Python SSOT) rather than beside the gateway: the gateway's vendor RESPONSE
-path, the gateway's Anthropic REQUEST path
+path, its Anthropic-bound and vendor-bound REQUEST paths
 (:mod:`model_router.tool_ids`), and ``vco fix-transcript``
 (:mod:`vco_lib.cli.fix_transcript`) must produce byte-identical results, or a
 transcript repaired by one is rejected after being touched by the other.
@@ -68,11 +68,14 @@ So the policy this module implements, and why each half of it exists:
 * **Normalising the id is enough — but only for a tool name Anthropic knows.**
   Hence :data:`PORTABLE_SERVER_TOOL_NAMES`, copied verbatim from the
   validator's own error text.
-* **A block whose name is not in that set cannot be represented at all**, so
-  it is STRIPPED together with the result that references it. There is no
-  third option: rewriting the name would claim a different tool ran, which is
-  the class of lie this codebase refuses elsewhere (honest naming in
-  :mod:`model_router.routing`).
+* **On the Anthropic repair route, a vendor block whose name is not in that
+  set cannot be represented at all**, so it is STRIPPED together with its
+  result. There is no valid server-tool spelling to substitute: rewriting the
+  name would claim a different tool ran, which is the class of lie this
+  codebase refuses elsewhere (honest naming in :mod:`model_router.routing`).
+  On a vendor response or vendor-bound request the block instead becomes a
+  clearly labelled text note, preserving its input and result without
+  claiming that another tool ran.
 
 The incident that paid for this: a session on a vendor route answered image
 attachments with the vendor's built-in ``analyze_image``, which wrote
@@ -106,6 +109,7 @@ from vco_lib.atomic import atomic_text_stream
 #: Prefix Anthropic requires on ``server_tool_use.id`` (validator pattern
 #: ``^srvtoolu_[a-zA-Z0-9_]+$``, quoted from the live 400 above).
 SERVER_TOOL_ID_PREFIX = "srvtoolu_"
+MCP_TOOL_ID_PREFIX = "mcptoolu_"
 
 #: Plain ``tool_use`` ids are NOT rewritten. The validator does not
 #: pattern-check them — a vendor ``call_…`` id round-trips at HTTP 200, proved
@@ -117,9 +121,10 @@ SERVER_TOOL_ID_PREFIX = "srvtoolu_"
 _SERVER_TOOL_ID_RE = re.compile(r"^srvtoolu_[a-zA-Z0-9_]+$")
 _DISALLOWED_RE = re.compile(r"[^A-Za-z0-9_]")
 
-#: Server-tool names Anthropic's validator accepts, verbatim from its own
-#: error text (2026-09-08). A ``server_tool_use`` block naming anything else
-#: is unrepresentable on the Anthropic route at any id, so it is stripped.
+#: Server-tool names Anthropic's validator accepts, from its 2026-09-08 error
+#: text plus ``advisor`` from the 2026-11-17 capture. A vendor-origin
+#: ``server_tool_use`` is converted on response/vendor routes and stripped on
+#: the Anthropic repair route; an Anthropic-minted future name is preserved.
 #: This is a CLIENT-CONTRACT list, like ``CLAUDE_ID_MARKERS`` in the gateway's
 #: vendor registry — not a preference, and not a place to add vendor names.
 PORTABLE_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
@@ -131,15 +136,16 @@ PORTABLE_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
         "text_editor_code_execution",
         "tool_search_tool_regex",
         "tool_search_tool_bm25",
+        "advisor",
     }
 )
 
 #: Block type of a CLIENT tool result — references a ``tool_use`` id.
 CLIENT_TOOL_RESULT_TYPE = "tool_result"
 
-#: The MCP connector's producer block. Never rewritten (its ids are
-#: Anthropic's), but recognised so its id is RECORDED as a producer — without
-#: that its result reads as an orphan and is stripped on every request.
+#: The MCP connector's producer block. Anthropic-minted ``mcptoolu_`` traffic
+#: is preserved; a vendor's pair is converted to text before any route stores
+#: or replays it, because other routes reject these server-side blocks.
 MCP_TOOL_USE_TYPE = "mcp_tool_use"
 
 #: Extended-thinking block types. Anthropic SIGNS every ``thinking`` block it
@@ -170,6 +176,80 @@ EMPTY_KEEP = "keep"
 #: Substituted for an emptied ``.jsonl`` entry. Reads as what it is: a note
 #: from a tool, in the transcript, where a vendor block used to be.
 EMPTY_PLACEHOLDER_TEXT = "[vendor tool block removed by vco fix-transcript]"
+THINKING_PLACEHOLDER_TEXT = "[vendor thinking block removed by vco fix-transcript]"
+
+#: Block types every route can carry without a destination-specific tool
+#: contract. On the vendor routes everything else is handled explicitly below
+#: or converted to a text note; an unfamiliar type beside an Anthropic-minted
+#: id is the one conservative exception (it may be a first-party block newer
+#: than this table). The Anthropic-bound route is wider — see
+#: :data:`ANTHROPIC_REQUEST_BLOCK_TYPES`: there a block is converted only on
+#: positive vendor evidence, and a USER block never.
+ROUTE_SAFE_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        THINKING_BLOCK_TYPE,
+        REDACTED_THINKING_BLOCK_TYPE,
+        "tool_use",
+        "image",
+        "document",
+        "tool_reference",
+    }
+)
+
+#: Every top-level content-block type the Anthropic Messages API accepts in a
+#: REQUEST. Used only on the Anthropic-bound route (no ``convert_server_tools``)
+#: by the catch-all in :meth:`TranscriptRepairer.repair_content`: a block of
+#: one of these types that reaches it is Anthropic's own shape and passes
+#: through unchanged. The id-bearing families (``server_tool_use``,
+#: ``*_tool_result``, ``mcp_tool_use``, ``tool_result``, ``thinking``) are
+#: still decided by their own branches first — membership here does not
+#: exempt a vendor-origin pair from them.
+#:
+#: Source: the ``anthropic`` Python SDK 0.102.0 type definitions — the union
+#: ``ContentBlockParam`` (``types/content_block_param.py``) and the beta union
+#: ``BetaContentBlockParam`` (``types/beta/beta_content_block_param.py``, which
+#: also admits every response ``BetaContentBlock``), each member's
+#: ``type: Required[Literal[...]]``. ``tool_reference`` is not a top-level
+#: member there (the SDK nests it inside ``tool_result`` content); it is kept
+#: because the client sends it and :data:`ROUTE_SAFE_BLOCK_TYPES` already
+#: carries it. Nested-only types (``web_search_result``,
+#: ``code_execution_result``, …) are not listed: this walk never descends.
+#: Not a place to add vendor types — a type outside this set is still passed
+#: through on the Anthropic route unless it is positively vendor-originated
+#: (see ``_unknown_is_vendor_origin``); the set only decides that a KNOWN type
+#: is never second-guessed.
+ANTHROPIC_REQUEST_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "document",
+        "search_result",
+        THINKING_BLOCK_TYPE,
+        REDACTED_THINKING_BLOCK_TYPE,
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "advisor_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+        "mcp_tool_use",
+        "mcp_tool_result",
+        "container_upload",
+        "compaction",
+        "tool_reference",
+    }
+)
+
+#: Plain client ``tool_use`` ids Anthropic mints (``toolu_01…``). Not part of
+#: :data:`ANTHROPIC_MINTED_ID_RE` because the server-tool gates must not treat
+#: them as server-tool provenance; used only to decide that an unknown block's
+#: id is NOT a vendor's.
+_ANTHROPIC_CLIENT_TOOL_ID_RE = re.compile(r"^toolu_[a-zA-Z0-9_]+$")
 
 #: Suffix identifying a SERVER-tool result block. Matched by suffix rather
 #: than by an enumerated list because the point of the exercise is vendor
@@ -210,6 +290,7 @@ SERVER_TOOL_RESULT_TYPE_BY_NAME: dict[str, str] = {
     "text_editor_code_execution": "text_editor_code_execution_tool_result",
     "tool_search_tool_regex": "tool_search_tool_result",
     "tool_search_tool_bm25": "tool_search_tool_result",
+    "advisor": "advisor_tool_result",
     "mcp_tool_use": "mcp_tool_result",
 }
 
@@ -356,6 +437,78 @@ def minted_by_anthropic(ref: object) -> bool:
     return not _GATEWAY_MINTED_RE.match(ref)
 
 
+def _capped(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _compact_json(value: Any, limit: int) -> str:
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return _capped(rendered, limit)
+
+
+def _tool_display_name(block: dict) -> str:
+    name = block.get("name")
+    server = block.get("server_name")
+    if isinstance(server, str) and isinstance(name, str):
+        return f"{server}.{name}"
+    if isinstance(name, str):
+        return name
+    kind = block.get("type")
+    return kind if isinstance(kind, str) else "unknown"
+
+
+def vendor_tool_note(block: dict) -> dict:
+    """Represent a vendor's server-side tool call without its route-only type."""
+    return {
+        "type": "text",
+        "text": (
+            f"[vendor tool {_tool_display_name(block)} "
+            f"input={_compact_json(block.get('input', {}), 2000)}]"
+        ),
+    }
+
+
+def _result_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            else:
+                parts.append(_compact_json(item, 4000))
+        return "\n".join(parts)
+    return _compact_json(content, 4000)
+
+
+def _vendor_result_note(block: dict, name: str) -> dict:
+    error = ", error" if block.get("is_error") else ""
+    text = _capped(_result_content_text(block.get("content")), 4000)
+    return {"type": "text", "text": f"[{name} result{error}: {text}]"}
+
+
+def _unknown_block_note(block: dict, *, result: bool = False) -> dict:
+    kind = block.get("type")
+    label = kind if isinstance(kind, str) else "unknown"
+    if result:
+        return _vendor_result_note(block, label)
+    return {
+        "type": "text",
+        "text": (
+            f"[{label} block from vendor: "
+            f"{_compact_json(block, 4000)}]"
+        ),
+    }
+
+
 def is_server_tool_result_type(block_type: object) -> bool:
     """True for a server-tool RESULT block (never for a client ``tool_result``)."""
     return (
@@ -419,58 +572,85 @@ def unmark_thinking_signature(signature: object) -> object:
     return signature
 
 
-def _has_marked_thinking(node: Any) -> bool:
-    """Read-only probe: does any ``thinking`` block carry the gateway marker?"""
-    if isinstance(node, list):
-        return any(_has_marked_thinking(item) for item in node)
-    if not isinstance(node, dict):
-        return False
-    if node.get("type") == THINKING_BLOCK_TYPE:
-        signature = node.get("signature")
-        if isinstance(signature, str) and signature.startswith(
-            THINKING_SIGNATURE_MARKER,
-        ):
-            return True
-    return any(_has_marked_thinking(value) for value in node.values())
+def _rewrite_message_content(
+    payload: Any, rewrite: Any,
+) -> tuple[Any, int]:
+    """Rewrite content blocks only, never tool inputs, tools, or system text."""
+
+    def rewrite_blocks(blocks: list, *, descend: bool) -> tuple[list, int]:
+        out = []
+        count = 0
+        for block in blocks:
+            if not isinstance(block, dict):
+                out.append(block)
+                continue
+            patched, edits = rewrite(block)
+            count += edits
+            if (
+                descend
+                and block.get("type") == CLIENT_TOOL_RESULT_TYPE
+                and isinstance(block.get("content"), list)
+            ):
+                nested, nested_edits = rewrite_blocks(
+                    block["content"], descend=False,
+                )
+                count += nested_edits
+                if nested_edits:
+                    patched = dict(patched)
+                    patched["content"] = nested
+            out.append(patched)
+        return (out, count) if count else (blocks, 0)
+
+    if not isinstance(payload, dict):
+        return payload, 0
+    if isinstance(payload.get("messages"), list):
+        messages = []
+        total = 0
+        for message in payload["messages"]:
+            if not isinstance(message, dict) or not isinstance(
+                message.get("content"), list,
+            ):
+                messages.append(message)
+                continue
+            content, count = rewrite_blocks(message["content"], descend=True)
+            total += count
+            if count:
+                patched_message = dict(message)
+                patched_message["content"] = content
+                messages.append(patched_message)
+            else:
+                messages.append(message)
+        if not total:
+            return payload, 0
+        patched = dict(payload)
+        patched["messages"] = messages
+        return patched, total
+    if isinstance(payload.get("content"), list):
+        content, count = rewrite_blocks(payload["content"], descend=True)
+        if not count:
+            return payload, 0
+        patched = dict(payload)
+        patched["content"] = content
+        return patched, count
+    return payload, 0
 
 
 def unmark_thinking_signatures(payload: Any) -> tuple[Any, int]:
-    """Strip the gateway marker from every ``thinking`` signature in ``payload``.
+    """Strip gateway markers in message content, never inside tool inputs."""
 
-    The inverse of the response-side marking, for the request leg back to a
-    vendor: the vendor must be handed its OWN signature, not our marker (the
-    brief's "a gateway prefix the vendor branch strips again before
-    forwarding, so vendors still get their own bytes back"). Walks the whole
-    document rather than assuming a message shape, because a thinking block
-    can sit anywhere in the history. A read-only probe runs FIRST so the
-    common case — a request with no marked thinking block — costs a walk and
-    not a full copy of a transcript that can be megabytes.
+    def rewrite(block: dict) -> tuple[dict, int]:
+        signature = block.get("signature")
+        if (
+            block.get("type") == THINKING_BLOCK_TYPE
+            and isinstance(signature, str)
+            and signature.startswith(THINKING_SIGNATURE_MARKER)
+        ):
+            patched = dict(block)
+            patched["signature"] = signature[len(THINKING_SIGNATURE_MARKER):]
+            return patched, 1
+        return block, 0
 
-    Returns ``(payload, unmarked_count)``; the input is not copied when
-    nothing matched.
-    """
-    if not _has_marked_thinking(payload):
-        return payload, 0
-
-    unmarked = 0
-
-    def walk(node: Any) -> Any:
-        nonlocal unmarked
-        if isinstance(node, list):
-            return [walk(item) for item in node]
-        if not isinstance(node, dict):
-            return node
-        out = {key: walk(value) for key, value in node.items()}
-        if out.get("type") == THINKING_BLOCK_TYPE:
-            signature = out.get("signature")
-            if isinstance(signature, str) and signature.startswith(
-                THINKING_SIGNATURE_MARKER,
-            ):
-                out["signature"] = signature[len(THINKING_SIGNATURE_MARKER):]
-                unmarked += 1
-        return out
-
-    return walk(payload), unmarked
+    return _rewrite_message_content(payload, rewrite)
 
 
 def thinking_enabled(payload: Any) -> bool:
@@ -530,6 +710,10 @@ class RepairStats:
     #: result blocks removed because the block they reference was removed, or
     #: because they reference nothing that exists (an orphan is its own 400).
     results_stripped: int = 0
+    #: Server-side calls replaced by readable text notes.
+    blocks_converted: int = 0
+    #: Their result blocks replaced by readable text notes.
+    results_converted: int = 0
     #: Messages removed because the repair left them with no content at all.
     messages_dropped: int = 0
     #: ``thinking`` blocks removed because their signature was not
@@ -566,6 +750,8 @@ class RepairStats:
             self.ids_rewritten
             or self.blocks_stripped
             or self.results_stripped
+            or self.blocks_converted
+            or self.results_converted
             or self.messages_dropped
             or self.thinking_blocks_stripped
             or self.thinking_signatures_marked
@@ -575,6 +761,8 @@ class RepairStats:
         self.ids_rewritten += other.ids_rewritten
         self.blocks_stripped += other.blocks_stripped
         self.results_stripped += other.results_stripped
+        self.blocks_converted += other.blocks_converted
+        self.results_converted += other.results_converted
         self.messages_dropped += other.messages_dropped
         self.thinking_blocks_stripped += other.thinking_blocks_stripped
         self.thinking_signatures_marked += other.thinking_signatures_marked
@@ -591,6 +779,8 @@ class RepairStats:
             f"ids_rewritten={self.ids_rewritten} "
             f"blocks_stripped={self.blocks_stripped} "
             f"results_stripped={self.results_stripped} "
+            f"blocks_converted={self.blocks_converted} "
+            f"results_converted={self.results_converted} "
             f"messages_dropped={self.messages_dropped} "
             f"thinking_stripped={self.thinking_blocks_stripped} "
             f"thinking_marked={self.thinking_signatures_marked} "
@@ -625,12 +815,11 @@ class TranscriptRepairer:
             valid form there: its result needs an ``encrypted_content`` blob
             only Anthropic issues.
 
-            Deliberately NOT set on the vendor RESPONSE path. The client's
-            next turn on that route goes back to the same vendor, which
-            understands its own blocks; stripping them at response time would
-            take the tool context out of a conversation that was working. The
-            destination decides, which is why this is a separate knob rather
-            than more behaviour hung on ``strip_nonportable``.
+            Deliberately NOT set on the vendor RESPONSE path. Response-side
+            portability is provided independently by ``convert_server_tools``:
+            every non-Anthropic server-side call and result becomes a readable
+            text note before the client can store it. This flag remains the
+            stricter Anthropic-request rule for old server-tool history.
 
             ALSO governs ``thinking`` blocks (item c): when True, a
             ``thinking`` block whose signature is not Anthropic's own
@@ -638,6 +827,10 @@ class TranscriptRepairer:
             replayed to the first-party route it is HTTP 400 ``"Invalid
             `signature` in `thinking` block"``. A genuine Anthropic thinking
             block is kept byte-identical.
+        convert_server_tools: replace non-Anthropic server-side tool pairs
+            with text notes. Used for vendor responses and vendor-bound
+            requests. MCP conversion is unconditional regardless of this flag;
+            native ``mcptoolu_`` pairs are always preserved.
         mark_thinking: prepend :data:`THINKING_SIGNATURE_MARKER` to a
             ``thinking`` block's signature. True ONLY on the vendor RESPONSE
             path (:func:`model_router.tool_ids.normalise_vendor_response`), so
@@ -658,15 +851,19 @@ class TranscriptRepairer:
         strip_nonportable: bool = True,
         strip_vendor_origin: bool = False,
         mark_thinking: bool = False,
+        convert_server_tools: bool = False,
     ) -> None:
         self._id_map = id_map
         self._strip_nonportable = strip_nonportable
         self._strip_vendor_origin = strip_vendor_origin
         self._mark_thinking = mark_thinking
+        self._convert_server_tools = convert_server_tools
         #: original -> new, for results that reference an earlier block.
         self._forward: dict[str, str] = {}
         #: ids whose producing block was stripped; their results go too.
         self._dropped: set[str] = set()
+        #: ids whose server-side call became a text note, mapped to its label.
+        self._converted: dict[str, str] = {}
         #: final ids of producers KEPT so far, in block order. A result whose
         #: reference is in here has its producer in this transcript, which is
         #: the only thing "orphan" ever meant.
@@ -688,6 +885,12 @@ class TranscriptRepairer:
 
         stats = RepairStats()
         out: list[Any] = []
+        vendor_turn = role == "assistant" and any(
+            isinstance(block, dict)
+            and block.get("type") == THINKING_BLOCK_TYPE
+            and thinking_signature_is_vendor_origin(block.get("signature"))
+            for block in blocks
+        )
         for block in blocks:
             if not isinstance(block, dict):
                 out.append(block)
@@ -705,10 +908,11 @@ class TranscriptRepairer:
                     out.append(kept)
                 continue
             if kind == MCP_TOOL_USE_TYPE:
-                # First-party MCP-connector traffic: never rewritten, but its
-                # id IS recorded, or its result reads as an orphan.
-                self._remember_producer(block.get("id"))
-                out.append(block)
+                if minted_by_anthropic(block.get("id")):
+                    self._remember_producer(block.get("id"))
+                    out.append(block)
+                else:
+                    out.append(self._convert_tool_use(block, stats))
                 continue
             if is_server_tool_result_type(kind):
                 kept = self._server_tool_result(block, stats)
@@ -720,7 +924,29 @@ class TranscriptRepairer:
                 if kept is not None:
                     out.append(kept)
                 continue
-            out.append(block)
+            if kind in ROUTE_SAFE_BLOCK_TYPES:
+                out.append(block)
+                continue
+            if minted_by_anthropic(block.get("id")) or minted_by_anthropic(
+                block.get("tool_use_id"),
+            ):
+                out.append(block)
+                continue
+            if not self._convert_server_tools and (
+                role == "user"
+                or kind in ANTHROPIC_REQUEST_BLOCK_TYPES
+                or not self._unknown_is_vendor_origin(block, vendor_turn)
+            ):
+                # Anthropic-bound: a USER block is the client's own; a type
+                # the Messages API accepts is first-party; and an unfamiliar
+                # type with no vendor evidence may be a first-party block
+                # newer than the table — destroying it would change what the
+                # conversation means, while a truly foreign one gets
+                # Anthropic's own clear error (the pre-GW-1 behaviour).
+                out.append(block)
+                continue
+            stats.blocks_converted += 1
+            out.append(_unknown_block_note(block))
 
         self.stats.merge(stats)
         return (out, True) if stats.changed else (blocks, False)
@@ -743,8 +969,9 @@ class TranscriptRepairer:
         if not isinstance(message, dict):
             return message, False, False
         role = message.get("role")
+        original_content = message.get("content")
         content, changed = self.repair_content(
-            message.get("content"), role=role if isinstance(role, str) else None,
+            original_content, role=role if isinstance(role, str) else None,
         )
         if not changed:
             return message, False, False
@@ -752,7 +979,21 @@ class TranscriptRepairer:
             if empty == EMPTY_DROP:
                 return message, True, True
             if empty == EMPTY_PLACEHOLDER:
-                content = [{"type": "text", "text": EMPTY_PLACEHOLDER_TEXT}]
+                only_thinking = (
+                    isinstance(original_content, list)
+                    and bool(original_content)
+                    and all(
+                        isinstance(block, dict)
+                        and block.get("type") == THINKING_BLOCK_TYPE
+                        for block in original_content
+                    )
+                )
+                text = (
+                    THINKING_PLACEHOLDER_TEXT
+                    if only_thinking
+                    else EMPTY_PLACEHOLDER_TEXT
+                )
+                content = [{"type": "text", "text": text}]
         patched = dict(message)
         patched["content"] = content
         return patched, True, False
@@ -783,6 +1024,49 @@ class TranscriptRepairer:
         return (out, True) if changed else (messages, False)
 
     # ── per-block-kind helpers ───────────────────────────────────────────
+    def _unknown_is_vendor_origin(self, block: dict, vendor_turn: bool) -> bool:
+        """POSITIVE evidence that an unfamiliar block was written by a vendor.
+
+        Only asked on the Anthropic-bound route, for a type outside
+        :data:`ANTHROPIC_REQUEST_BLOCK_TYPES` in a non-user message. Any one of:
+
+        * a gateway marker — an ``id`` / ``tool_use_id`` this module minted
+          (:data:`GATEWAY_ID_MARKER`), or a ``signature`` carrying
+          :data:`THINKING_SIGNATURE_MARKER`;
+        * a non-Anthropic id — an ``id`` / ``tool_use_id`` string that is not
+          Anthropic-shaped (``srvtoolu_`` / ``mcptoolu_`` / ``toolu_``,
+          unmarked), e.g. a vendor's ``call_…``;
+        * a recorded vendor producer — the reference names a block this pass
+          already converted or stripped as vendor-origin;
+        * a recorded vendor turn — the same assistant message carries a
+          ``thinking`` block whose signature is vendor-origin
+          (:func:`thinking_signature_is_vendor_origin`), i.e. the turn was
+          served by a vendor route.
+
+        No evidence means "keep": an unknown block might be first-party.
+        """
+        if vendor_turn:
+            return True
+        signature = block.get("signature")
+        if isinstance(signature, str) and signature.startswith(
+            THINKING_SIGNATURE_MARKER,
+        ):
+            return True
+        for key in ("id", "tool_use_id"):
+            ref = block.get(key)
+            if not isinstance(ref, str):
+                continue
+            if ref in self._converted or ref in self._dropped:
+                return True
+            if _GATEWAY_MINTED_RE.match(ref):
+                return True
+            if not (
+                minted_by_anthropic(ref)
+                or _ANTHROPIC_CLIENT_TOOL_ID_RE.match(ref)
+            ):
+                return True
+        return False
+
     def _remember(self, original: str, new: str) -> None:
         self._forward[original] = new
         if self._id_map is not None:
@@ -832,15 +1116,40 @@ class TranscriptRepairer:
                 return patched
         return block
 
+    def _convert_tool_use(
+        self, block: dict, stats: RepairStats,
+    ) -> dict:
+        raw_id = block.get("id")
+        name = _tool_display_name(block)
+        if isinstance(raw_id, str):
+            prefix = (
+                MCP_TOOL_ID_PREFIX
+                if block.get("type") == MCP_TOOL_USE_TYPE
+                else SERVER_TOOL_ID_PREFIX
+            )
+            self._converted[raw_id] = name
+            self._converted[normalise_id(raw_id, prefix)] = name
+        stats.blocks_converted += 1
+        return vendor_tool_note(block)
+
+    def _convert_result(
+        self, block: dict, stats: RepairStats, name: str,
+    ) -> dict:
+        stats.results_converted += 1
+        return _vendor_result_note(block, name)
+
     def _server_tool_use(
         self, block: dict, stats: RepairStats,
     ) -> Optional[dict]:
         name = block.get("name")
         raw_id = block.get("id")
+        if self._convert_server_tools and not minted_by_anthropic(raw_id):
+            return self._convert_tool_use(block, stats)
         unrepresentable = (
             self._strip_nonportable
             and isinstance(name, str)
             and name not in PORTABLE_SERVER_TOOL_NAMES
+            and not minted_by_anthropic(raw_id)
         )
         # Anthropic-bound, a pair we can see is not Anthropic's own goes
         # WHATEVER it is named: a portable name does not make its RESULT
@@ -867,7 +1176,11 @@ class TranscriptRepairer:
     def _server_tool_result(
         self, block: dict, stats: RepairStats,
     ) -> Optional[dict]:
-        """Keep, remap, or strip a ``<name>_tool_result`` block.
+        """Keep, remap, convert, or strip a ``<name>_tool_result`` block.
+
+        A result whose producer became a note becomes a note too. On vendor
+        response/request paths every non-Anthropic result takes that route.
+        The stripping rules below apply to the Anthropic repair path.
 
         Three ways it can be unrepresentable, and the middle one is the one
         an id-shaped fix keeps missing: the block's own TYPE. A vendor writes
@@ -889,11 +1202,16 @@ class TranscriptRepairer:
         decided, at :func:`minted_by_anthropic`.
         """
         ref = block.get("tool_use_id")
+        if isinstance(ref, str) and ref in self._converted:
+            return self._convert_result(block, stats, self._converted[ref])
+        kind = block.get("type")
+        first_party = minted_by_anthropic(ref)
+        if self._convert_server_tools and not first_party:
+            stats.results_converted += 1
+            return _unknown_block_note(block, result=True)
         if isinstance(ref, str) and ref in self._dropped:
             stats.results_stripped += 1
             return None
-        kind = block.get("type")
-        first_party = minted_by_anthropic(ref)
         if (
             self._strip_nonportable
             and isinstance(kind, str)
@@ -939,17 +1257,23 @@ class TranscriptRepairer:
         * stripping the producer and leaving this behind ->
           ``messages.1: `tool_result` blocks can only be in `user` messages``;
         * so does leaving it when the producer was KEPT — the placement is
-          illegal in an assistant message either way, which is why the role
-          test is unconditional rather than only firing for a dropped id.
+          illegal in an assistant message either way. The Anthropic repair
+          path therefore strips it; the vendor response/request path converts
+          it to text so its content survives without the illegal placement.
 
         In a USER message it is ordinary client-tool traffic and stays, with
         its reference remapped if the block it names was renamed.
         """
         ref = block.get("tool_use_id")
+        if isinstance(ref, str) and ref in self._converted:
+            return self._convert_result(block, stats, self._converted[ref])
         if isinstance(ref, str) and ref in self._dropped:
             stats.results_stripped += 1
             return None
         if role == "assistant":
+            if self._convert_server_tools:
+                stats.results_converted += 1
+                return _unknown_block_note(block, result=True)
             stats.results_stripped += 1
             return None
         if isinstance(ref, str) and ref in self._forward:
@@ -960,68 +1284,33 @@ class TranscriptRepairer:
         return block
 
 
-def _mentions_mapped_id(node: Any, id_map: MutableMapping[str, str]) -> bool:
-    """Read-only probe: does ``node`` carry any id present in ``id_map``?"""
-    if isinstance(node, list):
-        return any(_mentions_mapped_id(item, id_map) for item in node)
-    if not isinstance(node, dict):
-        return False
-    for key, value in node.items():
-        if key in ("id", "tool_use_id") and isinstance(value, str):
-            if value in id_map:
-                return True
-        elif _mentions_mapped_id(value, id_map):
-            return True
-    return False
-
-
 def restore_ids(payload: Any, id_map: MutableMapping[str, str]) -> tuple[Any, int]:
-    """Put the VENDOR's own ids back, everywhere they appear in ``payload``.
-
-    The inverse of a repair pass, for the request leg back to the vendor that
-    produced the ids: the gateway rewrote them on the way out, and a vendor
-    that keys anything off its own ids must not be handed ours. Walks the
-    whole document (bounded by the payload itself) rather than assuming a
-    message shape, because the id fields are what matter and they are always
-    named ``id`` / ``tool_use_id``.
-
-    Returns ``(payload, restored_count)``; the input is not mutated when
-    nothing matched. A read-only scan runs FIRST so the common case — a
-    request with no rewritten id in it — costs a walk and not a full copy of
-    a transcript that can be megabytes.
-    """
-    if not _mentions_mapped_id(payload, id_map):
+    """Restore ids in message content blocks, leaving every tool input alone."""
+    if not id_map:
         return payload, 0
 
-    restored = 0
-
-    def walk(node: Any) -> Any:
-        nonlocal restored
-        if isinstance(node, list):
-            return [walk(item) for item in node]
-        if not isinstance(node, dict):
-            return node
-        out = {}
-        for key, value in node.items():
-            if key in ("id", "tool_use_id") and isinstance(value, str):
-                original = id_map.get(value)
-                if original is not None and original != value:
-                    restored += 1
-                    out[key] = original
-                    continue
-                out[key] = value
+    def rewrite(block: dict) -> tuple[dict, int]:
+        patched = block
+        restored = 0
+        for key in ("id", "tool_use_id"):
+            value = block.get(key)
+            if not isinstance(value, str):
                 continue
-            out[key] = walk(value)
-        return out
+            original = id_map.get(value)
+            if original is not None and original != value:
+                if patched is block:
+                    patched = dict(block)
+                patched[key] = original
+                restored += 1
+        return patched, restored
 
-    walked = walk(payload)
-    return (walked, restored) if restored else (payload, 0)
+    return _rewrite_message_content(payload, rewrite)
 
 
 # ── .jsonl session repair (``vco fix-transcript``) ───────────────────────
 
 #: Entry types whose ``message.content`` can carry tool blocks.
-REPAIRABLE_ENTRY_TYPES = frozenset({"assistant", "user"})
+REPAIRABLE_ENTRY_TYPES = frozenset({"assistant", "user", "api-request-blob"})
 
 
 @dataclass
@@ -1044,6 +1333,9 @@ class FileRepairResult:
             f"  ids rewritten      : {self.stats.ids_rewritten}",
             f"  blocks stripped    : {self.stats.blocks_stripped}",
             f"  results stripped   : {self.stats.results_stripped}",
+            f"  blocks converted  : {self.stats.blocks_converted}",
+            f"  results converted  : {self.stats.results_converted}",
+            f"  thinking stripped  : {self.stats.thinking_blocks_stripped}",
         ]
         if self.stats.stripped_names:
             lines.append(
@@ -1245,6 +1537,7 @@ __all__ = [
     "ANTHROPIC_MINTED_ID_RE",
     "GATEWAY_ID_MARKER",
     "MCP_TOOL_USE_TYPE",
+    "MCP_TOOL_ID_PREFIX",
     "PORTABLE_SERVER_TOOL_NAMES",
     "PORTABLE_SERVER_TOOL_RESULT_TYPES",
     "REDACTED_THINKING_BLOCK_TYPE",
@@ -1254,6 +1547,7 @@ __all__ = [
     "SERVER_TOOL_RESULT_SUFFIX",
     "THINKING_BLOCK_TYPE",
     "THINKING_SIGNATURE_MARKER",
+    "THINKING_PLACEHOLDER_TEXT",
     "FileRepairResult",
     "LineOutcome",
     "RepairStats",
@@ -1273,4 +1567,5 @@ __all__ = [
     "thinking_signature_is_vendor_origin",
     "unmark_thinking_signature",
     "unmark_thinking_signatures",
+    "vendor_tool_note",
 ]

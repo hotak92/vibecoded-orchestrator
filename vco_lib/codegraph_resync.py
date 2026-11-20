@@ -183,6 +183,10 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
 # directly with a hardcoded INFO level, ignoring the global VCO_LOG_LEVEL
 # pref. Route them through the ONE shared helper instead.
 from vco_lib.log_setup import configure_logging  # noqa: E402 — grouped with the notes above
+# v0.2.107 (CG-2): the ONE whole-class listing (cursor from the nil uuid; a
+# 0-row pass is checked against the class count, never read as "empty").
+from vco_lib.codegraph_cursor import iter_class as _iter_class  # noqa: E402
+from vco_lib import codegraph_revision_heal as _revheal  # noqa: E402
 
 # v0.2.82 (WP-2 task 3): the resync's "owed work" staleness + the convergence
 # report's embed-vs-stamp split delegate to the ONE pure guards module, so the
@@ -603,7 +607,7 @@ _NARROW_MAX_PAGES = 20
 _RECONCILE_NARROW_MAX_PATHS = 32
 
 
-def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
+def _fetch_narrowed_rows(coll, read_props, narrow_filter, return_references=None) -> "Optional[list]":
     """Read back ONLY the rows matching ``narrow_filter`` (candidate selection).
 
     Returns the COMPLETE candidate list, or ``None`` when the narrowed read
@@ -615,8 +619,12 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
     SUPERSET of the exact-string rows (identical token set), so it can
     over-fetch (harmless — the Python exact-compare predicate rejects those)
     but can never miss an exact-path row.
+
+    ``return_references`` (v0.2.107 CG-3: the analyzer's scoped cross-reference
+    read) resolves links with their own bounded property lists.
     """
     rows: list = []
+    extra = {} if return_references is None else {"return_references": return_references}
     try:
         for page in range(_NARROW_MAX_PAGES):
             res = coll.query.fetch_objects(
@@ -624,6 +632,7 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
                 limit=_NARROW_PAGE_SIZE,
                 offset=page * _NARROW_PAGE_SIZE,
                 return_properties=list(read_props),
+                **extra,
             )
             objs = list(getattr(res, "objects", None) or [])
             rows.extend(objs)
@@ -640,6 +649,29 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
         getattr(coll, "name", "?"),
     )
     return None
+
+
+def fetch_narrowed_rows(coll, read_props, narrow_filter, return_references=None) -> "Optional[list]":
+    """Public name of :func:`_fetch_narrowed_rows` (the ONE narrowed read)."""
+    return _fetch_narrowed_rows(coll, read_props, narrow_filter, return_references)
+
+
+def narrowed_or_all_rows(coll, read_props, narrow_filter, call_site: str):
+    """The candidate rows of one decision: the narrowed read when
+    ``narrow_filter`` is given and completes, else the whole class through the
+    ONE cursor (:func:`vco_lib.codegraph_cursor.iter_class`).
+
+    Narrowing only changes WHICH rows are read back (see
+    :func:`_fetch_narrowed_rows`); the caller still decides per row in Python.
+    The whole-class arm raises ``CursorUndeterminable`` when the class could
+    not be read - the caller must then decide nothing.
+    """
+    rows = None
+    if narrow_filter is not None:
+        rows = _fetch_narrowed_rows(coll, read_props, narrow_filter)
+    if rows is not None:
+        return rows
+    return _iter_class(coll, call_site, return_properties=read_props)
 
 
 def delete_file_rows_exact(
@@ -721,14 +753,11 @@ def delete_file_rows_exact(
     except Exception:  # noqa: BLE001 — config probe is best-effort; fall through
         pass
 
-    rows = None
-    if narrow_filter is not None:
-        rows = _fetch_narrowed_rows(coll, read_props, narrow_filter)
-    if rows is None:
-        rows = coll.iterator(return_properties=read_props)
-
     to_delete = []
-    for obj in rows:
+    for obj in narrowed_or_all_rows(
+        coll, read_props, narrow_filter,
+        f"codegraph_resync.delete_file_rows_exact[{log_prefix or 'delete'}]",
+    ):
         props = (getattr(obj, "properties", None) or {})
         raw = props.get(path_prop) or ""
         if project and (props.get("project") or "") != project:
@@ -800,8 +829,9 @@ def _delete_is_already_gone(exc: BaseException) -> bool:
     v0.2.91 fix-round (NIT-3). ``delete_by_id`` is IDEMPOTENT in intent: the
     post-condition the caller wants is "this UUID no longer exists". A narrowed
     read pages with ``offset`` (see :func:`_fetch_narrowed_rows`), so under
-    concurrent mutation — the per-edit hook drain running while a resync walk
-    reconciles — the same row can legitimately be listed twice, or vanish
+    concurrent mutation — another code-graph writer (the HEAD catch-up, a
+    launcher build) running while a resync walk reconciles — the same row can
+    legitimately be listed twice, or vanish
     between the read and the delete. Counting that as a FAILURE propagates
     ``success -> partial`` through ``_prune_failures``, which defers the
     revision advance and re-spawns the whole background resync next update: a
@@ -971,16 +1001,13 @@ def reconcile_walked_file_rows(
     * **Project scoping.** ``project`` is compared in Python by the deleter;
       identity-drifted rows (a different ``project`` value) belong to the
       identity sweep, not here.
-    * **Stamped-but-not-read roots are skipped** (``walked_sources``). The
-      per-edit hook analyses a git WORKTREE file while stamping the CANONICAL
-      main-repo root (``--canonical-source``, v0.2.66 Bug 3) so both checkouts
-      converge on ONE row. That walk read a DIFFERENT tree than the tenant it
-      stamps — the worktree's branch may legitimately lack an entity the
-      canonical checkout still has — so its entity set is NOT authoritative and
-      the reconcile skips it entirely. Overwriting is the hook's design;
-      DELETING on that evidence is not. The canonical repo's own walks (update
-      resync, main-checkout edits, the batched drain — which passes the
-      canonical root as BOTH the repo path and the source) still converge it.
+    * **Stamped-but-not-read roots are skipped** (``walked_sources``). A
+      walked file keyed under a root the walk did NOT read is never judged:
+      its entity set is not authoritative for that root (the walked tree may
+      legitimately lack an entity the other root still has). Its shape once
+      came from the per-edit worktree canonicalisation (``--canonical-source``,
+      retired in v0.2.107); the guard stays so no caller can reintroduce the
+      delete.
     * **One deleter.** Every delete goes through ``deleter``
       (``delete_file_rows_exact``) — exact-Python-compare + ``delete_by_id``.
     * **Audited.** Every deleted identity is printed (UUID + full_name + path)
@@ -1039,11 +1066,11 @@ def reconcile_walked_file_rows(
     audit_lines: list = []
     for src, paths in by_source.items():
         if walked_sources is not None and src and src not in walked_sources:
-            # Stamped a root this walk did not read files from (the worktree
-            # `--canonical-source` dedup): not authoritative — never delete.
+            # Stamped a root this walk did not read files from: not
+            # authoritative — never delete.
             logger.info(
                 "%s: skipping %d walked path(s) stamped %r — this walk read a "
-                "different tree (worktree canonical-source dedup)",
+                "different tree",
                 log_prefix, len(paths), src,
             )
             continue
@@ -1134,8 +1161,14 @@ def _count_stale_in_collection(
     reachable_fn=None,
     primary_sources: "Optional[set]" = None,
     index_dot_claude: bool = True,
+    owed_paths: "Optional[set]" = None,
 ) -> Optional[int]:
     """Count rows a re-walk is genuinely OWED in one collection.
+
+    ``owed_paths`` (v0.2.107, the revision heal): when given, the stored path
+    of every row counted owed is added to it (classified tier only — it needs
+    ``reachable_fn``), so the driver lists the owed files in the same cursor
+    pass that counts them.
 
     v0.2.75 (P1b-1): the per-row decision routes through the ONE shared
     classifier (``vco_lib.codegraph_row_classify.classify_row`` — the same
@@ -1152,28 +1185,19 @@ def _count_stale_in_collection(
     (``project_source`` outside ``primary_sources``) classify ``"not_owed"``
     and converge on their own root's walk.
 
-    Bounded cost: the cheap filtered aggregate is ALWAYS the first gate. When
-    it returns 0, we return 0 IMMEDIATELY — no per-row scan (the converged
-    steady-state cost is one aggregate). The slow per-row classify scan is
-    paid ONLY when the aggregate says "stale > 0" (there is genuine work to
-    classify). Without a ``reachable_fn`` the aggregate count is returned
-    as-is (pre-R3 behaviour: all stale rows, orphans included — conservative
-    over-count, never a wrong "converged").
+    Bounded cost: a one-row, property-free filtered read answers the converged
+    case without an Aggregate. A positive or failed probe falls through to the
+    classified scan, which returns the exact count.
 
     Tiers:
-      1. Filtered aggregate ``embed_revision != rev OR embed_revision IS
-         NULL`` — cheap. The IsNull leg is load-bearing: Weaviate comparisons
-         ignore NULLs and pre-migration rows are exactly the NULL ones (a
-         ``min()``/``not_equal``-only probe reports "converged" over a
-         half-migrated collection — C-3 warning).
-      2. Full scan classified client-side (NULL-safe) — covers collections
-         created without ``index_null_state=True`` where the IsNull filter
-         errors, AND is where the shared classifier is applied.
+      1. ``fetch_objects(limit=1, return_properties=[])`` with the NULL-safe
+         stale filter — a property-free existence probe.
+      2. Full scan classified client-side — covers old null-index schemas and
+         returns the exact owed count.
 
     Returns ``None`` when neither tier could run (undeterminable — the caller
     must NOT treat that as zero).
     """
-    agg_total: Optional[int] = None
     try:
         from weaviate.classes.query import Filter
 
@@ -1181,23 +1205,13 @@ def _count_stale_in_collection(
             Filter.by_property("embed_revision").not_equal(int(current_revision))
             | Filter.by_property("embed_revision").is_none(True)
         )
-        agg = coll.aggregate.over_all(filters=flt, total_count=True)
-        total = getattr(agg, "total_count", None)
-        if total is not None:
-            agg_total = int(total)
-    except Exception:  # noqa: BLE001 — fall to the NULL-safe scan
-        agg_total = None
-
-    if agg_total is not None:
-        # Aggregate is authoritative for "is there ANY stale row?". Zero → done,
-        # NO per-row scan (the R3 bound: cheap converged steady state).
-        if agg_total == 0:
+        probe = coll.query.fetch_objects(
+            filters=flt, limit=1, return_properties=[],
+        )
+        if not getattr(probe, "objects", None):
             return 0
-        if reachable_fn is None:
-            # Pre-R3: return the aggregate (all stale rows, orphans included).
-            return agg_total
-        # R3: aggregate > 0 → pay the per-row scan to count only reachable
-        # stale rows (fall through to the scan below).
+    except Exception:  # noqa: BLE001 — fall to the NULL-safe scan
+        pass
 
     # Full NULL-safe scan. Reads embed_revision (+ the path property when R3
     # reachability filtering is on, + project_source when source-scoping is on
@@ -1219,7 +1233,9 @@ def _count_stale_in_collection(
             want_source = False
     try:
         stale = 0
-        for obj in coll.iterator(return_properties=read_props):
+        for obj in _iter_class(
+            coll, "codegraph_resync._count_stale_in_collection", return_properties=read_props,
+        ):
             props = getattr(obj, "properties", None) or {}
             if reachable_fn is None:
                 # Pre-R3 tier: no root/predicate → revision-only counting
@@ -1244,6 +1260,8 @@ def _count_stale_in_collection(
             )
             if verdict == "owed":
                 stale += 1
+                if owed_paths is not None and props.get(path_prop):
+                    owed_paths.add(str(props.get(path_prop)))
         return stale
     except Exception as exc:  # noqa: BLE001 — undeterminable
         logger.warning(
@@ -1267,8 +1285,13 @@ def count_stale_rows(
     weaviate_url: Optional[str] = None,
     grpc_port: Optional[int] = None,
     index_dot_claude: bool = True,
+    owed_paths: "Optional[set]" = None,
 ) -> Optional[dict]:
     """R-6 (v0.2.73): per-collection count of rows owed a re-embed.
+
+    ``owed_paths`` (v0.2.107): a set the stored path of every owed row is
+    added to (needs ``repo_root``) — the revision heal's file listing, taken
+    in the same pass (:mod:`vco_lib.codegraph_revision_heal`).
 
     Probes ``<Prefix>_{CodeModule,CodeClass,CodeFunction}`` (the collections
     a re-walk can actually converge — MUST MATCH the analyzer's
@@ -1339,6 +1362,7 @@ def count_stale_rows(
                 # owed forever, while the orchestrator root (which indexes
                 # `.claude/` as first-party source) keeps counting them.
                 index_dot_claude=index_dot_claude,
+                owed_paths=owed_paths,
             )
             if n is None:
                 return None
@@ -1394,7 +1418,7 @@ def has_rows_at_current_revision(
       correct content hashes are the ones every gate skips forever.
 
     Probes the same three file-anchored bases as :func:`count_stale_rows`
-    (``_RESYNC_PROBE_BASES``) with the cheap filtered aggregate; short-
+    (``_RESYNC_PROBE_BASES``) with a one-row, property-free read; short-
     circuits on the first positive.  Never raises.
     """
     if not project_name:
@@ -1422,9 +1446,10 @@ def has_rows_at_current_revision(
                 if status == _COLL_ERROR:
                     return None
                 try:
-                    agg = coll.aggregate.over_all(filters=flt, total_count=True)
-                    total = getattr(agg, "total_count", None)
-                    if total is not None and int(total) > 0:
+                    probe = coll.query.fetch_objects(
+                        filters=flt, limit=1, return_properties=[],
+                    )
+                    if getattr(probe, "objects", None):
                         return True
                 except Exception as exc:  # noqa: BLE001 — undeterminable, never False
                     logger.warning(
@@ -1510,7 +1535,9 @@ def demote_current_revision_rows(
                     continue  # undeclared slot: nothing a re-embed could fill
                 iter_kwargs["include_vector"] = [vector_slot]
             try:
-                for obj in coll.iterator(**iter_kwargs):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.demote_current_revision_rows", **iter_kwargs,
+                ):
                     props = getattr(obj, "properties", None) or {}
                     # Already-stale rows (NULL / 0 / older) re-embed on any
                     # walk — demoting them would be a pointless write.
@@ -1597,7 +1624,10 @@ def list_owed_row_identities(
                 continue
             read_props = ["embed_revision", path_prop, "project_source", "full_name"]
             try:
-                for obj in coll.iterator(return_properties=read_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.list_owed_row_identities",
+                    return_properties=read_props,
+                ):
                     if len(out) >= limit:
                         break
                     props = getattr(obj, "properties", None) or {}
@@ -1696,7 +1726,10 @@ def classify_stale_kinds(
                 read_props.append(path_prop)
                 read_props.append("project_source")
             try:
-                for obj in coll.iterator(return_properties=read_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.classify_stale_kinds",
+                    return_properties=read_props,
+                ):
                     props = getattr(obj, "properties", None) or {}
                     if reachable_fn is not None and classify_row(
                         props,
@@ -1807,7 +1840,10 @@ def count_cleanup_owed_rows(
                 except Exception:  # noqa: BLE001 — probe best-effort
                     want_source = False
             try:
-                for obj in coll.iterator(return_properties=read_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.count_cleanup_owed_rows",
+                    return_properties=read_props,
+                ):
                     props = getattr(obj, "properties", None) or {}
                     if is_deleted_primary_row(
                         props,
@@ -1979,7 +2015,8 @@ def _backfill_anchor_file_paths(
                     heal_is_test = False
             updated = 0
             left = 0
-            for obj in coll.iterator(
+            for obj in _iter_class(
+                coll, "codegraph_resync._backfill_anchor_file_paths",
                 return_properties=["file_path"],
                 return_references=query_refs,
             ):
@@ -2230,7 +2267,10 @@ def count_orphan_interaction_rows(
             pass
         try:
             orphans = 0
-            for obj in coll.iterator(return_properties=read_props):
+            for obj in _iter_class(
+                coll, "codegraph_resync.count_orphan_interaction_rows",
+                return_properties=read_props,
+            ):
                 props = getattr(obj, "properties", None) or {}
                 if is_provable_codegraph_orphan(
                     coll, str(obj.uuid), props,
@@ -2368,7 +2408,10 @@ def backfill_codegraph_metadata(
                     return_props += [body_prop, "doc", "language", "chunk_num"]
 
                 updated = 0
-                for obj in coll.iterator(return_properties=return_props):
+                for obj in _iter_class(
+                    coll, "codegraph_resync.backfill_metadata",
+                    return_properties=return_props,
+                ):
                     p = getattr(obj, "properties", None) or {}
                     new_props: dict = {}
 
@@ -4238,19 +4281,14 @@ def spawn_code_summary_after_walk(
 #: never starts the N−2 queued walks at once when the period expires. The slot
 #: is released on exit or crash (flock semantics); see
 #: ``vco_lib.atomic.machine_slot`` (and its known narrow overlap window).
-#:   VCO_RESYNC_DRIVER_SLOTS   — slots (default 2; minimum 1)
+#: v0.2.107: the pool is the ONE bulk-writer pool the owed-work worker also
+#: counts against — same directory (``atomic.bulk_slot_dir``) and same size
+#: (``atomic.machine_slot_count``: from the RAM, 1 below 12 GiB, 4 from 64 GiB).
+#:   VCO_RESYNC_DRIVER_SLOTS   — slots (overrides the RAM-sized count; minimum 1)
 #:   VCO_RESYNC_DRIVER_WAIT_S  — wait period in seconds before a dead holder's
 #:                               slot may be taken over (default 21600 = 6 h)
-_DRIVER_SLOTS_ENV = "VCO_RESYNC_DRIVER_SLOTS"
 _DRIVER_WAIT_ENV = "VCO_RESYNC_DRIVER_WAIT_S"
-_DRIVER_SLOTS_DEFAULT = 2
 _DRIVER_WAIT_DEFAULT_S = 6 * 3600.0
-
-
-def _driver_slot_dir() -> Path:
-    from vco_lib.paths import vct_root_dir
-
-    return vct_root_dir() / "state" / "resync-driver-slots"
 
 
 def _driver_claim_lock_path(project_name: str) -> Path:
@@ -4269,7 +4307,9 @@ def _driver_claim_lock_path(project_name: str) -> Path:
     """
     from vco_lib.codegraph_walk import claim_key
 
-    return _driver_slot_dir().parent / "resync-driver-claims" / f"{claim_key(project_name)}.lock"
+    from vco_lib.atomic import bulk_slot_dir
+
+    return bulk_slot_dir().parent / "resync-driver-claims" / f"{claim_key(project_name)}.lock"
 
 
 def run_resync_and_verify(
@@ -4299,7 +4339,14 @@ def run_resync_and_verify(
     (``flock``) and Windows (``msvcrt``, v0.2.103); only a platform with
     neither degrades to no exclusion.
     """
-    from vco_lib.atomic import LockTimeout, exclusive_file_lock, machine_slot
+    from vco_lib.atomic import (
+        BULK_SLOTS_ENV,
+        LockTimeout,
+        bulk_slot_dir,
+        exclusive_file_lock,
+        machine_slot,
+        machine_slot_count,
+    )
 
     claim = exclusive_file_lock(_driver_claim_lock_path(project_name), timeout_s=0)
     try:
@@ -4324,13 +4371,13 @@ def run_resync_and_verify(
         )
         return 0
     try:
-        slots = int(max(1, env_float(_DRIVER_SLOTS_ENV, _DRIVER_SLOTS_DEFAULT)))
+        slots = machine_slot_count()
         wait_s = max(0, env_float(_DRIVER_WAIT_ENV, _DRIVER_WAIT_DEFAULT_S))
 
         def _on_wait(waited: float) -> None:
             if waited < 1.0:
                 msg = (f"all {slots} resync-driver slot(s) are busy — queued "
-                       f"({_DRIVER_SLOTS_ENV} raises the cap)")
+                       f"({BULK_SLOTS_ENV} raises the cap)")
             else:
                 msg = (f"still queued after {waited / 3600:.1f} h — every slot "
                        f"holder is alive, so this driver keeps waiting (never "
@@ -4342,7 +4389,7 @@ def run_resync_and_verify(
             print(f"[resync-driver] {project_name}: slot {slot_i}'s holder "
                   f"(pid {pid}) is gone — taking the slot over", flush=True)
 
-        with machine_slot(_driver_slot_dir(), slots=slots, wait_s=wait_s,
+        with machine_slot(bulk_slot_dir(), slots=slots, wait_s=wait_s,
                           on_wait=_on_wait, on_takeover=_on_takeover):
             return _run_resync_and_verify_slotted(
                 project_name, repo_root, analyzer_path,
@@ -4414,6 +4461,16 @@ def _run_resync_and_verify_slotted(
        v0.2.103 — the single-flight every walk spawner takes; a held claim
        skips this run with a log line, never a twin). ``--prune-stale``
        is forwarded only when the spawn confirmed it safe (no extra paths).
+       v0.2.107 (revision heal): unless the run is forced (``--force-rewalk``,
+       an extractor-generation rung) or pruning, the walk is ONE scoped
+       ``--only-files-from <owed files> --revision-heal`` run — the pre-walk
+       owed count lists the owed rows' files by cursor and
+       :mod:`vco_lib.codegraph_revision_heal` keeps the ones this checkout
+       may re-extract (committed, unchanged, present). On any doubt, or with
+       nothing eligible, no analyzer runs (nothing changed, nothing deleted,
+       a ``skipped`` terminal report) and step 3 keeps the heal owed. Nothing
+       owed but deleted-file rows awaiting the sweep, or a code-model slot
+       fill owed → the whole-repo walk.
     2. Posts the TERMINAL build status to the hub (v0.2.91 #31 — the
        completion half of the R-4 spawn registration; without it the
        pid-aliveness reconciler false-failed every successful walk).
@@ -4568,16 +4625,67 @@ def _run_resync_and_verify_slotted(
     # aggregate short-circuits at zero); this path only runs inside the detached
     # driver, which the owed gate already decided has work to do. Soft-fail: an
     # unavailable pre-probe simply disables the no-progress branch.
-    try:
-        pre_counts = count_stale_rows(
-            project_name,
-            analyzer_path=Path(analyzer_path),
-            repo_root=Path(repo_root),
-            index_dot_claude=index_dot_claude,
+    #
+    # v0.2.107 (CG-3, revision heal): a run that is neither forced (an
+    # extractor-generation rung needs every file), nor pruning, nor owed a
+    # code-model slot fill (the analyzer's whole-graph walk fills the new
+    # model's vector on EVERY row, current ones included) takes the count
+    # as a HEAL PLAN — the same cursor pass lists the owed rows' files, and
+    # only those files are re-extracted (`vco_lib.codegraph_revision_heal`).
+    # On any doubt the plan runs nothing and the verifier below keeps the
+    # heal owed.
+    heal_plan = None
+    if force_rewalk or prune_stale or _code_model_fill_owed(project_name):
+        try:
+            pre_counts = count_stale_rows(
+                project_name,
+                analyzer_path=Path(analyzer_path),
+                repo_root=Path(repo_root),
+                index_dot_claude=index_dot_claude,
+            )
+        except Exception as exc:  # noqa: BLE001 — never gate the walk on the probe
+            print(f"[resync-driver] pre-walk probe raised: {exc}", flush=True)
+            pre_counts = None
+    else:
+        heal_plan = _plan_revision_heal(
+            project_name, Path(repo_root), Path(analyzer_path), index_dot_claude,
         )
-    except Exception as exc:  # noqa: BLE001 — never gate the walk on the probe
-        print(f"[resync-driver] pre-walk probe raised: {exc}", flush=True)
-        pre_counts = None
+        pre_counts = heal_plan.counts
+        if heal_plan.verdict == _revheal.NOTHING_OWED and _cleanup_sweep_owed(
+                project_name, Path(repo_root)):
+            # No owed row, but primary rows of deleted files (at the current
+            # revision) wait for the whole-repo walk's deleted-file sweep —
+            # the work the spawn gate launched this driver for.
+            print(
+                "[resync-driver] no revision-owed row; deleted-file rows owe "
+                "the whole-repo walk's sweep — running it",
+                flush=True,
+            )
+            heal_plan = None
+    heal_list: Optional[Path] = None
+    if heal_plan is not None and heal_plan.runs_analyzer:
+        heal_list = _revheal.write_list_file(Path(repo_root), heal_plan.files)
+        if heal_list is None:
+            heal_plan.verdict = _revheal.UNDETERMINABLE
+            heal_plan.reason = "the file list could not be written"
+    if heal_plan is not None and not heal_plan.runs_analyzer:
+        print(
+            f"[resync-driver] revision heal: {heal_plan.describe()} — no "
+            "analyzer run; nothing changed, nothing deleted",
+            flush=True,
+        )
+        _report_skip_to_hub(
+            project_name, repo_root,
+            f"revision heal: nothing re-extracted ({heal_plan.verdict}"
+            + (f": {heal_plan.reason}" if heal_plan.reason else "") + ")",
+        )
+        return _verify_resync_outcome(
+            project_name, Path(repo_root), Path(analyzer_path),
+            index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            rc="not run", pre_counts=pre_counts,
+            exposure_heal_ok=exposure_heal_ok,
+            python_exe=_python_exe.resolve_or_current(),
+        )
 
     # v0.2.94: the ONE resolver, not `sys.executable`. This process was itself
     # spawned with a preflighted venv python by `spawn_background_resync`, so
@@ -4589,6 +4697,13 @@ def _run_resync_and_verify_slotted(
         _python_exe.resolve_or_current(), str(analyzer_path), str(repo_root),
         "--project", project_name,
     ]
+    if heal_list is not None and heal_plan is not None:
+        # The revision heal: ONE scoped run over the owed files.
+        # `--revision-heal` bypasses the per-file gate for them (every listed
+        # file owns an owed row) and keeps the rows of a listed file that
+        # vanished meanwhile (never a delete on a missing file).
+        print(f"[resync-driver] revision heal: {heal_plan.describe()}", flush=True)
+        argv += ["--only-files-from", str(heal_list), "--revision-heal"]
     if prune_stale:
         argv.append("--prune-stale")
     # v0.2.92: the extractor-generation re-index needs the analyzer's per-FILE
@@ -4611,15 +4726,16 @@ def _run_resync_and_verify_slotted(
     # running RIGHT NOW: skip this run — never queue, never kill, never wait
     # on a walk that may legitimately run for hours. The ledger stays as it
     # is; the concurrent walk's own completion converges it, exactly the
-    # driver-claim skip's accepted posture above. Scoped --only-file(s)
-    # runs never reach this function — the driver only ever requests full
-    # walks.
+    # driver-claim skip's accepted posture above. The revision heal's scoped
+    # --only-files-from run takes the same claim (v0.2.107): it is this
+    # driver's walk, never a second one beside it.
     from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
 
     try:
         with walk_claim(project_name):
             rc = subprocess.run(argv, cwd=str(repo_root)).returncode  # noqa: S603
     except WalkAlreadyRunning:
+        _revheal.drop_list_file(heal_list)
         print(
             f"[resync-driver] {project_name}: another code-graph walk is "
             f"already running for this project — skipping this run (no twin "
@@ -4660,6 +4776,7 @@ def _run_resync_and_verify_slotted(
         print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)
         start_error = f"could not start the analyzer: {exc}"
         rc = -1
+    _revheal.drop_list_file(heal_list)
     analyzer_duration_ms = int((time.monotonic() - analyzer_started) * 1000)
 
     # v0.2.105 (fix round): the POST-WALK half of the backend-reachability
@@ -4750,6 +4867,74 @@ def _run_resync_and_verify_slotted(
     except Exception as exc:  # noqa: BLE001 — observability, never a gate
         logger.debug("codegraph resync: terminal report raised: %s", exc)
 
+    return _verify_resync_outcome(
+        project_name, Path(repo_root), Path(analyzer_path),
+        index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+        rc=rc, pre_counts=pre_counts, exposure_heal_ok=exposure_heal_ok,
+        python_exe=argv[0],
+    )
+
+
+def _plan_revision_heal(
+    project_name: str, repo_root: Path, analyzer_path: Path, index_dot_claude: bool,
+) -> "_revheal.HealPlan":
+    """The driver's revision heal plan (v0.2.107): the pre-walk owed count
+    (:func:`count_stale_rows`) also lists the owed rows' files, and
+    :func:`vco_lib.codegraph_revision_heal.plan_revision_heal` picks the ones
+    this checkout may re-extract. Never raises."""
+
+    def _count(paths: set) -> Optional[dict]:
+        return count_stale_rows(
+            project_name, analyzer_path=analyzer_path, repo_root=repo_root,
+            index_dot_claude=index_dot_claude, owed_paths=paths,
+        )
+
+    return _revheal.plan_revision_heal(repo_root, _count)
+
+
+def _code_model_fill_owed(project_name: str) -> bool:
+    """A selected code model whose slot is still being filled needs the
+    whole-graph walk (:func:`vco_lib.code_embed_model.fill_owed`, which reads
+    an unreadable state as "not owed"); a scoped heal run would only hand the
+    fill back to a new driver."""
+    try:
+        from vco_lib.code_embed_model import fill_owed
+
+        return bool(fill_owed(project_name))
+    except Exception as exc:  # noqa: BLE001 — never crash the child
+        logger.debug("resync driver: code-model fill read failed: %s", exc)
+        return False
+
+
+def _cleanup_sweep_owed(project_name: str, repo_root: Path) -> bool:
+    """True only on a POSITIVE count of deleted-file primary rows
+    (:func:`count_cleanup_owed_rows`); unknown → False (no walk, no sweep)."""
+    try:
+        owed = count_cleanup_owed_rows(project_name, repo_root=repo_root)
+    except Exception as exc:  # noqa: BLE001 — probe must never crash the child
+        print(f"[resync-driver] cleanup-owed probe raised: {exc}", flush=True)
+        return False
+    return bool(owed and owed > 0)
+
+
+def _verify_resync_outcome(
+    project_name: str,
+    repo_root: Path,
+    analyzer_path: Path,
+    *,
+    index_dot_claude: bool,
+    force_rewalk: bool,
+    rc: object,
+    pre_counts: Optional[dict],
+    exposure_heal_ok: bool,
+    python_exe: str,
+) -> int:
+    """Steps 3-4 of the driver (moved out of
+    :func:`_run_resync_and_verify_slotted` in v0.2.107 so the revision heal's
+    no-run outcomes reach the same verifier): re-probe the owed rows, clear
+    the ledger entry on a positive zero, otherwise record the one-time
+    unconverged entry. ``rc`` is the analyzer's exit status, or ``"not run"``.
+    Always returns 0."""
     try:
         counts = count_stale_rows(
             project_name,
@@ -4887,7 +5072,7 @@ def _run_resync_and_verify_slotted(
     # post-walk probe is what clears this entry once the rows converge.
     _record_unconverged_deferral(
         repo_root, project_name, counts, driver_resume_command(
-            argv[0], Path(repo_root), Path(analyzer_path), project_name,
+            python_exe, Path(repo_root), Path(analyzer_path), project_name,
             index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
         ), stuck,
     )
@@ -4904,14 +5089,16 @@ _IDENTITY_UNMIGRATABLE_BASES = frozenset({"CodeInteraction"})
 def _probe_stale_identity_count(
     client, prefix: str, canonical: str,
 ) -> Optional[int]:
-    """Cheap gate for :func:`identity_sweep_if_stale`: total count of rows whose
-    ``project`` ≠ ``canonical`` across the 5 ``<prefix>_<base>`` classes, via a
-    filtered aggregate (the cheapest read — no per-row scan). ``None`` when the
-    probe is undeterminable on EVERY class (Weaviate down / prefix unresolvable
-    / aggregate shape unsupported) so the caller never treats "can't tell" as
-    "converged". ``0`` means every class positively reported zero stale rows.
+    """Cheap gate for :func:`identity_sweep_if_stale`: how many of the 5
+    ``<prefix>_<base>`` classes hold a row whose ``project`` ≠ ``canonical``.
+    v0.2.107 CG-1: each class is asked with a one-row, property-free filtered
+    read (an existence check — the caller only distinguishes zero from
+    non-zero), never a filtered Aggregate. ``None`` when the probe is
+    undeterminable on EVERY class (Weaviate down / prefix unresolvable) so the
+    caller never treats "can't tell" as "converged". ``0`` means every class
+    positively reported no stale row.
 
-    Soft-fail per class: an aggregate error on one class does not poison the
+    Soft-fail per class: a read error on one class does not poison the
     others (it contributes ``undeterminable``, not ``0``) — EXCEPT when that
     class positively lacks the ``project`` property (v0.2.102 S16-4): then the
     probe returns ``None`` so the caller runs the sweep, which adds it.
@@ -4955,15 +5142,16 @@ def _probe_stale_identity_count(
                 pass
             continue
         try:
-            flt = Filter.by_property("project").not_equal(canonical)
-            agg = coll.aggregate.over_all(filters=flt, total_count=True)
-            count = getattr(agg, "total_count", None)
-            if count is not None:
-                any_determinable = True
-                total += int(count)
+            probe = coll.query.fetch_objects(
+                filters=Filter.by_property("project").not_equal(canonical),
+                limit=1, return_properties=[],
+            )
+            any_determinable = True
+            if getattr(probe, "objects", None):
+                total += 1
         except Exception as exc:  # noqa: BLE001 — one class undeterminable
             logger.debug(
-                "identity sweep probe: aggregate %s failed: %s", coll_name, exc
+                "identity sweep probe: read %s failed: %s", coll_name, exc
             )
             try:
                 if "project" not in {p.name for p in coll.config.get().properties}:
@@ -5138,13 +5326,15 @@ def spawn_background_resync(
     index_dot_claude: bool = True,
     wait_for_starting_backend: bool = False,
 ) -> ResyncTriggerResult:
-    """Launch a BACKGROUND, revision-gated full re-analyze of ``repo_root``.
+    """Launch the BACKGROUND resync driver for ``repo_root``.
 
-    A full (no ``--incremental``, no ``--only-file``) analyze is intentional:
-    the revision gate inside the analyzer makes it LIGHT — only rows whose
-    stored ``embed_revision`` differs from the current one re-embed; the 90%+
-    already-current rows hash-skip. This is the host-agnostic, revision-based
-    resync (it re-embeds the root project too, not just non-root projects).
+    The driver (:func:`run_resync_and_verify`) heals revision-owed rows by
+    re-extracting ONLY the files that own them (v0.2.107 revision heal, one
+    scoped analyzer run; :mod:`vco_lib.codegraph_revision_heal`); with
+    ``force_rewalk`` (an extractor-generation rung) it runs the whole-repo
+    walk, whose per-entity gates still keep unchanged rows from re-embedding.
+    This is the host-agnostic, revision-based resync (it re-embeds the root
+    project too, not just non-root projects).
 
     Non-blocking: the analyzer is spawned detached via ``Popen`` and this
     function returns immediately with ``status="launched"``. NO global timeout
@@ -5373,8 +5563,9 @@ def spawn_background_resync(
         )
 
     # Build the DRIVER argv (R-7): the detached child is this module in
-    # --run-resync mode. It runs the analyzer as a blocking subprocess (full
-    # walk; the revision gate keeps it light), then re-probes convergence and
+    # --run-resync mode. It runs the analyzer as a blocking subprocess (the
+    # revision heal's scoped run over the owed files, or the whole-repo walk
+    # when forced), then re-probes convergence and
     # records the one-time deferral when stale rows remain — the RT-5 walk
     # died silently precisely because nothing verified it. We do NOT pass
     # --force-recreate (that would DROP + rebuild the schema, losing all

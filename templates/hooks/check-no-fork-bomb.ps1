@@ -19,6 +19,8 @@
 # Ported from sibling .sh in PR-32 (Group K Phase B): scrub sensitive env
 # vars before any subprocess spawning — defence-in-depth parity with every
 # other VCO hook (enforced by tests/test_hooks_disable_guard.py).
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 $secretEnvNames = @(
     'SUPABASE_KEY', 'SUPABASE_URL', 'GITHUB_TOKEN', 'GH_TOKEN',
     'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'AWS_SECRET_ACCESS_KEY',
@@ -27,6 +29,7 @@ $secretEnvNames = @(
 )
 foreach ($v in $secretEnvNames) {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+}
 }
 
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }

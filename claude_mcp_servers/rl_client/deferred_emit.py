@@ -299,6 +299,48 @@ def hand_off(items: Sequence[DeferredEmit], *, emit=None) -> str:
     return "inline"
 
 
+def hold(items: Sequence[DeferredEmit]) -> list:
+    """The JSON-safe form of ``items`` (each event plus the writer identity
+    resolved HERE), for a caller that must keep events UNSENT for now — the
+    hook router's cache warmer, whose retrieval nobody has seen yet. Send
+    them later with :func:`release_held`. Items without a writer are dropped
+    and ledgered exactly as for a hand-off."""
+    items = [i for i in (items or ()) if i is not None]
+    if not items:
+        return []
+    return list(json.loads(_serialize(items)).get("items") or [])
+
+
+def release_held(batch: Sequence[dict], *, session_id: str = "", emit=None) -> str:
+    """Send events kept by :func:`hold` — like :func:`hand_off` (detached
+    child, inline when none can start). ``session_id``, when given, replaces
+    the session each event was built under: a held retrieval belongs to the
+    run that SHOWS it. Returns ``"detached"``, ``"inline"`` or ``"none"``."""
+    items = []
+    for raw in batch or ():
+        if not isinstance(raw, dict) or not isinstance(raw.get("event"), dict):
+            continue
+        event = dict(raw["event"])
+        if session_id:
+            event["session_id"] = session_id
+        items.append({"event": event, "writer": dict(raw.get("writer") or {})})
+    if not items:
+        return "none"
+    payload = json.dumps({"items": items}, separators=(",", ":"))
+    _reap_orphaned_payloads()
+    if _can_detach():
+        try:
+            _spawn_child(payload)
+            return "detached"
+        except Exception as exc:  # noqa: BLE001 — fall back to inline, never drop
+            logger.debug("deferred emit: detached child unavailable (%s); sending inline", exc)
+    loaded = _items_from_batch(json.loads(payload))
+    results = emit_each(loaded, emit=emit)
+    if not all(results):
+        _record_unsent(loaded, results)
+    return "inline"
+
+
 def _safe_unlink(path: Any) -> None:
     """Remove ``path`` if present; never raise. One home for the child's
     payload cleanup (the try/finally in :func:`_child_main` and the ``atexit``
@@ -310,12 +352,16 @@ def _safe_unlink(path: Any) -> None:
 
 
 def _load(path: str) -> list:
-    from .telemetry_emit import RetrievalEvent
-
     # NB-04: read WITHOUT unlinking — the payload must outlive the emit so a
     # crash between load and POST can still be recorded (and, per NB-05, so the
     # ``finally`` in the caller can be the one true cleanup site).
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return _items_from_batch(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _items_from_batch(data: dict) -> list:
+    """Rebuild :class:`DeferredEmit` items from a serialized batch."""
+    from .telemetry_emit import RetrievalEvent
+
     out = []
     for raw in data.get("items") or []:
         ev = RetrievalEvent(**raw["event"])

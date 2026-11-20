@@ -6,14 +6,15 @@
 # powershell fallback for PS 5.1-only machines). No bash-side logic
 # change is needed - bash hooks never spawn PowerShell.
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 # VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
 #   Calls .claude/scripts/kg-sync (writes to the project's own
-#   KG_COLLECTION / DEVELOPMENT_COLLECTION) and code-graph-incremental.sh
-#   (writes to the project's own code-graph collections via
-#   analyze_code_graph.py). Writes do NOT consult VCT_KG_ACCESS_LIST or
+#   KG_COLLECTION / DEVELOPMENT_COLLECTION); the code graph is written by
+#   the HEAD catch-up, not by an edit (v0.2.107). Writes do NOT consult VCT_KG_ACCESS_LIST or
 #   VCT_CODE_GRAPH_ACCESS_LIST — those env vars are read-side only
 #   (fan-out search across peer KGs). This hook is correct as-is; no
 #   centralization needed: writes always target the project's OWN
@@ -143,7 +144,7 @@ except Exception:
 sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 " 2>/dev/null)
 # V52-L.2 Fix 2b context (preserved): AGENT_ID/AGENT_TYPE are exported
-# below so the kg-sync / code-graph-incremental subprocesses we spawn can
+# below so the kg-sync subprocesses we spawn can
 # attribute their retrieval / sync telemetry to the originating subagent;
 # SESSION_ID feeds VCT_SESSION_ID for the same 3-layer telemetry chain.
 # Export for child processes so they can attribute their work to the
@@ -164,7 +165,7 @@ sys.stdout.write(''.join(str(f) + '\0' for f in fields))
 
 [ -z "$EDITED_FILE" ] && exit 0
 
-# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-edit reminder ===
 # ONE home — _lib/route-touched-path.sh — shared with post-bash-file-sync.sh
 # so a CLI write routes identically to an Edit/Write. vco_route_init resolves
 # the debounce helper, the code-extension helper, VCT_PROJECT_ID and the

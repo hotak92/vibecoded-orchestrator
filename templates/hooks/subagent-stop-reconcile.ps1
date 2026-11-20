@@ -3,8 +3,10 @@
 #
 # subagent-stop-reconcile.ps1 — Windows sibling of subagent-stop-reconcile.sh.
 # SubagentStop hook that reconciles a subagent's filesystem changes back
-# into the project's KG / code-graph / credential-scan / nudge-counter
-# state, plus the V52-L.2 JSONL audit row.
+# into the project's KG / credential-scan / nudge-counter state, plus the
+# V52-L.2 JSONL audit row. Code files are not queued for the code graph
+# (Step 3 retired in v0.2.107, CG-3: the graph follows the main checkout's
+# commits; a subagent's code reaches it through the commit or merge).
 #
 # V52-L.1 (v0.2.52): side effects, all soft-fail. See .sh sibling for the
 # full design rationale. MUST MATCH the .sh sibling, in particular
@@ -24,10 +26,14 @@
 #   * Step 5 holds the nudge's sidecar lock (census F5).
 
 # Scrub sensitive env vars before any subprocess spawning.
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 $ScriptDir = $PSScriptRoot
 
@@ -44,13 +50,6 @@ $SnapshotHelper = Join-Path $ScriptDir "_lib/snapshot.ps1"
 if (Test-Path $SnapshotHelper) { . $SnapshotHelper }
 $CredScanHelper = Join-Path $ScriptDir "_lib/credscan.ps1"
 if (Test-Path $CredScanHelper) { . $CredScanHelper }
-# v0.2.73 HIGH-2: the canonical-root resolver + FIX-A' worktree gate — the SAME
-# shared libs the per-edit code-graph hook + the Stop drain use (mirror-don't-
-# fork). Optional; when absent Step-3 falls back to CONSERVATIVE enqueue-all.
-$CanonHelper = Join-Path $ScriptDir "_lib/canonical-repo-root.ps1"
-if (Test-Path $CanonHelper) { . $CanonHelper }
-$WorktreeGateHelper = Join-Path $ScriptDir "_lib/worktree-gate.ps1"
-if (Test-Path $WorktreeGateHelper) { . $WorktreeGateHelper }
 
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     $env:CLAUDE_PROJECT_DIR
@@ -62,9 +61,6 @@ $LogDir = Join-Path $ProjectRoot ".claude/logs"
 $StateDir = Join-Path $ProjectRoot ".claude/state"
 $LogFile = Join-Path $LogDir "subagent-reconciliation.jsonl"
 $AlertLog = Join-Path $LogDir "credential_alerts.jsonl"
-# v0.2.73 HIGH-2: the session-agnostic drain queue the Stop-hook batched drain
-# consumes (replaces the orphan code-graph-queue.jsonl that nothing drained).
-$CgDrainShared = Join-Path $StateDir "codegraph_drain_shared.txt"
 
 try {
     if (-not (Test-Path $LogDir)) {
@@ -108,7 +104,7 @@ if ($JobFile) {
     try { $HookStdin = [System.IO.File]::ReadAllText($JobFile) } catch { $HookStdin = "" }
     try { Remove-Item -LiteralPath $JobFile -Force -ErrorAction SilentlyContinue } catch { }
 } else {
-    try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+    try { $HookStdin = Read-VcoHookStdin } catch { }
 }
 if (-not $HookStdin) { exit 0 }
 
@@ -291,31 +287,26 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
     } catch { }
 }
 
-# Step 1b (v0.2.102 W6-Q follow-up) - must match the .sh sibling: reap the
-# agent's worktree when it is provably unchanged (the harness neither removes
-# a hook-created worktree nor runs WorktreeRemove when a subagent finishes).
-# Conditions live in _lib/worktree-records.ps1 :: Invoke-WtrecReap. A kept
-# worktree is logged with path + reason and named on stderr. Never blocks.
-# A kept worktree's notice reaches the parent ONCE per path per session
-# (v0.2.105: an interim stop, the agent waiting on its own background work,
-# is indistinguishable in the payload from a final one) and says so.
+# Step 1b (v0.2.102 W6-Q follow-up; v0.2.107 REAP-INTERIM) - must match the
+# .sh sibling: decide the agent's worktree, but NEVER remove it here (the
+# harness neither removes a hook-created worktree nor runs WorktreeRemove when
+# a subagent finishes, and SubagentStop also fires on an INTERIM stop that the
+# payload cannot tell from a final one - removing here lost paused agents). A
+# provably unchanged worktree is only marked a reap candidate;
+# session-worktree-reap removes it at a SessionStart once it has been idle
+# for 7 days (a kept one once its commits are merged into the main
+# checkout's branch), re-checking it first. Conditions live in _lib/worktree-records.ps1 ::
+# Invoke-WtrecReap. Every decision is logged; a kept worktree is also named on
+# stderr. Never blocks. A kept worktree's notice reaches the parent ONCE per
+# path per session (v0.2.105) and says the agent may still be running.
 $WtrecHelper = Join-Path $ScriptDir "_lib/worktree-records.ps1"
 if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
     . $WtrecHelper
     $reap = $null
-    try { $reap = Invoke-WtrecReap $ProjectRoot $AgentId } catch { $reap = $null }
+    try { $reap = Invoke-WtrecReap $ProjectRoot $AgentId $SessionId $TranscriptPath } catch { $reap = $null }
     if ($reap) {
-        try {
-            $row = [ordered]@{
-                timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                hook          = "subagent-stop-reconcile"
-                decision      = "reap_" + $reap.Decision
-                reason        = $reap.Reason
-                agent_id      = $AgentId
-                resolved_path = $reap.Path
-            }
-            Add-Content -Path (Join-Path $LogDir "worktree-guard.jsonl") -Value ($row | ConvertTo-Json -Compress) -ErrorAction Stop
-        } catch { }
+        Write-WtrecReapLog (Join-Path $LogDir "worktree-guard.jsonl") "subagent-stop-reconcile" $AgentId `
+            ([string]$reap.Decision) ([string]$reap.Reason) ([string]$reap.Path)
         if ($reap.Decision -eq "kept") {
             # v0.2.105 - must match the .sh sibling: an interim SubagentStop
             # (the agent is waiting on its own background work and will resume)
@@ -325,9 +316,10 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
             # Tell the parent ONCE per worktree path per session
             # (_lib/worktree-records.ps1 :: Test-WtrecKeptAlertOnce), worded so
             # the reader knows the agent may still be running. In the ordinary
-            # sequence the second stop of one launch is already suppressed by
-            # Invoke-WtrecReap's PRE-EXISTING already_handled gate; the marker
-            # covers the rewritten-record case and the detached-job race.
+            # sequence the second stop of one launch whose worktree was kept is
+            # already suppressed by Invoke-WtrecReap's PRE-EXISTING
+            # already_handled gate; the marker covers the rewritten-record case
+            # and the detached-job race.
             $keptRec = Find-WtrecRecord $ProjectRoot $AgentId
             if (-not $keptRec -or (Test-WtrecKeptAlertOnce $keptRec $SessionId ([string]$reap.Path))) {
                 $keptHead = Get-ReconcileHeadDescription ([string]$reap.Path)
@@ -393,10 +385,7 @@ if (-not $changedAbs -or $changedAbs.Count -eq 0) {
 $fileCount = 0
 $totalBytes = [int64]0
 $kgFiles = New-Object System.Collections.Generic.List[string]    # absolute; shared tree only
-$codeFiles = New-Object System.Collections.Generic.List[string]  # relative; shared tree only
 $allFiles = New-Object System.Collections.Generic.List[string]   # absolute; credential scan
-
-$codeExtRe = '\.(py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql)$'
 
 foreach ($abs in $changedAbs) {
     if (-not $abs) { continue }
@@ -407,15 +396,13 @@ foreach ($abs in $changedAbs) {
         } catch {}
     }
     $allFiles.Add($abs) | Out-Null
-    # Indexing for SHARED-TREE files only: a worktree agent's files reach the
-    # KG / code graph when its work is merged.
+    # KG/docs sync for SHARED-TREE files only: a worktree agent's files reach
+    # the KG when its work is merged. Code files are not routed (Step 3
+    # retired in v0.2.107, CG-3).
     if ($Attribution -eq "agent_worktree") { continue }
     $rel = $abs.Substring($ProjectRoot.Length).TrimStart('\', '/') -replace '\\', '/'
     if ($rel -match '^knowledge/.*\.md$' -or $rel -match '^docs/.*\.md$') {
         $kgFiles.Add($abs) | Out-Null
-    }
-    if ($rel -match $codeExtRe) {
-        $codeFiles.Add($rel) | Out-Null
     }
 }
 
@@ -457,55 +444,6 @@ if ($kgFiles.Count -gt 0) {
             $skip = [ordered]@{ event = "kg_sync_skipped"; reason = "_lib/route-touched-path.ps1 missing"; agent_id = $safeId }
             Add-Content -LiteralPath $FilesLog -Value ($skip | ConvertTo-Json -Compress) -ErrorAction Stop
         } catch { }
-    }
-}
-
-# -------------------- Step 3: Code-graph drain enqueue --------------------
-# MUST MATCH subagent-stop-reconcile.sh Step 3. Route modified code files into
-# the SAME batched, worktree-gated path the Stop drain consumes — NOT the old
-# orphan code-graph-queue.jsonl (nothing drained it — v0.2.73 HIGH-2). Apply
-# the FIX-A' worktree gate (drop ephemeral/unregistered worktree edits), resolve
-# + gate ONCE per distinct canonical root, and append gated-IN ABSOLUTE paths
-# (newline-delimited) to the session-agnostic shared drain queue. Never run the
-# analyzer synchronously; only enqueue. Soft-fail throughout.
-if ($codeFiles.Count -gt 0) {
-    $gateCache = @{}   # canonical root -> 'SKIP' | 'INDEX'
-    $toEnqueue = New-Object System.Collections.Generic.List[string]
-    $canonAvail = [bool](Get-Command Get-CanonicalRepoRoot -ErrorAction SilentlyContinue)
-    $gateAvail  = [bool](Get-Command Test-EphemeralWorktreeEdit -ErrorAction SilentlyContinue)
-    foreach ($rel in $codeFiles) {
-        if (-not $rel) { continue }
-        $abs = Join-Path $ProjectRoot $rel
-
-        # Canonical MAIN root (empty when unresolved → gate treats as non-worktree/INDEX).
-        $canon = ""
-        if ($canonAvail) {
-            try { $canon = Get-CanonicalRepoRoot -File $abs } catch { $canon = "" }
-            if (-not $canon) { $canon = "" }
-        }
-
-        $key = $canon
-        if (-not $gateCache.ContainsKey($key)) {
-            $verdict = "INDEX"
-            if ($gateAvail) {
-                try {
-                    if (Test-EphemeralWorktreeEdit -EditedFile $abs -RepoPath $ProjectRoot -CanonRoot $canon) {
-                        $verdict = "SKIP"
-                    }
-                } catch { $verdict = "INDEX" }
-            }
-            $gateCache[$key] = $verdict
-        }
-        if ($gateCache[$key] -eq "INDEX") { [void]$toEnqueue.Add($abs) }
-    }
-
-    if ($toEnqueue.Count -gt 0) {
-        try {
-            $sb = New-Object System.Text.StringBuilder
-            foreach ($p in $toEnqueue) { [void]$sb.AppendLine($p) }
-            # No BOM (Encoding.UTF8 writes one into a NEW file, glued to the first path).
-            Add-VcoUtf8Content -Path $CgDrainShared -Value $sb.ToString() -NoNewline
-        } catch {}
     }
 }
 

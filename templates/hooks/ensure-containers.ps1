@@ -2,8 +2,11 @@
 # Windows PowerShell 5.1 only and has no Bash-side counterpart; every
 # behaviour must match the ensure-containers.sh sibling).
 # Scrub sensitive env vars before any subprocess
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+}
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
@@ -732,11 +735,27 @@ if ($script:ComposeList.Count -gt 0) {
                 Write-RecoveryLog -Container $name -Action "failed" -Reason "removed; compose up failed"
             }
         } else {
-            Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; recreate refused or not run (data identity not proven)"
+            $zRunning = (& $Runtime inspect -f '{{.State.Running}}' $name 2>$null | Out-String).Trim()
+            if ($zRunning -eq "true") {
+                Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; not recreated, started by name instead (a version move is made only by python install.py --update)"
+            } else {
+                Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; recreate refused or not run (data identity not proven or version differs; a version move is made only by python install.py --update)"
+            }
         }
     }
 }
 $recovered = $script:recovered
+
+# v0.2.107: a Weaviate container VCO did not create keeps its own compose, so
+# VCO cannot write a memory limit at create time. ONE Python verb
+# (vco_lib.weaviate_memory, the limit's one home) applies it IN PLACE --
+# `<runtime> update --memory`, never a recreate, never a restart -- and it runs
+# at every ensure because an in-place limit does not survive a restart on
+# podman 4.9. It does nothing for VCO's own container (its compose carries the
+# limit), for a container that already has a limit, or when the user switched
+# it off (VCO_WEAVIATE_FOREIGN_LIMIT=off). It prints one line only when it
+# changed something or could not (`--quiet`: applied, failed, or unreadable).
+& $RunPy -m vco_lib.weaviate_memory ensure-foreign-limit --quiet 2>$null | ForEach-Object { Write-Output $_ }
 
 if ($started -gt 0) { Write-Output "Started $started container(s) via $Runtime" }
 if ($recovered -gt 0) { Write-Output "Recovered $recovered zombie container(s) via $Runtime" }

@@ -206,6 +206,90 @@ def run_git(
     return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
 
 
+def linked_worktree_main(repo: Path) -> Optional[Path]:
+    """The main checkout ``repo`` is a LINKED WORKTREE of, or None.
+
+    A linked worktree is told by its own git dir differing from the common
+    dir it shares (``git rev-parse --absolute-git-dir`` ≠ ``--git-common-dir``,
+    both resolved) — never by the repository toplevel differing from
+    ``repo``: a project folder nested inside a larger repository (a monorepo
+    sub-project, a folder under a home-directory repository) has a toplevel
+    above it and is still the main checkout (v0.2.107 WAVE2-CHECK M-2).
+
+    None also covers the main checkout itself, a submodule (its git dir is
+    its own common dir), a folder that is not a repository, and git that
+    cannot run — every caller reads None as "not a worktree". The returned
+    path is the parent of the common ``.git`` dir (the common dir itself for
+    a bare repository).
+    """
+    rc, out, _err = run_git(
+        repo, ["rev-parse", "--path-format=absolute", "--absolute-git-dir", "--git-common-dir"]
+    )
+    lines = out.splitlines() if rc == 0 else []
+    if len(lines) != 2:
+        # git < 2.31 has no --path-format: --git-common-dir may then be
+        # relative to ``repo``.
+        rc, out, _err = run_git(repo, ["rev-parse", "--absolute-git-dir", "--git-common-dir"])
+        lines = out.splitlines() if rc == 0 else []
+        if len(lines) != 2:
+            return None
+    git_dir_raw, common_raw = (ln.strip() for ln in lines)
+    if not git_dir_raw or not common_raw:
+        return None
+    common_path = Path(common_raw)
+    if not common_path.is_absolute():
+        common_path = Path(repo) / common_path
+    try:
+        git_dir = Path(git_dir_raw).resolve()
+        common = common_path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if git_dir == common:
+        return None
+    return common.parent if common.name == ".git" else common
+
+
+def committed_paths(repo: Path) -> Optional[set[str]]:
+    """POSIX paths, relative to ``repo``, of every file in HEAD's tree under
+    ``repo`` (``git ls-tree -r --name-only -z HEAD`` run from ``repo``, so a
+    project nested in a larger repository gets its own subtree, relative to
+    itself). None when git cannot answer (git unrunnable, no HEAD, an error):
+    callers must read None as "cannot tell", never as "nothing committed"."""
+    # The binary runner: run_git strips its output, which would clip a path
+    # that starts with a space.
+    rc, out, _err = run_git_binary(
+        repo, ["ls-tree", "-r", "--name-only", "-z", "HEAD"], timeout=60,
+    )
+    if rc != 0:
+        return None
+    text = out.decode("utf-8", errors="surrogateescape")
+    return {p for p in text.split("\0") if p}
+
+
+def uncommitted_paths(repo: Path) -> Optional[set[str]]:
+    """POSIX paths, relative to ``repo``, of every TRACKED file under ``repo``
+    whose working-tree or staged content differs from HEAD (``git diff
+    --name-only -z --relative HEAD`` run from ``repo``). Untracked files are
+    not listed (they are not in HEAD's tree: :func:`committed_paths` tells
+    them apart). None when git cannot answer — "cannot tell", never "clean"."""
+    rc, out, _err = run_git_binary(
+        repo, ["diff", "--name-only", "-z", "--relative", "HEAD", "--"], timeout=60,
+    )
+    if rc != 0:
+        return None
+    text = out.decode("utf-8", errors="surrogateescape")
+    return {p for p in text.split("\0") if p}
+
+
+def is_git_work_tree(repo: Path) -> Optional[bool]:
+    """True inside a git work tree, False when git ran and said it is not
+    one, None when git could not run (cannot tell)."""
+    rc, out, _err = run_git(repo, ["rev-parse", "--is-inside-work-tree"])
+    if rc is None:
+        return None
+    return rc == 0 and out.strip() == "true"
+
+
 def run_git_binary(
     repo: Path, args: Sequence[str], *, timeout: int = GIT_TIMEOUT_SECONDS
 ) -> tuple[Optional[int], bytes, bytes]:
@@ -279,7 +363,7 @@ def git_short_sha(repo: Path) -> Optional[str]:
     return out or None
 
 
-def head_state(repo: Path) -> HeadState:
+def head_state(repo: Path, *, require_dot_git: bool = True) -> HeadState:
     """Tri-state: is ``repo`` a work tree whose HEAD resolves to a commit?
 
     ``git rev-parse --verify HEAD`` is the probe — it exits non-zero both for
@@ -291,8 +375,12 @@ def head_state(repo: Path) -> HeadState:
     ``git_short_sha`` (it saves a subprocess on the common tarball-install
     path) but is now reported as NOT_APPLICABLE with a reason, instead of
     being indistinguishable from a spawn failure.
+
+    ``require_dot_git=False`` drops that short-circuit: a project folder
+    NESTED inside a larger repository has no ``.git`` of its own and still
+    has a HEAD (the code-graph catch-up asks this way, WAVE2-CHECK M-2).
     """
-    if not (repo / ".git").exists():
+    if require_dot_git and not (repo / ".git").exists():
         return HeadState(
             state=GitState.NOT_APPLICABLE,
             reason=f"{repo} has no .git — not a git work tree",
@@ -313,7 +401,7 @@ def head_state(repo: Path) -> HeadState:
     return HeadState(state=GitState.OK, sha=out)
 
 
-def git_head_sha(repo: Path) -> Optional[str]:
+def git_head_sha(repo: Path, *, require_dot_git: bool = True) -> Optional[str]:
     """FULL SHA of ``repo``'s HEAD, or ``None`` when it is not determinable.
 
     v0.2.92 (WP-G): thin wrapper over :func:`head_state` for callers that only
@@ -329,7 +417,7 @@ def git_head_sha(repo: Path) -> Optional[str]:
     instead — this collapses all three to ``None``, same lossy trade-off as
     :func:`git_branch` over :func:`branch_state`.
     """
-    state = head_state(repo)
+    state = head_state(repo, require_dot_git=require_dot_git)
     return state.sha if state.state is GitState.OK else None
 
 

@@ -390,7 +390,7 @@ class _CountingColl:
         self._objects = objects or []
         self.query = types.SimpleNamespace(fetch_objects=self._fetch)
 
-    def _fetch(self, filters=None, limit=None):
+    def _fetch(self, filters=None, limit=None, return_properties=None):
         self._counter.append(filters)
         return types.SimpleNamespace(objects=self._objects)
 
@@ -774,7 +774,7 @@ class _F7Coll:
         self._rows = rows
         self.query = types.SimpleNamespace(fetch_objects=self._fetch)
 
-    def _fetch(self, filters=None, limit=None):
+    def _fetch(self, filters=None, limit=None, return_properties=None):
         return types.SimpleNamespace(
             objects=[types.SimpleNamespace(properties=p) for p in self._rows]
         )

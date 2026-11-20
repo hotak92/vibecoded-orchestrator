@@ -91,4 +91,28 @@ describe('update: the one-time catch-up notice is an info toast', () => {
     expect(toastCalls).toContainEqual({ kind: 'info', text: NOTICE });
     expect(toastCalls.some((t) => t.kind === 'error' && t.text === NOTICE)).toBe(false);
   });
+
+  // v0.2.107 (UPDATE-ALL): the backend says what the update queued for the
+  // code graph and the KG sync, and why — or that nothing was needed. Those
+  // lines ride `notices` and must reach the user as info, never as an error.
+  it('shows what was queued for the indexes, and why, as info', async () => {
+    const CG = 'Code graph: nothing queued — HEAD 0123456789ab is unchanged since the last build.';
+    const KG = 'Knowledge sync queued: the update changed knowledge/concepts/n.md.';
+    invokeMock.mockResolvedValueOnce({
+      project: view('p4'),
+      warnings: [],
+      summary: {
+        created: 1, overwritten: 0, preserved: 0, noop: 3, always_overwritten: 0,
+        skipped_existing: 0, errors_count: 0, adopted: 0,
+        kg_or_docs_content_changed: true,
+        kg_content_changed_paths: ['knowledge/concepts/n.md'],
+        codegraph_walk: 'not_owed', codegraph_walk_reason: null,
+      },
+      notices: [CG, KG],
+    });
+    await projects.update('p4');
+    expect(toastCalls).toContainEqual({ kind: 'info', text: CG });
+    expect(toastCalls).toContainEqual({ kind: 'info', text: KG });
+    expect(toastCalls.some((t) => t.kind === 'error')).toBe(false);
+  });
 });

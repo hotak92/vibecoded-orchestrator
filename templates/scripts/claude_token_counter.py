@@ -69,8 +69,10 @@ Verified 2026-05-01 against live transcript + Anthropic public docs:
 
 Claude Code emits ~3 JSONL entries per actual API request during streaming;
 all three entries share the same requestId. Without dedup, totals inflate
-~3x. v10.1 dedups BOTH usage AND tool_use credits by requestId (v10
-regressed on this for tool_use bodies; B12 fix below).
+~3x. Usage is deduped by requestId; tool_use credits are deduped by the
+tool_use block's OWN id: each entry carries one content block, so a tool_use
+normally sits on a later entry of its request, and the earlier "first entry
+of the request only" rule (B12) dropped it together with its tool_result.
 
 ## Sub-agent / sidechain note
 
@@ -208,6 +210,11 @@ class ScanResult:
     start_offset_used: int = 0         # W6-F: where the scan actually began
     end_offset: int = 0                # W6-F: bytes consumed (resume point)
     seen_request_ids: set[str] = field(default_factory=set)
+    # tool_use ids already credited. Claude Code writes ONE content block per
+    # transcript line, every line of a response carrying the same requestId, so
+    # a tool_use usually sits on a LATER line of its request: it is deduped by
+    # its own id, never by "first line of the request" (which dropped it).
+    seen_tool_use_ids: set[str] = field(default_factory=set)
     # Per-request char tallies, accumulated when the next request's tool_result
     # blocks reveal what was returned. Keyed by tool_use_id (correlates the
     # assistant's tool_use to the user's tool_result reply).
@@ -412,6 +419,10 @@ class TranscriptScanner:
             ) or ""
             if req_id:
                 result.seen_request_ids.add(req_id)
+            if isinstance(msg, dict):
+                for block in _iter_blocks(msg):
+                    if block.get("type") == "tool_use" and block.get("id"):
+                        result.seen_tool_use_ids.add(block["id"])
 
     def _process_line(
         self,
@@ -435,12 +446,13 @@ class TranscriptScanner:
 
         # The requestId we attribute work to. Each unique requestId is one
         # logical API call (Claude Code emits ~3 JSONL entries per call
-        # during streaming; we dedup by gating BOTH usage and tool_use
-        # credits on `is_new_request`).
+        # during streaming; usage is credited once per requestId, a tool_use
+        # once per its own block id — see the tool_use section below).
         req_id = entry.get("requestId") or msg.get("id") or ""
-        # B10 fix: empty requestId means we can't dedup → skip both usage
-        # and tool_use accounting. This avoids inflating work via duplicate
-        # streaming entries that lack req_id (rare but possible).
+        # B10 fix: empty requestId means we can't dedup the USAGE → skip it,
+        # which avoids inflating work via duplicate streaming entries that
+        # lack req_id (rare but possible). A tool_use that carries its own
+        # block id is deduped by that id and is credited regardless.
         is_new_request = bool(req_id) and (req_id not in result.seen_request_ids)
         if is_new_request:
             result.seen_request_ids.add(req_id)
@@ -458,15 +470,25 @@ class TranscriptScanner:
                 result.deduped_requests += 1
 
         # ── tool_use intake / authorship accounting (assistant turns) ─────
-        # B12 fix: gate the tool_use walk by `is_new_request` to prevent
-        # 3× over-credit on streaming-duplicated entries.
-        if is_new_request and msg.get("role") == "assistant":
+        # Deduped per tool_use id, so a block repeated on several streaming
+        # entries is credited once (the over-credit B12 guarded against) and
+        # a block on a later entry of its request is still credited.
+        if msg.get("role") == "assistant":
             for block in _iter_blocks(msg):
                 if block.get("type") != "tool_use":
                     continue
                 tool_name = block.get("name") or ""
                 tool_use_id = block.get("id") or ""
                 tool_input = block.get("input") or {}
+                # Credit each tool_use ONCE, keyed by its own id (see
+                # ScanResult.seen_tool_use_ids). A block without an id keeps
+                # the old rule: only on the first line of its request.
+                if tool_use_id:
+                    if tool_use_id in result.seen_tool_use_ids:
+                        continue
+                    result.seen_tool_use_ids.add(tool_use_id)
+                elif not is_new_request:
+                    continue
 
                 if tool_name in EDIT_TOOL_NAMES:
                     body_chars = _edit_body_chars(tool_name, tool_input)

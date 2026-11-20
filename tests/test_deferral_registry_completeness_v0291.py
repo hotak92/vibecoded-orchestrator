@@ -340,6 +340,21 @@ _V02106_OWNED_ADDITIONS = frozenset({
     "weaviate_upgrade_snapshot_refused",
 })
 
+# v0.2.107 (lane CONTAINERS): the protected move of VCO's own Weaviate to the
+# pinned image runs INSIDE install.py's step [5b] (service_reconcile.reconcile
+# -> vco_lib.container_upgrade) and its three rows go into that run's report:
+# family A proper. `_refused` is re-detected by every update that still cannot
+# move the container; `_rolled_back` and `_backup_kept` are one-shot records
+# of what the run that emitted them did.
+_V02107_OWNED_ADDITIONS = frozenset({
+    "container_upgrade_refused",
+    "container_upgrade_rolled_back",
+    "container_upgrade_backup_kept",
+    # A-021: step 5's disk-space check before an image pull
+    # (vco_lib.compose_image_prepull), same shape as service_image_pull_failed.
+    "service_image_no_disk_space",
+})
+
 
 # v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
 # wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
@@ -779,6 +794,10 @@ class TestRegistryCompleteness(unittest.TestCase):
             # emit (pinned by tests/test_v02106_weaviate_raft_guard.py).
             "weaviate_upgrade_snapshot_refused", "weaviate_collection_index_missing",
             "weaviate_raft_replay_exposed", "weaviate_container_uncapped",
+            # v0.2.107: vco_lib.container_upgrade's entry builders attach
+            # service + container on every emit (pinned by
+            # tests/test_v02107_container_upgrade.py).
+            "container_upgrade_refused", "container_upgrade_rolled_back",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
@@ -822,7 +841,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V02101_OWNED_ADDITIONS
             | _V02103_OWNED_ADDITIONS
             | _V02105_OWNED_ADDITIONS
-            | _V02106_OWNED_ADDITIONS,
+            | _V02106_OWNED_ADDITIONS
+            | _V02107_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

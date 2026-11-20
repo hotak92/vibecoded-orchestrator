@@ -474,11 +474,11 @@ struct ProjectConfigResponse {
     retrieval_tuning: RetrievalTuning,
     /// v0.2.47 — extra read-only paths that contribute to this project's
     /// codegraph collection. Sourced from
-    /// `project_codegraph_extra_paths` (only `enabled=1` rows). Hooks
-    /// (`.claude/hooks/code-graph-incremental.sh`) query this field via
-    /// the resolver clients (bash/ps1/python) to decide whether an edit
-    /// under an out-of-project path should re-trigger analyze for THIS
-    /// project — so they don't talk to SQLite directly. The launcher GUI
+    /// `project_codegraph_extra_paths` (only `enabled=1` rows). The Stop
+    /// hook's extras refresh (`vco_lib.codegraph_extras_refresh`) reads it
+    /// through the Python resolver to re-index a folder whose HEAD moved,
+    /// and the edit-routing hooks cache it for the end-of-turn reminder —
+    /// so neither talks to SQLite directly. The launcher GUI
     /// Identity tab "Extra codegraph paths" panel reads + mutates the
     /// underlying rows via the Tauri commands in
     /// `commands::project_codegraph_extras`.
@@ -574,8 +574,8 @@ struct ProjectConfigResponse {
     /// Stop hook (`templates/hooks/stop-codegraph-drain.{sh,ps1}`). It
     /// compares this with the main checkout's HEAD and indexes the
     /// `git diff --name-only <recorded>..HEAD` files — the code that arrives
-    /// through a merge, a pull or a shell commit, which the per-edit hook
-    /// never queues (field report 2026-10-29: a graph six days / 1,070
+    /// through a commit, a merge or a pull — since v0.2.107 the only way code
+    /// reaches the graph (field report 2026-10-29: a graph six days / 1,070
     /// commits behind). The new baseline is recorded through
     /// `POST /projects/{id}/codegraph/analyzed` (advance-only).
     ///

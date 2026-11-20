@@ -27,6 +27,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 use super::Db;
 
@@ -65,6 +66,15 @@ pub struct RlEvent {
 
 /// RL-14: the app_state key guarding the one-time historical marking pass.
 /// Present (any value) ⇒ the backfill already ran on this launcher.db.
+/// What [`Db::insert_rl_event`] returns when `project_id` names no
+/// registered project (migration 053 moved this rule from a foreign key into
+/// the writer). It keeps the words "FOREIGN KEY" on purpose: the hub's POST
+/// handler (`vct-hub/src/rl_events_api.rs`) answers 422 `unknown_project_id`
+/// on exactly that substring, the answer the Python writer re-resolves its
+/// cached project identity on.
+pub const UNKNOWN_PROJECT_ID_ERROR: &str =
+    "insert rl_event: FOREIGN KEY constraint failed (project_id names no registered project)";
+
 pub const QUARANTINE_BACKFILL_STATE_KEY: &str = "rl_events.quarantine_backfill_v1";
 
 /// RL-14: stable reason tag for the historical out-of-range-score class.
@@ -95,7 +105,7 @@ pub const QUARANTINE_REASON_SCORE_OUT_OF_RANGE: &str = "score_out_of_range";
 // `vco_lib/rl_archive.py` is the shared reader (and its `python -m` CLI).
 //
 // CRASH ORDERING: the archive is written to `<name>.jsonl.gz.pending`, fsynced,
-// and VERIFIED (re-read + line count) BEFORE any DELETE. It is renamed to its
+// and VERIFIED (re-read: line count + SHA-256 of the bytes) BEFORE any DELETE. It is renamed to its
 // final `.jsonl.gz` name only AFTER the DELETE succeeds. So a crash between the
 // two leaves a `.pending` file the reader ignores while the rows are still in
 // the DB — no loss, and no double-count. A crash after the DELETE but before
@@ -174,10 +184,13 @@ fn write_pending_archive(dir: &Path, stem: &str, rows: &[RlEvent]) -> Result<Pat
         let _ = std::fs::remove_file(p);
     };
 
-    // Build the gzip stream.
+    // Build the gzip stream. A-014 (v0.2.107): the SHA-256 of the
+    // uncompressed bytes is taken while writing, so the read-back below can
+    // check every byte, not only the line count.
     let file = std::fs::File::create(&pending)
         .map_err(|e| format!("rl archive: create {}: {}", pending.display(), e))?;
     let mut enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut written = Sha256::new();
     for row in rows {
         let line = match archive_line(row) {
             Ok(l) => l,
@@ -192,7 +205,10 @@ fn write_pending_archive(dir: &Path, stem: &str, rows: &[RlEvent]) -> Result<Pat
             cleanup(&pending);
             return Err(format!("rl archive: write {}: {}", pending.display(), e));
         }
+        written.update(line.as_bytes());
+        written.update(b"\n");
     }
+    let written: Vec<u8> = written.finalize().to_vec();
     // finish() flushes the deflate trailer; sync_all() puts the bytes on the
     // platter BEFORE we are allowed to delete the rows they represent.
     let file = match enc.finish() {
@@ -208,19 +224,12 @@ fn write_pending_archive(dir: &Path, stem: &str, rows: &[RlEvent]) -> Result<Pat
     }
     drop(file);
 
-    // VERIFY: re-open, decompress, count lines. An archive we cannot read back
-    // is a delete with extra steps — refuse to proceed on any mismatch.
-    match verify_archive_line_count(&pending) {
-        Ok(n) if n == rows.len() => Ok(pending),
-        Ok(n) => {
-            cleanup(&pending);
-            Err(format!(
-                "rl archive: verify {} — {} lines readable, {} expected",
-                pending.display(),
-                n,
-                rows.len()
-            ))
-        }
+    // VERIFY: re-open, decompress, count lines AND compare the checksum of the
+    // bytes read back with the one taken while writing. An archive we cannot
+    // read back exactly is a delete with extra steps — refuse to proceed on
+    // any mismatch.
+    match check_archive_matches(&pending, rows.len(), &written) {
+        Ok(()) => Ok(pending),
         Err(e) => {
             cleanup(&pending);
             Err(e)
@@ -228,22 +237,49 @@ fn write_pending_archive(dir: &Path, stem: &str, rows: &[RlEvent]) -> Result<Pat
     }
 }
 
-/// Decompress `path` and count newline-terminated records. Used as the
-/// post-write verification gate (and by the archive tests).
-fn verify_archive_line_count(path: &Path) -> Result<usize, String> {
+/// The verification gate in front of every DELETE: the archive at `path`,
+/// read back, holds exactly `rows_expected` records and its bytes hash to
+/// `sum_expected` (taken while writing). Any mismatch or read error is `Err`.
+fn check_archive_matches(path: &Path, rows_expected: usize, sum_expected: &[u8]) -> Result<(), String> {
+    let (n, sum) = verify_archive(path)?;
+    if n != rows_expected {
+        return Err(format!(
+            "rl archive: verify {} — {} lines readable, {} expected",
+            path.display(),
+            n,
+            rows_expected
+        ));
+    }
+    if sum != sum_expected {
+        return Err(format!(
+            "rl archive: verify {} — checksum of the bytes read back differs from the bytes written",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Decompress `path`, count its non-empty records and take the SHA-256 of
+/// every line as read back (each followed by the `\n` the writer put after
+/// it). Used as the post-write verification gate: the count must equal the
+/// rows selected and the checksum the one taken while writing.
+fn verify_archive(path: &Path) -> Result<(usize, Vec<u8>), String> {
     use std::io::BufRead;
     let f = std::fs::File::open(path)
         .map_err(|e| format!("rl archive: reopen {}: {}", path.display(), e))?;
     let dec = flate2::read::GzDecoder::new(f);
     let reader = std::io::BufReader::new(dec);
     let mut n = 0usize;
+    let mut sum = Sha256::new();
     for line in reader.lines() {
         let line = line.map_err(|e| format!("rl archive: decode {}: {}", path.display(), e))?;
+        sum.update(line.as_bytes());
+        sum.update(b"\n");
         if !line.trim().is_empty() {
             n += 1;
         }
     }
-    Ok(n)
+    Ok((n, sum.finalize().to_vec()))
 }
 
 /// Row ids recorded in an archive sidecar, in file order.
@@ -365,13 +401,24 @@ impl Db {
         if let Some(id) = existing {
             return Ok(id);
         }
-        guard
+        // A-022 / migration 053: rl_events has no foreign key to `projects`
+        // any more (a project's events outlive its unregister), so the
+        // "project_id names a registered project" rule lives HERE, in the
+        // one writer: the INSERT inserts nothing when ?4 is set and no such
+        // project exists, in the same statement (no check-then-insert window
+        // against a concurrent unregister). The same statement copies the
+        // project's name into project_name when the writer sent none, so a
+        // row stays attributable after its project is gone.
+        let inserted = guard
             .execute(
                 "INSERT INTO rl_events
                     (event_type, schema_version, ts, project_id, project_name,
                      task_id, task_type, embedding_source, embedding_dim,
                      embedding_model, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 SELECT ?1, ?2, ?3, ?4,
+                        COALESCE(?5, (SELECT p.name FROM projects p WHERE p.id = ?4)),
+                        ?6, ?7, ?8, ?9, ?10, ?11
+                  WHERE ?4 IS NULL OR EXISTS (SELECT 1 FROM projects p WHERE p.id = ?4)",
                 params![
                     event_type,
                     schema_version,
@@ -387,6 +434,9 @@ impl Db {
                 ],
             )
             .map_err(|e| format!("insert rl_event: {}", e))?;
+        if inserted == 0 {
+            return Err(UNKNOWN_PROJECT_ID_ERROR.to_string());
+        }
         Ok(guard.last_insert_rowid())
     }
 
@@ -409,6 +459,41 @@ impl Db {
         since_ms: Option<i64>,
         until_ms: Option<i64>,
         limit: u32,
+        include_quarantined: bool,
+    ) -> Result<Vec<RlEvent>, String> {
+        self.list_rl_events_page(
+            project_id,
+            event_type,
+            since_ms,
+            until_ms,
+            None,
+            limit,
+            None,
+            include_quarantined,
+        )
+    }
+
+    /// One PAGE of [`Db::list_rl_events`] (same filters, same newest-first
+    /// order), for a reader that walks a large window (MCPREAD-05).
+    ///
+    ///   * `before` — keyset cursor `(ts_ms, id)` of the last row of the
+    ///     previous page: only rows strictly older in `(ts, id)` order are
+    ///     returned, so a page boundary never skips or repeats a row that
+    ///     shares a timestamp with its neighbour.
+    ///   * `max_bytes` — the page ends once the `payload_json` bytes it holds
+    ///     reach this many (at least one row is always returned, so a single
+    ///     row larger than the bound still pages forward). Bounds the memory
+    ///     a page costs the hub and the reader, whatever the row size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_rl_events_page(
+        &self,
+        project_id: Option<&str>,
+        event_type: Option<&str>,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        before: Option<(i64, i64)>,
+        limit: u32,
+        max_bytes: Option<usize>,
         include_quarantined: bool,
     ) -> Result<Vec<RlEvent>, String> {
         // Build the WHERE clause + params iteratively to keep the prepared
@@ -436,6 +521,12 @@ impl Db {
         if let Some(u) = until_ms {
             sql.push_str(" AND ts <= ?");
             params_vec.push(Box::new(u));
+        }
+        if let Some((b_ts, b_id)) = before {
+            sql.push_str(" AND (ts < ? OR (ts = ? AND id < ?))");
+            params_vec.push(Box::new(b_ts));
+            params_vec.push(Box::new(b_ts));
+            params_vec.push(Box::new(b_id));
         }
         if !include_quarantined {
             sql.push_str(" AND quarantined_at IS NULL");
@@ -471,8 +562,14 @@ impl Db {
             .map_err(|e| format!("query list_rl_events: {}", e))?;
 
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for r in rows {
-            out.push(r.map_err(|e| format!("read rl_event row: {}", e))?);
+            let row = r.map_err(|e| format!("read rl_event row: {}", e))?;
+            bytes += row.payload_json.len();
+            out.push(row);
+            if matches!(max_bytes, Some(cap) if bytes >= cap) {
+                break;
+            }
         }
         Ok(out)
     }
@@ -589,10 +686,11 @@ impl Db {
     /// any row of a task is selected, every row of that task — inside the same
     /// project scope — moves with it.
     ///
-    /// R1 incrementality: one pass moves at most
+    /// R1 incrementality: one call (one BATCH) moves at most
     /// [`RL_PRUNE_MAX_TASKS_PER_PASS_DEFAULT`] task groups, OLDEST FIRST, so the
     /// archive's in-memory row set stays bounded even on the first prune of a
-    /// long-neglected corpus. The hourly cadence drains the rest.
+    /// long-neglected corpus. [`Db::prune_rl_events_pass`] runs several batches
+    /// per retention pass (A-014); the hourly cadence drains the rest.
     ///
     /// Wave-4 additions, both about a pass that is not alone in the world: every
     /// pass first reconciles stale `.pending` sidecars left by a crashed
@@ -766,6 +864,86 @@ impl Db {
         }
 
         Ok(deleted)
+    }
+
+    /// One RETENTION PASS (A-014, v0.2.107): repeat [`Db::prune_rl_events`]
+    /// — each batch archive-verified (row count + SHA-256) before it deletes
+    /// exactly the ids it archived — until a batch moves nothing or
+    /// `max_batches` batches have run, then hand the freed pages back to the
+    /// file system ([`Db::incremental_vacuum`]).
+    ///
+    /// Why a loop: one batch moves at most
+    /// `RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS` task groups (default 500) so its
+    /// in-memory row set stays bounded; with one batch per hourly pass the
+    /// prune moved ≤ 12,000 groups a day, below a busy install's arrival rate,
+    /// and the table only grew. `max_batches` (default 20,
+    /// `RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS`) keeps the memory bound per batch
+    /// and lets one pass clear 10,000 groups.
+    ///
+    /// Returns the rows deleted. A batch that fails returns its `Err` — the
+    /// batches before it are already archived, published and deleted, and the
+    /// failed one deleted nothing.
+    pub fn prune_rl_events_pass(
+        &self,
+        cutoff_ms: Option<i64>,
+        max_rows: Option<i64>,
+        project_id: Option<&str>,
+        archive_dir: &Path,
+        max_batches: usize,
+    ) -> Result<u64, String> {
+        let mut total: u64 = 0;
+        for _ in 0..max_batches.max(1) {
+            let n = self.prune_rl_events(cutoff_ms, max_rows, project_id, archive_dir)?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        if total > 0 {
+            // Best effort: a vacuum that cannot run (busy DB) costs only the
+            // file size, never data; the next pass tries again.
+            let _ = self.incremental_vacuum(RL_INCREMENTAL_VACUUM_MAX_PAGES);
+        }
+        Ok(total)
+    }
+
+    /// Return up to `max_pages` free pages to the file system when the DB
+    /// was created with `auto_vacuum = INCREMENTAL` (every launcher.db created
+    /// since v0.2.107 — `db::mod.rs` sets it before the first table). On an
+    /// older DB the mode is NONE until one full `VACUUM`; this is then a no-op
+    /// and freed pages are reused by later inserts instead (the file stops
+    /// growing but does not shrink). Returns the pages released.
+    pub fn incremental_vacuum(&self, max_pages: i64) -> Result<i64, String> {
+        let guard = self.lock();
+        let mode: i64 = guard
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .map_err(|e| format!("incremental_vacuum (mode): {}", e))?;
+        if mode != 2 {
+            return Ok(0);
+        }
+        let before: i64 = guard
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .map_err(|e| format!("incremental_vacuum (freelist): {}", e))?;
+        // `PRAGMA incremental_vacuum(N)` frees ONE page per step, so it must be
+        // stepped to completion: `execute_batch` steps it once and released a
+        // single page (6,007 free pages left after a 400-row prune).
+        {
+            let mut stmt = guard
+                .prepare(&format!("PRAGMA incremental_vacuum({})", max_pages.max(1)))
+                .map_err(|e| format!("incremental_vacuum: {}", e))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| format!("incremental_vacuum: {}", e))?;
+            while rows
+                .next()
+                .map_err(|e| format!("incremental_vacuum: {}", e))?
+                .is_some()
+            {}
+        }
+        let after: i64 = guard
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .map_err(|e| format!("incremental_vacuum (freelist): {}", e))?;
+        Ok((before - after).max(0))
     }
 
     /// Delete rl_events rows by explicit id, in bounded chunks (SQLite's
@@ -1055,6 +1233,25 @@ impl Db {
 /// who wants a backlog drained faster.
 const RL_PRUNE_MAX_TASKS_PER_PASS_DEFAULT: usize = 500;
 pub const RL_PRUNE_MAX_TASKS_ENV: &str = "RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS";
+
+/// A-014: batches of [`RL_PRUNE_MAX_TASKS_ENV`] task groups one retention pass
+/// may run ([`Db::prune_rl_events_pass`]).
+const RL_PRUNE_MAX_BATCHES_PER_PASS_DEFAULT: usize = 20;
+pub const RL_PRUNE_MAX_BATCHES_ENV: &str = "RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS";
+
+/// Pages one pass's incremental vacuum may release (≈ 400 MB at the 4 KiB
+/// default page size); the rest is released by later passes.
+pub const RL_INCREMENTAL_VACUUM_MAX_PAGES: i64 = 100_000;
+
+/// The batch bound of one retention pass: `$RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS`
+/// when it is a positive integer, else the default.
+pub fn prune_max_batches_per_pass() -> usize {
+    std::env::var(RL_PRUNE_MAX_BATCHES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(RL_PRUNE_MAX_BATCHES_PER_PASS_DEFAULT)
+}
 
 fn prune_max_tasks_per_pass() -> usize {
     std::env::var(RL_PRUNE_MAX_TASKS_ENV)
@@ -1381,7 +1578,8 @@ mod tests {
     }
 
     /// Helper: seed a `projects` row so an rl_events insert with that
-    /// `project_id` satisfies the FK constraint (project_id → projects.id).
+    /// `project_id` is accepted (`insert_rl_event` refuses an id that names
+    /// no registered project — migration 053 moved that rule from the FK).
     fn seed_project(db: &Db, id: &str) {
         use crate::db::models::ProjectHost;
         db.insert_project(
@@ -2250,5 +2448,219 @@ mod tests {
         assert!(!super::payload_has_out_of_range_score("{}"));
         assert!(!super::payload_has_out_of_range_score(r#"{"nodes":"oops"}"#));
         assert!(!super::payload_has_out_of_range_score(r#"{"nodes":[{"score":"high"}]}"#));
+    }
+
+    // ── v0.2.107 RL-STORE (A-014 / MCPREAD-05) ──────────────────────────
+
+    fn insert_payload_at(db: &Db, ts: i64, task: &str, etype: &str, payload: &str) -> i64 {
+        db.insert_rl_event(etype, 3, ts, None, None, task, None, None, None, None, payload)
+            .unwrap()
+    }
+
+    /// The gate in front of every DELETE checks the BYTES, not only the line
+    /// count: an archive whose content changed after writing (same number of
+    /// lines) is refused; the intact one passes.
+    #[test]
+    fn archive_check_refuses_changed_bytes_and_accepts_the_intact_archive() {
+        use std::io::{Read as _, Write as _};
+        let db = fresh_db();
+        insert_payload_at(&db, 100, "t-a", "retrieval", r#"{"query_emb":"f16:AAA="}"#);
+        insert_payload_at(&db, 101, "t-b", "retrieval", r#"{"query_emb":"f16:AAB="}"#);
+        let rows = db.list_rl_events(None, None, None, None, 10, true).unwrap();
+        let arch = tmp_archive();
+        let pending = super::write_pending_archive(arch.path(), "stem", &rows).unwrap();
+        let (n, sum) = super::verify_archive(&pending).unwrap();
+        assert_eq!(n, 2);
+        assert!(super::check_archive_matches(&pending, 2, &sum).is_ok(), "intact archive passes");
+        assert!(super::check_archive_matches(&pending, 3, &sum).is_err(), "wrong count refused");
+
+        // Change one byte inside a line, keep the line count, re-compress.
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&pending).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        let changed = text.replacen("AAB", "AAC", 1);
+        assert_ne!(changed, text);
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&pending).unwrap(),
+            flate2::Compression::default(),
+        );
+        enc.write_all(changed.as_bytes()).unwrap();
+        enc.finish().unwrap();
+        let err = super::check_archive_matches(&pending, 2, &sum).unwrap_err();
+        assert!(err.contains("checksum"), "{err}");
+    }
+
+    /// A-014: a retention pass keeps up with a busy install. 30,000 rows in a
+    /// day (15,000 retrieval+citation task pairs) are drained by two passes
+    /// at the defaults (500 groups x 20 batches each) — the hourly cadence has
+    /// 24 — every row archived exactly once, and rows newer than the cutoff
+    /// left alone.
+    #[test]
+    fn retention_pass_keeps_up_with_30k_rows_a_day() {
+        let _env_lock = crate::test_env::env_lock();
+        let prev_tasks = std::env::var(super::RL_PRUNE_MAX_TASKS_ENV).ok();
+        let prev_batches = std::env::var(super::RL_PRUNE_MAX_BATCHES_ENV).ok();
+        std::env::remove_var(super::RL_PRUNE_MAX_TASKS_ENV);
+        std::env::remove_var(super::RL_PRUNE_MAX_BATCHES_ENV);
+
+        let db = fresh_db();
+        let arch = tmp_archive();
+        let day_ms: i64 = 86_400_000;
+        {
+            let mut guard = db.lock();
+            let tx = guard.transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO rl_events (event_type, schema_version, ts, task_id, payload_json)
+                         VALUES (?1, 3, ?2, ?3, '{}')",
+                    )
+                    .unwrap();
+                for i in 0..15_000i64 {
+                    let ts = i * day_ms / 15_000;
+                    let task = format!("t{i}");
+                    stmt.execute(rusqlite::params!["retrieval", ts, task]).unwrap();
+                    stmt.execute(rusqlite::params!["citation", ts + 1, task]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        // The next day's rows: newer than the cutoff, never touched.
+        for i in 0..50i64 {
+            insert_payload_at(&db, 2 * day_ms + i, &format!("keep{i}"), "retrieval", "{}");
+        }
+        let cutoff = day_ms + 10;
+        let max_batches = super::prune_max_batches_per_pass();
+        assert_eq!(max_batches, 20);
+
+        let first = db
+            .prune_rl_events_pass(Some(cutoff), None, None, arch.path(), max_batches)
+            .unwrap();
+        assert_eq!(first, 20_000, "one pass moves 20 batches of 500 task pairs");
+        let second = db
+            .prune_rl_events_pass(Some(cutoff), None, None, arch.path(), max_batches)
+            .unwrap();
+        assert_eq!(first + second, 30_000, "two passes drain a whole day");
+        assert_eq!(
+            db.prune_rl_events_pass(Some(cutoff), None, None, arch.path(), max_batches).unwrap(),
+            0
+        );
+        let left = db.list_rl_events(None, None, None, None, 1_000, true).unwrap();
+        assert_eq!(left.len(), 50);
+        assert!(left.iter().all(|r| r.task_id.starts_with("keep")));
+        let archived = archived_rows(arch.path());
+        assert_eq!(archived.len(), 30_000);
+        let ids: std::collections::HashSet<i64> =
+            archived.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids.len(), 30_000, "every row archived exactly once");
+
+        match prev_tasks {
+            Some(v) => std::env::set_var(super::RL_PRUNE_MAX_TASKS_ENV, v),
+            None => std::env::remove_var(super::RL_PRUNE_MAX_TASKS_ENV),
+        }
+        match prev_batches {
+            Some(v) => std::env::set_var(super::RL_PRUNE_MAX_BATCHES_ENV, v),
+            None => std::env::remove_var(super::RL_PRUNE_MAX_BATCHES_ENV),
+        }
+    }
+
+    /// A pass stops at its batch bound and leaves the rest for the next one;
+    /// a pass with no bound deletes nothing.
+    #[test]
+    fn retention_pass_stops_at_its_batch_bound() {
+        let _env_lock = crate::test_env::env_lock();
+        let prev = std::env::var(super::RL_PRUNE_MAX_TASKS_ENV).ok();
+        std::env::set_var(super::RL_PRUNE_MAX_TASKS_ENV, "2");
+        let db = fresh_db();
+        let arch = tmp_archive();
+        for i in 0..10 {
+            insert_at(&db, 100 + i, None, &format!("task-{i}"));
+        }
+        assert_eq!(db.prune_rl_events_pass(None, None, None, arch.path(), 3).unwrap(), 0);
+        assert_eq!(db.prune_rl_events_pass(Some(1_000), None, None, arch.path(), 3).unwrap(), 6);
+        assert_eq!(db.list_rl_events(None, None, None, None, 100, true).unwrap().len(), 4);
+        match prev {
+            Some(v) => std::env::set_var(super::RL_PRUNE_MAX_TASKS_ENV, v),
+            None => std::env::remove_var(super::RL_PRUNE_MAX_TASKS_ENV),
+        }
+    }
+
+    /// A launcher.db created by `Db::open` uses incremental auto-vacuum, and
+    /// a retention pass gives the freed pages back: the file shrinks. A DB
+    /// without the mode (an in-memory one here; an older file in the field)
+    /// is left alone.
+    #[test]
+    fn retention_pass_shrinks_a_new_launcher_db() {
+        crate::test_env::with_state_dir(|root| {
+            let db = Db::open().expect("open launcher.db");
+            let mode: i64 = db.lock().query_row("PRAGMA auto_vacuum", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode, 2, "a new launcher.db uses incremental auto-vacuum");
+            let big = format!(r#"{{"query_emb":"f16:{}"}}"#, "A".repeat(60_000));
+            for i in 0..400i64 {
+                insert_payload_at(&db, 100 + i, &format!("t{i}"), "retrieval", &big);
+            }
+            let checkpoint = |db: &Db| {
+                db.lock().execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            };
+            checkpoint(&db);
+            let path = root.join("launcher.db");
+            let before = std::fs::metadata(&path).unwrap().len();
+            let arch = tmp_archive();
+            let deleted = db
+                .prune_rl_events_pass(Some(10_000), None, None, arch.path(), 20)
+                .unwrap();
+            assert_eq!(deleted, 400);
+            checkpoint(&db);
+            let after = std::fs::metadata(&path).unwrap().len();
+            assert!(after * 4 < before, "file did not shrink: {before} -> {after}");
+        });
+
+        let mem = fresh_db();
+        assert_eq!(mem.incremental_vacuum(1_000).unwrap(), 0, "no auto-vacuum mode: no-op");
+    }
+
+    /// MCPREAD-05: a page ends at its byte bound (one row at least), and the
+    /// keyset cursor walks a window newest-first without skipping or
+    /// repeating rows that share a timestamp.
+    #[test]
+    fn list_page_is_bounded_in_bytes_and_keyset_paged() {
+        let db = fresh_db();
+        let payload = format!(r#"{{"p":"{}"}}"#, "x".repeat(1_000));
+        for i in 0..9i64 {
+            insert_payload_at(&db, 100 + i / 3, &format!("t{i}"), "retrieval", &payload);
+        }
+        let page = db
+            .list_rl_events_page(None, None, None, None, None, 100, Some(2_500), true)
+            .unwrap();
+        assert_eq!(page.len(), 3, "the page stops once 2,500 payload bytes are reached");
+        let one = db
+            .list_rl_events_page(None, None, None, None, None, 100, Some(1), true)
+            .unwrap();
+        assert_eq!(one.len(), 1, "a row larger than the bound still pages forward");
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = db
+                .list_rl_events_page(None, None, None, None, cursor, 2, None, true)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            let last = page.last().unwrap();
+            cursor = Some((last.ts_ms, last.id));
+            seen.extend(page.iter().map(|r| r.id));
+        }
+        let mut expect: Vec<i64> = db
+            .list_rl_events(None, None, None, None, 100, true)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(seen, expect, "newest first, every row once");
+        expect.sort();
+        expect.dedup();
+        assert_eq!(expect.len(), 9);
     }
 }

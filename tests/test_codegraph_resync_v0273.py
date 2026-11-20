@@ -202,6 +202,14 @@ class _AggColl:
             self.aggregate = _t.SimpleNamespace(
                 over_all=lambda **kw: _t.SimpleNamespace(total_count=agg_count)
             )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if agg_raises or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return _t.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = _t.SimpleNamespace(fetch_objects=_probe)
 
     def iterator(self, return_properties=None):
         import types as _t
@@ -237,8 +245,11 @@ def _client_for(prefix, module_coll, class_coll, func_coll):
 
 def test_count_stale_rows_aggregate_path(monkeypatch):
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    # v0.2.107 CG-1: a positive existence probe pays one exact scan, which
+    # supplies the count (2 stale of 3 rows), instead of a filtered Aggregate.
     client = _client_for(
-        "Proj", _AggColl(agg_count=0), _AggColl(agg_count=2), _AggColl(agg_count=0)
+        "Proj", _AggColl(agg_count=0), _AggColl(agg_count=2, rows=[0, None, 1]),
+        _AggColl(agg_count=0),
     )
     counts = cr.count_stale_rows("Proj", current_revision=1, client=client)
     assert counts == {
@@ -291,6 +302,14 @@ class _R3PathColl:
         self.aggregate = _t.SimpleNamespace(
             over_all=lambda **kw: _t.SimpleNamespace(total_count=agg_count)
         )
+        # v0.2.107 CG-1: the stale probe is a one-row existence read now
+        # (fetch_objects limit=1), not a filtered Aggregate; it mirrors
+        # the same count (None / raising = probe unavailable).
+        def _probe(**_kw):
+            if False or agg_count is None:
+                raise RuntimeError("probe unavailable")
+            return _t.SimpleNamespace(objects=[object()] if agg_count else [])
+        self.query = _t.SimpleNamespace(fetch_objects=_probe)
 
     def iterator(self, return_properties=None):
         import types as _t
@@ -420,6 +439,7 @@ def test_count_cleanup_owed_ignores_extra_path_deleted_rows(monkeypatch, tmp_pat
     """B1: an extra-path deleted row (project_source outside the primary root)
     is NEVER counted — it converges on its own root's walk."""
     monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    (tmp_path / "README.md").write_text("x\n")  # the root holds entries
     func = _ConfigPathColl(agg_count=0, rows=[
         {"embed_revision": 1, "file_path": "gone.py",
          "project_source": "/some/other/root"},   # extra-path deleted → skip
@@ -429,6 +449,18 @@ def test_count_cleanup_owed_ignores_extra_path_deleted_rows(monkeypatch, tmp_pat
     client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
     n = cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client)
     assert n == 1
+
+
+def test_count_cleanup_owed_is_zero_under_an_empty_root(monkeypatch, tmp_path):
+    """v0.2.107 DESTRUCTIVE-03a: an empty root (unmounted drive) owes no
+    cleanup, so the gate never spawns a walk that could only sweep it."""
+    monkeypatch.setattr(cr, "_collection_prefix", lambda name: "Proj")
+    func = _ConfigPathColl(agg_count=0, rows=[
+        {"embed_revision": 1, "file_path": "gone2.py",
+         "project_source": tmp_path.as_posix()},
+    ])
+    client = _client_for("Proj", _R3PathColl(0), _R3PathColl(0), func)
+    assert cr.count_cleanup_owed_rows("Proj", repo_root=tmp_path, client=client) == 0
 
 
 def test_count_cleanup_owed_none_on_scan_failure(monkeypatch, tmp_path):
@@ -554,8 +586,20 @@ def _seed_pending_deferral(folder: Path) -> None:
     rep.write(folder)
 
 
+def _no_worktree_no_cleanup(monkeypatch):
+    """The heal's own probes, answered without git or Weaviate: not a linked
+    worktree, no deleted-file rows awaiting the sweep."""
+    import vco_lib.git_meta as _gm
+
+    monkeypatch.setattr(_gm, "linked_worktree_main", lambda _root: None)
+    monkeypatch.setattr(cr, "count_cleanup_owed_rows", lambda *a, **k: 0)
+
+
 def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
+    """v0.2.107: a positive zero runs no analyzer (the revision heal pages
+    only owed rows) and still resolves the persisted ledger entry."""
     _seed_pending_deferral(tmp_path)
+    _no_worktree_no_cleanup(monkeypatch)
     rec = _RunRecord(returncode=0)
     monkeypatch.setattr(cr.subprocess, "run", rec)
     # v0.2.105: the driver\'s backend-reachability gate must not probe a
@@ -569,7 +613,7 @@ def test_driver_converged_resolves_persisted_deferral(monkeypatch, tmp_path):
         "MyProj", tmp_path, tmp_path / "analyze_code_graph.py"
     )
     assert rc == 0
-    assert len(rec.calls) == 1
+    assert rec.calls == [], "nothing owed: no analyzer run"
     assert "codegraph_embed_resync_pending" not in _persisted_cids(tmp_path), (
         "positive zero-stale must resolve the persisted ledger entry"
     )
@@ -609,8 +653,11 @@ def test_driver_unconverged_records_one_time_deferral(monkeypatch, tmp_path):
 
 def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
     """DESIGN-DECISION: unverifiable convergence must SURFACE (one-time
-    deferral), never soft-fail into a void."""
-    monkeypatch.setattr(cr.subprocess, "run", _RunRecord(returncode=0))
+    deferral), never soft-fail into a void. v0.2.107: and an undeterminable
+    count runs no analyzer at all (the heal changes nothing on doubt)."""
+    _no_worktree_no_cleanup(monkeypatch)
+    rec = _RunRecord(returncode=0)
+    monkeypatch.setattr(cr.subprocess, "run", rec)
     # v0.2.105: the driver's backend-reachability gate must not probe a
     # real code-embed/Ollama from these tests.
     monkeypatch.setattr(cr, "code_backend_down_waiting",
@@ -625,9 +672,14 @@ def test_driver_unverifiable_probe_still_surfaces(monkeypatch, tmp_path):
     assert rep.has_condition("codegraph_embed_resync_pending")
     entry = rep.entries[0]
     assert "could not be verified" in entry.detected
+    assert rec.calls == [], "undeterminable count: no analyzer run"
 
 
 def test_driver_analyzer_crash_never_raises(monkeypatch, tmp_path):
+    from tests.common.revision_heal_fakes import heal_always_runs
+
+    heal_always_runs(monkeypatch, cr)  # the heal runs; its analyzer cannot start
+
     def _boom(*a, **k):
         raise OSError("exec failed")
 

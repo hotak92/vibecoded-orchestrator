@@ -35,6 +35,8 @@
 
 # Scrub sensitive env before any subprocess (canonical HK-2 list — MUST
 # MATCH _lib/scrub-env.sh; enforced by the scrub parity gate).
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
@@ -76,11 +78,12 @@ json_path = project / ".claude" / "context" / "UPDATE_DEFERRED.json"
 md_path = project / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
 # --- v0.2.91 WP-H: owed-work retry trigger -------------------------------
-# The containers hook (same SessionStart batch) has by now attempted to start
-# the embedding backend. If the ledger carries an `auto_retryable` condition,
-# hand it to the DETACHED driver: it re-probes the backend itself and does
-# nothing while it is still down, so this hook never waits and never guesses.
-# The rule lives in vco_lib (ONE home, shared with the .ps1 sibling).
+# If the ledger carries an `auto_retryable` condition, the project is put in
+# the MACHINE's owed-work queue (v0.2.107: one entry per project, one worker
+# per machine — never a driver per project). The worker gates on Weaviate and
+# the embedding backend itself and leaves the work queued while they are not
+# ready, so this hook never waits and never guesses. The rule lives in
+# vco_lib (ONE home, shared with the .ps1 sibling).
 # v0.2.105: it runs BEFORE the ledger is read — and so also on an EMPTY
 # ledger — because it first DETECTS owed work the ledger does not hold yet
 # (an enabled extra code folder whose rows are gone); the read below then
@@ -171,7 +174,7 @@ for cid, title, sev, _cmd in entries:
     lines.append(f"  - [{sev}] {cid}: {title}")
 if owed:
     lines.append(
-        "  VCO is retrying in the background (backend permitting): "
+        "  Queued for VCO's background worker (runs when Weaviate is ready): "
         + ", ".join(owed)
     )
 lines.append(

@@ -38,9 +38,30 @@ if not defined FOUND call :probe "%~dp0launcher\src-tauri\target\debug\vct-launc
 if not defined FOUND call :probe "%~dp0launcher\dist\windows-x64\vct-launcher.exe"
 if not defined FOUND call :probe "%LOCALAPPDATA%\Programs\VCT Launcher\vct-launcher.exe"
 
+REM UPDATER-02: an update that ended between renaming the binaries aside
+REM (vct-launcher.exe renamed to vct-launcher.exe.old-PID) and putting them back
+REM leaves the bytes next to an empty canonical path. Put them back with the
+REM one Python home for that rule (vco_lib.dist_binary_repair restore-backups:
+REM only onto a MISSING canonical path, only for a pid that is gone), then
+REM probe the dist slot again.
+set "DIST_SLOT=%~dp0launcher\dist\windows-x64"
+if not defined FOUND if exist "%DIST_SLOT%\vct-launcher.exe.old-*" if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" -m vco_lib.dist_binary_repair restore-backups --dir "%DIST_SLOT%" --name vct-launcher.exe --name vct-hub.exe
+    call :probe "%DIST_SLOT%\vct-launcher.exe"
+)
+
 if "%FOUND%"=="" (
     echo ERROR: launcher binary not found.
     echo.
+    if exist "%DIST_SLOT%\vct-launcher.exe.old-*" (
+        echo An interrupted update left the launcher as %DIST_SLOT%\vct-launcher.exe.old-^<number^>.
+        echo If an update is still running, wait for it to finish. Otherwise restore it from
+        echo a terminal in this folder with ONE of:
+        echo   git checkout HEAD -- launcher/dist/windows-x64/
+        echo   .venv\Scripts\python.exe install.py --update
+        echo.
+        goto :interrupted_update
+    )
     if defined SKIPPED (
         echo Skipped broken binary/binaries ^(no embedded frontend^):
         echo %SKIPPED%
@@ -65,6 +86,12 @@ REM quoted path as the title and doesn't actually launch anything.
 REM This is a known Windows cmd gotcha.
 start "" "%FOUND%" %*
 exit /b 0
+
+REM Top-level on purpose: an `exit /b 1` inside a NESTED if-block loses its
+REM exit code in cmd (the caller saw 0 on the interrupted-update path).
+:interrupted_update
+pause
+exit /b 1
 
 REM ─── helpers ────────────────────────────────────────────────────────────
 :probe

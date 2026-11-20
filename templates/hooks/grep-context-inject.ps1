@@ -10,10 +10,14 @@
 
 # Scrub sensitive env vars before any subprocess spawning
 # (list MUST MATCH _lib/scrub-env.ps1; enforced by the scrub parity gate).
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # v0.2.105: the hook's start, for the router's run deadline AND its hard
 # end-to-end deadline (the harness timeout counts from HERE).
@@ -46,7 +50,7 @@ $env:CLAUDE_PROJECT_DIR = $ProjectRoot
 
 # stdin passthrough (see read-context-inject.ps1 for the R31 rationale).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 
 # The broken-install notice is keyed per SESSION -- extract the payload's
 # session_id the pattern way (no JSON parser needed at this stage). The

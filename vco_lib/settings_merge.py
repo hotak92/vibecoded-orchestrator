@@ -630,6 +630,18 @@ def _fields_signature(hook: Any) -> str:
                       sort_keys=True, default=str)
 
 
+def fold_event_groups(event: str, entries: list, template_hooks: dict) -> list:
+    """The merge's group-fold pass (:func:`_fold_duplicate_shipped_groups`)
+    for ONE event, reporting nothing — for a caller that must place a
+    registration exactly where the merge would leave it
+    (:func:`vco_lib.parked_hooks.carried_registrations`). Pure."""
+    if not isinstance(template_hooks, dict):
+        return entries
+    return _fold_duplicate_shipped_groups(
+        event, entries, template_hooks.get(event) or [],
+        _shipped_spellings(template_hooks), None)
+
+
 def _shipped_spellings(template_hooks: dict) -> dict[str, set[str]]:
     """Every command spelling VCO ships or once shipped, as
     ``{spelling key: {field signatures it shipped with}}``.

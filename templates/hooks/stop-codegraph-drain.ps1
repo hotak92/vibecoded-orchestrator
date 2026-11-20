@@ -1,33 +1,39 @@
 ﻿# Parity: kept in step with stop-codegraph-drain.sh (the v0.2.92 PowerShell-only
 # detached-spawn hardening, Start-VcoDetachedPwsh, is Windows-specific; every
 # other behaviour must match the .sh sibling).
-# stop-codegraph-drain.ps1 -- Stop hook (v0.2.73 FIX-B)
-# OS-PARITY: ports templates/hooks/stop-codegraph-drain.sh. END-OF-TURN BATCHED
-# code-graph sync. Replaces the per-EDIT code-graph-incremental scheduling that
-# post-file-edit used to fire on every code-file Edit (the Weaviate disk
-# write-amplification driver). post-file-edit now appends each edited path to a
-# per-turn drain queue (.claude/state/codegraph_drain_<sid>.txt); this hook
-# drains it at end-of-turn and runs ONE analyzer pass per canonical root,
-# subject to a 2-minute per-project rate limit + per-canonical-root
-# serialization. Vanished (edited-then-deleted) paths are pruned by the
-# analyzer's --only-files-from. FIX-A' worktree gate is applied per path.
+# stop-codegraph-drain.ps1 -- Stop + SessionStart hook (v0.2.107 CG-3)
+# OS-PARITY: ports templates/hooks/stop-codegraph-drain.sh. The code graph
+# follows the COMMITTED state of the main checkout's current branch (and of
+# each enabled extra code folder at its own HEAD), updated only when HEAD
+# moves: an Edit/Write queues nothing, an edit in a linked git worktree (a
+# lane) is never indexed and reaches the graph when merged into the main
+# checkout's branch. This hook spawns, each DETACHED and at most once per its
+# interval: the extras check (vco_lib.codegraph_extras_refresh) and the HEAD
+# catch-up (vco_lib.codegraph_head_catchup, ONE analyzer run per HEAD move,
+# plus the daily path-existence reconciliation). Registered on Stop AND
+# SessionStart, so a pull made outside a session is picked up at the next
+# session start. The name is historical: the per-edit drain queue was retired
+# in v0.2.107. A project that is not a git repository is updated by a manual
+# re-analysis only.
 #
 # Contract: always exit 0; soft-fail throughout. MUST MATCH the .sh sibling.
 # Plain ASCII only (no em-dash, no BOM needed).
 
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 if (Test-Path "$PSScriptRoot/_lib/stderr-cap.ps1") { . "$PSScriptRoot/_lib/stderr-cap.ps1" }
 if (Test-Path "$PSScriptRoot/_lib/resolve-powershell.ps1") { . "$PSScriptRoot/_lib/resolve-powershell.ps1" }
 # Shared venv resolver -- resolves the analyzer's python interpreter from the
-# VCO clone's `.venv` (mirrors code-graph-incremental.ps1). MUST dot-source
+# VCO clone's `.venv`. MUST dot-source
 # this helper for any `.venv` reference (venv-resolver-drift gate).
 if (Test-Path "$PSScriptRoot/_lib/resolve-vco-venv.ps1") { . "$PSScriptRoot/_lib/resolve-vco-venv.ps1" }
-if (Test-Path "$PSScriptRoot/_lib/canonical-repo-root.ps1") { . "$PSScriptRoot/_lib/canonical-repo-root.ps1" }
-if (Test-Path "$PSScriptRoot/_lib/worktree-gate.ps1") { . "$PSScriptRoot/_lib/worktree-gate.ps1" }
 
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
@@ -36,32 +42,13 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 }
 
-# Rate-limit window (seconds) between drains per project.
-$MinInterval = 120
-if ($env:VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS -match '^\d+$') {
-    $MinInterval = [int]$env:VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS
-}
-
-$HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$SessionId = ""
-try {
-    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload -and $payload.session_id) { $SessionId = [string]$payload.session_id }
-} catch { }
-if ([string]::IsNullOrEmpty($SessionId)) { exit 0 }
-if ($SessionId -match '[^A-Za-z0-9_-]') { exit 0 }
+# The payload carries nothing this hook needs; read it so the harness's pipe
+# is consumed.
+try { $null = Read-VcoHookStdin } catch { }
 
 $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
-$queue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
-# Session-agnostic SHARED drain queue (v0.2.73 I/O-audit HIGH-2 -- must match
-# stop-codegraph-drain.sh + subagent-stop-reconcile.*): the SubagentStop
-# reconciler enqueues gated-IN subagent code edits here (replacing the removed
-# orphan code-graph-queue.jsonl) so the NEXT eligible Stop drain (any session)
-# processes them, decoupled from the subagent's session id.
-$sharedQueue = Join-Path $stateDir "codegraph_drain_shared.txt"
 # --- RUNTIME: analyzer script + interpreter (one home for this hook) ---
-# Used by BOTH the extra-path refresh below and the queue drain. Sets
+# Used by BOTH the extra-path refresh and the HEAD catch-up below. Sets
 # $script:analyzer / $script:python and returns (cached, resolved at most
 # once per run): 0 usable, 1 no analyzer script, 2 bare-PATH interpreter
 # cannot import the analyzer's dependencies (or no interpreter at all).
@@ -91,7 +78,7 @@ function Resolve-DrainRuntime {
     # v0.2.96 (WP-5 S2) -- MUST MATCH the .sh probe. When the venv resolver
     # missed, the bare-PATH interpreter in a user project routinely has
     # neither `weaviate` nor `vco_lib`; the detached analyzer would die into a
-    # redirected stream after the queue was consumed. Probed only on fallback.
+    # redirected stream. Probed only on fallback.
     if ($fellBack) {
         & $py -c 'import weaviate, vco_lib' 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { $script:runtimeRc = 2; return 2 }
@@ -107,8 +94,8 @@ function Resolve-DrainRuntime {
 # enabled extra path's HEAD with its last indexed commit, runs the SAME
 # single-path analyzer argv as the panel's Sync button (throttled per path,
 # bounded), and records the new commit through the hub route -- never by
-# opening launcher.db. Runs whether or not this turn queued any file (the
-# extra path's repo moves on its own). Log: .claude/logs/codegraph_extras_refresh.log.
+# opening launcher.db. The extra folder is re-indexed when ITS HEAD moves.
+# Log: .claude/logs/codegraph_extras_refresh.log.
 $extrasInterval = 600
 if ($env:VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS -match '^\d+$') {
     $extrasInterval = [int]$env:VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS
@@ -148,10 +135,9 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
     }
 }
 
-# --- HEAD-DIFF CATCH-UP: commits, merges and pulls on the main checkout ---
-# MUST MATCH the .sh block of the same name (v0.2.105 #512A). The queue above
-# only ever holds files the EDIT hook saw; code that arrives through a
-# `git merge`, a `git pull`, a shell commit or a GUI merge is never queued. At
+# --- HEAD-DIFF CATCH-UP: the ONE writer of the primary root's code graph ---
+# MUST MATCH the .sh block of the same name (v0.2.105 #512A; since v0.2.107
+# CG-3 the only path by which the main checkout's code reaches the graph). At
 # most once per VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS (default 600),
 # spawn `python -m vco_lib.codegraph_head_catchup` DETACHED: it compares the
 # binding's last_analyzed_commit (hub /config) with the main checkout's HEAD
@@ -160,10 +146,10 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
 # enormous diff or a deleted code file goes to the analyzer's incremental walk
 # instead, and a non-ancestor / missing baseline takes ONE full
 # (non-incremental) walk, then records HEAD -- the converging fallback. A
-# project with no ENABLED code-graph binding is skipped entirely. On success it records HEAD through the hub route
-# /projects/{id}/codegraph/analyzed -- never by opening launcher.db. Runs
-# whether or not the turn queued anything, and installs NO git hook.
-# Log: .claude/logs/codegraph_head_catchup.log.
+# project with no ENABLED code-graph binding, and a session whose checkout is
+# a linked worktree, are skipped. On success it records HEAD through the hub
+# route /projects/{id}/codegraph/analyzed -- never by opening launcher.db.
+# Installs NO git hook. Log: .claude/logs/codegraph_head_catchup.log.
 $catchupInterval = 600
 if ($env:VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS -match '^\d+$') {
     $catchupInterval = [int]$env:VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS
@@ -198,243 +184,4 @@ if (Test-Path -LiteralPath $stateDir -PathType Container) {
     }
 }
 
-# --- EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ---
-# MUST MATCH the .sh block of the same name: route-touched-path queues a code
-# edit under an ENABLED extra path to codegraph_drain_extra_<md5>_<sid>.txt
-# (never the primary queue). Drain those queues through
-# `vco_lib.codegraph_extras_refresh --queued` (scoped --only-files-from with
-# the extra's OWN --project prefix). Deliberately OUTSIDE both throttles (the
-# 120 s primary rate limit below, the 600 s commit-stamp interval above):
-# those protect the analyzer from repeated FULL walks; a queued scoped drain
-# is cheap, so a queued extra is drained on every Stop. The per-path root
-# lock inside refresh_queued still serialises runs over the same checkout.
-$extraQueues = @(Get-ChildItem -LiteralPath $stateDir -Filter 'codegraph_drain_extra_*_*.txt' -File -ErrorAction SilentlyContinue |
-    # Skip the pre-fix-round-2 TRANSIENT analyzer input
-    # (codegraph_drain_extra_list_<md5>.txt): a process killed mid-drain could
-    # leak one, and it is not a queue (v0.2.102 I-A5). The current transient
-    # name (codegraph_drain_extra-files-<md5>.txt) does not match the filter.
-    Where-Object { $_.Name -notlike 'codegraph_drain_extra_list_*' })
-if ($extraQueues.Count -gt 0) {
-    if ((Resolve-DrainRuntime) -eq 0) {
-        $extrasLogDir = Join-Path (Join-Path $ProjectRoot ".claude") "logs"
-        try { New-Item -ItemType Directory -Path $extrasLogDir -Force -ErrorAction Stop | Out-Null } catch { }
-        $extrasLog = Join-Path $extrasLogDir "codegraph_extras_refresh.log"
-        $q2 = { param($v) "'" + ($v -replace "'","''") + "'" }
-        $queuedInner = "& " + (& $q2 $script:python) + " -m vco_lib.codegraph_extras_refresh --queued --project-root " + (& $q2 $ProjectRoot) +
-            " --analyzer " + (& $q2 $script:analyzer) + " --state-dir " + (& $q2 $stateDir) + " *>> " + (& $q2 $extrasLog)
-        Start-VcoDetachedPwsh -Command $queuedInner -PowerShellExe $PsExe
-    }
-}
-
-if (-not (Test-Path -LiteralPath $queue) -and -not (Test-Path -LiteralPath $sharedQueue)) { exit 0 }
-
-# --- RATE LIMIT ---
-$lastTsFile = Join-Path $stateDir "codegraph_drain_last_sync.ts"
-# True UTC unix seconds on every edition. `Get-Date -UFormat %s` is LOCAL
-# time on Windows PowerShell 5.1 (measured on an it-IT host: +7200 s), which
-# skewed every stamp the .sh sibling and Python read (v0.2.103 Windows run).
-$now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-$lastTs = 0
-if (Test-Path -LiteralPath $lastTsFile) {
-    try {
-        $raw = (Get-Content -LiteralPath $lastTsFile -Raw -ErrorAction Stop).Trim()
-        if ($raw -match '^\d+$') { $lastTs = [long]$raw }
-    } catch { }
-}
-# A future stamp (pre-v0.2.103 local-time stamp, or a clock moved back) is
-# no stamp: never let it rate-limit the drain for hours (R20 L1). MUST
-# MATCH the .sh sibling's clamp.
-if ($lastTs -gt $now) { $lastTs = 0 }
-if ($lastTs -gt 0 -and (($now - $lastTs) -lt $MinInterval)) {
-    # Rate-limited: leave the queue for the next eligible drain.
-    exit 0
-}
-
-# --- DRAIN: consume queue + shared queue, gate, group by canonical root ---
-# Consume the per-session queue (if present) by atomic rename so concurrent
-# appends start a fresh queue; then FOLD IN the shared queue (subagent edits)
-# the same way. If the per-session queue is absent, seed CONSUMED empty so the
-# shared fold still has a target.
-$consumed = Join-Path $stateDir ("codegraph_drain_{0}.draining.{1}" -f $SessionId, $PID)
-if (Test-Path -LiteralPath $queue) {
-    try { Move-Item -LiteralPath $queue -Destination $consumed -Force -ErrorAction Stop }
-    catch { try { Set-Content -LiteralPath $consumed -Value $null -ErrorAction Stop } catch { exit 0 } }
-} else {
-    try { Set-Content -LiteralPath $consumed -Value $null -ErrorAction Stop } catch { exit 0 }
-}
-if (Test-Path -LiteralPath $sharedQueue) {
-    $sharedConsumed = Join-Path $stateDir ("codegraph_drain_shared.draining.{0}" -f $PID)
-    try {
-        Move-Item -LiteralPath $sharedQueue -Destination $sharedConsumed -Force -ErrorAction Stop
-        try { Get-Content -LiteralPath $sharedConsumed -ErrorAction Stop | Add-Content -LiteralPath $consumed } catch { }
-        Remove-Item -LiteralPath $sharedConsumed -ErrorAction SilentlyContinue
-    } catch { }
-}
-
-# Resolve analyzer + interpreter through the ONE home above. Unusable -> put
-# the queue back + no-op; the bare-PATH interpreter case also says one line.
-$runtimeRc = Resolve-DrainRuntime
-if ($runtimeRc -ne 0) {
-    try { Get-Content -LiteralPath $consumed | Add-Content -LiteralPath $queue } catch { }
-    Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
-    if ($runtimeRc -eq 2) {
-        [Console]::Error.WriteLine("i  code-graph drain: no interpreter with weaviate+vco_lib (tried '$($script:python)'); queue kept for a later turn.")
-    }
-    exit 0
-}
-
-$codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
-
-function Resolve-DrainProject {
-    param([string]$Root)
-    $name = ""
-    $resolver = Join-Path $Root ".claude/scripts/vct_project_config.ps1"
-    if (Test-Path $resolver) {
-        try { $name = (& $PsExe -NoProfile -File $resolver -Project $Root -Field "code_graph_collection_prefix" 2>$null) } catch { $name = "" }
-    }
-    if (-not $name) { $name = Split-Path $Root -Leaf }
-    return ("" + $name).Trim()
-}
-function Resolve-DrainDotClaude {
-    param([string]$Root)
-    $val = ""
-    $resolver = Join-Path $Root ".claude/scripts/vct_project_config.ps1"
-    if (Test-Path $resolver) {
-        try { $val = (& $PsExe -NoProfile -File $resolver -Project $Root -Field "code_graph_index_dot_claude" 2>$null) } catch { $val = "" }
-    }
-    switch -Regex ($val) {
-        '^(true|True|TRUE|1)$'  { return '--index-dot-claude' }
-        '^(false|False|FALSE|0)$' { return '--no-index-dot-claude' }
-    }
-    if ((Test-Path (Join-Path $Root "vco_lib")) -and (Test-Path (Join-Path $Root ".claude"))) {
-        return '--index-dot-claude'
-    }
-    return '--no-index-dot-claude'
-}
-
-# Group surviving paths by canonical root.
-$byRoot = @{}          # hash -> list of paths
-$rootForHash = @{}     # hash -> canonical root
-$seen = @{}
-$lines = @()
-try { $lines = @(Get-Content -LiteralPath $consumed -ErrorAction Stop) } catch { }
-foreach ($p in $lines) {
-    if ([string]::IsNullOrWhiteSpace($p)) { continue }
-    if ($seen.ContainsKey($p)) { continue }
-    $seen[$p] = $true
-    if ($p -notmatch $codeRe) { continue }
-    if ($p -match '[\\/]\.claude[\\/]state[\\/]') { continue }
-
-    $canon = Get-CanonicalRepoRoot -File $p
-    if (-not $canon) {
-        $canon = Get-CanonicalRepoRoot -File (Join-Path $ProjectRoot ".")
-        if (-not $canon) { $canon = $ProjectRoot }
-    }
-    if (Test-EphemeralWorktreeEdit -EditedFile $p -RepoPath $ProjectRoot -CanonRoot $canon) { continue }
-
-    $h = [System.BitConverter]::ToString(
-        [System.Security.Cryptography.MD5]::Create().ComputeHash(
-            [System.Text.Encoding]::UTF8.GetBytes($canon))).Replace('-','').ToLower()
-    $rootForHash[$h] = $canon
-    if (-not $byRoot.ContainsKey($h)) { $byRoot[$h] = New-Object System.Collections.Generic.List[string] }
-    [void]$byRoot[$h].Add($p)
-}
-
-# v0.2.102 W6-ALERTS2 (owner ruling 3): a gate probe found the hub unreachable
-# and indexed on doubt (FIX-A' unchanged). Tell the model once per session per
-# agent key so it can bring the hub back. This hook runs async on Stop, so
-# Claude Code hands the additionalContext over on the next turn (vendor hooks
-# doc, "How async hooks execute"). MUST MATCH stop-codegraph-drain.sh.
-if ($script:WorktreeGateHubUnreachable) {
-    $emitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
-    if (Test-Path -LiteralPath $emitLib) { . $emitLib }
-    $sidLib = Join-Path $PSScriptRoot "_lib/session-id.ps1"
-    if (Test-Path -LiteralPath $sidLib) { . $sidLib }
-    $hubKey = $SessionId
-    if (Get-Command Get-VcoHookFastAgentKey -ErrorAction SilentlyContinue) {
-        $hubKey = Get-VcoHookFastAgentKey -HookStdin $HookStdin
-    }
-    if (Get-Command Get-VcoHubUnreachableNotice -ErrorAction SilentlyContinue) {
-        $hubNotice = Get-VcoHubUnreachableNotice -HooksDir $PSScriptRoot -ProjectRoot $ProjectRoot -AgentKey $hubKey `
-            -Who "The end-of-turn code-graph drain (stop-codegraph-drain)" `
-            -What "It still indexed this turn's worktree edits (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
-        if ($hubNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
-            $hubEvent = if ($HookStdin -match '"SubagentStop"') { "SubagentStop" } else { "Stop" }
-            Emit-AdditionalContext $hubNotice $hubEvent
-        }
-    }
-}
-
-# Nothing survived -> advance the rate-limit clock + clean up.
-if ($byRoot.Count -eq 0) {
-    Set-Content -LiteralPath $lastTsFile -Value "$now" -NoNewline -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
-    exit 0
-}
-
-# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1; PID-based per Stage-1 SEV-2 #3 --
-# must match stop-codegraph-drain.sh): the per-root lock dir below is released
-# only inside the detached analyzer's cleanup. If that process dies before release
-# (kill, OOM, out-of-disk -- the exact condition this effort targets, or a reboot)
-# the lock leaks and that root's code graph freezes silently forever.
-# LIVENESS, not time: the detached run writes its PID into the lock dir FIRST. A
-# slow-but-healthy full pass can exceed 30 min, so a pure-mtime breaker would
-# delete a LIVE lock and launch a 2nd concurrent analyzer on the same collection
-# (the write-amplification FIX-B kills). Break a lock ONLY when its recorded PID
-# is dead (Get-Process fails); fall back to the 30-min mtime bound ONLY when the
-# PID file is absent (a lock predating this PID-stamping / a partial acquire).
-try {
-    Get-ChildItem -LiteralPath $stateDir -Directory -Filter 'codegraph_drain_root_*.lock' -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            $pidFile = Join-Path $_.FullName 'pid'
-            $stalePid = $null
-            if (Test-Path -LiteralPath $pidFile) {
-                try { $stalePid = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction Stop).Trim() } catch { $stalePid = $null }
-            }
-            if ($stalePid -match '^\d+$') {
-                # Recorded PID: break ONLY if that process is no longer alive.
-                $alive = $null
-                try { $alive = Get-Process -Id ([int]$stalePid) -ErrorAction Stop } catch { $alive = $null }
-                if (-not $alive) { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-            } elseif ($_.LastWriteTime -lt (Get-Date).AddMinutes(-30)) {
-                # No/invalid PID -> mtime fallback (>30 min => break).
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-} catch {}
-
-foreach ($h in @($byRoot.Keys)) {
-    $canon = $rootForHash[$h]
-    $project = Resolve-DrainProject -Root $canon
-    $dotFlag = Resolve-DrainDotClaude -Root $canon
-
-    # Per-canonical-root serialization: atomic dir-create lock.
-    $lock = Join-Path $stateDir ("codegraph_drain_root_{0}.lock" -f $h)
-    $gotLock = $false
-    try { New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null; $gotLock = $true } catch { $gotLock = $false }
-    if (-not $gotLock) {
-        # A prior drain for this root is running -> requeue its paths.
-        try { $byRoot[$h] | Add-Content -LiteralPath $queue } catch { }
-        continue
-    }
-
-    $listFile = Join-Path $stateDir ("codegraph_drain_list_{0}.txt" -f $h)
-    try { Set-Content -LiteralPath $listFile -Value $byRoot[$h] -ErrorAction Stop } catch { }
-
-    # Detached background run holding the per-root lock for the whole analyzer
-    # run, then releasing it + the list file.
-    $argList = @($script:analyzer, $canon, '--project', $project, '--only-files-from', $listFile, '--canonical-source', $canon, $dotFlag)
-    $cleanup = "try { Remove-Item -LiteralPath '$listFile' -ErrorAction SilentlyContinue } catch {}; try { Remove-Item -LiteralPath '$lock' -Recurse -Force -ErrorAction SilentlyContinue } catch {}"
-    # Write the detached run's own PID into the lock dir FIRST so the PID-based
-    # stale-lock breaker can tell a live long run from a dead holder (SEV-2 #3).
-    $pidStamp = "try { Set-Content -LiteralPath '$lock/pid' -Value `$PID -ErrorAction SilentlyContinue } catch {}; "
-    $inner = $pidStamp + "& '$($script:python)' " + (($argList | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ' ') + " *> `$null; $cleanup"
-    # Through the ONE guarded spawn home: an unguarded `-WindowStyle Hidden`
-    # is REJECTED on non-Windows PowerShell, which kills the drain outright
-    # AND leaves the per-root lock dir behind (the cleanup runs in the child).
-    Start-VcoDetachedPwsh -Command $inner -PowerShellExe $PsExe
-}
-
-Set-Content -LiteralPath $lastTsFile -Value "$now" -NoNewline -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
 exit 0

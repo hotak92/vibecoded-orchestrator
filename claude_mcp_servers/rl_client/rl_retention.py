@@ -46,8 +46,10 @@ Archive-then-delete (R1, v0.2.91)
 --------------------------------
 The hub-side prune is no longer a bare DELETE. Every row it removes is first
 written to a compressed, loader-readable sidecar (gzip JSONL in hub-row shape),
-fsynced and read back for verification, BEFORE the first DELETE runs — and a
-failed archive ABORTS the pass, leaving the corpus untouched. Retrieval↔citation
+fsynced and read back for verification — the row count AND the SHA-256 of the
+bytes must match what was written (v0.2.107) — BEFORE the DELETE runs, which
+then removes exactly the ids that were archived; a failed archive ABORTS the
+batch, leaving its rows untouched. Retrieval↔citation
 pairs are kept together (the victim set is completed by ``task_id`` group), so a
 prune can never split a training pair across the boundary.
 
@@ -77,11 +79,18 @@ Config (env, all optional — sane defaults when unset)
   * ``RL_EVENTS_ARCHIVE_DIR``             — where the prune writes its archive
     sidecars. Read HUB-SIDE (the process that owns launcher.db), not here.
     Default ``<VCT_STATE_DIR or ~/.vct>/rl_archive``.
-  * ``RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS`` — how many task GROUPS one pass may
-    move (default 500, oldest-first). Also HUB-SIDE. It bounds the archive's
-    in-memory row set, which makes the prune INCREMENTAL: a long-neglected
-    corpus drains over successive hourly passes instead of materializing
-    gigabytes of embeddings at once. Raise it to drain a backlog faster.
+  * ``RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS`` — how many task GROUPS one archive
+    BATCH may move (default 500, oldest-first). Also HUB-SIDE. It bounds the
+    archive's in-memory row set, so a long-neglected corpus is never
+    materialized at once.
+  * ``RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS`` — how many such batches one prune
+    request runs (default 20, so one pass moves up to 10,000 groups; v0.2.107).
+    Also HUB-SIDE. With one batch per hourly pass the prune moved fewer rows a
+    day than a busy install writes; 20 keeps up with tens of thousands of rows
+    a day. After a pass that deleted rows the hub hands the freed pages back
+    to the file system when the DB was created with incremental auto-vacuum
+    (every launcher.db created since v0.2.107; an older one keeps its size and
+    reuses the pages until one full ``VACUUM``).
 """
 from __future__ import annotations
 

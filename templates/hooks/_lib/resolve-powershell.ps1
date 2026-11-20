@@ -7,7 +7,8 @@
 # `powershell` (5.1, ships with every Windows 10+) per
 # settings.json.windows.template - so on machines without PowerShell 7
 # the hook body ran fine but every child spawn (`kg-sync.ps1`,
-# `vct_access_check.ps1`, `code-graph-incremental.ps1`, ...) failed
+# `vct_access_check.ps1`, `code-graph-incremental.ps1` (retired in v0.2.107),
+# ...) failed
 # silently: KG sync, write-gate, dup-detection and code-graph updates
 # were all lost with no error surfaced.
 #

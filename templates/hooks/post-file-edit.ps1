@@ -2,16 +2,19 @@
 # Windows PowerShell 5.1 only and has no Bash-side counterpart; every
 # behaviour must match the post-file-edit.sh sibling).
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
 #   Calls .claude/scripts/kg-sync (writes to the project's own
-#   KG_COLLECTION / DEVELOPMENT_COLLECTION) and code-graph-incremental.ps1
-#   (writes to the project's own code-graph collections via
-#   analyze_code_graph.py). Writes do NOT consult VCT_KG_ACCESS_LIST or
+#   KG_COLLECTION / DEVELOPMENT_COLLECTION); the code graph is written by
+#   the HEAD catch-up, not by an edit (v0.2.107). Writes do NOT consult VCT_KG_ACCESS_LIST or
 #   VCT_CODE_GRAPH_ACCESS_LIST — those env vars are read-side only
 #   (fan-out search across peer KGs). This hook is correct as-is; no
 #   centralization needed: writes always target the project's OWN
@@ -39,7 +42,8 @@ $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
 if (Test-Path $EmitContextLib) { . $EmitContextLib }
 
 # v0.2.95 (lane F10): the ROUTING - knowledge/ -> kg-sync, docs/ ->
-# upload_docs, code files -> the end-of-turn code-graph drain queue -
+# upload_docs, code files -> the end-of-turn edit reminder (v0.2.107: an
+# edit queues nothing for the code graph, which follows commits) -
 # plus the Phase-8 access gate and
 # the per-file debounce now live in _lib/route-touched-path.ps1, because a
 # SECOND hook needs exactly the same decision: post-bash-file-sync.ps1,
@@ -77,10 +81,10 @@ function Add-Nudge([string]$msg) {
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 $EditedFile = ""
 # V52-L.2 Fix 2b: parse subagent identity + session_id. We don't write
-# a JSONL log directly, but the kg-sync / code-graph-incremental child
+# a JSONL log directly, but the kg-sync child
 # processes DO emit retrieval/sync telemetry — exporting these as env
 # vars (VCT_AGENT_ID / VCT_AGENT_TYPE / VCT_SESSION_ID) lets the
 # canonical emit path attribute those rows to the agent that triggered
@@ -104,7 +108,7 @@ try {
 } catch {
     # Empty/malformed stdin — keep variables at defaults
 }
-# Export for child processes (kg-sync, code-graph-incremental.ps1, etc.)
+# Export for child processes (kg-sync, etc.)
 # so their emit paths can attribute telemetry to the originating agent.
 # Skip empty exports — downstream readers treat unset and empty
 # identically, but unset keeps the env listing clean.
@@ -131,7 +135,7 @@ $DocsDirSep = $DocsDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorCh
 
 if (-not $EditedFile) { exit 0 }
 
-# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-edit reminder ===
 # ONE home - _lib/route-touched-path.ps1 - shared with
 # post-bash-file-sync.ps1 so a CLI write routes identically to an
 # Edit/Write. Initialize-VcoRoute resolves the debounce helper, the

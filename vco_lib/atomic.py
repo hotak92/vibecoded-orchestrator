@@ -906,8 +906,10 @@ def machine_slot(
     open file description, it is also released when the holder process exits
     or crashes.
 
-    Best-effort exactly like :func:`exclusive_file_lock`: where ``flock`` does
-    not exist (Windows, or a filesystem without it) the first slot "succeeds"
+    Best-effort exactly like :func:`exclusive_file_lock`: POSIX locks with
+    ``flock`` and Windows with ``msvcrt.locking`` (since v0.2.103), so the slot
+    count holds on both. Only where NEITHER works (a filesystem without
+    ``flock``, a platform with neither module) the first slot "succeeds"
     without exclusion, so the block runs unbounded, as it did before. The
     yielded value is always a slot index (``Optional`` only for callers typed
     against the pre-W6-U contract, which yielded ``None`` on expiry).
@@ -974,6 +976,112 @@ def machine_slot(
             # then "still queued" once per wait period (floored: wait_s=0 never spams)
             next_notice = (next_notice or started) + max(period, 10 * float(poll_s))
         time.sleep(max(0.05, float(poll_s)))
+
+
+@contextlib.contextmanager
+def try_machine_slot(slot_dir: Path, *, slots: int) -> Iterator[Optional[int]]:
+    """Take a FREE :func:`machine_slot` slot without waiting, or none.
+
+    Yields the slot index when one of ``slots`` was free (held for the block,
+    with the same holder record :func:`machine_slot` writes), else ``None`` —
+    the caller then skips its work and retries at its next chance. For
+    low-priority periodic jobs (v0.2.107 CG-3: the daily code-graph path
+    reconciliation) that must neither run beside a bulk writer nor queue a
+    detached waiter behind one.
+    """
+    for i in range(max(1, int(slots))):
+        cm = exclusive_file_lock(Path(slot_dir) / f"slot-{i}.lock", timeout_s=0)
+        try:
+            cm.__enter__()
+        except LockTimeout:
+            continue
+        holder_path = _slot_holder_path(slot_dir, i)
+        mine = _this_process_holder(takeover=False)
+        _write_slot_holder(holder_path, mine)
+        try:
+            yield i
+        finally:
+            if _read_slot_holder(holder_path) == json.loads(json.dumps(mine)):
+                _write_slot_holder(holder_path, None)
+            cm.__exit__(None, None, None)
+        return
+    yield None
+
+
+#: v0.2.107 (A-003): the ONE pool every machine-wide bulk writer counts
+#: against — the code-graph resync drivers (``codegraph_resync``) and the
+#: owed-work worker (``owed_work``). The directory name predates the second
+#: user and is kept so a resync driver of either version shares the pool.
+BULK_SLOT_DIRNAME = "resync-driver-slots"
+#: Env override for the slot count — the name the resync drivers already read.
+BULK_SLOTS_ENV = "VCO_RESYNC_DRIVER_SLOTS"
+#: Slot count when the machine's RAM cannot be read (the pre-v0.2.107 value).
+BULK_SLOTS_DEFAULT = 2
+#: ``(RAM below GiB, slots)`` — a bulk writer (a KG ``--all``, a code-graph
+#: walk) drives Weaviate's heap and an embedding model at once, so a small
+#: machine runs one at a time. 64 GiB and up: 4.
+_BULK_SLOTS_BY_RAM = ((12.0, 1), (32.0, 2), (64.0, 3))
+_BULK_SLOTS_MAX = 4
+
+
+def bulk_slot_dir() -> Path:
+    """``<vct_root_dir>/state/resync-driver-slots`` — the slot directory
+    :func:`machine_slot` is given by every bulk writer on this machine."""
+    from vco_lib.paths import vct_root_dir  # noqa: PLC0415
+
+    return vct_root_dir() / "state" / BULK_SLOT_DIRNAME
+
+
+def machine_slot_count(*, ram_gb: Optional[float] = None,
+                       env: Optional[Any] = None) -> int:
+    """How many :func:`machine_slot` slots the bulk-writer pool has.
+
+    ``VCO_RESYNC_DRIVER_SLOTS`` (a positive integer) wins; otherwise the count
+    follows the machine's total RAM (``_BULK_SLOTS_BY_RAM``); a RAM figure that
+    cannot be read (``0`` / ``None`` from the probe) gives
+    :data:`BULK_SLOTS_DEFAULT`, the count every driver used before. ``ram_gb``
+    and ``env`` are test seams.
+    """
+    source = os.environ if env is None else env
+    raw = str(source.get(BULK_SLOTS_ENV) or "").strip()
+    if raw:
+        try:
+            value = int(float(raw))
+        except ValueError:
+            value = 0
+        if value >= 1:
+            return value
+    if ram_gb is None:
+        try:
+            from vco_lib.host_probe import probe_system_ram_gb  # noqa: PLC0415
+
+            ram_gb = probe_system_ram_gb()
+        except Exception:  # noqa: BLE001 — unreadable RAM is the default case
+            ram_gb = 0.0
+    if not ram_gb or ram_gb <= 0:
+        return BULK_SLOTS_DEFAULT
+    for below, slots in _BULK_SLOTS_BY_RAM:
+        if ram_gb < below:
+            return slots
+    return _BULK_SLOTS_MAX
+
+
+def try_machine_slot_free(slot_dir: Path, *, slots: int) -> Optional[int]:
+    """Index of a slot of ``slot_dir`` nobody holds right now, or ``None``.
+
+    A non-blocking PEEK (each lock is taken and released at once), so a
+    caller can decide not to start a wait at all — the owed-work worker
+    leaves its job queued instead of parking a process on a full pool. The
+    answer can be stale a moment later; :func:`machine_slot` stays the
+    one that actually holds a slot.
+    """
+    for i in range(max(1, int(slots))):
+        try:
+            with exclusive_file_lock(Path(slot_dir) / f"slot-{i}.lock", timeout_s=0):
+                return i
+        except LockTimeout:
+            continue
+    return None
 
 
 def claim_once(path: Path, *, stale_after_s: float) -> Optional[bool]:

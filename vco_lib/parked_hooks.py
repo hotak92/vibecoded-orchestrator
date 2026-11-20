@@ -394,10 +394,67 @@ def carried_registrations(
             "timeout_seconds": timeout if isinstance(timeout, int)
             and not isinstance(timeout, bool) else None,
             "parked_json": json.dumps(
-                parked_entry_for_registration(key[0], key[1], group, items),
+                _placed_as_the_merge_places_it(
+                    user_hooks, template_hooks,
+                    parked_entry_for_registration(key[0], key[1], group, items)),
                 ensure_ascii=False),
         })
     return out
+
+
+def _placed_as_the_merge_places_it(
+    user_hooks: Any, template_hooks: dict, entry: dict,
+) -> dict:
+    """``entry`` (its own group, appended) re-targeted to where the bundle
+    merge would put the registration in the user's CURRENT file.
+
+    Since v0.2.105 the merge folds same-matcher groups that are provably
+    VCO's into one group in the template's order
+    (:func:`vco_lib.settings_merge.fold_event_groups`). So when the event
+    already holds such a group — the template ships the carried hook beside
+    another one in the same matcher group — the merge JOINS that group, and a restore
+    that founds a second group would leave a shape the next update folds.
+    Simulated on a copy: restore the entry, fold the event, and when the
+    group count did not grow, record the joined group and the folded
+    position. Otherwise (no such group, or a group holding the user's own
+    command, which is never folded) ``entry`` is returned unchanged."""
+    import copy
+
+    from vco_lib.hooks_settings import HooksSettingsError, SettingsDoc, insert_hook
+    from vco_lib.settings_merge import fold_event_groups
+
+    event = entry.get("event")
+    groups = user_hooks.get(event) if isinstance(user_hooks, dict) else None
+    if not isinstance(event, str) or not isinstance(groups, list) or not groups:
+        return entry
+    scratch = SettingsDoc(Path("settings.json"),
+                          {"hooks": {event: copy.deepcopy(groups)}}, 2, True)
+    try:
+        if not insert_hook(scratch, copy.deepcopy(entry)):
+            return entry
+    except HooksSettingsError:
+        return entry
+    folded = fold_event_groups(event, scratch.data["hooks"][event], template_hooks)
+    if not isinstance(folded, list) or len(folded) != len(groups):
+        return entry
+    commands = [entry["item"]["command"]] if "item" in entry else [
+        rec["item"]["command"] for rec in entry.get("items", [])]
+    for g_idx, group in enumerate(folded):
+        inner = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(inner, list):
+            continue
+        at = [i for i, h in enumerate(inner)
+              if isinstance(h, dict) and h.get("command") in commands]
+        if not at:
+            continue
+        joined: dict[str, Any] = dict(entry, group_removed=False, group_index=g_idx)
+        if "item" in entry:
+            joined["hook_index"] = at[0]
+        else:
+            joined["items"] = [dict(rec, hook_index=i)
+                               for rec, i in zip(entry["items"], at)]
+        return joined
+    return entry
 
 
 def _template_registration(

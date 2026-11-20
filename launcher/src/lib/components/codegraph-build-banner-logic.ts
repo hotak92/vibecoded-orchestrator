@@ -49,7 +49,7 @@ export function isPruneFailurePartial(
  * project whose binding says `VCODev_Code*`, rebuilding a family the project
  * does not read (and, on a collision, dropping one another project does).
  * `--from-resolver` asks vct-hub for `collection_prefix`, which is exactly
- * what the per-edit hooks and the launcher's own analyzer spawns use. It also
+ * what the HEAD catch-up and the launcher's own analyzer spawns use. It also
  * removes the unquoted-`${name}` bug: a display name with spaces produced a
  * command that parsed as a different project.
  */

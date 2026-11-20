@@ -11,7 +11,8 @@
 # (as `rl_client.rl_logger`), `claude_mcp_servers/rl_client/rerank_wire.py`
 # (the /cache_nodes feature format, shared with the client) and the
 # stdlib-only `vco_lib` modules
-# `rl_training_targets`, `atomic` (every atomic write), `log_setup`
+# `rl_training_targets`, `rl_vector_codec` (the stored vectors' compact
+# form, decoded by the event loader), `atomic` (every atomic write), `log_setup`
 # (root-logger setup, one-line log values) and `safe_paths` (request-supplied
 # paths contained under the /data roots). The root `.dockerignore` whitelists
 # exactly what this file COPYs, so the rest of the checkout never enters the
@@ -137,6 +138,7 @@ COPY --chown=app:app claude_mcp_servers/rl_reranker/ranking_metrics.py          
 COPY --chown=app:app claude_mcp_servers/rl_client/rl_logger.py                 /app/rl_client/rl_logger.py
 COPY --chown=app:app claude_mcp_servers/rl_client/rerank_wire.py                /app/rl_client/rerank_wire.py
 COPY --chown=app:app vco_lib/rl_training_targets.py                             /app/vco_lib/rl_training_targets.py
+COPY --chown=app:app vco_lib/rl_vector_codec.py                                 /app/vco_lib/rl_vector_codec.py
 COPY --chown=app:app vco_lib/atomic.py                                          /app/vco_lib/atomic.py
 COPY --chown=app:app vco_lib/log_setup.py                                       /app/vco_lib/log_setup.py
 COPY --chown=app:app vco_lib/safe_paths.py                                      /app/vco_lib/safe_paths.py

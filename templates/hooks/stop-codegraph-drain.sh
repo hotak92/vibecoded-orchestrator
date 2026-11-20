@@ -3,43 +3,41 @@
 # Parity: kept in step with stop-codegraph-drain.ps1 (its v0.2.92 PowerShell-only
 # detached-spawn hardening is the Windows twin of the setsid / nohup spawn below;
 # every other behaviour must match the .ps1 sibling).
-# stop-codegraph-drain.sh — Stop hook (v0.2.73 FIX-B)
+# stop-codegraph-drain.sh — Stop + SessionStart hook: the code graph follows
+# the COMMITTED state of the main checkout (v0.2.107 CG-3).
 #
-# END-OF-TURN BATCHED code-graph sync. Replaces the per-EDIT
-# code-graph-incremental.sh scheduling that post-file-edit.sh used to fire on
-# every code-file Edit. That per-edit cadence hit the big CodeFunction
-# collection's insert-time HNSW churn on every keystroke, and parallel
-# subagents editing in worktrees multiplied it into the measured Weaviate disk
-# write-amplification (857 GB/8h vs a 5 GB dataset). Instead, post-file-edit.sh
-# now only APPENDS each edited path to a per-turn drain queue
-# (.claude/state/codegraph_drain_<sid>.txt); this Stop hook drains it at
-# end-of-turn and runs ONE analyzer pass over all the turn's files, grouped by
-# canonical repo root, SUBJECT TO a 2-minute rate limit.
+# The code graph of a project reflects the files at HEAD of its MAIN checkout's
+# current branch, and of each enabled extra code folder at its own HEAD. It is
+# updated when HEAD moves and at no other time (owner rulings 2026-11-17 and
+# 2026-11-19): an Edit/Write queues nothing, an edit in a linked git worktree
+# (a lane) is never indexed — not under the project, not into a collection of
+# its own — and reaches the graph when it is merged into the main checkout's
+# branch and that HEAD moves. Uncommitted edits in the main checkout are not
+# indexed either; the commit that carries them is. A slightly outdated graph
+# is accepted, a graph bouncing between worktrees is not.
 #
-# Design (maintainer decision 2026-07-03):
-#   * END-OF-TURN batch + 2-MINUTE RATE LIMIT. If the turn ends < 120s since
-#     the last sync for this project, DON'T run — leave the queue so the next
-#     eligible drain (past the 2-min window) processes the UNION.
-#   * FIX-A' gate applied per path: an edit in an EPHEMERAL/unregistered
-#     worktree is DROPPED here too (cross-fix consistency — else the drain
-#     re-introduces the worktree churn FIX-A' removes at per-edit time).
-#   * GROUP by canonical root: a turn's files can span worktree + main → two
-#     canonical roots → two analyzer batches (each with its own
-#     --canonical-source + resolved --project prefix).
-#   * SERIALIZE per canonical root: a per-root lock-dir (mkdir is atomic on
-#     POSIX) so a later drain for the same root can't be overtaken by an
-#     earlier one. If the lock is held (a prior drain still running for this
-#     root), skip THIS root's batch and leave its paths queued.
-#   * edited-then-DELETED-in-turn → the analyzer's --only-files-from prunes a
-#     vanished path (deletes its objects), never a self-inflicted orphan.
+# What this hook does, each at most once per its interval per project, each
+# DETACHED (a Stop/SessionStart hook never waits on an analyzer):
+#   1. extras check  → `python -m vco_lib.codegraph_extras_refresh` (an enabled
+#      extra code folder whose HEAD moved is re-indexed by commit range);
+#   2. HEAD catch-up → `python -m vco_lib.codegraph_head_catchup` (the main
+#      checkout's HEAD vs the binding's recorded commit: ONE analyzer run per
+#      HEAD move; it skips a linked worktree; it also runs the daily
+#      path-existence reconciliation that removes rows of code deleted outside
+#      any diffed range).
+# Registered on Stop AND on SessionStart, so a pull or merge made outside a
+# session is picked up when the next session starts. The name is historical:
+# the per-edit drain queue this hook used to consume was retired in v0.2.107.
+# A project that is not a git repository is updated by a manual re-analysis
+# (launcher Codegraph page) only.
 #
 # Contract / constraints:
 #   * Always exit 0 — a Stop hook must never block turn end.
-#   * Soft-fail throughout: a missing queue, unkeyable session, or resolution
-#     failure is a clean no-op (the paths stay queued for a later drain).
-#   * The analyzer runs DETACHED in the background so the hook returns fast.
+#   * Soft-fail throughout.
 #   * MUST MATCH templates/hooks/stop-codegraph-drain.ps1 (cross-language).
 
+# Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+{ . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
@@ -50,50 +48,17 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/stderr-cap.sh" ] && . "$SCRIPT_DIR/_lib/stderr-cap.sh"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
-# shellcheck source=_lib/canonical-repo-root.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/canonical-repo-root.sh" ] && . "$SCRIPT_DIR/_lib/canonical-repo-root.sh"
-# shellcheck source=_lib/worktree-gate.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/worktree-gate.sh" ] && . "$SCRIPT_DIR/_lib/worktree-gate.sh"
 
-# Rate-limit window (seconds) between code-graph drains per project. Maintainer:
-# END-OF-TURN batch + 2-MINUTE RATE LIMIT. Overridable for tests / tuning.
-_CG_DRAIN_MIN_INTERVAL="${VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS:-120}"
-case "$_CG_DRAIN_MIN_INTERVAL" in
-    ''|*[!0-9]*) _CG_DRAIN_MIN_INTERVAL=120 ;;
-esac
-
-# Interpreter for hashing + running the analyzer. No python → soft no-op
-# (nothing can run; the queue persists for a session that later has python).
+# Interpreter for the analyzer. No python → soft no-op.
 [ -z "${PY:-}" ] && exit 0
 
-HOOK_STDIN=$(cat 2>/dev/null || echo "")
-SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    print(json.loads(sys.stdin.read()).get('session_id', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-
-# Untrustworthy session id → no keyed queue to drain (post-file-edit skips
-# accumulation for the same case).
-[ -n "$SESSION_ID" ] || exit 0
-case "$SESSION_ID" in
-    *[!A-Za-z0-9_-]*) exit 0 ;;
-esac
+# The payload carries nothing this hook needs; read it so the harness's pipe
+# is consumed.
+cat >/dev/null 2>&1 || true
 
 STATE_DIR="$PROJECT_ROOT/.claude/state"
-QUEUE="$STATE_DIR/codegraph_drain_${SESSION_ID}.txt"
-# Session-agnostic SHARED drain queue (v0.2.73 I/O-audit HIGH-2): the
-# SubagentStop reconciler (subagent-stop-reconcile.{sh,ps1}) enqueues gated-IN
-# subagent code edits here rather than the removed orphan code-graph-queue.jsonl.
-# A subagent's payload session_id is the PARENT session's id today, but rather
-# than couple the fix to that undocumented harness detail, subagent edits land
-# in this session-AGNOSTIC file so the NEXT eligible Stop drain (any session)
-# processes them. MUST MATCH stop-codegraph-drain.ps1 + subagent-stop-reconcile.*.
-SHARED_QUEUE="$STATE_DIR/codegraph_drain_shared.txt"
 # ── RUNTIME: analyzer script + interpreter (one home for this hook) ─────────
-# Used by BOTH the extra-path refresh below and the queue drain. Sets ANALYZER,
+# Used by BOTH the extra-path refresh and the HEAD catch-up below. Sets ANALYZER,
 # ANALYZER_PY and _CG_RUNTIME_RC (cached — resolved at most once per run):
 #   0 usable · 1 no analyzer script · 2 bare-PATH interpreter cannot import
 #   the analyzer's dependencies.
@@ -115,7 +80,7 @@ _drain_resolve_runtime() {
     #   2. shared venv resolver (VCT_INSTALL_ROOT/.venv, clone-relative, …)
     #   3. $PY              bare PATH — python3 / python / py
     # v0.2.96: this file read NEITHER $VCT_PYTHON (its .ps1 sibling and
-    # code-graph-incremental.sh both do — a silent cross-OS divergence) nor any
+    # the since-retired code-graph-incremental.sh both did — a silent cross-OS divergence) nor any
     # record of WHICH tier answered, which is what the probe below needs.
     ANALYZER_PY="${VCT_PYTHON:-}"
     local _from_bare_path=0
@@ -130,9 +95,7 @@ _drain_resolve_runtime() {
     # v0.2.96 (WP-5 S2): when every venv tier missed, ANALYZER_PY is whatever
     # `python3`/`python`/`py` happens to be on PATH — an interpreter that in a
     # user project routinely has neither `weaviate` nor `vco_lib`. The
-    # analyzer would then die inside a detached run whose output goes to
-    # /dev/null, after the queue was already consumed: the batch of edited
-    # paths lost with no trace. Probe the SAME import string the shipped
+    # analyzer would then die inside a detached run. Probe the SAME import string the shipped
     # wrappers gate on (`kg-duplicates`, `vct_venv_ladder.sh`), and only when
     # we actually fell back — a healthy install resolves a venv and pays
     # nothing.
@@ -169,9 +132,8 @@ _drain_spawn_detached() {
 
 # ── EXTRA CODE-GRAPH PATHS: automatic re-index (v0.2.100 W5R-04) ────────────
 # An extra path (launcher → project → Codegraph → "Extra codegraph paths")
-# feeds another checkout into THIS project's code-graph collections. Its repo
-# moves on independently of this session's edits, so this check runs whether
-# or not the turn queued any file. At most once per
+# feeds another checkout into THIS project's code-graph collections. It is
+# re-indexed when ITS HEAD moves (edits there queue nothing either). At most once per
 # VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS (default 600) per project, it
 # spawns `python -m vco_lib.codegraph_extras_refresh` DETACHED: that module
 # compares each enabled extra path's HEAD with its last indexed commit, runs
@@ -216,25 +178,24 @@ if [ -d "$STATE_DIR" ]; then
     fi
 fi
 
-# ── HEAD-DIFF CATCH-UP: commits, merges and pulls on the main checkout ──────
-# v0.2.105 (#512A). The queue above only ever holds files the EDIT hook saw.
-# Code that arrives through `git merge` of a lane branch, `git pull`, a commit
-# made from a shell, or a GUI merge is never queued — a field report found a
-# project's code graph six days and 1,070 commits behind its HEAD for exactly
-# that reason. At most once per
+# ── HEAD-DIFF CATCH-UP: the ONE writer of the primary root's code graph ────
+# v0.2.105 (#512A); since v0.2.107 (CG-3) the only path by which the main
+# checkout's code reaches the graph. Commits, merges of lane branches, pulls
+# and GUI merges all move HEAD. At most once per
 # VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS (default 600) per project, this
 # spawns `python -m vco_lib.codegraph_head_catchup` DETACHED: it compares the
 # binding's `last_analyzed_commit` (hub /config) with the main checkout's HEAD
 # and, when the recorded commit is an ANCESTOR, indexes exactly
-# `git diff --name-only <recorded>..HEAD` (existing code files only, filtered
-# like the drain's own lines); an enormous diff, or a deleted code file, goes
-# to the analyzer's incremental walk instead. A non-ancestor / missing
-# recorded commit takes ONE full (non-incremental) walk, then records HEAD —
-# the converging fallback. A project with no ENABLED code-graph binding is
-# skipped entirely. On success it records HEAD through the hub route
-# `/projects/{id}/codegraph/analyzed` — never by opening launcher.db.
-# Runs whether or not this turn queued any file (a merge queues none), and
-# deliberately installs NO git hook into the user's repo.
+# `git diff --name-only <recorded>..HEAD` (existing code files only); an
+# enormous diff, or a deleted code file, goes to the analyzer's incremental
+# walk instead. A non-ancestor / missing recorded commit takes ONE full
+# (non-incremental) walk, then records HEAD — the converging fallback. A
+# project with no ENABLED code-graph binding is skipped entirely, and a
+# session whose checkout is a linked worktree is skipped (the main checkout's
+# own session owns the catch-up). On success it records HEAD through the hub
+# route `/projects/{id}/codegraph/analyzed` — never by opening launcher.db.
+# Coalescing is inherent: ten commits between two runs are one range.
+# Deliberately installs NO git hook into the user's repo.
 # Log: .claude/logs/codegraph_head_catchup.log. MUST MATCH the .ps1 sibling.
 _CG_CATCHUP_INTERVAL="${VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS:-600}"
 case "$_CG_CATCHUP_INTERVAL" in
@@ -264,313 +225,5 @@ if [ -d "$STATE_DIR" ]; then
         fi
     fi
 fi
-
-# ── EXTRA EDIT QUEUES: drain on Stop (v0.2.102 S16-7) ─────────────────────
-# route-touched-path.sh queues a code edit under an ENABLED extra path to
-# codegraph_drain_extra_<md5(extra)>_<session>.txt (never the primary queue —
-# an extra path must not be analyzed under the primary's collection). Drain
-# those queues here through `vco_lib.codegraph_extras_refresh --queued`, a
-# scoped --only-files-from run with the extra's OWN --project prefix.
-# Deliberately OUTSIDE both throttles: the 120 s primary rate limit below and
-# the 600 s commit-stamp interval above protect the analyzer from repeated
-# FULL walks; a queued scoped drain is cheap, so a queued extra is drained on
-# every Stop. The per-path root lock inside refresh_queued still serialises
-# runs over the same checkout. MUST MATCH the .ps1 sibling.
-shopt -s nullglob 2>/dev/null || true
-_CG_EXTRA_QUEUES=( "$STATE_DIR"/codegraph_drain_extra_*_*.txt )
-shopt -u nullglob 2>/dev/null || true
-# Skip the pre-fix-round-2 TRANSIENT analyzer input
-# (codegraph_drain_extra_list_<md5>.txt): a process killed mid-drain could
-# leak one, and it is not a queue (v0.2.102 I-A5). The current transient name
-# (codegraph_drain_extra-files-<md5>.txt) does not match the glob at all.
-_CG_EXTRA_QUEUES_REAL=()
-for _f in "${_CG_EXTRA_QUEUES[@]}"; do
-    case "$_f" in
-        */codegraph_drain_extra_list_*.txt) continue ;;
-    esac
-    _CG_EXTRA_QUEUES_REAL+=("$_f")
-done
-if [ "${#_CG_EXTRA_QUEUES_REAL[@]}" -gt 0 ]; then
-    if _drain_resolve_runtime; then
-        _CG_EXTRAS_LOG_DIR="$PROJECT_ROOT/.claude/logs"
-        mkdir -p "$_CG_EXTRAS_LOG_DIR" 2>/dev/null || true
-        _CG_EXTRAS_LOG="$_CG_EXTRAS_LOG_DIR/codegraph_extras_refresh.log"
-        _drain_spawn_detached '"$0" -m vco_lib.codegraph_extras_refresh --queued --project-root "$1" --analyzer "$2" --state-dir "$3" >>"$4" 2>&1' \
-            "$ANALYZER_PY" "$PROJECT_ROOT" "$ANALYZER" "$STATE_DIR" "$_CG_EXTRAS_LOG"
-    fi
-fi
-
-# Drain when EITHER the per-session queue OR the shared queue has entries.
-[ -f "$QUEUE" ] || [ -f "$SHARED_QUEUE" ] || exit 0
-
-# ── RATE LIMIT ──────────────────────────────────────────────────────────────
-# Per-project last-sync timestamp. If < interval since the last drain, DON'T
-# run — leave the queue so the next eligible drain processes the union.
-LAST_TS_FILE="$STATE_DIR/codegraph_drain_last_sync.ts"
-NOW="$(date +%s 2>/dev/null || echo 0)"
-LAST_TS=0
-if [ -f "$LAST_TS_FILE" ]; then
-    LAST_TS=$(cat "$LAST_TS_FILE" 2>/dev/null || echo 0)
-    case "$LAST_TS" in ''|*[!0-9]*) LAST_TS=0 ;; esac
-fi
-# A future stamp is no stamp (R20 L1; MUST MATCH the .ps1 sibling's clamp).
-[ "$LAST_TS" -gt "$NOW" ] && LAST_TS=0
-if [ "$LAST_TS" -gt 0 ]; then
-    _AGE=$(( NOW - LAST_TS ))
-    if [ "$_AGE" -lt "$_CG_DRAIN_MIN_INTERVAL" ]; then
-        # Rate-limited: leave the queue (union grows) for the next eligible drain.
-        exit 0
-    fi
-fi
-
-# ── DRAIN: read queue, gate each path, group by canonical root ──────────────
-# Read the queue's full paths (dedup, preserve first-seen order). We consume
-# the queue now (rename aside) so concurrent appends during the run start a
-# fresh queue — but we ONLY unlink the consumed copy after we've dispatched the
-# batches, so a crash mid-dispatch leaves the consumed file for the next drain
-# to recover is NOT attempted here (soft-fail: worst case a turn's edits wait
-# for the next edit+drain — acceptable, eventually-consistent index).
-CONSUMED="$STATE_DIR/codegraph_drain_${SESSION_ID}.draining.$$"
-# Consume the per-session queue (if present) by atomic rename so concurrent
-# appends during the run start a fresh queue. Then FOLD IN the shared queue
-# (subagent edits) by atomic-renaming it aside too and appending its lines to
-# CONSUMED — one batch covers both. If the per-session queue is absent, seed
-# CONSUMED empty so the shared-queue fold still has a target.
-if [ -f "$QUEUE" ]; then
-    mv "$QUEUE" "$CONSUMED" 2>/dev/null || : > "$CONSUMED" 2>/dev/null || exit 0
-else
-    : > "$CONSUMED" 2>/dev/null || exit 0
-fi
-if [ -f "$SHARED_QUEUE" ]; then
-    _SHARED_CONSUMED="$STATE_DIR/codegraph_drain_shared.draining.$$"
-    if mv "$SHARED_QUEUE" "$_SHARED_CONSUMED" 2>/dev/null; then
-        cat "$_SHARED_CONSUMED" >> "$CONSUMED" 2>/dev/null || true
-        rm -f "$_SHARED_CONSUMED" 2>/dev/null || true
-    fi
-fi
-
-# Resolve analyzer + interpreter through the ONE home above. Unusable →
-# put the queue back (append, so nothing is lost) + no-op; the bare-PATH
-# interpreter case also says one line on stderr (see _drain_resolve_runtime).
-_drain_resolve_runtime
-case "$_CG_RUNTIME_RC" in
-    0) ;;
-    *)
-        cat "$CONSUMED" >> "$QUEUE" 2>/dev/null || true
-        rm -f "$CONSUMED" 2>/dev/null || true
-        if [ "$_CG_RUNTIME_RC" = "2" ]; then
-            echo "ℹ️  code-graph drain: no interpreter with weaviate+vco_lib (tried '$ANALYZER_PY'); queue kept for a later turn." >&2
-        fi
-        exit 0
-        ;;
-esac
-
-# Resolve the code-graph collection prefix for a canonical root (hub resolver
-# `code_graph_collection_prefix`, else basename). Mirrors
-# code-graph-incremental.sh :: _resolve_codegraph_project.
-_drain_resolve_project() {
-    local _root="$1" _name="" _resolver="$1/.claude/scripts/vct_project_config.sh"
-    if [ -x "$_resolver" ]; then
-        _name=$("$_resolver" "$_root" --field code_graph_collection_prefix 2>/dev/null) || _name=""
-    fi
-    [ -z "$_name" ] && _name="$(basename "$_root")"
-    printf '%s' "$_name"
-}
-
-# md5 of a string → slash-free key (portable, via python).
-_drain_key() {
-    printf '%s' "$1" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null || printf '%s' "_"
-}
-
-CODE_RE='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$'
-
-# Per-canonical-root batch files: <hash> → tmp file of paths for that root.
-BATCH_DIR="$(mktemp -d "$STATE_DIR/cg_drain_batch.XXXXXX" 2>/dev/null || mktemp -d 2>/dev/null)"
-if [ -z "$BATCH_DIR" ] || [ ! -d "$BATCH_DIR" ]; then
-    # mktemp failed → put the queue back + no-op.
-    cat "$CONSUMED" >> "$QUEUE" 2>/dev/null || true
-    rm -f "$CONSUMED" 2>/dev/null || true
-    exit 0
-fi
-# Map canonical-root-hash → canonical root path (for --canonical-source).
-declare -A _ROOT_FOR_HASH 2>/dev/null || true
-
-# Dedup + gate + group.
-_SEEN_TMP="$BATCH_DIR/.seen"
-: > "$_SEEN_TMP"
-while IFS= read -r _p; do
-    [ -n "$_p" ] || continue
-    # Dedup within this drain.
-    if grep -Fxq "$_p" "$_SEEN_TMP" 2>/dev/null; then continue; fi
-    printf '%s\n' "$_p" >> "$_SEEN_TMP"
-
-    # Only code files (mirror the incremental hook's extension gate).
-    case "$_p" in
-        *) ;;
-    esac
-    if ! printf '%s' "$_p" | grep -Eq "$CODE_RE"; then continue; fi
-    # Never index transient scratch.
-    case "$_p" in */.claude/state/*) continue ;; esac
-
-    # Resolve canonical root. A vanished (deleted) path may not resolve via its
-    # dirname if the dir is gone; fall back to PROJECT_ROOT's canonical root so
-    # a deleted file still gets pruned under the right prefix.
-    _canon="$(_canonical_repo_root "$_p")" || _canon=""
-    if [ -z "$_canon" ]; then
-        _canon="$(_canonical_repo_root "$PROJECT_ROOT/.")" || _canon="$PROJECT_ROOT"
-    fi
-
-    # FIX-A' gate: drop EPHEMERAL/unregistered worktree edits (cross-fix
-    # consistency). REPO_PATH here is PROJECT_ROOT (the on-disk session root);
-    # the gate compares it against the canonical root.
-    if command -v _worktree_gate_should_skip >/dev/null 2>&1 \
-        && _worktree_gate_should_skip "$_p" "$PROJECT_ROOT" "$_canon"; then
-        continue
-    fi
-
-    _h="$(_drain_key "$_canon")"
-    _ROOT_FOR_HASH["$_h"]="$_canon"
-    printf '%s\n' "$_p" >> "$BATCH_DIR/$_h.paths"
-done < "$CONSUMED"
-
-# v0.2.102 W6-ALERTS2 (owner ruling 3): a gate probe found the hub unreachable
-# and indexed on doubt (FIX-A' unchanged). Tell the model once per session per
-# agent key so it can bring the hub back. This hook runs async on Stop, so
-# Claude Code hands the additionalContext over on the next turn (vendor hooks
-# doc, "How async hooks execute"). MUST MATCH stop-codegraph-drain.ps1.
-if [ "${VCO_WORKTREE_GATE_HUB_UNREACHABLE:-}" = "1" ]; then
-    # shellcheck source=_lib/emit-context.sh disable=SC1091
-    [ -f "$SCRIPT_DIR/_lib/emit-context.sh" ] && . "$SCRIPT_DIR/_lib/emit-context.sh"
-    # shellcheck source=_lib/session-id.sh disable=SC1091
-    [ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
-    _hub_key="$SESSION_ID"
-    if command -v vco_hook_fast_agent_key >/dev/null 2>&1; then
-        _hub_key="$(vco_hook_fast_agent_key "$HOOK_STDIN")"
-    fi
-    if command -v vco_report_hub_unreachable >/dev/null 2>&1; then
-        vco_report_hub_unreachable "$SCRIPT_DIR" "$PROJECT_ROOT" "$_hub_key" \
-            "The end-of-turn code-graph drain (stop-codegraph-drain)" \
-            "It still indexed this turn's worktree edits (the safe default when it cannot confirm that a worktree is unregistered), so throwaway worktrees may be indexed until the hub is back."
-        if [ -n "$VCO_HUB_DOWN_NOTICE" ] && command -v emit_additional_context >/dev/null 2>&1; then
-            _hub_event="Stop"
-            case "$HOOK_STDIN" in *'"SubagentStop"'*) _hub_event="SubagentStop" ;; esac
-            emit_additional_context "$VCO_HUB_DOWN_NOTICE" "$_hub_event"
-        fi
-    fi
-fi
-
-# Nothing survived the gate → clean up + record the drain ts (so a turn of
-# pure-worktree edits still advances the rate-limit clock) and exit.
-_ANY=0
-for _pf in "$BATCH_DIR"/*.paths; do
-    [ -e "$_pf" ] || continue
-    _ANY=1
-    break
-done
-if [ "$_ANY" -eq 0 ]; then
-    printf '%s' "$NOW" > "$LAST_TS_FILE" 2>/dev/null || true
-    rm -rf "$BATCH_DIR" 2>/dev/null || true
-    rm -f "$CONSUMED" 2>/dev/null || true
-    exit 0
-fi
-
-# Resolve the `.claude` gate flag for a canonical root (mirror the incremental
-# hook's _resolve_index_dot_claude fallback).
-_drain_index_dot_claude() {
-    local _root="$1" _val="" _resolver="$1/.claude/scripts/vct_project_config.sh"
-    if [ -x "$_resolver" ]; then
-        _val=$("$_resolver" "$_root" --field code_graph_index_dot_claude 2>/dev/null) || _val=""
-    fi
-    case "$_val" in
-        true|True|TRUE|1)  printf -- '--index-dot-claude'; return 0 ;;
-        false|False|FALSE|0) printf -- '--no-index-dot-claude'; return 0 ;;
-    esac
-    if [ -d "$_root/vco_lib" ] && [ -d "$_root/.claude" ]; then
-        printf -- '--index-dot-claude'
-    else
-        printf -- '--no-index-dot-claude'
-    fi
-}
-
-# Stale-lock breaker (v0.2.73 I/O-audit HIGH-1; PID-based per Stage-1 SEV-2 #3).
-# The per-root lock below is a lock-DIR released only inside the detached
-# analyzer's `_snip` (rm -rf "$_lock"). If that detached process dies before the
-# release — SIGKILL, OOM, ENOSPC (the exact disk-full condition this effort
-# targets), or a reboot — the lock LEAKS and the `mkdir` acquire fails forever,
-# freezing that root's code graph silently.
-# LIVENESS, not time: the `_snip` writes its PID into the lock dir BEFORE the
-# run. A first full pass on a slow embedder can legitimately exceed 30 min, so a
-# pure mtime breaker would delete a LIVE lock and launch a SECOND concurrent
-# analyzer on the same collection (the exact write-amplification FIX-B kills).
-# So: break a lock ONLY when its recorded PID is no longer alive (`kill -0`
-# fails). Fall back to the 30-min mtime bound ONLY when the PID file is absent
-# (a lock from an older drain that predates this PID-stamping, or a partial
-# acquire). Soft-fail throughout.
-for _stale in "$STATE_DIR"/codegraph_drain_root_*.lock; do
-    [ -d "$_stale" ] || continue
-    _stale_pid=""
-    [ -f "$_stale/pid" ] && _stale_pid="$(cat "$_stale/pid" 2>/dev/null)"
-    case "$_stale_pid" in
-        ''|*[!0-9]*)
-            # No/invalid PID → fall back to the mtime bound (>30 min ⇒ break).
-            if command -v find >/dev/null 2>&1; then
-                find "$_stale" -maxdepth 0 -mmin +30 -exec rm -rf {} + 2>/dev/null || true
-            fi
-            ;;
-        *)
-            # Recorded PID: break ONLY if it is no longer alive. A live long run
-            # (kill -0 succeeds) keeps its lock regardless of age.
-            if ! kill -0 "$_stale_pid" 2>/dev/null; then
-                rm -rf "$_stale" 2>/dev/null || true
-            fi
-            ;;
-    esac
-done
-
-# Run one analyzer batch per canonical root, serialized per-root.
-for _pf in "$BATCH_DIR"/*.paths; do
-    [ -e "$_pf" ] || continue
-    _h="$(basename "$_pf" .paths)"
-    _canon="${_ROOT_FOR_HASH[$_h]:-$PROJECT_ROOT}"
-    _project="$(_drain_resolve_project "$_canon")"
-    _dot_flag="$(_drain_index_dot_claude "$_canon")"
-
-    # Per-canonical-root serialization: atomic mkdir lock. If held, a prior
-    # drain for THIS root is still running → skip this batch and put its paths
-    # back on the queue for the next drain (never lose them).
-    _lock="$STATE_DIR/codegraph_drain_root_${_h}.lock"
-    if ! mkdir "$_lock" 2>/dev/null; then
-        cat "$_pf" >> "$QUEUE" 2>/dev/null || true
-        continue
-    fi
-
-    # Persist the batch's path list to a stable file the analyzer reads (the
-    # BATCH_DIR is removed after dispatch, so copy it out).
-    _list="$STATE_DIR/codegraph_drain_list_${_h}.txt"
-    cp "$_pf" "$_list" 2>/dev/null || cat "$_pf" > "$_list" 2>/dev/null || true
-
-    # Detached background run: hold the per-root lock for the WHOLE analyzer
-    # run so a later drain for the same root serializes behind it, then release.
-    # Write the detached shell's PID into the lock dir FIRST (`$$` inside the
-    # `sh -c` subshell) so the stale-lock breaker (above) can tell a LIVE long
-    # run from a DEAD holder via `kill -0` — a slow-but-healthy full pass keeps
-    # its lock past 30 min instead of being broken into a 2nd concurrent run
-    # (Stage-1 SEV-2 #3).
-    #
-    # NB-H5 (v0.2.102 fix-round 2): every path travels as a POSITIONAL
-    # PARAMETER, exactly like the extras spawns above — interpolating
-    # "$_canon" & co. into the sh -c string re-parsed `$`, backticks and `"`
-    # in a canonical root. $6 is the dot-claude flag (one fixed token from
-    # _drain_index_dot_claude) and stays UNQUOTED so an empty value disappears
-    # instead of reaching the analyzer as an empty argument.
-    # shellcheck disable=SC2086
-    _drain_spawn_detached 'printf "%s" "$$" > "$0/pid" 2>/dev/null; "$1" "$2" "$3" --project "$4" --only-files-from "$5" --canonical-source "$3" $6 >/dev/null 2>&1; rm -f "$5" 2>/dev/null; rm -rf "$0" 2>/dev/null' \
-        "$_lock" "$ANALYZER_PY" "$ANALYZER" "$_canon" "$_project" "$_list" "$_dot_flag"
-done
-
-# Record the drain timestamp (rate-limit clock) + clean up.
-printf '%s' "$NOW" > "$LAST_TS_FILE" 2>/dev/null || true
-rm -rf "$BATCH_DIR" 2>/dev/null || true
-rm -f "$CONSUMED" 2>/dev/null || true
 
 exit 0

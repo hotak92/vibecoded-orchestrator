@@ -4,10 +4,14 @@
 # parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 # pre-compact-save.ps1
 # Fires BEFORE every context compaction (PreCompact event, matcher "*" --
 # v0.2.102 W6-D widened it from "auto": the vendor hooks doc gives PreCompact
@@ -34,7 +38,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # (including session_id and transcript_path) via stdin JSON; CLAUDE_*
 # env vars are NOT populated by Claude Code (verified 2026-05-08).
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { $HookStdin = "{}" }
 
 $SessionId = ""

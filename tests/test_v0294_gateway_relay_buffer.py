@@ -162,7 +162,11 @@ class ChunkedVendorJsonRelayTests(GatewayTestBase):
         body = await resp.read()
         payload = json.loads(body)
         self.assertEqual(len(payload["content"]), 2)
-        self.assertEqual(payload["content"][0]["id"], "srvtoolu_vct_call_abc123")
+        # v0.2.107 GW-1: a vendor server-side tool block reaches the client
+        # as a text note (the next route cannot accept it); this test pins
+        # only that the chunked body arrives WHOLE, in that converted shape.
+        self.assertEqual(payload["content"][0]["type"], "text")
+        self.assertIn("web_search", payload["content"][0]["text"])
         self.assertEqual(payload["content"][1]["text"], "y" * 64)
         self.assertEqual(
             resp.headers.get("Content-Length"), str(len(body)),

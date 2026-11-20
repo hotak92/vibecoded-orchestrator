@@ -22,7 +22,8 @@
 # KNOWN MISSES (identical to the .sh sibling -- read its header for the
 # reasoning): interpreter-internal writes (`python - <<EOF ... open(p,'w')`)
 # are recovered for knowledge/ and docs/ by a bounded watermarked mtime
-# scan and are a REAL MISS for code files; a relative path written after an
+# scan; code files reach the code graph through their commit (v0.2.107
+# CG-3), not through this hook; a relative path written after an
 # unresolvable `cd` is dropped rather than guessed.
 #
 # That scan runs only when the parser found nothing AND the command text
@@ -35,10 +36,14 @@
 # Always exits 0 and never writes to plain stdout.
 
 # Scrub sensitive env vars before any subprocess spawning
+# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
+}
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+. "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
@@ -70,7 +75,7 @@ if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # --- Hook input -----------------------------------------------------------
 $HookStdin = ""
-try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+try { $HookStdin = Read-VcoHookStdin } catch { }
 if (-not $HookStdin) { exit 0 }
 
 $ToolName = ""

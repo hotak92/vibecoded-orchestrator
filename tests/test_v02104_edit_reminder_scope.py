@@ -93,9 +93,10 @@ def _reminder(proj: Path) -> str:
     return f.read_text() if f.exists() else ""
 
 
-def _drain(proj: Path) -> str:
-    f = proj / ".claude" / "state" / f"codegraph_drain_{SID}.txt"
-    return f.read_text() if f.exists() else ""
+def _queued(proj: Path) -> list:
+    """v0.2.107 (CG-3): no edit queues anything for the code graph."""
+    state = proj / ".claude" / "state"
+    return sorted(p.name for p in state.glob("codegraph_drain_*")) if state.exists() else []
 
 
 def _check_three_arms(tmp_path: Path, argv: list[str]) -> None:
@@ -110,7 +111,7 @@ def _check_three_arms(tmp_path: Path, argv: list[str]) -> None:
     assert str(in_proj) not in _reminder(proj), (
         "a subagent's edit must never land in the main session's reminder"
     )
-    assert str(in_proj) in _drain(proj), "a subagent's edit must still reach the code-graph queue"
+    assert _queued(proj) == [], "an edit never queues anything for the code graph (CG-3)"
 
     # Main-agent edit outside the project (scratch dir): NOT listed.
     r = _run(argv, _edit_payload(outside), env)
@@ -150,7 +151,7 @@ def _check_bash_write(tmp_path: Path, argv: list[str]) -> None:
     cmd = f"printf 'z = 3\\n' > '{target}'"
     r = _run(argv, _bash_payload(cmd, agent_id="lane9"), env)
     assert r.returncode == 0, r.stderr
-    assert str(target) in _drain(proj), "precondition: the CLI write was routed"
+    assert _queued(proj) == [], "an edit never queues anything for the code graph (CG-3)"
     assert str(target) not in _reminder(proj)
     r = _run(argv, _bash_payload(cmd), env)
     assert r.returncode == 0, r.stderr

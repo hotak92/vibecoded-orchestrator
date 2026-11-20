@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from vco_lib import codegraph_resync as _cr
+from vco_lib.codegraph_cursor import iter_class as _iter_class
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,10 @@ def prune_orphan_interactions(
             pass
         candidates: list = []
         try:
-            for obj in coll.iterator(return_properties=read_props):
+            for obj in _iter_class(
+                coll, "codegraph_source_purge.prune_orphan_interactions",
+                return_properties=read_props,
+            ):
                 props = getattr(obj, "properties", None) or {}
                 if _cr.is_provable_codegraph_orphan(
                     coll, str(obj.uuid), props,
@@ -178,6 +182,10 @@ def prune_orphan_interactions(
     return out
 
 
+#: Rows of one filtered page the source count re-checks exactly (CG-1).
+_SOURCE_COUNT_PAGE = 64
+
+
 def count_rows_for_project_source(
     project_name: str,
     source: str,
@@ -191,13 +199,15 @@ def count_rows_for_project_source(
     carry ``project_source == source`` (EXACT string, compared in Python).
 
     The missing-extra-folder detection asks this ("an enabled extra has 0
-    rows of its own in the prefix"). Cheap filtered aggregate first
-    (``project_source`` is TEXT — an ``equal`` filter matches on the token
-    set, so a pathological sibling path could over-count, never under-count;
-    the exact per-row compare below is the fallback when the filter cannot
-    run). Returns ``None`` when undeterminable — the caller must NOT read
-    that as zero (a false "0 rows" would trigger an unnecessary re-sync; a
-    false positive merely skips one).
+    rows of its own in the prefix"), and both callers only distinguish zero
+    from non-zero. v0.2.107 CG-1: no filtered Aggregate — one bounded page of
+    filtered rows carrying ``project_source`` only. ``project_source`` is TEXT,
+    so the ``equal`` filter matches on the token set: the page is re-checked
+    with the exact string compare. An empty page is a zero; an exact match on
+    the page is a positive (its count is a lower bound, never an over-count).
+    Only a full page with no exact match (a pathological token sibling) or a
+    failed read falls through to the exact per-row compare over the class.
+    Returns ``None`` when undeterminable — never a false zero.
     """
     src = str(source or "").strip()
     if not project_name or not src:
@@ -220,13 +230,17 @@ def count_rows_for_project_source(
             try:
                 from weaviate.classes.query import Filter
 
-                agg = coll.aggregate.over_all(
+                page = list(getattr(coll.query.fetch_objects(
                     filters=Filter.by_property("project_source").equal(src),
-                    total_count=True,
+                    limit=_SOURCE_COUNT_PAGE, return_properties=["project_source"],
+                ), "objects", None) or [])
+                exact = sum(
+                    1 for obj in page
+                    if str((getattr(obj, "properties", None) or {})
+                           .get("project_source") or "").strip() == src
                 )
-                _tc = getattr(agg, "total_count", None)
-                if _tc is not None:
-                    n = int(_tc)
+                if exact or len(page) < _SOURCE_COUNT_PAGE:
+                    n = exact
             except Exception:  # noqa: BLE001 — fall to the exact scan
                 n = None
             if n is None:
@@ -234,7 +248,8 @@ def count_rows_for_project_source(
                 # same one every delete here follows).
                 try:
                     n = sum(
-                        1 for obj in coll.iterator(
+                        1 for obj in _iter_class(
+                            coll, "codegraph_source_purge.count_rows_for_project_source",
                             return_properties=["project_source"])
                         if str((getattr(obj, "properties", None) or {})
                                .get("project_source") or "").strip() == src

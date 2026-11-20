@@ -49,6 +49,9 @@ if str(REPO_ROOT) not in sys.path:
 from vco_lib.rl_trainability_thresholds import (  # noqa: E402
     TRAINABILITY_THRESHOLDS,
 )
+# A-014: a stored vector is a JSON array (older rows) or a compact "f16:"
+# string; both count as present.
+from vco_lib.rl_vector_codec import sql_vector_present  # noqa: E402
 
 
 def _resolve_db_path(override: str | None) -> Path | None:
@@ -140,10 +143,8 @@ def _compute_metrics(conn: sqlite3.Connection) -> dict[str, float]:
         row = conn.execute(
             """
             SELECT
-              SUM(CASE WHEN (json_extract(node.value, '$.emb') IS NOT NULL
-                             AND json_array_length(json_extract(node.value, '$.emb')) > 0)
-                         OR (json_extract(node.value, '$.n_emb') IS NOT NULL
-                             AND json_array_length(json_extract(node.value, '$.n_emb')) > 0)
+              SUM(CASE WHEN """ + sql_vector_present("node.value", "$.emb") + """
+                         OR """ + sql_vector_present("node.value", "$.n_emb") + """
                        THEN 1 ELSE 0 END) AS with_emb,
               COUNT(*) AS total
             FROM rl_events,
@@ -164,8 +165,7 @@ def _compute_metrics(conn: sqlite3.Connection) -> dict[str, float]:
         row = conn.execute(
             """
             SELECT
-              SUM(CASE WHEN json_extract(payload_json, '$.query_emb') IS NOT NULL
-                        AND json_array_length(json_extract(payload_json, '$.query_emb')) > 0
+              SUM(CASE WHEN """ + sql_vector_present("payload_json", "$.query_emb") + """
                        THEN 1 ELSE 0 END) AS with_emb,
               COUNT(*) AS total
             FROM rl_events

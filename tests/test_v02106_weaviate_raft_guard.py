@@ -237,6 +237,11 @@ def _check(box: Runtime, **kw) -> rg.UpgradeVerdict:
     kw.setdefault("ref", "vco_weaviate")
     kw.setdefault("target_image", NEW_IMAGE)
     kw.setdefault("data_mount", None)
+    # v0.2.107: a recreate that changes a live container's version is made
+    # only by vco_lib.container_upgrade's protected move, so the snapshot
+    # below is reached only from there (protected_move=True). The refusal
+    # every other caller gets is pinned in tests/test_v02107_container_upgrade.py.
+    kw.setdefault("protected_move", True)
     return rg.upgrade_check(runtime="podman", run=box.run, **kw)
 
 
@@ -416,11 +421,11 @@ def wv_world(tmp_path):
     return infra, db, data, live
 
 
-def _guard(box: Runtime, infra: Path, db: Path):
+def _guard(box: Runtime, infra: Path, db: Path, *, protected_move: bool = False):
     rows = se.load_rows(db)
     return di.guard_recreate("weaviate", runtime="podman", infra_dir=infra,
                              compose_argv=["podman", "compose"], row=rows["weaviate"],
-                             rows=rows, db_path=db, run=box.run)
+                             rows=rows, db_path=db, run=box.run, protected_move=protected_move)
 
 
 def test_guard_recreate_takes_the_snapshot_before_a_move(wv_world, one_off):
@@ -428,7 +433,7 @@ def test_guard_recreate_takes_the_snapshot_before_a_move(wv_world, one_off):
     one_off((4, 4))
     box = Runtime(live_mount=live)
     box.compose_source = str(data)
-    g = _guard(box, infra, db)
+    g = _guard(box, infra, db, protected_move=True)   # the protected move's own guard call
     assert g.verdict == di.PRESERVES, g.reason
     assert "stop vco_weaviate" in box.verbs() and box.verbs()[-1] == "start vco_weaviate"
 
@@ -521,7 +526,9 @@ def test_prepare_for_compose_reads_the_live_container_and_the_pin(wv_world, one_
     one_off((5, 5))
     box = Runtime(live_mount=live)
     v = rg.prepare_for_compose(infra.parent, runtime="podman", run=box.run)
-    assert v.status == rg.PREPARED  # 1.28.4 live, 1.37.18 pinned → snapshot taken
+    # 1.28.4 live, 1.37.18 pinned: the launcher's volume migration would change
+    # the version — v0.2.107: refused, nothing stopped (the protected move does it)
+    assert v.status == rg.VERSION_MOVE and not v.ok and box.verbs() == []
     refused = rg.prepare_for_compose(
         infra.parent, runtime="podman",
         run=Runtime(live_mount=live, image="docker.io/semitechnologies/weaviate:latest").run)
@@ -1015,10 +1022,15 @@ def test_read_mem_cap_reads_hostconfig_memory():
 def test_every_new_condition_is_registered_with_its_lifecycle():
     from vco_lib import deferral_probes, deferral_registry
 
-    for cid, probe in ((rg.CID_INDEX_MISSING, "weaviate_collection_index_still_missing"),
-                       (rg.CID_REPLAY_EXPOSED, "weaviate_raft_replay_still_exposed"),
-                       (rg.CID_UNCAPPED, "weaviate_container_still_uncapped")):
-        assert deferral_registry.disposition_for(cid) == "action_required"
+    # v0.2.107: the uncapped container is environmental — VCO now applies the
+    # limit itself (its own container through compose, a foreign one in place
+    # at every ensure-containers), so the entry describes a machine where the
+    # user switched that off or the engine refused, not a to-do.
+    for cid, probe, cls in (
+            (rg.CID_INDEX_MISSING, "weaviate_collection_index_still_missing", "action_required"),
+            (rg.CID_REPLAY_EXPOSED, "weaviate_raft_replay_still_exposed", "action_required"),
+            (rg.CID_UNCAPPED, "weaviate_container_still_uncapped", "environmental")):
+        assert deferral_registry.disposition_for(cid) == cls
         assert probe in deferral_probes.PROBES
     assert deferral_registry.disposition_for(rg.CID_UPGRADE_REFUSED) == "action_required"
     assert deferral_registry.disposition_for(

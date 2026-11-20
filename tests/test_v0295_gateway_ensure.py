@@ -48,6 +48,8 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.delenv("VCT_MODEL_GATEWAY_SECRET_PROJECT", raising=False)
     # No real init tool is ever reachable from this suite.
     monkeypatch.setattr(bs.shutil, "which", lambda name: None)
+    # a recorded start runs no daemon: do not hold the ensure lock waiting for one
+    monkeypatch.setattr(ge, "GATEWAY_SETTLE_S", 0)
     return home, state
 
 

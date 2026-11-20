@@ -54,15 +54,25 @@ class FakeObj:
 
 
 class FakeClient:
-    """Records every collection a near_vector query was issued against."""
+    """Records every collection a near_vector query was issued against.
 
-    def __init__(self, queried: list) -> None:
+    ``behaviour`` (v0.2.107 HR-1) maps a collection name to ``"fail"`` (its
+    query raises, the collection exists), ``"missing"`` (its query raises and
+    ``collections.exists`` answers False) or ``"empty"`` (it answers with no
+    rows); any other collection answers with two rows.
+    """
+
+    def __init__(self, queried: list, behaviour: "dict | None" = None) -> None:
         self.queried = queried
+        self.behaviour = dict(behaviour or {})
         client = self
 
         class _Colls:
             def get(self, name):
                 return _Coll(name, client)
+
+            def exists(self, name):
+                return client.behaviour.get(name) != "missing"
 
         self.collections = _Colls()
 
@@ -78,6 +88,11 @@ class _Coll:
         class _Q:
             def near_vector(self, **kw):
                 client.queried.append(coll.name)
+                mode = client.behaviour.get(coll.name)
+                if mode in ("fail", "missing"):
+                    raise RuntimeError(f"fake query failure on {coll.name}")
+                if mode == "empty":
+                    return SimpleNamespace(objects=[])
                 return SimpleNamespace(
                     objects=[
                         FakeObj(f"{coll.name}-node-a", coll.name, 0.10),
@@ -159,7 +174,8 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
         # (kg_search / hook_injection / …); the fake accepts and ignores it.
         return list(ACTIVE_VEC), ACTIVE_SLOT
 
-    patch(srv, "get_weaviate_client", lambda *a, **k: FakeClient(queried))
+    behaviour = dict(cfg.get("collection_behaviour") or {})
+    patch(srv, "get_weaviate_client", lambda *a, **k: FakeClient(queried, behaviour))
     patch(srv, "_get_search_vector", _search_vector)
     patch(
         srv,
@@ -173,7 +189,11 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
             "chunk_number": 0,
         },
     )
-    patch(srv, "_enrich_with_adjacent_chunks", lambda coll, formatted, name: formatted)
+    def _adjacent(coll, formatted, name, **kwargs):
+        state.setdefault("neighbour_floors", []).append(kwargs.get("min_score"))
+        return formatted
+
+    patch(srv, "_enrich_with_adjacent_chunks", _adjacent)
     patch(srv, "_extract_obj_vector", lambda obj, slot: obj.vector.get(slot))
     patch(srv, "_get_result_verbosity_by_score", lambda score: "discard")
     patch(srv, "_rl_enrich_nodes_with_linked_embs", _fake_enrich(state))
@@ -269,9 +289,12 @@ def import_rl_kg_search():
 
 
 def run_main(mod, query: str = "dual log query", limit: int = 1,
-             task_type: str = "pre_edit_kg_search") -> None:
+             task_type: str = "pre_edit_kg_search",
+             injection_profile: str | None = None) -> None:
     saved = sys.argv
     sys.argv = ["rl_kg_search.py", query, "--limit", str(limit), "--hook-format"]
+    if injection_profile:
+        sys.argv += ["--injection-profile", injection_profile]
     if task_type:
         sys.argv += ["--task-type", task_type]
     try:

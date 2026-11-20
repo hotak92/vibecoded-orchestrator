@@ -50,6 +50,8 @@ def test_readable_counts_keep_the_existing_branches():
 
 
 def test_counter_reports_none_not_zero_when_weaviate_is_unreachable():
-    with mock.patch.object(weaviate_helpers, "connect_v4", side_effect=OSError("down")):
-        assert weaviate_helpers.count_objects_v4_or_none(NAME) is None
+    # v0.2.107: the classifier counts through the ONE count helper (the
+    # server's Aggregate), no longer by listing the class.
+    with mock.patch.object(weaviate_helpers, "http_request", side_effect=OSError("down")):
+        assert weaviate_helpers.http_count_objects(NAME) is None
         assert project_init._count_objects(NAME) is None

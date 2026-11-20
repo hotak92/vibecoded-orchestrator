@@ -477,8 +477,18 @@ def test_subagent_start_names_the_reservation(flavour: str, pr, hub: _Hub) -> No
 
 
 def _stop(flavour: str, p: Path, agent_id: str, env: dict) -> None:
+    """The agent's final stop, 8 idle days, then the next session's start:
+    SubagentStop only marks an unchanged worktree a reap candidate (v0.2.107
+    REAP-INTERIM); session-worktree-reap removes it at a SessionStart once
+    it has been idle for 7 days (owner 2026-11-20)."""
     proc = _hook("subagent-stop-reconcile", flavour,
                  {"hook_event_name": "SubagentStop", "agent_id": agent_id, "session_id": "s"}, p, env)
+    assert proc.returncode == 0, proc.stderr
+    old = time.time() - 8 * 86400
+    for rec in (p / ".claude" / "state" / "worktree-guard").glob("wt-*.json"):
+        os.utime(rec, (old, old))
+    proc = _hook("session-worktree-reap", flavour,
+                 {"hook_event_name": "SessionStart", "session_id": "s-next", "source": "startup"}, p, env)
     assert proc.returncode == 0, proc.stderr
 
 
@@ -575,14 +585,15 @@ def test_worktree_add_is_never_time_bounded(pr, monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.parametrize("os_name", ["linux", "windows"])
-def test_worktree_create_registration_has_no_explicit_timeout(os_name: str) -> None:
-    """A1: the guard's WorktreeCreate registration carries no `timeout`, so
-    the harness default (600 s) applies rather than a VCO-chosen kill."""
+def test_worktree_create_registration_never_cuts_below_the_harness_default(os_name: str) -> None:
+    """A1: the guard's WorktreeCreate registration is never cut below the
+    harness default (600 s) by a VCO-chosen kill; since v0.2.107 it states
+    that default explicitly."""
     doc = json.loads((REPO_ROOT / "templates" / f"settings.json.{os_name}.template")
                      .read_text(encoding="utf-8"))
     guards = [h for g in doc["hooks"]["WorktreeCreate"] for h in g["hooks"]
               if "worktree-guard" in h.get("command", "")]
-    assert len(guards) == 1 and "timeout" not in guards[0], guards
+    assert len(guards) == 1 and guards[0].get("timeout", 0) >= 600, guards
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)

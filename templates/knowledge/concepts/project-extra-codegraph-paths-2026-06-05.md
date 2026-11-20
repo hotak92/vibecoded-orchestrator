@@ -10,7 +10,7 @@ tags:
   - hub-resolver
   - low-level-implementation
 created: 2026-06-05T00:00:00Z
-updated: 2026-10-30T00:00:00Z
+updated: 2026-11-19T00:00:00Z
 status: active
 ---
 
@@ -45,7 +45,7 @@ Four surfaces co-evolve:
 | Launcher (Tauri) | `commands::project_codegraph_extras` | 6 commands: list / add / remove / set_enabled / sync / reindex. Per-project mutex serialises add→reindex sequences. Disambiguation response when path is an existing launcher project |
 | Hub resolver | `code_graph_extra_paths: Vec<{path, enabled, last_indexed_commit}>` on `/api/v1/projects/{id}/config` | Additive field; older clients ignore. Only enabled rows projected |
 | GUI (Svelte) | `ExtraCodegraphPathsPanel.svelte` + `ExtrasDisambiguationModal` + `ExtrasSyncProgressModal` | Per-row sync/disable/remove. Auto-sync on add. Remove/disable purges that folder's rows (see below). Hide-to-pill on long syncs |
-| Hooks | `post-file-edit` → `_lib/route-touched-path.sh` (+ `.ps1`) queues; `stop-codegraph-drain.sh` (+ `.ps1`) drains | A code edit under an enabled code folder goes to that folder's own drain queue (never the primary queue); the Stop hook drains it as a scoped run into the CURRENT project's prefix, and periodically re-indexes folders whose HEAD moved. `code-graph-incremental.sh` keeps the first-match ordering below but ships unregistered |
+| Hooks | `stop-codegraph-drain.sh` (+ `.ps1`) → `vco_lib.codegraph_extras_refresh` | Since v0.2.107 an edit queues nothing: an enabled code folder is re-indexed into the CURRENT project's prefix when ITS HEAD moves (commit-range refresh, throttled per folder). A folder that is not a git repository is updated by its Sync button only. `_lib/route-touched-path.sh` (+ `.ps1`) reads the enabled-folder list only to list such edits in the end-of-turn reminder |
 | Analyzer CLI | `--extra-path <DIR>` (repeatable) + `--since-commit <SHA>` | Walks all source roots in ONE pass; `visited_uuids` is the UNION across primary repo + all extras. Schema adds `project_source` property to all 5 code collections |
 
 ## The critical invariant
@@ -107,28 +107,12 @@ path primitives):
 The hub resolver returns the canonical form so hooks can substring-match
 against `EDITED_FILE` directly.
 
-## Hook ordering
+## Hook ordering (retired)
 
-Live scheduling is the queue + Stop-hook drain in the Architecture table.
-The standalone `code-graph-incremental.sh` (and `.ps1`), unregistered since
-its scheduling moved to `stop-codegraph-drain.sh`, checks in this order,
-**first match wins**:
-
-1. **Own-repo fast path** — edit under current `$REPO_PATH` → no override
-   (also avoids one hub RTT per Edit in the common case)
-2. **Extras of current project** — query hub resolver for
-   `code_graph_extra_paths`; if `$EDITED_FILE` is under any enabled
-   path, set `REPO_PATH=<extra>`, keep `PROJECT_NAME`
-3. **Sibling project** — existing `detect-project.sh` behaviour
-4. **None match** — graceful no-op
-
-`EXTRAS_MATCHED=1` skips the subsequent sibling-detection block so an
-extras-claimed file doesn't get re-routed to a sibling project's
-codegraph.
-
-Older hub binaries that lack the field → resolver exits 4 ("field not found")
-→ `EXTRAS_LIST` stays empty → no-op fall-through to sibling detection.
-Backwards-compatible by construction.
+The per-edit routing that decided "own repo / extra folder / sibling project"
+for every edit (the queue + Stop drain, and the standalone
+`code-graph-incremental.sh`) was retired in v0.2.107: the code graph follows
+commits, so an extra folder is re-indexed by its own HEAD moves.
 
 ## What's NOT in scope
 
@@ -180,15 +164,12 @@ Every transition records to `audit_log`:
 - `templates/hooks/_lib/route-touched-path.sh` / `.ps1`, `templates/hooks/stop-codegraph-drain.sh` / `.ps1`, `vco_lib/codegraph_extras_refresh.py`
 - `templates/scripts/analyze_code_graph.py` (+ `.claude/scripts/` mirror)
 - `templates/scripts/vct_project_config.sh` / `.ps1` (+ `.claude/scripts/` mirrors)
-- `templates/hooks/code-graph-incremental.sh` / `.ps1` (+ `.claude/hooks/` mirrors)
 - `vco_lib/project_config.py` (Python resolver client field)
 
 ## Tests
 
 - `tests/test_analyze_code_graph_extras.py` — 12 tests, including the
   critical-invariant lock-in `test_visited_uuids_is_single_shared_set`
-- `tests/test_code_graph_incremental_hook.sh` — 11 tests, all 4 ordering
-  branches + older-hub fallback
 - `tests/test_vct_project_config_extras.sh` — 9 tests, bash resolver
   `--field code_graph_extra_paths` rendering
 - `tests/test_project_config.py::CodeGraphExtraPathsTest` — 8 tests,

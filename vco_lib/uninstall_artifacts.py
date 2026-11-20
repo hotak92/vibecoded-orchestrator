@@ -20,6 +20,11 @@ the clone (review V02103-FINAL2 M-1):
   script and by the launcher's ``desktop_shortcut.rs``;
 * state files this cycle added under the VCO state root:
   ``state/engine-start.lock`` (``container_engine_start``),
+  ``state/ensure-{hub,gateway,launcher}.lock`` (``ensure_lock``),
+  ``state/launcher-instance.{lock,ready}`` (the launcher's
+  ``instance_lock.rs``), the MCP servers' heartbeat records
+  ``run/mcp/*.json`` (``mcp_stdio_lifetime.heartbeat_dir``; the emptied
+  ``run/mcp`` and ``run`` folders are pruned),
   ``state/codegraph-walk-claims/*.lock`` and their ``*.holder`` sidecars
   (``codegraph_walk``),
   ``model-guidance.json`` (``model_selection``) and the engine starter's log
@@ -69,6 +74,12 @@ WINDOWS_LAUNCHER_EXES = ("vct-launcher.exe", "vct-hub.exe", "vct-updater.exe")
 #: ``first-install.bat`` ``DEST_DIR=%LOCALAPPDATA%\\vct-launcher``.
 WINDOWS_LAUNCHER_DIRNAME = "vct-launcher"
 LNK_NAME = f"{LAUNCHER_PRODUCT_NAME}.lnk"
+#: The launcher's single-instance lock and its "ready" marker under
+#: ``<vct_root>/state/`` (v0.2.107). Must match ``LOCK_BASENAME`` /
+#: ``READY_BASENAME`` in ``launcher/src-tauri/src/instance_lock.rs`` (the Rust
+#: launcher takes the lock before any interpreter is available, so the names
+#: are mirrored; tests/test_v02103_uninstall_artifacts.py pins the parity).
+LAUNCHER_INSTANCE_FILES = ("launcher-instance.lock", "launcher-instance.ready")
 DESKTOP_ENTRY_NAME = "vct-launcher.desktop"
 APP_BUNDLE_NAME = f"{LAUNCHER_PRODUCT_NAME}.app"
 
@@ -270,6 +281,13 @@ def _plan_state_files(plan: Plan, vct_root: Path) -> None:
     """VCO state files added this cycle (every OS) — exact names only."""
     state = vct_root / "state"
     _add_file(plan, state / "engine-start.lock", "container-engine start lock", vct_root)
+    # the names have ONE home (review R34-4 posture: imported, not re-typed)
+    from vco_lib.ensure_lock import SERVICES, ensure_lock_path
+
+    for service in SERVICES:
+        _add_file(plan, ensure_lock_path(service, vct_root), f"{service} ensure lock", vct_root)
+    for basename in LAUNCHER_INSTANCE_FILES:
+        _add_file(plan, state / basename, "launcher single-instance lock", vct_root)
     claims = state / "codegraph-walk-claims"
     if claims.is_dir() and _through_real_dirs(claims / "x", vct_root):
         for lock in sorted(claims.glob("*.lock")):
@@ -281,6 +299,17 @@ def _plan_state_files(plan: Plan, vct_root: Path) -> None:
         plan.keep.append((claims, "code-graph walk claims behind a symlink or junction — not followed"))
     plan.prune_if_empty.append(state)
     _add_file(plan, vct_root / "model-guidance.json", "model-guidance record", vct_root)
+    # MCP liveness heartbeats (v0.2.107): the directory has ONE home
+    from vco_lib.mcp_stdio_lifetime import heartbeat_dir
+
+    beats = heartbeat_dir(vct_root)
+    if beats.is_dir() and _through_real_dirs(beats / "x", vct_root):
+        for record in sorted(beats.glob("*.json")):
+            _add_file(plan, record, "MCP server heartbeat record", vct_root)
+        plan.prune_if_empty.append(beats)
+        plan.prune_if_empty.append(beats.parent)
+    elif beats.is_dir():
+        plan.keep.append((beats, "MCP heartbeat records behind a symlink or junction — not followed"))
     logs = vct_root / "logs"
     # the two log names have ONE home; imported here, not at module load, so
     # the uninstaller does not pull in the container stack (review R34-4)

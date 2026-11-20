@@ -4,7 +4,8 @@
 # Before this file the same extension alternation was written out in
 # pre-edit-context-inject.sh, pre-bash-context-inject.sh (indirectly, via
 # codegraph-query.sh), post-file-edit.sh, pre-tool-use.sh,
-# code-graph-incremental.sh and stop-codegraph-drain.sh — a C-tier mirror
+# code-graph-incremental.sh and stop-codegraph-drain.sh (both mirrors retired
+# since) — a C-tier mirror
 # per consumer, each with a "MUST MATCH the other two" comment that could
 # only ever be enforced by a human reading all of them. Lane F10 added a
 # further consumer (the Bash-write routing), which is the point at which
@@ -18,10 +19,11 @@
 # command-noise-strip mirrors were retired with those code paths.
 #
 # Consumers that source this file use `$VCO_CODE_EXT_RE` /
-# `vco_is_code_file`. The remaining mirrors (code-graph-incremental,
-# stop-codegraph-drain) are pinned to this literal by
-# tests/test_v0295_code_extension_one_home.py, so a drift is a RED test
-# rather than a silent divergence.
+# `vco_is_code_file`. The one remaining mirror — the HEAD catch-up's Python
+# filter (vco_lib/codegraph_head_catchup.CODE_RE; the code-graph-incremental
+# and Stop-drain shell mirrors were retired in v0.2.107) — is pinned to this
+# literal by tests/test_v0295_code_extension_one_home.py, so a drift is a RED
+# test rather than a silent divergence.
 #
 # The decision this encodes: which file extensions the code graph
 # analyses. Adding a language means editing THIS line and the ratchet

@@ -471,8 +471,16 @@ relaunch). The same module
 owns the Windows pre-pull rename, its **non-clobbering** revert, and the
 at-rest reconcile.
 
-Two invariants worth keeping:
+Three invariants worth keeping:
 
+- **A canonical binary path is never left empty** (v0.2.107). Right after the
+  git operation, before install.py, `refill_canonical_from_backup` copies the
+  `<name>.old-<pid>` backup back to every canonical path the pull did not
+  write; a path the pull wrote is left alone. If the launcher dies before
+  that, the boot sweep, the session-start hub/launcher resolver
+  (`vco_lib.hub_ensure.find_dist_binary`) and `start-launcher.bat` rename a
+  dead pid's backup back when its canonical file is missing, instead of
+  deleting it.
 - **An abort never blind-restores.** `revert_pre_pull_rename` hash-compares the
   `<name>.old-<pid>` backup against the canonical path and keeps the canonical
   bytes when they differ (the pull already landed a newer binary there). Both

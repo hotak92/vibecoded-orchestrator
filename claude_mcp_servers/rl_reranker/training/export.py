@@ -49,6 +49,8 @@ from typing import Any, Iterable, Iterator, Optional
 
 import numpy as np
 
+from vco_lib.rl_vector_codec import decode_event_vectors
+
 from ..offline_trainer import citation_targets
 from ..rl_model import (  # noqa: F401 — TYPE_CODE_OTHER / type_code re-exported
     MAX_LINKED,
@@ -517,8 +519,9 @@ def export_project(
             w.drops["retrieval_arctic_before_prefix_fix"] += 1
             continue
         try:
-            payload = json.loads(payload_json)
-        except (TypeError, ValueError):
+            # A-014: stored vectors may be in their compact half-float form.
+            payload = decode_event_vectors(json.loads(payload_json))
+        except (TypeError, ValueError, AttributeError):
             w.drops["retrieval_unparseable"] += 1
             continue
         q_raw = payload.get("query_emb")

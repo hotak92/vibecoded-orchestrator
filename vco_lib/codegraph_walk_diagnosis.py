@@ -204,7 +204,13 @@ def root_incremental_gate(collection: Any, root: object, *,
                 filters=Filter.by_property("project_source").equal(extra_stamp), limit=1,
             ).objects
         else:
-            found = collection.query.fetch_objects(limit=1).objects
+            # v0.2.107 (CG-2): the shared cursor, one row. "No row" on a class
+            # that is not confirmed empty raises -> the "could not tell" arm.
+            from vco_lib.codegraph_cursor import iter_class  # noqa: PLC0415
+
+            found = any(True for _ in iter_class(
+                collection, "codegraph_walk_diagnosis.root_incremental_gate",
+                return_properties=[], page_size=1))
     except Exception as exc:  # noqa: BLE001 — unknown is not empty
         print(f"{TAG} incremental: could not tell whether {root} was indexed before "
               f"({exc}); keeping the changed-files gate", file=sys.stderr, flush=True)

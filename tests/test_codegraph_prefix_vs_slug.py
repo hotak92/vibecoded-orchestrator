@@ -138,138 +138,34 @@ class WeaviateMcpServerPrefixContract(unittest.TestCase):
 
 
 class HookResolverFieldContract(unittest.TestCase):
-    """Pin the bash hooks to ask the resolver for code_graph_collection_prefix."""
+    """No shipped hook resolves a code-graph write target from the slug alias.
 
-    # v0.2.73 (FIX-B): post-file-edit no longer resolves the code-graph
-    # collection prefix — the per-edit code-graph sync moved to the end-of-turn
-    # batched drain (stop-codegraph-drain.sh), which now owns the per-canonical-
-    # root prefix resolution. The incremental hook still resolves it (GUI
-    # reanalyze / direct invocation path). So the code-graph write-target
-    # resolvers to pin are the incremental hook AND the drain hook.
-    HOOKS = [
-        "templates/hooks/code-graph-incremental.sh",
-        "templates/hooks/stop-codegraph-drain.sh",
-    ]
+    v0.2.107 (CG-3): no hook resolves the code-graph prefix in shell any more
+    — the per-edit hook and the Stop drain's queue half are retired, and the
+    one writer (``vco_lib.codegraph_head_catchup``) reads the prefix in
+    Python from ``code_graph_collection_prefix``. What stays pinned: no hook
+    asks the resolver for the slug alias ``code_graph_project`` (it routes
+    writes to a divergent zombie prefix after a rename), and the catch-up
+    reads the canonical field.
+    """
 
-    @staticmethod
-    def _strip_comments(text: str, marker: str) -> str:
-        """Drop lines starting with ``marker`` (after optional whitespace).
-
-        Both bash (``#``) and PowerShell (``#``) use ``#`` for comments.
-        We strip them before the regex so an explanatory comment that
-        mentions ``--field code_graph_project`` for context can't cause
-        a false-positive match.
-        """
-        out = []
-        for line in text.splitlines():
-            stripped = line.lstrip()
-            if stripped.startswith(marker):
-                continue
-            out.append(line)
-        return "\n".join(out)
-
-    # v0.2.47 (extras): the hooks now query a SECOND resolver field
-    # (`code_graph_extra_paths`) in addition to the canonical
-    # `code_graph_collection_prefix`. Both are legitimate. The slug-
-    # alias `code_graph_project` remains banned — it routes writes to a
-    # divergent zombie prefix after rename. The allowlist below names
-    # every field the hook is allowed to ask for; new fields land here
-    # explicitly so the test catches accidental regressions to slug
-    # alias use.
-    ALLOWED_HOOK_RESOLVER_FIELDS = frozenset({
-        "code_graph_collection_prefix",   # canonical Weaviate prefix
-        "code_graph_extra_paths",         # v0.2.47 (extras)
-        # v0.2.72 (P5): per-project ".claude/ is first-party source" bool —
-        # drives the --index-dot-claude / --no-index-dot-claude analyzer
-        # flag. A resolver FIELD read for a CLI toggle, not a write-target
-        # name; unrelated to the banned slug alias.
-        "code_graph_index_dot_claude",
-    })
-
-    def test_hooks_ask_resolver_for_collection_prefix(self):
-        """All hooks that resolve a project-name for the code-graph write
-        target MUST ask the resolver for ``code_graph_collection_prefix``,
-        never ``code_graph_project``. The slug alias diverges from the
-        canonical Weaviate prefix when the slug contains characters that
-        the analyzer's sanitiser would re-canonicalise differently from
-        the binding row.
-
-        v0.2.47: the hooks ALSO query ``code_graph_extra_paths`` to drive
-        the extras-path detection. Both fields are in the allowlist
-        ``ALLOWED_HOOK_RESOLVER_FIELDS``; the slug alias
-        ``code_graph_project`` remains banned.
-
-        Strategy: scan non-comment lines for ``--field <name>``. The
-        hooks construct the resolver path in a variable (``$_RESOLVER``)
-        rather than calling it by literal name, so we don't anchor on
-        the script name.
-        """
-        for rel in self.HOOKS:
-            path = PROJECT_ROOT / rel
-            text = self._strip_comments(path.read_text(encoding="utf-8"), "#")
-            fields = re.findall(r"--field\s+(\S+)", text)
-            self.assertTrue(
-                fields,
-                f"{rel}: expected at least one '--field <name>' call",
+    def test_no_hook_asks_for_the_slug_alias(self):
+        hooks = PROJECT_ROOT / "templates" / "hooks"
+        for path in sorted(list(hooks.rglob("*.sh")) + list(hooks.rglob("*.ps1"))):
+            code = "\n".join(
+                ln for ln in path.read_text(encoding="utf-8").splitlines()
+                if not ln.lstrip().startswith("#")
             )
-            # At least one of the fields must be the canonical prefix —
-            # that's still the contract for the code-graph write target.
-            self.assertIn(
-                "code_graph_collection_prefix",
-                fields,
-                f"{rel}: at least one '--field code_graph_collection_prefix' "
-                f"call required (the canonical Weaviate-prefix resolver path)",
+            self.assertIsNone(
+                re.search(r"-{1,2}[Ff]ield\s+[\"']?code_graph_project\b", code),
+                f"{path}: asks the resolver for the slug alias code_graph_project",
             )
-            for fld in fields:
-                self.assertIn(
-                    fld,
-                    self.ALLOWED_HOOK_RESOLVER_FIELDS,
-                    f"{rel}: '--field {fld!r}' is not in the allowed-fields "
-                    "set. code_graph_project is the slug alias and routes "
-                    "writes to a divergent prefix after rename. New "
-                    "legitimate fields must be added to "
-                    "ALLOWED_HOOK_RESOLVER_FIELDS in this test class.",
-                )
 
-    # v0.2.47 (extras): PowerShell sibling extras-check uses
-    # ``-Field code_graph_extra_paths`` — same allowlist applies.
-    ALLOWED_PS1_RESOLVER_FIELDS = frozenset({
-        "code_graph_collection_prefix",
-        "code_graph_extra_paths",
-        # v0.2.73 (FIX-B): the drain resolves the `.claude` gate per canonical
-        # root (Resolve-DrainDotClaude), same as the incremental hook's
-        # Resolve-IndexDotClaude. A CLI-toggle field read, not a write-target
-        # name; unrelated to the banned slug alias.
-        "code_graph_index_dot_claude",
-    })
-
-    def test_ps1_hook_uses_collection_prefix_field(self):
-        """PowerShell sibling of stop-codegraph-drain.sh — cross-OS parity.
-
-        v0.2.73 (FIX-B): the per-edit code-graph sync moved from
-        post-file-edit to the end-of-turn batched drain, which now owns the
-        per-canonical-root ``code_graph_collection_prefix`` resolution. So the
-        PS1 code-graph write-target resolver to pin is the drain hook (via its
-        ``Resolve-DrainProject`` helper's ``-Field
-        code_graph_collection_prefix`` call), not post-file-edit.ps1.
-        v0.2.47: the drain also queries ``code_graph_index_dot_claude`` for the
-        analyzer's ``.claude`` gate — both are in the allowlist.
-        """
-        path = PROJECT_ROOT / "templates" / "hooks" / "stop-codegraph-drain.ps1"
-        text = self._strip_comments(path.read_text(encoding="utf-8"), "#")
-        fields = re.findall(r"-Field\s+[\"']?([A-Za-z0-9_]+)[\"']?", text)
-        self.assertTrue(fields, f"{path}: expected at least one '-Field <name>' call")
-        self.assertIn(
-            "code_graph_collection_prefix", fields,
-            f"{path}: the drain must resolve '-Field code_graph_collection_prefix'",
-        )
-        for fld in fields:
-            self.assertIn(
-                fld,
-                self.ALLOWED_PS1_RESOLVER_FIELDS,
-                f"{path}: '-Field {fld!r}' not in allowlist "
-                "(code_graph_project is the slug alias).",
-            )
+    def test_the_catchup_reads_the_canonical_prefix_field(self):
+        text = (PROJECT_ROOT / "vco_lib" / "codegraph_head_catchup.py").read_text(
+            encoding="utf-8")
+        self.assertIn('"code_graph_collection_prefix"', text)
+        self.assertNotIn('"code_graph_project"', text)
 
 
 # v0.2.23's source-text pin of the replace()→insert() fallback lived here. It

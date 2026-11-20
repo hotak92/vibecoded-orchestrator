@@ -46,7 +46,7 @@ Params: `query` (natural language), `limit` (default 5), `node_type` (filter: pr
 
 The `detail` param controls token cost. `"auto"` picks a verbosity tier per result from its relevance score (higher-scoring results render richer detail — summary → single chunk → three chunks → full node); the explicit values apply one tier uniformly to every result. Summaries are pre-generated and stored in `knowledge/.node_formats.json`, so summary-tier renders are fast and cheap.
 
-Collections searched: `KG_COLLECTION` + `SHARED_KG_COLLECTION` + `DEVELOPMENT_COLLECTION` (all resolved from env, set per-project in `.claude/settings.json` `env` — the canonical channel; `.vscode/settings.json` `claude-code.env` does not propagate to MCP subprocesses on Linux and is not used). Results are deduplicated across collections. RL reranking applies transparently when `RL_SERVER_URL` is reachable (Pro tier only).
+Collections searched: `KG_COLLECTION` + `SHARED_KG_COLLECTION` + `DEVELOPMENT_COLLECTION` (all resolved from env, set per-project in `.claude/settings.json` `env` — the canonical channel; `.vscode/settings.json` `claude-code.env` does not propagate to MCP subprocesses on Linux and is not used). Results are deduplicated across collections. RL reranking applies transparently when `RL_SERVER_URL` is reachable (no licence needed since v0.2.106 — see "RL Reranking" below).
 
 </details>
 
@@ -282,7 +282,7 @@ Generates LLM summaries (Claude Haiku) for KG nodes and stores them in `knowledg
 Security scan backend for `pre-tool-use.sh`: SSRF guards, shell injection pattern matching.
 
 ### `detect-project.sh` / `detect-project.ps1`
-Given a file path and the current project root, prints the name of the sibling folder (under the root's parent) that holds the file, or nothing. Its only consumer is the unregistered `code-graph-incremental` hook. It is never used to choose a code graph to search: since v0.2.100 every hook search (pre-edit included) runs as the calling project, with its own prefix (which also holds its extra code-graph paths — the launcher's "Add code folder" folders, where isolated subagents may also get worktrees through lane reservations) and its own code-graph grants, because a folder name is not a grant. (Secrets scoping by a `.vct-project` marker is `vct detect-project`, a different tool.)
+Given a file path and the current project root, prints the name of the sibling folder (under the root's parent) that holds the file, or nothing. No shipped hook calls it since v0.2.107: its last consumer, the per-edit `code-graph-incremental` hook, was retired (the code graph follows commits), and the script is kept for standalone use. It is never used to choose a code graph to search: since v0.2.100 every hook search (pre-edit included) runs as the calling project, with its own prefix (which also holds its extra code-graph paths — the launcher's "Add code folder" folders, where isolated subagents may also get worktrees through lane reservations) and its own code-graph grants, because a folder name is not a grant. (Secrets scoping by a `.vct-project` marker is `vct detect-project`, a different tool.)
 
 ### `get_node_info.py`
 Backend for `kg-info`. Loads a single KG node, parses its frontmatter, and prints metadata + connections.

@@ -84,7 +84,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from vco_lib import kg_context_triple
 from vco_lib.intfile import read_int_line
@@ -205,6 +205,26 @@ BLOCKED = "blocked"
 #: it was last fixed inherited the earlier episodes' attempts and was reported
 #: as capped before VCO had retried it once (field 2026-10-16).
 RESOLVED = "resolved"
+
+#: v0.2.107 (A-003) verdict row: the attempt ran, did not clear its condition,
+#: and there is POSITIVE evidence the MACHINE failed during it — Weaviate
+#: answered "not ready" right after it, or its container start time changed
+#: (``owed_work.machine_failed_between``). The row closes the attempt and
+#: :func:`retry_history` does not count it toward the cap. Never written for a
+#: worker that merely died (a ``STARTED`` row with no verdict still counts —
+#: the v0.2.91 crash-loop rule), and at most :data:`MAX_EXCUSED_INTERRUPTIONS`
+#: times per episode: a job that itself brings Weaviate down must still reach
+#: the cap.
+INTERRUPTED = "interrupted"
+MAX_EXCUSED_INTERRUPTIONS = 3
+
+#: v0.2.107 (A-003) RESULT-only status (never a trail row): the job did not
+#: run and no attempt was consumed — Weaviate was not ready, or another
+#: driver holds this folder. The machine queue keeps the project's entry.
+QUEUED = "queued"
+WEAVIATE_NOT_READY_DETAIL = (
+    "Weaviate is not ready — left in the machine queue (no attempt consumed)"
+)
 
 #: v0.2.104 (R1 M1): names the dispatched attempt a clear happened INSIDE.
 #: The dispatcher sets it in its own environment around ``handler.run`` (so
@@ -592,29 +612,7 @@ def retry_kg_seed(ctx: RetryContext) -> RetryResult:
     script = _sync_script(ctx.folder)
     if script is None:
         return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
-    env_root = str(ctx.folder)
-    # v0.2.101 (caller-audit Gap 3): pin the child's TARGET from the context the
-    # enqueue carried. Without it the child resolves its class through the hub
-    # alone, and in a hub-down window `_resolve_collections` falls back to the
-    # literal "KnowledgeGraph" — a walk into a class nobody reads. The hub still
-    # WINS when it answers (`cfg.kg_collection or os.getenv(...)`), so this is
-    # strictly a fallback, and it is what the foreground path always had (the
-    # install's own shell env). S1 keeps the DRIVER base env free of it; the
-    # carried value is the only way in.
-    carried = seed_context_from_env() or {}
-    _pinned = ("KG_SYNC_PROJECT_ROOT", "KG_COLLECTION")
-    prev = {key: os.environ.get(key) for key in _pinned}
-    os.environ["KG_SYNC_PROJECT_ROOT"] = env_root
-    if carried.get("kg_collection"):
-        os.environ["KG_COLLECTION"] = carried["kg_collection"]
-    try:
-        rc = ctx.run([ctx.interpreter(), str(script), "--all"])
-    finally:
-        for key, value in prev.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    rc = _run_project_sync(ctx, script, ["--all"])
     if rc == 0:
         if condition_cleared(ctx.folder, ctx.condition_id) is True:
             # v0.2.101 (caller-audit Gap 4/5/6): the CONTEXT TRIPLE is no
@@ -628,6 +626,103 @@ def retry_kg_seed(ctx: RetryContext) -> RetryResult:
             stamp_metadata_repair_from_child(ctx.folder)
         return RetryResult(ctx.condition_id, RETRIED, "kg sync --all completed")
     return RetryResult(ctx.condition_id, FAILED, f"kg sync --all exited {rc}")
+
+
+def _run_project_sync(ctx: RetryContext, script: Path, args: Sequence[str]) -> int:
+    """Run ``sync_knowledge_graph.py <args>`` for ``ctx.folder`` with the
+    project-seed pins — ONE home for every per-project KG handler."""
+    # v0.2.101 (caller-audit Gap 3): pin the child's TARGET from the context the
+    # enqueue carried. Without it the child resolves its class through the hub
+    # alone, and in a hub-down window `_resolve_collections` falls back to the
+    # literal "KnowledgeGraph" — a walk into a class nobody reads. The hub still
+    # WINS when it answers (`cfg.kg_collection or os.getenv(...)`), so this is
+    # strictly a fallback, and it is what the foreground path always had (the
+    # install's own shell env). S1 keeps the DRIVER base env free of it; the
+    # carried value is the only way in.
+    carried = seed_context_from_env() or {}
+    _pinned = ("KG_SYNC_PROJECT_ROOT", "KG_COLLECTION")
+    prev = {key: os.environ.get(key) for key in _pinned}
+    os.environ["KG_SYNC_PROJECT_ROOT"] = str(ctx.folder)
+    if carried.get("kg_collection"):
+        os.environ["KG_COLLECTION"] = carried["kg_collection"]
+    try:
+        return ctx.run([ctx.interpreter(), str(script), *[str(a) for a in args]])
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+# Q-1: above either bound the narrow sync-failure retry runs the whole-tree
+# `--all` instead of passing every failed path on the command line.
+MAX_NARROW_SYNC_PATHS = 200
+MAX_NARROW_SYNC_ARG_CHARS = 24_000
+
+
+def retry_kg_sync_paths(ctx: RetryContext) -> RetryResult:
+    """v0.2.107 (A-003): ``kg_sync_failures_pending`` re-syncs ONLY the paths
+    that failed (``owed_work.owed_failed_sync_paths``). The child's file-list
+    run is the paired clear (``owed_work.settle_clean_sync_paths``: zero
+    failures and nothing the entry owes left). No record for the CURRENT
+    entry — it owes the whole tree (install.py's enqueued seed uses this
+    condition) — falls back to :func:`retry_kg_seed`'s ``--all``."""
+    from vco_lib.owed_work import owed_failed_sync_paths
+
+    paths = owed_failed_sync_paths(ctx.folder)
+    if not paths:
+        return retry_kg_seed(ctx)
+    if (len(paths) > MAX_NARROW_SYNC_PATHS
+            or sum(len(str(p)) + 1 for p in paths) > MAX_NARROW_SYNC_ARG_CHARS):
+        # Q-1: a long list would overflow the Windows command line (32 767
+        # characters). `--all` is content-hash gated, so it re-embeds only
+        # what never landed.
+        return retry_kg_seed(ctx)
+    script = _sync_script(ctx.folder)
+    if script is None:
+        return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
+    try:
+        rc = _run_project_sync(ctx, script, paths)
+    except OSError as exc:  # the command could not be started — a failed attempt
+        return RetryResult(ctx.condition_id, FAILED,
+                           f"kg sync of the {len(paths)} failed path(s) could not start: {exc}")
+    if rc == 0:
+        return RetryResult(ctx.condition_id, RETRIED,
+                           f"kg sync of the {len(paths)} failed path(s) completed")
+    return RetryResult(ctx.condition_id, FAILED,
+                       f"kg sync of the {len(paths)} failed path(s) exited {rc}")
+
+
+def retry_kg_node_formats(ctx: RetryContext) -> RetryResult:
+    """v0.2.107 (A-003): ``kg_node_formats_refresh_failed`` re-runs the
+    ``.node_formats.json`` refresh ALONE (``--refresh-node-formats``) — it
+    writes no Weaviate row, so it never needed the whole-tree sync it used to
+    get. The refresh's own paired clear retires the entry."""
+    script = _sync_script(ctx.folder)
+    if script is None:
+        return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
+    rc = _run_project_sync(ctx, script, ["--refresh-node-formats"])
+    if rc == 0:
+        return RetryResult(ctx.condition_id, RETRIED, "node-format refresh completed")
+    return RetryResult(ctx.condition_id, FAILED, f"node-format refresh exited {rc}")
+
+
+def retry_kg_secondary_backfill(ctx: RetryContext) -> RetryResult:
+    """v0.2.107 (A-003): ``kg_secondary_backfill_pending`` embeds only the rows
+    that lack the secondary vector (``python -m vco_lib.owed_work backfill``,
+    no tree walk). Only when rows the secondary refuses whole remain — which
+    only kg-sync's writer can re-lay — does it fall back to ``--all``."""
+    from vco_lib.owed_work import BACKFILL_DONE, BACKFILL_NEEDS_WALK
+
+    rc = ctx.run([ctx.interpreter(), "-m", "vco_lib.owed_work", "backfill",
+                  "--folder", str(ctx.folder)])
+    if rc == BACKFILL_NEEDS_WALK:
+        trail(f"{ctx.condition_id}: refused rows need kg-sync's writer — whole-tree sync")
+        return retry_kg_seed(ctx)
+    if rc == BACKFILL_DONE:
+        return RetryResult(ctx.condition_id, RETRIED, "secondary backfill completed")
+    return RetryResult(ctx.condition_id, FAILED, f"secondary backfill exited {rc}")
 
 
 def _shared_collection_for(folder: Path, env: Optional[Mapping[str, str]] = None) -> str:
@@ -948,6 +1043,13 @@ class Handler:
     run: Callable[[RetryContext], RetryResult]
     backend: str
     needs_current_code_embed_image: bool = False
+    #: v0.2.107: the handler's child takes its OWN slot of the machine-wide
+    #: bulk-writer pool (the resync driver, ``codegraph_resync``) — the
+    #: worker must not hold one around it, or a 1-slot machine waits on itself.
+    own_slot: bool = False
+    #: v0.2.107: the work writes to (or reads from) Weaviate, so the machine
+    #: queue's readiness gate applies before it starts.
+    needs_weaviate: bool = True
 
 
 #: handler name → handler. The registry references these as
@@ -972,9 +1074,18 @@ HANDLERS: dict[str, Handler] = {
     "codegraph_resync": Handler(
         retry_codegraph_resync, CODE_BACKEND,
         needs_current_code_embed_image=True,
+        own_slot=True,
     ),
     "ollama_models": Handler(retry_ollama_models, TEXT_BACKEND),
-    "code_embed_backend": Handler(retry_code_embed_backend, CODE_BACKEND),
+    # v0.2.107 (A-003): NARROW jobs for conditions whose registry row names
+    # `kg_seed` — never named by the registry itself; `job_for_condition`
+    # selects them, and a whole-tree `kg_seed` job in the same pass absorbs
+    # them (its `--all` does their work and carries their clears).
+    "kg_sync_paths": Handler(retry_kg_sync_paths, TEXT_BACKEND),
+    "kg_node_formats": Handler(retry_kg_node_formats, TEXT_BACKEND, needs_weaviate=False),
+    "kg_secondary_backfill": Handler(retry_kg_secondary_backfill, TEXT_BACKEND),
+    "code_embed_backend": Handler(retry_code_embed_backend, CODE_BACKEND,
+                                  needs_weaviate=False),
     # v0.2.105 (prune lane): re-indexing embeds through the code backend.
     "codegraph_extras_heal": Handler(
         retry_codegraph_extras_heal, CODE_BACKEND,
@@ -1062,6 +1173,8 @@ class RetryHistory:
     streak_last_detail: str = ""
     #: Status of the newest row of any kind (``""`` when the trail is empty).
     last_status: str = ""
+    #: :data:`INTERRUPTED` rows in this episode (each one excused an attempt).
+    interrupted: int = 0
 
     @property
     def cap_reached(self) -> bool:
@@ -1117,7 +1230,7 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return RetryHistory(condition_id=condition_id)
-    attempts = blocked = streak = 0
+    attempts = blocked = streak = interrupted = 0
     streak_first = streak_last = streak_detail = ""
     last_status = ""
     in_attempt = False
@@ -1139,12 +1252,21 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
             status == RESOLVED and in_attempt and _is_own_childs_clear(row, open_attempt)
         ):
             # Episode over: what follows is a NEW occurrence of the condition.
-            attempts = blocked = streak = 0
+            attempts = blocked = streak = interrupted = 0
             streak_first = streak_last = streak_detail = ""
             in_attempt = False
             open_attempt = ""
             continue
-        if status == STARTED:
+        if status == INTERRUPTED:
+            # v0.2.107: the machine failed during the open attempt (positive
+            # evidence, recorded by the dispatcher) — that attempt is excused.
+            # A row that closes no open attempt excuses nothing.
+            if in_attempt and attempts > 0:
+                attempts -= 1
+                interrupted += 1
+            in_attempt = False
+            open_attempt = ""
+        elif status == STARTED:
             attempts += 1
             in_attempt = True
             open_attempt = str(row.get("attempt") or "")
@@ -1171,6 +1293,7 @@ def retry_history(folder: Path, condition_id: str) -> RetryHistory:
         streak_last_ts=streak_last,
         streak_last_detail=streak_detail,
         last_status=last_status,
+        interrupted=interrupted,
     )
 
 
@@ -1352,6 +1475,60 @@ def retryable_condition_ids(condition_ids: Iterable[str]) -> list[str]:
         if cid and handler_name_for(cid) and cid not in out:
             out.append(cid)
     return out
+
+
+#: v0.2.107 (A-003): conditions whose registry row names ``kg_seed`` but whose
+#: owed work is narrower than a whole-tree sync.
+_NARROW_KG_JOBS: dict[str, str] = {
+    "kg_secondary_backfill_pending": "kg_secondary_backfill",
+    "kg_node_formats_refresh_failed": "kg_node_formats",
+    "kg_sync_failures_pending": "kg_sync_paths",
+}
+_WHOLE_TREE_JOB = "kg_seed"
+#: Jobs that run before the rest of a pass: ``ollama_models`` seeds the KG
+#: itself once the models are pulled, so a ``kg_seed`` job behind it finds
+#: its condition already cleared instead of walking the tree a second time.
+_FIRST_JOBS = ("code_embed_backend", "ollama_models")
+
+
+def job_for_condition(folder: Path, condition_id: str) -> Optional[str]:
+    """The handler that runs ``condition_id``'s owed work — the registry's,
+    narrowed for the ``kg_seed`` family (:data:`_NARROW_KG_JOBS`). A sync
+    failure without a failed-path record for the CURRENT entry owes the whole
+    tree and stays ``kg_seed``."""
+    name = handler_name_for(condition_id)
+    if name != _WHOLE_TREE_JOB:
+        return name
+    narrow = _NARROW_KG_JOBS.get(condition_id)
+    if narrow == "kg_sync_paths":
+        try:
+            from vco_lib.owed_work import owed_failed_sync_paths
+
+            return narrow if owed_failed_sync_paths(Path(folder)) else _WHOLE_TREE_JOB
+        except Exception:  # noqa: BLE001 — cannot tell ⇒ the whole tree
+            return _WHOLE_TREE_JOB
+    return narrow or _WHOLE_TREE_JOB
+
+
+def plan_jobs(folder: Path, condition_ids: Sequence[str]) -> "list[tuple[str, list[str]]]":
+    """Group owed conditions into jobs — ONE run per job, however many
+    conditions need it. A whole-tree ``kg_seed`` job absorbs the narrow KG jobs
+    of the same project (its ``--all`` does their work and carries their
+    paired clears). Conditions without a handler are left out (the caller
+    trails them)."""
+    groups: dict[str, list[str]] = {}
+    for cid in condition_ids:
+        job = job_for_condition(folder, cid)
+        if job is None:
+            continue
+        bucket = groups.setdefault(job, [])
+        if cid not in bucket:
+            bucket.append(cid)
+    if _WHOLE_TREE_JOB in groups:
+        for narrow in dict.fromkeys(_NARROW_KG_JOBS.values()):
+            groups[_WHOLE_TREE_JOB].extend(groups.pop(narrow, []))
+    first = [(j, groups.pop(j)) for j in _FIRST_JOBS if j in groups]
+    return first + list(groups.items())
 
 
 def owed_condition_ids(folder: Path) -> list[str]:
@@ -1562,13 +1739,17 @@ def dispatch(
     runner: Optional[Callable[[Sequence[str], Path], int]] = None,
     python: str = "",
     single_instance: bool = True,
+    machine_watch: Optional[Callable[[], Any]] = None,
+    slot_guard: Optional[Callable[[bool], Any]] = None,
 ) -> list[RetryResult]:
     """Retry every owed condition whose precondition now holds.
 
     The gate order matters and is the safety property:
 
-    1. no other driver holds this folder's lock;
+    1. no other driver holds this folder's lock (held ⇒ :data:`QUEUED`, no
+       attempt);
     2. registry says the condition is ``auto_retryable`` AND names a handler;
+       conditions are grouped into JOBS (:func:`plan_jobs`) — one run per job;
     3. attempts so far < :data:`MAX_ATTEMPTS`;
     4. the probe for the backend THAT handler needs returns **True** (False and
        None both skip);
@@ -1576,9 +1757,13 @@ def dispatch(
        ``needs_current_code_embed_image``, the code-embed image verdict must
        not be ``stale`` — a stale verdict BLOCKS without consuming an attempt
        (same convention as gate 4's BLOCKED rows);
-    6. the attempt is recorded, THEN the handler runs;
-    7. the condition is resolved only when the child's own paired clear removed
-       it from the ledger — never on the exit code alone.
+    6. v0.2.107: with ``machine_watch`` (the machine queue's worker), Weaviate
+       must answer ready — otherwise :data:`QUEUED`, no row, no attempt;
+    7. the attempt is recorded, THEN the job runs (inside ``slot_guard``);
+    8. the condition is resolved only when the child's own paired clear removed
+       it from the ledger — never on the exit code alone. With
+       ``machine_watch``, an attempt that did not clear while the machine
+       provably failed is recorded :data:`INTERRUPTED` (excused).
 
     ``single_instance=False`` is for tests that drive the dispatcher many times
     over one folder without exercising the lock.
@@ -1589,7 +1774,7 @@ def dispatch(
         lock = _acquire_lock(folder)
         if lock is None and _lock_is_held(pidfile_path(folder)):
             return [
-                RetryResult(cid, SKIPPED, "another retry driver is already running")
+                RetryResult(cid, QUEUED, "another retry driver is already running")
                 for cid in (
                     list(condition_ids)
                     if condition_ids is not None
@@ -1603,6 +1788,8 @@ def dispatch(
             backend_probe=backend_probe,
             runner=runner,
             python=python,
+            machine_watch=machine_watch,
+            slot_guard=slot_guard,
         )
     finally:
         _release_lock(lock)
@@ -1615,6 +1802,8 @@ def _dispatch_locked(
     backend_probe: Optional[Callable[[Path, str], Optional[bool]]],
     runner: Optional[Callable[[Sequence[str], Path], int]],
     python: str,
+    machine_watch: Optional[Callable[[], Any]] = None,
+    slot_guard: Optional[Callable[[bool], Any]] = None,
 ) -> list[RetryResult]:
     explicit = condition_ids is not None
     results: list[RetryResult] = []
@@ -1641,10 +1830,15 @@ def _dispatch_locked(
         if not cids:
             break
         attempted.update(cids)
-        results.extend(
-            _dispatch_pass(folder, cids=cids, backend_probe=backend_probe,
-                           runner=runner, python=python)
+        pass_results = _dispatch_pass(
+            folder, cids=cids, backend_probe=backend_probe, runner=runner,
+            python=python, machine_watch=machine_watch, slot_guard=slot_guard,
         )
+        results.extend(pass_results)
+        if any(r.status == QUEUED for r in pass_results):
+            # The machine is not ready: everything still owed waits in the
+            # queue — another pass now would only find the same.
+            break
         # SF-1: a row written WHILE we ran (install.py's second enqueue) is
         # picked up here — this driver holds the lock, and the driver spawned
         # for that row is blocked by it.
@@ -1662,37 +1856,54 @@ def _dispatch_pass(
     backend_probe: Optional[Callable[[Path, str], Optional[bool]]],
     runner: Optional[Callable[[Sequence[str], Path], int]],
     python: str,
+    machine_watch: Optional[Callable[[], Any]] = None,
+    slot_guard: Optional[Callable[[bool], Any]] = None,
 ) -> list[RetryResult]:
-    """One ledger pass: every cid in *cids*, in order (see :func:`dispatch`)."""
+    """One ledger pass: every JOB of *cids*, in order (see :func:`dispatch`)."""
+    import contextlib
+
     results: list[RetryResult] = []
     #: backend kind → tri-state, probed at most once per kind per pass.
     probed: dict[str, Optional[bool]] = {}
     for cid in cids:
-        name = handler_name_for(cid)
-        if name is None:
+        if handler_name_for(cid) is None:
             # Only reachable when the CALLER named the cids: owed_condition_ids
             # already filters on this. Trail it rather than `continue`-ing in
             # silence — an unexplained absence from the results is the exact
             # thing the empty-log defect taught us not to ship.
             trail(f"{cid}: not retryable (registry declares no retry_action) — skipping")
-            continue
+    ran_jobs: "set[str]" = set()
+    for name, group in plan_jobs(folder, cids):
         handler = HANDLERS.get(name)
         if handler is None:
-            results.append(
+            results.extend(
                 RetryResult(cid, SKIPPED, f"registry names unknown handler {name!r}")
+                for cid in group
             )
             continue
-        attempts = attempt_count(folder, cid)
-        trail(f"{cid}: handler `{name}` (needs {handler.backend} backend), "
-              f"{attempts}/{MAX_ATTEMPTS} attempt(s) so far")
-        if attempts >= MAX_ATTEMPTS:
-            results.append(
-                RetryResult(cid, SKIPPED, f"attempt cap ({MAX_ATTEMPTS}) reached")
-            )
+        live: list[str] = []
+        for cid in group:
+            if (name == _WHOLE_TREE_JOB and "ollama_models" in ran_jobs
+                    and condition_cleared(folder, cid) is True):
+                # The Ollama retry ran the seed earlier in this pass: no
+                # second whole-tree run, no attempt.
+                trail(f"{cid}: already cleared by an earlier job of this pass")
+                results.append(RetryResult(cid, SKIPPED, "cleared by an earlier job of this pass"))
+                continue
+            attempts = attempt_count(folder, cid)
+            trail(f"{cid}: job `{name}` (needs {handler.backend} backend), "
+                  f"{attempts}/{MAX_ATTEMPTS} attempt(s) so far")
+            if attempts >= MAX_ATTEMPTS:
+                results.append(
+                    RetryResult(cid, SKIPPED, f"attempt cap ({MAX_ATTEMPTS}) reached")
+                )
+                continue
+            live.append(cid)
+        if not live:
             continue
         ctx = RetryContext(
             folder=folder,
-            condition_id=cid,
+            condition_id=live[0],
             backend_probe=backend_probe,
             runner=runner,
             python=python,
@@ -1701,7 +1912,7 @@ def _dispatch_pass(
             probed[handler.backend] = ctx.backend_available(handler.backend)
         backend = probed[handler.backend]
         trail(
-            f"{cid}: {handler.backend} backend gate → "
+            f"{', '.join(live)}: {handler.backend} backend gate → "
             + {True: "reachable", False: "provably down", None: "unknown"}[backend]
         )
         if backend is not True:
@@ -1709,88 +1920,137 @@ def _dispatch_pass(
             # because `retry_disposition_note` classifies the row back into a
             # cause from it — a second copy here would drift and silently
             # revert the note to the wrong cause.
-            skipped = RetryResult(
-                cid, SKIPPED, backend_block_detail(handler.backend, backend),
-            )
-            # v0.2.92 (WFT C7): record the BLOCK durably. Until now this arm
-            # returned and left nothing behind but a per-run detached log, so
-            # the ledger could keep promising "VCO retries this itself" while
-            # nothing recorded that it had been unable to, twelve passes
-            # running. A distinct status keeps the cap untouched — being
-            # blocked is not an attempt (`test_skips_do_not_burn_the_cap`).
-            record_attempt(folder, RetryResult(cid, BLOCKED, skipped.detail))
-            results.append(skipped)
+            detail = backend_block_detail(handler.backend, backend)
+            for cid in live:
+                # v0.2.92 (WFT C7): record the BLOCK durably; a distinct
+                # status keeps the cap untouched — being blocked is not an
+                # attempt (`test_skips_do_not_burn_the_cap`).
+                record_attempt(folder, RetryResult(cid, BLOCKED, detail))
+                results.append(RetryResult(cid, SKIPPED, detail))
             continue
         # v0.2.96 (WP-3, register issue 8): IMAGE-freshness gate for handlers
-        # whose work embeds through the code-embed service. The backend gate
-        # above asks reachability; a service built from stale source answers
-        # it fine and then silently truncates over-window embed input at HTTP
-        # 200 — so a retry dispatched into a stale-image machine would run
-        # the driver into its own refusal (the driver gates too, M-1) and
-        # come back INCONCLUSIVE with the attempt already consumed. Three
-        # such passes and the durable cap stops the retries FOREVER —
-        # including on the day the image is finally rebuilt and current. So
-        # the stale verdict BLOCKS here, BEFORE the STARTED row is written:
-        # same convention as the backend gate above (being blocked is not an
-        # attempt; `retry_disposition_note` renders the streak), and the
-        # retry resumes by itself the moment the verdict turns current.
-        # ``unknown``/``current`` proceed — unknown is could-not-look, and
-        # this gate must never be the thing that skips owed work.
+        # whose work embeds through the code-embed service. A service built
+        # from stale source answers the reachability gate and then silently
+        # truncates over-window input at HTTP 200; three INCONCLUSIVE passes
+        # would stop the retry FOREVER. So a stale verdict BLOCKS here, BEFORE
+        # the STARTED row (being blocked is not an attempt), and the retry
+        # resumes by itself once the verdict turns current. ``unknown`` and
+        # ``current`` proceed — this gate must never be what skips owed work.
         if handler.needs_current_code_embed_image:
             verdict = _code_embed_image_verdict(folder)
-            trail(f"{cid}: code-embed image gate → {verdict}")
+            trail(f"{', '.join(live)}: code-embed image gate → {verdict}")
             if verdict == _IMAGE_STALE:
-                # Same ONE home as the backend arm above: the note reads this
-                # row's detail back to decide which cause to name.
-                blocked = RetryResult(cid, SKIPPED, BLOCKED_BY_IMAGE_DETAIL)
-                record_attempt(folder, RetryResult(cid, BLOCKED, blocked.detail))
-                results.append(blocked)
+                for cid in live:
+                    record_attempt(folder, RetryResult(cid, BLOCKED, BLOCKED_BY_IMAGE_DETAIL))
+                    results.append(RetryResult(cid, SKIPPED, BLOCKED_BY_IMAGE_DETAIL))
                 continue
-        # Recorded BEFORE the handler runs: a crash must still consume its
-        # attempt, or the cap can never engage on a handler that always dies.
+        # v0.2.107 (A-003): the machine queue's readiness gate. Not ready ⇒
+        # the job waits in the queue: no row, no attempt.
+        before = None
+        if machine_watch is not None and handler.needs_weaviate:
+            before = _watch(machine_watch)
+            if getattr(before, "ready", None) is not True:
+                trail(f"{', '.join(live)}: {WEAVIATE_NOT_READY_DETAIL}")
+                results.extend(RetryResult(cid, QUEUED, WEAVIATE_NOT_READY_DETAIL)
+                               for cid in live)
+                continue
+        # Recorded BEFORE the job runs: a crash (or a worker that dies) must
+        # still consume its attempt, or the cap can never engage on a handler
+        # that always dies. One attempt id for the whole job — the env the
+        # child's clears copy is one value.
         attempt = _new_attempt_id()
-        record_attempt(
-            folder, RetryResult(cid, STARTED, f"handler {name}"), {"attempt": attempt},
-        )
+        for cid in live:
+            record_attempt(
+                folder, RetryResult(cid, STARTED, f"handler {name}"), {"attempt": attempt},
+            )
         # S2 heartbeat: the staleness bound covers ONE handler's silence, so
         # a pass of several hours-long seeds never ages this driver out.
         _heartbeat_lock(folder)
-        result = _run_handler_in_attempt(folder, cid, handler, ctx, attempt)
-        if result.status == RETRIED:
-            cleared = condition_cleared(folder, cid)
-            trail(
-                f"{cid}: ledger re-read → "
-                + {
-                    True: "the child's own clear removed the condition",
-                    False: "the condition is STILL in the ledger",
-                    None: "the ledger could not be re-read",
-                }[cleared]
-            )
-            if cleared is not True:
-                result = RetryResult(
-                    cid, INCONCLUSIVE,
-                    f"{result.detail}; the condition is STILL in the ledger"
-                    if cleared is False
-                    else f"{result.detail}; the ledger could not be re-read",
-                )
-        record_attempt(folder, result)
-        if result.status == RETRIED:
-            _record_resolution(folder, cid, result.detail)
-        results.append(result)
+        guard = slot_guard(handler.own_slot) if slot_guard is not None else contextlib.nullcontext()
+        with guard:
+            result = _run_handler_in_attempt(folder, live, handler, ctx, attempt)
+        ran_jobs.add(name)
+        machine_failed = False
+        if before is not None:
+            after = _watch(machine_watch)
+            try:
+                from vco_lib.owed_work import machine_failed_between
+
+                machine_failed = after is not None and machine_failed_between(before, after)
+            except Exception:  # noqa: BLE001 — no evidence ⇒ no excuse
+                machine_failed = False
+        for cid in live:
+            verdict = _verdict(folder, cid, result, machine_failed, attempt,
+                               primary=cid == live[0])
+            record_attempt(folder, verdict,
+                           {"attempt": attempt} if verdict.status == INTERRUPTED else None)
+            if verdict.status == RETRIED:
+                _record_resolution(folder, cid, verdict.detail)
+            results.append(verdict)
     return results
 
 
+def _watch(machine_watch: Optional[Callable[[], Any]]) -> Any:
+    try:
+        return machine_watch() if machine_watch is not None else None
+    except Exception:  # noqa: BLE001 — a probe that blew up is "unknown"
+        return None
+
+
+def _verdict(folder: Path, cid: str, result: RetryResult, machine_failed: bool,
+             attempt: str, *, primary: bool = True) -> RetryResult:
+    """The verdict row for ``cid`` after its job ran. The ledger re-read is the
+    ground truth: the job's PRIMARY condition is RETRIED when the job
+    succeeded and its clear removed it (a job that exited 0 without clearing
+    is INCONCLUSIVE); a condition the job ABSORBED is RETRIED whenever its
+    clear happened — a whole-tree sync clears the backfill row and exits 1
+    for one failed node. One that did not clear while the machine provably
+    failed is INTERRUPTED (excused, at most
+    :data:`MAX_EXCUSED_INTERRUPTIONS` times per episode)."""
+    cleared = condition_cleared(folder, cid)
+    trail(
+        f"{cid}: ledger re-read → "
+        + {
+            True: "the child's own clear removed the condition",
+            False: "the condition is STILL in the ledger",
+            None: "the ledger could not be re-read",
+        }[cleared]
+    )
+    if cleared is True and (result.status == RETRIED or not primary):
+        return RetryResult(cid, RETRIED, result.detail)
+    if machine_failed and cleared is not True:
+        excused = retry_history(folder, cid).interrupted
+        if excused < MAX_EXCUSED_INTERRUPTIONS:
+            trail(f"{cid}: Weaviate failed during the job (attempt {attempt}) — "
+                  "the attempt is excused and the job stays queued")
+            return RetryResult(
+                cid, INTERRUPTED,
+                f"{result.detail}; Weaviate failed during the job — attempt excused",
+            )
+        trail(f"{cid}: Weaviate failed during the job again — {excused} attempt(s) "
+              "already excused this episode, so this one counts")
+    if result.status == RETRIED:
+        return RetryResult(
+            cid, INCONCLUSIVE,
+            f"{result.detail}; the condition is STILL in the ledger"
+            if cleared is False
+            else f"{result.detail}; the ledger could not be re-read",
+        )
+    return RetryResult(cid, result.status, result.detail)
+
+
 def _run_handler_in_attempt(
-    folder: Path, cid: str, handler: Handler, ctx: RetryContext, attempt: str,
+    folder: Path, cids: "Sequence[str]", handler: Handler, ctx: RetryContext, attempt: str,
 ) -> RetryResult:
     """Run ``handler`` with :data:`ATTEMPT_ENV` naming ``attempt``.
 
     The env pair is what a child's clear copies onto its :data:`RESOLVED` row
     (:func:`record_episode_end`); it is restored afterwards so nothing outside
-    the attempt inherits it. A handler that RAISES still gets a verdict row
-    (R1 M1): an exception must not leave the attempt open, or a later
-    external clear would be read as the attempt's own. The exception is then
-    re-raised — the dispatcher does not swallow a crash it cannot judge.
+    the attempt inherits it. A handler that RAISES still gets a verdict row for
+    every condition of its job (R1 M1): an exception must not leave an attempt
+    open, or a later external clear would be read as the attempt's own. The
+    exception is then re-raised — the dispatcher does not swallow a crash it
+    cannot judge.
     """
     try:
         from vco_lib.deferral_probes import process_start_token
@@ -1805,9 +2065,11 @@ def _run_handler_in_attempt(
     try:
         return handler.run(ctx)
     except BaseException as exc:
-        record_attempt(
-            folder, RetryResult(cid, FAILED, f"handler raised {type(exc).__name__}: {exc}"),
-        )
+        for cid in cids:
+            record_attempt(
+                folder,
+                RetryResult(cid, FAILED, f"handler raised {type(exc).__name__}: {exc}"),
+            )
         raise
     finally:
         for key, value in prev.items():
@@ -1817,29 +2079,19 @@ def _run_handler_in_attempt(
                 os.environ[key] = value
 
 
-def _log_path_for_stamp(stamp: str) -> Optional[Path]:
-    """``<vct_root_dir>/logs/deferral-retry-<stamp>.log``, or ``None``."""
-    try:
-        from vco_lib.paths import vct_root_dir
-
-        logs_dir = vct_root_dir() / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        return logs_dir / f"deferral-retry-{stamp}.log"
-    except Exception:  # noqa: BLE001 — logging must never block the spawn
-        return None
-
-
 def detached_log_glob() -> Optional[str]:
-    """The glob a freshly-spawned driver's log matches, for install output.
+    """The glob the owed-work logs match, for install output.
 
     v0.2.101 item 4: the install tells the user the seed continues in the
-    background and where to watch it. The exact filename carries a timestamp
-    chosen inside :func:`spawn_detached`, so the caller names the glob
-    (``<vct_root_dir>/logs/deferral-retry-*.log``). ``None`` when the logs dir
-    cannot be resolved.
+    background and where to watch it. v0.2.107: the work runs in the machine's
+    one owed-work worker (``vco_lib.owed_work``), whose logs are
+    ``<vct_root_dir>/logs/owed-work-*.log`` — one per job, named after the
+    project key and the worker pid. ``None`` when the logs dir cannot be
+    resolved.
     """
-    path = _log_path_for_stamp("*")
-    return str(path) if path is not None else None
+    from vco_lib.owed_work import log_glob
+
+    return log_glob()
 
 
 def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
@@ -1862,116 +2114,46 @@ def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Detached spawn — the session-start trigger
+# The hand-off to the machine queue — the session-start trigger
 # ---------------------------------------------------------------------------
-
-#: Handles for children that deliberately outlive us (suppresses Popen's
-#: destructor ResourceWarning) — the codegraph-resync driver's precedent.
-_DETACHED_CHILDREN: list = []
-
-#: v0.2.101 N-1: environment keys a detached driver must NOT inherit from the
-#: caller. Each names a KG target, and the driver dispatches EVERY owed row —
-#: a caller whose shell exported another project's ``KG_COLLECTION`` (or a
-#: stale ``KG_BASE_DIR``/``KG_SYNC_PROJECT_ROOT``) would otherwise misroute a
-#: per-project seed. The handlers pin the root they own and resolve the target
-#: from ``--folder``; ``install_weaviate._DRIVER_ENV_ALLOW`` then decides what
-#: may be added back per handler.
-_DRIVER_ENV_STRIP: frozenset = frozenset({
-    "KG_COLLECTION",
-    "SHARED_KG_COLLECTION",
-    "KG_BASE_DIR",
-    "KG_SYNC_PROJECT_ROOT",
-})
 
 
 def spawn_detached(
     folder: Path, *, python: str = "", extra_env: Optional[Mapping[str, str]] = None
 ) -> bool:
-    """Spawn ``python -m vco_lib.deferral_retry --folder <folder>`` detached.
+    """Hand ``folder``'s owed work to the machine's owed-work queue.
 
-    Used by the session-start hook: the hook must return in milliseconds, and
-    a KG seed can take minutes. Returns True when the child was launched (NOT
-    when the retry succeeded — nobody waits for that).
+    v0.2.107 (A-003): this used to start one detached
+    ``python -m vco_lib.deferral_retry --folder <folder>`` driver per call — per
+    project, per session start, ungated. It now ENQUEUES the project
+    (:func:`vco_lib.owed_work.enqueue`, one entry per project however often it
+    is asked) and makes sure the machine's ONE worker runs
+    (:func:`vco_lib.owed_work.ensure_worker`), which works the queue one job
+    per free slot of the bulk-writer pool and only while Weaviate is ready.
+    The name is kept: install.py and the session-start trigger call it.
 
-    *extra_env* overlays the child's environment (v0.2.101 item 4): install.py
-    passes the ACTIVE_EMBEDDING / EMBEDDING_MODEL pair the seed must embed with
-    plus the context triple this driver stamps after a proven seed. Overlaid
-    AFTER :func:`vco_lib.install_companions.detached_child_env`, so the caller's
-    values win over anything the scrub left behind.
+    *extra_env* (v0.2.101 item 4 — install.py's embedding pair and the context
+    triple a proven seed stamps) is stored WITH the project's entry and
+    overlaid on the worker's environment only while that project's jobs run;
+    the worker's own environment is the caller's minus the keys that name one
+    project's KG target (``owed_work._WORKER_ENV_STRIP``), because it serves
+    every project.
 
-    Child stdout/stderr go to ``<vct_root_dir>/logs/deferral-retry-*.log`` so a
-    driver that dies mid-run leaves a record (the R-5 lesson: DEVNULL is how a
-    walk dies at 40% with no trace anywhere).
-
-    The driver's BASE environment is the caller's own minus
-    :data:`_DRIVER_ENV_STRIP` (v0.2.101 N-1): an install run from a shell that
-    sourced another project's ``.claude/env`` would otherwise hand every seed
-    child a foreign ``KG_COLLECTION``/``SHARED_KG_COLLECTION``/``KG_BASE_DIR``.
-    Those are exactly the vars ``install_weaviate._DRIVER_ENV_ALLOW`` exists to
-    control, and the handlers resolve the project's own config from
-    ``--folder`` instead.
+    Returns True when the work is queued and a worker is running or on its
+    way; False when the queue could not be written or no worker could be
+    started — install.py then runs the seed in the foreground.
     """
-    from vco_lib.python_exe import resolve_or_current
+    from vco_lib import owed_work
 
-    argv = [python or resolve_or_current(), "-m", "vco_lib.deferral_retry",
-            "--folder", str(folder)]
-    log_handle = None
-    log_path = _log_path_for_stamp(time.strftime("%Y%m%d-%H%M%S"))
-    if log_path is not None:
-        try:
-            log_handle = open(log_path, "ab")
-            # v0.2.91 dogfood fix: the SPAWNER writes the first line, before
-            # Popen. Without it a child that dies before its first print (a
-            # bad interpreter, an import error swallowed by the OS, a spawn
-            # that never happened) leaves a zero-byte file indistinguishable
-            # from a healthy "nothing owed" pass — which is exactly what the
-            # field logs looked like.
-            log_handle.write(
-                (
-                    f"# vco deferral-retry driver spawned "
-                    f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
-                    f"# folder: {folder}\n"
-                    f"# argv:   {' '.join(argv)}\n"
-                ).encode("utf-8")
-            )
-            log_handle.flush()
-        except Exception:  # noqa: BLE001 — logging must never block the spawn
-            log_handle = None
-    child_out = log_handle if log_handle is not None else subprocess.DEVNULL
-    from vco_lib.install_companions import detached_child_env
-
-    base_env = {
-        k: v for k, v in detached_child_env().items() if k not in _DRIVER_ENV_STRIP
-    }
-    kwargs = {
-        "cwd": str(folder),
-        "stdout": child_out,
-        "stderr": child_out,
-        "stdin": subprocess.DEVNULL,
-        "env": base_env,  # outlives the caller: no relaunch record
-    }
-    if extra_env:
-        kwargs["env"] = {**kwargs["env"], **{k: str(v) for k, v in extra_env.items()}}
-    from vco_lib.windowless_spawn import detached_popen_kwargs
-
-    kwargs.update(detached_popen_kwargs())
     try:
-        _DETACHED_CHILDREN.append(
-            subprocess.Popen(argv, **kwargs)  # noqa: S603 — argv is ours
-        )
-        return True
-    except Exception:  # noqa: BLE001 — a failed spawn is a no-op, never a crash
+        owed_work.enqueue(Path(folder), env=extra_env)
+    except Exception:  # noqa: BLE001 — cannot queue ⇒ the caller runs it
         return False
-    finally:
-        if log_handle is not None:
-            try:
-                log_handle.close()
-            except OSError:
-                pass
+    return owed_work.ensure_worker(python=python, origin=f"enqueue {Path(folder).name}")
 
 
 def session_start_owed_check(folder: Path, *, python: str = "") -> list[str]:
-    """Session-start trigger: owed retryable cids, handed to a detached driver.
+    """Session-start trigger: owed retryable cids, handed to the machine queue.
 
     ONE home for the check BOTH session-start hooks perform, so the bash and
     PowerShell siblings carry five lines of glue each instead of two copies of
@@ -1982,10 +2164,13 @@ def session_start_owed_check(folder: Path, *, python: str = "") -> list[str]:
 
     * Returns the owed condition ids (possibly empty). The caller prints them;
       this function never prints.
-    * Spawns AT MOST ONE detached driver per call, and only when something is
-      owed. The driver — not the hook — probes the backend, so a session that
-      starts before the containers finish coming up simply retries next time
-      rather than the hook having to guess.
+    * When something is owed and not every condition is capped, ENQUEUES the
+      project in the machine's owed-work queue and makes sure the ONE worker
+      runs (:func:`spawn_detached`, v0.2.107). It never starts a driver per
+      project: three projects opening together are three queue entries and
+      one worker. The worker — not the hook — gates on Weaviate and the
+      embedding backend, so a session that starts before the containers are up
+      leaves the work queued, with no attempt consumed.
     * Never raises: a SessionStart hook must not be able to break a session.
 
     v0.2.105 (prune lane): BEFORE reading the ledger, the lost-extras
@@ -2013,11 +2198,35 @@ def session_start_owed_check(folder: Path, *, python: str = "") -> list[str]:
     except Exception:  # noqa: BLE001 — detection must never block the check
         pass
     try:
+        # v0.2.107: a chunker re-sync entry whose remedy has provably run
+        # (both halves recorded, or the project's forced walk completed while
+        # its half went to another tree) is retired HERE — file reads only, no
+        # new walk. The update's registry probe does the same on its surface.
+        from vco_lib.chunker_revision import heal_stuck_resync
+
+        heal_stuck_resync(Path(folder))
+    except Exception:  # noqa: BLE001 — a heal must never block the check
+        pass
+    try:
         owed = owed_condition_ids(Path(folder))
     except Exception:  # noqa: BLE001
         return []
     if not owed:
         return []
+    # A driver whose EVERY condition is at the attempt cap does nothing but
+    # log "attempt cap reached" (the cap gate in `_dispatch_pass` records
+    # nothing) — so do not start an interpreter and a log file for it at
+    # every session start. The owed list is still returned: the hook prints
+    # it. A trail that cannot be counted is not "capped" — spawn and let the
+    # driver decide.
+    try:
+        all_capped = all(
+            attempt_count(Path(folder), cid) >= MAX_ATTEMPTS for cid in owed
+        )
+    except Exception:  # noqa: BLE001 — could-not-count ⇒ spawn
+        all_capped = False
+    if all_capped:
+        return owed
     try:
         spawn_detached(Path(folder), python=python)
     except Exception:  # noqa: BLE001 — a failed spawn is a no-op
@@ -2101,9 +2310,12 @@ __all__ = [
     "FAILED",
     "HANDLERS",
     "INCONCLUSIVE",
+    "INTERRUPTED",
     "MAX_ATTEMPTS",
+    "MAX_EXCUSED_INTERRUPTIONS",
     "PIDFILE_NAME",
     "PIDFILE_STALE_SECONDS",
+    "QUEUED",
     "RESOLVED",
     "RETRIED",
     "SKIPPED",
@@ -2122,9 +2334,11 @@ __all__ = [
     "default_runner",
     "dispatch",
     "handler_name_for",
+    "job_for_condition",
     "main",
     "owed_condition_ids",
     "pidfile_path",
+    "plan_jobs",
     "record_attempt",
     "record_episode_end",
     "retry_disposition_note",

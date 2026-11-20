@@ -147,11 +147,14 @@
         <code>knowledge/</code> notes, <code>CLAUDE.md</code>,
         <code>CONTEXT_STATE.md</code>, VCO's backups of your earlier files,
         and any VCO file you changed yourself. Shared collections and other
-        projects' collections are never dropped.
+        projects' collections are never dropped. The RL training events VCO
+        collected for this project stay in the launcher database, with the
+        project's name.
       </p>
       <p class="hint">
-        For finer control (keep the collections, keep the bundled files),
-        use the project's Settings → Danger zone.
+        For finer control (keep the collections, keep the bundled files,
+        delete the RL training events), use the project's Settings → Danger
+        zone.
       </p>
     {/snippet}
     {#snippet footer()}

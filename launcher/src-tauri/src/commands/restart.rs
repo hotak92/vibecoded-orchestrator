@@ -991,8 +991,9 @@ pub(crate) enum HiddenIdleRelaunchOutcome {
     /// Spawned, but a guard FLIPPED on the pre-exit re-check — the old
     /// process stays running. The already-spawned child carries
     /// [`RELAUNCH_PARENT_FLAG`], so it waits out its bounded lock window,
-    /// sees this parent live, and gives up (logged there) — the
-    /// single-instance hand-off then exits it cleanly. Nothing is lost.
+    /// sees this parent live, and gives up (logged there) — the launcher
+    /// instance lock (`instance_lock.rs`) then exits it cleanly. Nothing is
+    /// lost.
     Aborted(&'static str),
     /// The version guard refused; NOTHING was spawned. The next tick
     /// retries.
@@ -1172,8 +1173,9 @@ pub(crate) fn wait_for_parent_exit(
 /// Production wrapper: called at the very top of `lib.rs::run()` (before the
 /// Tauri builder, hence before the single-instance plugin) when this process
 /// was started as a relaunch child. Waits the bounded window; on expiry logs
-/// one line and falls through — the plugin's normal hand-off then decides,
-/// exactly like a normal second launch.
+/// one line and falls through — the launcher instance lock taken next
+/// (`instance_lock.rs`) then finds the parent's lock held and this relaunch
+/// child exits, so the parent stays.
 pub(crate) fn wait_for_relaunch_parent_before_lock(parent_pid: u32) {
     let budget = relaunch_lock_wait();
     tracing::info!(
@@ -1194,7 +1196,7 @@ pub(crate) fn wait_for_relaunch_parent_before_lock(parent_pid: u32) {
             tracing::warn!(
                 "[restart] relaunch child: the previous launcher (pid {}) still holds \
                  the single-instance lock after {:?} — giving up the wait; the \
-                 single-instance hand-off decides",
+                 instance lock decides (this relaunch child exits if it is still held)",
                 parent_pid,
                 budget
             );

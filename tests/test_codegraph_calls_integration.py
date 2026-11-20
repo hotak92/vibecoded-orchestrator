@@ -56,7 +56,7 @@ class _FakeQuery:
     def __init__(self, rows: Dict[str, Dict[str, Any]]) -> None:
         self._rows = rows
 
-    def fetch_object_by_id(self, uuid: str) -> Optional[_FakeObj]:
+    def fetch_object_by_id(self, uuid: str, return_properties=None) -> Optional[_FakeObj]:
         props = self._rows.get(str(uuid))
         return _FakeObj(props) if props is not None else None
 
@@ -96,7 +96,7 @@ def _wire(analyzer_mod: types.ModuleType, rows: Dict[str, Dict[str, Any]],
     inst._xref_stored_calls = {}
     inst._xref_stored_ncallers = {}
     # Stub the whole-collection scan — we seeded the caches directly.
-    inst._populate_caches_from_weaviate = lambda: None  # type: ignore[assignment]
+    inst._populate_caches_from_weaviate = lambda: True  # type: ignore[assignment]
     return inst
 
 

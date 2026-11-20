@@ -122,8 +122,10 @@ def _wrap_as_hub_rows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _build_mock_events_hub(events: list[dict[str, Any]], *, page_size: int | None = None) -> web.Application:
     """aiohttp app serving GET /modules/{id}/projects/{pid}/rl/events.
 
-    Honours ``since_ms``/``limit`` so the client's pagination is exercised when
-    ``page_size`` is set (forces multiple pages).
+    Mirrors the real hub (``Db::list_rl_events_page``): NEWEST FIRST by
+    ``(ts, id)``, ``since_ms``/``until_ms`` window, the ``before_ts`` /
+    ``before_id`` keyset cursor and ``limit`` — so the client's pagination is
+    exercised when ``page_size`` is set (forces multiple pages).
     """
     rows_all = _wrap_as_hub_rows(events)
 
@@ -131,12 +133,15 @@ def _build_mock_events_hub(events: list[dict[str, Any]], *, page_size: int | Non
         since = request.query.get("since_ms")
         limit = int(request.query.get("limit", "10000"))
         etype = request.query.get("event_type")
+        b_ts, b_id = request.query.get("before_ts"), request.query.get("before_id")
         rows = rows_all
         if since is not None:
             rows = [r for r in rows if r["ts_ms"] >= int(since)]
         if etype:
             rows = [r for r in rows if r["event_type"] == etype]
-        rows = sorted(rows, key=lambda r: r["ts_ms"])
+        if b_ts is not None and b_id is not None:
+            rows = [r for r in rows if (r["ts_ms"], r["id"]) < (int(b_ts), int(b_id))]
+        rows = sorted(rows, key=lambda r: (r["ts_ms"], r["id"]), reverse=True)
         effective_limit = min(limit, page_size) if page_size else limit
         rows = rows[:effective_limit]
         # Return a BARE JSON ARRAY — this matches the real hub

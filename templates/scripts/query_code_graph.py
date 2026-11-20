@@ -43,6 +43,26 @@ except ImportError:
     sys.exit(1)
 
 
+def _structure_reference(link_on: str):
+    """v0.2.107 CG-1: resolve one link with a bounded field list (shared home:
+    ``vco_lib.codegraph_bounded_read``, imported below with the other vco_lib
+    helpers)."""
+    return _bounded_read.reference(link_on)
+
+
+def _structure_fetch_objects(coll, call_site: str, **kwargs):
+    """``fetch_objects``; an oversized reply logs one line and reads as empty."""
+    return _bounded_read.fetch_objects(coll, call_site, **kwargs)
+
+
+def _structure_identity_rows(coll, prop: str, target: str, call_site: str, **kwargs):
+    """``code_identity_rows``; an oversized reply logs one line and reads as []."""
+    return _bounded_read.rows_or_empty(
+        code_identity_rows, coll, call_site, prop, target, "",
+        filter_cls=Filter, **kwargs,
+    )
+
+
 # VCO-SHARED-BEGIN: _resolve_orchestrator_root (verbatim across templates/scripts/*.py)
 def _resolve_orchestrator_root() -> "Path | None":
     """Return the orchestrator clone root — the directory that CONTAINS
@@ -303,6 +323,7 @@ from vco_lib.codegraph_config_query import (  # noqa: E402 — config_users / co
     format_config_result,
     run_config_query,
 )
+from vco_lib import codegraph_bounded_read as _bounded_read  # noqa: E402 — bounded reads, shared with the MCP (v0.2.107 CG-1)
 from vco_lib.weaviate_exact_match import names_same_path  # noqa: E402 — the ONE tolerant path-identity home (v0.2.102 L4)
 
 CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
@@ -459,7 +480,8 @@ def _single_populated_slot(coll, uuid) -> str:
     ``near_object`` leg, which compares stored vectors and so needs no
     embedding backend — just the slot those vectors live in."""
     try:
-        obj = coll.query.fetch_object_by_id(uuid, include_vector=True)
+        obj = coll.query.fetch_object_by_id(
+            uuid, include_vector=True, return_properties=[])
     except Exception:  # noqa: BLE001 — unresolvable → caller fails loudly
         return ""
     vectors = getattr(obj, "vector", None) if obj is not None else None
@@ -628,6 +650,7 @@ class CodeGraphQuery:
                         rows = confirmed_entity_rows(
                             coll_obj, filter_cls=Filter,
                             project=self.project or "", max_matches=4,
+                            return_properties=_bounded_read.anchor_properties(base),
                             **_kw,
                         )
                     except Exception:
@@ -680,7 +703,10 @@ class CodeGraphQuery:
                         q = flt
                         if self.project:
                             q = flt & Filter.by_property("project").equal(self.project)
-                        resp = coll_obj.query.fetch_objects(filters=q, limit=4)
+                        resp = coll_obj.query.fetch_objects(
+                            filters=q, limit=4,
+                            return_properties=_bounded_read.anchor_properties(base),
+                        )
                     except Exception:
                         continue
                     for obj in resp.objects:
@@ -1037,6 +1063,7 @@ class CodeGraphQuery:
                             coll_obj, filter_cls=Filter, project=self.project or "",
                             file_path=file_path,
                             max_matches=SIBLING_FETCH_LIMIT,
+                            return_properties=list(_bounded_read.SIBLING_PROPERTIES),
                         )
                         for obj in sib_rows:
                             sp = obj.properties or {}
@@ -1136,6 +1163,7 @@ class CodeGraphQuery:
                             coll_obj, filter_cls=Filter, project=self.project or "",
                             full_name=full_name, file_path=file_path,
                             max_matches=max(total, max_chunks) + 4,
+                            return_properties=_bounded_read.chunk_properties(base),
                         )
                         for obj in resp_rows:
                             cp = obj.properties or {}
@@ -1204,6 +1232,8 @@ class CodeGraphQuery:
 
         except Exception as e:
             print(f"❌ Search error: {e}", file=sys.stderr)
+            if hook_format:
+                raise  # HR-1: an errored lookup is not an empty answer
 
     @staticmethod
     def _print_code_result(rendered: dict, rank: int, hook_format: bool,
@@ -1436,6 +1466,7 @@ class CodeGraphQuery:
             ref_query = SimpleNamespace(objects=code_identity_rows(
                 coll, "full_name", reference_name, "",
                 filter_cls=Filter, tolerant_limit=1,
+                return_properties=_bounded_read.similarity_reference_properties(collection),
             ))
 
             if not ref_query.objects:
@@ -1566,10 +1597,11 @@ class CodeGraphQuery:
                 # v0.2.102 L5: exact-then-tolerant module-path identity (the
                 # ONE shared home) — a tokenized `Equal + limit=1` could
                 # answer for `src/a_b.py` when asked for `src/a.py`.
-                dep_rows = code_identity_rows(
-                    coll, "path", target, "",
-                    filter_cls=Filter, tolerant_limit=1,
-                    return_references=QueryReference(link_on="imports"),
+                dep_rows = _structure_identity_rows(
+                    coll, "path", target, "query_structure.dependencies",
+                    tolerant_limit=1,
+                    return_properties=["path", "language"],
+                    return_references=_structure_reference("imports"),
                 )
                 response = SimpleNamespace(objects=dep_rows)
 
@@ -1708,23 +1740,33 @@ class CodeGraphQuery:
                 # single-root graph keeps the exact pre-scope fetch size.
                 CALLERS_FETCH_LIMIT = 50
                 scan_limit = _caller_scan_limit(CALLERS_FETCH_LIMIT, False)
-                caller_response = coll.query.fetch_objects(
+                caller_response = _structure_fetch_objects(
+                    coll, "query_structure.callers",
                     filters=Filter.by_property("call_names").contains_any(
                         _caller_match_terms(target)
                     ),
                     limit=scan_limit,
-                    return_references=QueryReference(link_on="calls"),
+                    return_properties=[
+                        "full_name", "signature", "file_path", "start_line",
+                        "chunk_num", "project_source",
+                    ],
+                    return_references=_structure_reference("calls"),
                 )
                 if _caller_page_proves_mixed(
                         caller_response.objects, target_roots,
                         CALLERS_FETCH_LIMIT):
                     scan_limit = _caller_scan_limit(CALLERS_FETCH_LIMIT, True)
-                    caller_response = coll.query.fetch_objects(
+                    caller_response = _structure_fetch_objects(
+                        coll, "query_structure.callers.mixed",
                         filters=Filter.by_property("call_names").contains_any(
                             _caller_match_terms(target)
                         ),
                         limit=scan_limit,
-                        return_references=QueryReference(link_on="calls"),
+                        return_properties=[
+                            "full_name", "signature", "file_path", "start_line",
+                            "chunk_num", "project_source",
+                        ],
+                        return_references=_structure_reference("calls"),
                     )
 
                 # `call_names` holds BARE leaf names, so a name match alone can
@@ -1813,24 +1855,34 @@ class CodeGraphQuery:
                             # rows), so the latency-budgeted hook path pays
                             # it only in graphs that actually hold an extra
                             # code folder's rows.
-                            resp = coll.query.fetch_objects(
+                            resp = _structure_fetch_objects(
+                                coll, "query_structure.callers.hook",
                                 filters=Filter.by_property("call_names").contains_any(
                                     terms
                                 ),
                                 limit=_caller_scan_limit(
                                     CALLERS_FETCH_LIMIT, False),
-                                return_references=QueryReference(link_on="calls"),
+                                return_properties=[
+                                    "full_name", "signature", "file_path", "start_line",
+                                    "chunk_num", "project_source",
+                                ],
+                                return_references=_structure_reference("calls"),
                             )
                             if _caller_page_proves_mixed(
                                     resp.objects, entity_roots,
                                     CALLERS_FETCH_LIMIT):
-                                resp = coll.query.fetch_objects(
+                                resp = _structure_fetch_objects(
+                                    coll, "query_structure.callers.hook_mixed",
                                     filters=Filter.by_property("call_names").contains_any(
                                         terms
                                     ),
                                     limit=_caller_scan_limit(
                                         CALLERS_FETCH_LIMIT, True),
-                                    return_references=QueryReference(link_on="calls"),
+                                    return_properties=[
+                                        "full_name", "signature", "file_path", "start_line",
+                                        "chunk_num", "project_source",
+                                    ],
+                                    return_references=_structure_reference("calls"),
                                 )
                         group_confirmed = set()
                         for obj in resp.objects:
@@ -1934,9 +1986,13 @@ class CodeGraphQuery:
                 # chunk (the MCP's own selection) — the methods list lives on
                 # chunk 0, and a tokenized `limit=1` could hand back a
                 # sibling class or a non-canonical chunk.
-                methods_obj = pick_canonical_chunk(code_identity_rows(
-                    coll, "full_name", target, "",
-                    filter_cls=Filter, tolerant_limit=8,
+                methods_obj = pick_canonical_chunk(_structure_identity_rows(
+                    coll, "full_name", target, "query_structure.methods",
+                    tolerant_limit=8,
+                    return_properties=[
+                        "full_name", "file_path", "start_line", "language",
+                        "methods", "chunk_num",
+                    ],
                 ))
                 response = SimpleNamespace(
                     objects=[methods_obj] if methods_obj is not None else []
@@ -1978,10 +2034,13 @@ class CodeGraphQuery:
                 coll = self.client.collections.get(self._coll("CodeClass"))
                 # v0.2.102 L5: exact-then-tolerant identity + canonical chunk
                 # (the `extends` references live on chunk 0).
-                extends_obj = pick_canonical_chunk(code_identity_rows(
-                    coll, "full_name", target, "",
-                    filter_cls=Filter, tolerant_limit=8,
-                    return_references=QueryReference(link_on="extends"),
+                extends_obj = pick_canonical_chunk(_structure_identity_rows(
+                    coll, "full_name", target, "query_structure.extends",
+                    tolerant_limit=8,
+                    return_properties=[
+                        "full_name", "file_path", "start_line", "language", "chunk_num",
+                    ],
+                    return_references=_structure_reference("extends"),
                 ))
                 response = SimpleNamespace(
                     objects=[extends_obj] if extends_obj is not None else []
@@ -2035,9 +2094,9 @@ class CodeGraphQuery:
                 interactions_coll = self.client.collections.get(self._coll("CodeInteraction"))
                 func_coll = self.client.collections.get(self._coll("CodeFunction"))
                 # v0.2.102 L5: exact-then-tolerant identity (ONE shared home).
-                func_resp = SimpleNamespace(objects=code_identity_rows(
-                    func_coll, "full_name", target, "",
-                    filter_cls=Filter, tolerant_limit=1,
+                func_resp = SimpleNamespace(objects=_structure_identity_rows(
+                    func_coll, "full_name", target, "query_structure.interactions.function",
+                    tolerant_limit=1, return_properties=["full_name", "chunk_num"],
                 ))
                 # v0.2.46 V46-D: emit truncation signal (Pattern B). The
                 # `limit=50` is an intentional top-N cap, but previously
@@ -2045,15 +2104,20 @@ class CodeGraphQuery:
                 INTERACTIONS_FETCH_LIMIT = 50
                 if func_resp.objects:
                     source_uuid = str(func_resp.objects[0].uuid)
-                    ix_resp = interactions_coll.query.fetch_objects(
+                    ix_resp = _structure_fetch_objects(
+                        interactions_coll, "query_structure.interactions.function_rows",
                         filters=Filter.by_ref("source_function").by_id().equal(source_uuid),
-                        limit=INTERACTIONS_FETCH_LIMIT
+                        limit=INTERACTIONS_FETCH_LIMIT,
+                        return_properties=[
+                            "interaction_type", "direction", "protocol", "endpoint",
+                            "confidence", "raw_target", "description",
+                        ],
                     )
                 else:
                     mod_coll = self.client.collections.get(self._coll("CodeModule"))
-                    mod_resp = SimpleNamespace(objects=code_identity_rows(
-                        mod_coll, "path", target, "",
-                        filter_cls=Filter, tolerant_limit=1,
+                    mod_resp = SimpleNamespace(objects=_structure_identity_rows(
+                        mod_coll, "path", target, "query_structure.interactions.module",
+                        tolerant_limit=1, return_properties=["path"],
                     ))
                     if not mod_resp.objects:
                         if hook_format:
@@ -2061,9 +2125,14 @@ class CodeGraphQuery:
                         print(f"❌ Function or module '{target}' not found")
                         return
                     source_uuid = str(mod_resp.objects[0].uuid)
-                    ix_resp = interactions_coll.query.fetch_objects(
+                    ix_resp = _structure_fetch_objects(
+                        interactions_coll, "query_structure.interactions.module_rows",
                         filters=Filter.by_ref("source_module").by_id().equal(source_uuid),
-                        limit=INTERACTIONS_FETCH_LIMIT
+                        limit=INTERACTIONS_FETCH_LIMIT,
+                        return_properties=[
+                            "interaction_type", "direction", "protocol", "endpoint",
+                            "confidence", "raw_target", "description",
+                        ],
                     )
 
                 truncated = len(ix_resp.objects) >= INTERACTIONS_FETCH_LIMIT
@@ -2121,6 +2190,10 @@ class CodeGraphQuery:
 
         except Exception as e:
             print(f"❌ Structure query error: {e}", file=sys.stderr)
+            if hook_format:
+                # HR-1: a failed lookup must reach main() as an error so the
+                # injection router never caches it as "no callers".
+                raise
 
     def close(self):
         """Close Weaviate connection."""

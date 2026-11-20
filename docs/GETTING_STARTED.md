@@ -52,7 +52,7 @@ Or, after cloning, double-click the file for your OS:
 | macOS | `first-install.command` |
 | Windows | `first-install.bat` |
 
-`first-install.{sh,command,bat}` is a thin OS shim (~100 LoC each) — see [`first-install.sh:1-106`](../first-install.sh) and [`first-install.command:1-131`](../first-install.command). The three steps it runs in sequence:
+`first-install.{sh,command,bat}` is a thin OS shim (~100 LoC each) — see [`first-install.sh`](../first-install.sh) and [`first-install.command`](../first-install.command). The three steps it runs in sequence:
 
 1. **Python detect** — OS-aware candidate cascade. macOS tries Apple Silicon Homebrew under `/opt/homebrew/opt/python@3.13/` first, then PATH; Linux tries PATH then `/home/linuxbrew/.linuxbrew/bin/`; Windows uses the Python Launcher (`py -3.13` first) then PATH. Each candidate is version-probed (`>= 3.11` required). If none qualifies, the shim prints the distro-specific install hint (apt/dnf/pacman/zypper/apk on Linux, `brew install python@3.13` on macOS, `winget install Python.Python.3.13` on Windows) and on interactive runs offers to install via the package manager.
 
@@ -103,15 +103,15 @@ python3 install.py --bootstrap                            # human-readable summa
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time), plus ONE local text-generation model as the fallback KG-summary tier (`qwen3.5:0.8b` on a small host, up to `qwen3.5:9b` ≈ 6 GB). Short on disk? Set `VCT_LOCAL_SUMMARY_MODEL=off` before running the installer (or turn off Preferences → KG Summaries → "Local summary model" in the launcher) and that model is never downloaded; summaries then use Claude / cloud tiers only
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so that opening the folder in VS Code runs the same `session-start-ensure-hub` hook Claude Code runs on `SessionStart` — which ensures `vct-hub`, the model gateway (when one is registered) and the launcher GUI (when session-autostart is on)
-6. Copies 44 agent templates into `.claude/agents/` and 54 skill templates into `.claude/skills/`; renders 51 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
+6. Copies the default agent templates into `.claude/agents/` and the default skill templates into `.claude/skills/` (the lists are in [`templates/README.md`](../templates/README.md)); renders 51 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
 7. Registers two MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) is **enabled by default per project**, and `playwright` (browser automation) is **enabled by default** and invoked separately via `npx -y @playwright/mcp@<pin> --browser chromium` (pinned in `vco_lib/bundled_mcp_versions.toml`); install.py pre-caches the pinned package and the Chromium revision it requests at `_install_playwright_browsers`, deferring `playwright_browser_missing` if the browser is still absent. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. Being registered as a bare `npx` command, it is only spawnable when `npx` resolves on PATH — the doctor phase at the end of every install/update checks exactly that and defers `npx_missing_mcp_unspawnable` when it does not. Disable either server for a single project in the launcher's Permissions tab: it writes `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers. (v0.2.101 removed the `search` paper MCP; v0.2.102 removed the `mermaid`/`excalidraw` diagram wrapper MCPs entirely — a leftover entry from an older install is scrubbed automatically by the ordinary install/update, with one notice line.) The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama.
-8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
+8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/api/v1/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Code-embedding backend by host
 
 The code-graph subsystem embeds source code into Weaviate for semantic search. Two backends ship:
 
-- **CodeSage-Large-v2** (2048-dim, Apache 2.0) — the default on NVIDIA hosts with ≥12 GB VRAM. Runs inside `infrastructure/codesage/Dockerfile.cuda` and listens on `:11440`. The bundled image is **CUDA-only by default**; the `Dockerfile.cuda` variant is the one the install pulls when it detects an NVIDIA GPU + drivers + ≥12 GB VRAM.
+- **CodeSage-Large-v2** (2048-dim, Apache 2.0) — the default on NVIDIA hosts with ≥12 GB VRAM. Runs inside the image built from `claude_mcp_servers/code_embedding_service/Dockerfile.cuda` and listens on `:11440`. The bundled image is **CUDA-only by default**; the `Dockerfile.cuda` variant is the one the install pulls when it detects an NVIDIA GPU + drivers + ≥12 GB VRAM.
 - **Ollama fallback** — for hosts without a workstation-class NVIDIA GPU. The code-embed service exposes the same `:11440` HTTP API but routes embed requests through Ollama on `:11435`. The stock fallback model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim, code-specialized, the universal CPU / low-VRAM floor); hosts with 6-12 GB of GPU VRAM are tiered up to `qwen3-embedding:0.6b` (1024-dim) instead. Lower quality than CodeSage but works on every CPU and on Apple Silicon. AMD/ROCm hosts also use this path regardless of VRAM — CodeSage has no ROCm build, while Ollama itself IS ROCm-accelerated via the rocm compose overlay, so the embedding still runs on the GPU.
 
 Apple Silicon + macOS Intel users get the Ollama-based code embedding via the standard install — no extra flags, no manual Dockerfile swap. The hardware detection step (step 2) classifies the host as "Apple Silicon" and the embedding-backend resolver picks Ollama automatically; the CodeSage Dockerfile is skipped entirely (it would not build on the host's image-pull architecture anyway). A native Metal-accelerated CodeSage variant is on the roadmap — `code_embedding_service/server.py` already auto-probes `mps` for native non-container runs; the remaining gap is an arm64 container image with stock torch.
@@ -129,7 +129,7 @@ python install.py --update            # Re-apply the checked-out tree to an exis
 `--update` never fetches or pulls: it applies whatever release is checked out. To
 move to a newer release, use the launcher's update (the MenuBar badge, the tray's
 "Check for updates", or Preferences → Updates — all three run the same update), or
-from a terminal in the install root: `git fetch --tags --force vco_upstream`,
+from a terminal in the install root (the launcher creates the `vco_upstream` remote; if `git remote get-url vco_upstream` fails, add it as INSTALL_RECOVERY.md shows): `git fetch --tags --force vco_upstream`,
 `git pull --ff-only vco_upstream main`, then `python install.py --update`
 ([INSTALL_RECOVERY.md → Update from the shell](INSTALL_RECOVERY.md#update-from-the-shell-no-launcher-gui)
 covers a pull that is not a fast-forward).
@@ -236,11 +236,11 @@ After install, open the `vibecoded-orchestrator` directory in one of the three s
 On session start, the following hooks fire automatically (`SessionStart` matcher: `startup`):
 
 1. `ensure-containers.sh` — checks that Weaviate, Ollama, and the code-embedding service are running; starts them if not
-2. `session-start-ensure-hub.sh` — also registered for `resume|clear|compact` (v0.2.104), so a chat restored after a reboot brings the services back too — three idempotent legs, each a call into its own `vco_lib.*_ensure` module: **hub** (`vco_lib.hub_ensure` — probes `vct-hub /health`, starts it if not running; the hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver), **model gateway** (`vco_lib.gateway_ensure`, v0.2.95 — only when one is registered for this project) and **launcher GUI** (`vco_lib.launcher_ensure`, v0.2.95 — only when session-autostart is enabled, started hidden so it never steals focus). A leg that can do nothing reports and moves on; none of them can block the session
+2. `session-start-ensure-hub.sh` — also registered for `resume|clear|compact` (v0.2.104), so a chat restored after a reboot brings the services back too — three idempotent legs, each a call into its own `vco_lib.*_ensure` module: **hub** (`vco_lib.hub_ensure` — probes `vct-hub /api/v1/health`, starts it if not running; the hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver), **model gateway** (`vco_lib.gateway_ensure`, v0.2.95 — only when one is registered for this project) and **launcher GUI** (`vco_lib.launcher_ensure`, v0.2.95 — only when session-autostart is enabled, started hidden so it never steals focus). A leg that can do nothing reports and moves on; none of them can block the session
 3. `session-start-kg-loader.sh` — displays KG resource paths
 4. `context-size-check.sh` — warns if `.claude/CONTEXT_STATE.md` is over 500 lines
 5. `embedding-failures-surface.sh` — if `.claude/context/EMBEDDING_FAILURES.md` exists (written by `vco_lib.embedding_service` when a backend was unreachable), surfaces a Claude-readable hint on the next chat start. Auto-clears on the next successful embed
-6. `session-start-deferral-surface.sh` — lists any pending `UPDATE_DEFERRED` entries in one line each, and (v0.2.91) performs the **owed-work check**: if the ledger carries an `auto_retryable` condition — a KG seed or code-graph walk that was skipped because the embedding backend was down — it hands it to a DETACHED retry driver (`python -m vco_lib.deferral_retry`). The driver re-probes the backend itself and does nothing while it is still down, so the hook never waits and never guesses; the retry is idempotent (content-hash-gated sync / revision-gated walk), capped at 3 attempts per condition, and resolves the ledger entry only on a proven success. Attempts are logged to `.claude/logs/deferral-retries.jsonl`
+6. `session-start-deferral-surface.sh` — lists any pending `UPDATE_DEFERRED` entries in one line each, and (v0.2.91) performs the **owed-work check**: if the ledger carries an `auto_retryable` condition — a KG seed or code-graph walk that was skipped because the embedding backend was down — it puts the project in the machine's owed-work queue (v0.2.107: one queue file per project, ONE worker per machine — `python -m vco_lib.owed_work`). The worker runs a job only when Weaviate answers ready and a bulk-writer slot is free, re-probes the embedding backend itself and leaves the work queued (no attempt consumed) while either is not ready, so the hook never waits and never guesses; a skipped secondary-vector backfill embeds only the rows that lack the vector and a failed sync re-syncs only the failed files; the retry is idempotent (content-hash-gated sync / revision-gated walk), capped at 3 attempts per condition, and resolves the ledger entry only on a proven success. Attempts are logged to `.claude/logs/deferral-retries.jsonl`
 7. `compact-context-reinject.sh` (on resume after compaction) — reinjects `CONTEXT_STATE.md`, recent commits, and any active plan
 
 Verify MCP servers connected:
@@ -262,8 +262,8 @@ claude mcp list
 Verify the hub is up:
 
 ```bash
-vct-hub --status                                # CLI helper
-curl -s http://127.0.0.1:7700/health            # raw probe (no auth required on /health)
+launcher/dist/<os>-<arch>/vct-hub --status      # CLI helper (the binary is not on PATH; run it from the install root)
+curl -s http://127.0.0.1:7700/api/v1/health     # raw probe (the one route that needs no token; a bare /health answers 401)
 ```
 
 ## Set up a project
@@ -289,7 +289,7 @@ Alternatively, use the VCT Launcher GUI: it runs the same configuration wizard v
 
 The `create_project_v2` Tauri command returns the moment bundle install finishes; three background tasks then run in parallel so a project with pre-existing content lands fully indexed without you running CLI commands by hand:
 
-1. **Code graph build** (`commands::codegraph::spawn_initial_build`) — runs `code-graph-analyze` over the project root.
+1. **Code graph build** (`commands::codegraph::spawn_build`) — runs `code-graph-analyze` over the project root.
 2. **KG sync** (`commands::kg_sync::spawn_initial_sync`) — runs `.claude/scripts/kg-sync --all` against `knowledge/**/*.md` and `docs/**/*.md`. Idempotent at the Weaviate layer (UUIDs derived from node title); safe to re-run.
 3. **KG summaries** (`commands::kg_summary::spawn_initial_summary`) — runs `.claude/scripts/generate-kg-summary.py` per file. Picks the first available backend: `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`, default: the machine's generation model — the launcher Preferences pick, else the one install pulled for the hardware tier) → `ANTHROPIC_API_KEY` direct → silent skip. Content-hashes each node, so re-runs are a cheap no-op for unchanged nodes.
 
@@ -326,7 +326,7 @@ Once a project is configured, here is what fires on normal use:
 **On every file edit** (`PostToolUse` hook on `Edit`/`Write`):
 - Files under `knowledge/` sync to Weaviate (per-project `<KG_COLLECTION>`; content-hash skip on unchanged nodes)
 - Files under `docs/` sync to the development collection (per-project `<DEVELOPMENT_COLLECTION>`; same content-hash + status handling as the KG — unchanged content is a cheap no-op)
-- Code files are queued for code graph re-analysis (`code-graph-incremental.{sh,ps1}` — invokes `analyze --incremental --language <lang> --prune-stale`, scoped per-language so deleted files in one language never wipe rows from another)
+- Code files are NOT queued for the code graph: it follows the main checkout's commits. When HEAD moves (a commit, merge or pull), the `Stop`/`SessionStart` hook `stop-codegraph-drain.{sh,ps1}` runs the analyzer over the changed files; edits in git worktrees reach it when they are merged
 - A credential scan runs on the text the edit introduced (`post-tool-security.sh`; it reports path, line and shape, never the value)
 
 **On every explicit retrieval** (`PostToolUse` hook on `mcp__weaviate-kg__hybrid_search` / `semantic_graph_search` / `search_code_graph`, v0.2.91):
@@ -430,7 +430,7 @@ Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
 
 | Surface | URL / file | Notes |
 |---|---|---|
-| HTTP listener | `http://127.0.0.1:7700` (default; `VCT_HUB_PORT` to override; falls back to `<vct_root>/hub.port`) | All `/api/v1/*` routes require `Authorization: Bearer <token>`, except `/health` |
+| HTTP listener | `http://127.0.0.1:7700` (default; `VCT_HUB_PORT` to override; falls back to `<vct_root>/hub.port`) | All `/api/v1/*` routes require `Authorization: Bearer <token>`, except `/api/v1/health` |
 | Token | `<vct_root>/hub.token` (mode `0o600`) | Regenerated on every hub startup. Read by every resolver client |
 | Lockfile | `<vct_root>/hub.pid` | Single-instance per user |
 | CLI | `vct-hub --start-if-not-running` / `--status` / `--stop` / `--foreground` | Also `--register-boot` / `--unregister-boot` / `--boot-status` for the OS auto-start (systemd-user / launchd / Windows Scheduled Task; **default off**, user opts in via launcher Preferences) |
@@ -446,7 +446,7 @@ Resolver client libraries ship in the install bundle: `templates/scripts/vct_pro
 ## Common next steps
 
 - Read [docs/CONFIGURATION.md](CONFIGURATION.md) to understand where each config file lives and why
-- Run `/context` inside a Claude session to verify the active workspace path and KG collection name
+- To verify which KG collection a session uses, look for the `weaviate-kg: resolved collections (...)` line in the weaviate-kg MCP startup log (`/context` shows context usage, not KG routing)
 - Add `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to `~/.claude/settings.json` to enable parallel agents (3–5x speedup on multi-file tasks)
 - If you have an OpenAI key and want it as the default embedding provider, run the OnboardingWizard (Identity → Onboarding) or set it via Preferences → Secrets. The orchestrator validates via the free `GET /v1/models/text-embedding-3-small` endpoint — no billing entry created
 - Check [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md) for container, MCP, hub, and hook issues
