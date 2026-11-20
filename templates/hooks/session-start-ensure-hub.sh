@@ -247,10 +247,12 @@ rm -f "$__vco_gw_err"
 #     applies to its window config BEFORE any window exists. Nothing is
 #     mapped, activated or destroyed: that sequence as a side effect is what
 #     aborted mutter and killed a whole desktop session on 2026-09-09.
-#   * NO SECOND INSTANCE — it only spawns when a process scan finds nothing,
-#     and the launcher's single-instance plugin refuses a duplicate that races
-#     it (and, seeing the flag in the duplicate's argv, does not take focus
-#     either).
+#   * NO SECOND INSTANCE — the process scan and the spawn run under one
+#     cross-process lock (vco_lib.ensure_lock, shared with the hub and gateway
+#     legs), so this hook and the folderOpen task firing together spawn ONE
+#     launcher; and a duplicate that gets through anyway exits at the
+#     launcher's per-user instance lock before any start-up work (with the
+#     flag in its argv it does not take focus either).
 #   * CHEAP — a launcher already running costs one `pgrep` and stops there.
 #   * SWITCHABLE — `launcher.session_autostart` in the launcher's Preferences →
 #     Startup, default ON. `VCT_DISABLE_LAUNCHER_AUTOSTART=1` is the env kill

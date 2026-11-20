@@ -149,6 +149,8 @@ def spy_spawn(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, bool]]:
         )
 
     monkeypatch.setattr(hub_ensure, "_spawn", fake_spawn)
+    # a recorded spawn starts no hub: do not hold the ensure lock waiting for one
+    monkeypatch.setattr(hub_ensure, "HUB_SETTLE_S", 0)
     return calls
 
 

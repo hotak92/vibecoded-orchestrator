@@ -11,6 +11,7 @@
 mod commands;
 mod hub_launcher;
 mod hub_status;
+mod instance_lock;
 mod installer_engine;
 // Shared read-modify-write primitives for USER-OWNED JSON files (advisory
 // lock + atomic rename + pre-write backup). Extracted from
@@ -671,7 +672,7 @@ pub(crate) fn apply_hidden_start(
 /// race. Hiding the window later (what the `tray_start_minimized` preference
 /// does from `setup`) is NOT equivalent: by then the window exists.
 fn hidden_start_context() -> tauri::Context<tauri::Wry> {
-    let mut context = tauri::generate_context!();
+    let mut context = base_context();
     let args: Vec<String> = std::env::args().collect();
     let hidden = start_hidden_requested(&args);
     let changed = apply_hidden_start(&mut context.config_mut().app.windows, hidden);
@@ -684,6 +685,93 @@ fn hidden_start_context() -> tauri::Context<tauri::Wry> {
         );
     }
     context
+}
+
+/// The ONE expansion of `tauri::generate_context!()` (it embeds the frontend
+/// assets — a second expansion would embed them twice).
+fn base_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+/// v0.2.107 LAUNCH-ONCE: take the per-user instance lock, or leave.
+///
+/// Returns only when THIS process is the launcher (it now holds the lock for
+/// its whole life) or the lock cannot be asked at all (an unwritable state
+/// dir — the single-instance plugin then stays the guard, as before). Every
+/// other outcome ends the process here, before `run()` has opened the
+/// database or started anything. See `instance_lock.rs` for the mechanism.
+fn take_instance_lock_or_exit(argv: &[String]) {
+    use instance_lock::{LockAttempt, Step};
+
+    let root = paths::vct_root_dir();
+    let hidden = start_hidden_requested(argv);
+    let relaunch_child = commands::restart::relaunch_parent_pid(argv).is_some();
+    let started = std::time::Instant::now();
+    loop {
+        let attempt = instance_lock::try_acquire(&root);
+        let (lock, ready) = match &attempt {
+            LockAttempt::Acquired(_) => (Some(true), false),
+            LockAttempt::Unavailable(_) => (None, false),
+            LockAttempt::Busy => (
+                Some(false),
+                instance_lock::holder_ready(&root, vct_launcher_core::process::pid_is_alive),
+            ),
+        };
+        match instance_lock::decide(
+            lock,
+            hidden,
+            relaunch_child,
+            ready,
+            started.elapsed(),
+            instance_lock::HAND_OFF_WAIT,
+        ) {
+            Step::Primary => {
+                match attempt {
+                    LockAttempt::Acquired(file) => instance_lock::hold(file, root),
+                    LockAttempt::Unavailable(why) => tracing::warn!(
+                        "[vct] launcher instance lock unavailable ({}) — starting without \
+                         it; the single-instance plugin still refuses a duplicate",
+                        why
+                    ),
+                    LockAttempt::Busy => {}
+                }
+                return;
+            }
+            Step::Exit => {
+                tracing::info!(
+                    "[vct] another launcher is already running for this user ({}) — \
+                     exiting before start-up",
+                    instance_lock::lock_path(&root).display()
+                );
+                std::process::exit(0);
+            }
+            Step::HandOff => hand_off_to_running_instance(),
+            Step::Wait => std::thread::sleep(instance_lock::HAND_OFF_POLL),
+        }
+    }
+}
+
+/// Hand this (user) launch to the running launcher, then exit.
+///
+/// The hand-off is the single-instance plugin's own (it raises the running
+/// launcher's window), run ALONE: the plugin initialises inside
+/// `Builder::build`, finds the running launcher, passes this argv and exits
+/// the process. Nothing else is built — no window (cleared from the config,
+/// and windows are only created by `App::run`, which is never called), no
+/// tray, no database. If the plugin finds nobody (the holder exited between
+/// our check and now) this process still just exits.
+fn hand_off_to_running_instance() -> ! {
+    let mut context = base_context();
+    context.config_mut().app.windows.clear();
+    context.config_mut().app.tray_icon = None;
+    if let Err(e) = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
+        .build(context)
+    {
+        tracing::warn!("[vct] single-instance hand-off could not run: {}", e);
+    }
+    tracing::info!("[vct] another launcher is already running for this user — exiting");
+    std::process::exit(0);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -715,6 +803,13 @@ pub fn run() {
         {
             commands::restart::wait_for_relaunch_parent_before_lock(parent_pid);
         }
+        // v0.2.107 LAUNCH-ONCE: the per-user instance lock, BEFORE any
+        // start-up work below (the reapers, launcher.db, the root
+        // registration, the backfill, the boot exports — and, from `setup`,
+        // the engine autostart and the hub start). A second launcher exits
+        // here, touching nothing. It comes after the relaunch wait so a
+        // relaunch child finds its parent's lock released.
+        take_instance_lock_or_exit(&argv);
     }
 
     // v0.2.49: reap any stale install.py.lock left behind by a crashed
@@ -847,12 +942,14 @@ pub fn run() {
     let local_config = config::LocalConfig::load();
 
     tauri::Builder::default()
-        // v0.2.21: per-user single-instance enforcement. Register BEFORE
-        // any other plugins so the OS-level lock acquire happens before
-        // we start tearing into state-dir setup. If this is the second
-        // launcher process on the same user, the callback below fires in
-        // the FIRST launcher and the second process exits cleanly without
-        // ever creating a window or touching launcher.db.
+        // v0.2.21: per-user single-instance enforcement, registered BEFORE
+        // any other plugin. Since v0.2.107 it is the SECOND line of defence:
+        // the instance lock taken at the top of `run()`
+        // (`take_instance_lock_or_exit`) is what makes a second launcher
+        // exit without ever creating a window or touching launcher.db — this
+        // plugin only runs after that start-up work, so on its own it could
+        // not. It still owns the focus hand-off: when another launch is
+        // attempted the callback below fires in the FIRST launcher.
         //
         // Callback semantics: invoked in the FIRST launcher's runtime when
         // another launch is attempted. Args are the second process's argv;
@@ -948,6 +1045,12 @@ pub fn run() {
             // wrongly clear it).
             let _ = commands::restart::LAUNCHER_BOOT_TIME
                 .get_or_init(std::time::SystemTime::now);
+
+            // v0.2.107 LAUNCH-ONCE: the plugins (single-instance included)
+            // initialised in `build`, before this hook runs — so a user
+            // launch waiting in `take_instance_lock_or_exit` may now hand
+            // off to this launcher.
+            instance_lock::mark_ready();
 
             // v0.2.53 M-P0-7: augment PATH for graphical-launch contexts
             // BEFORE any subprocess is spawned by the setup hook (sweep

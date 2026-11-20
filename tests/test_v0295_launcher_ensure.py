@@ -97,6 +97,9 @@ def _ensure(binary, spawns, *, repo_root=None, **over):
         "system": "Linux",
         "spawner": spawns,
         "repo_root": repo_root or Path("/nonexistent-checkout-for-tests"),
+        # a recorded spawn starts nothing, so nothing will ever show up: do
+        # not hold the ensure lock waiting for it
+        "settle_s": 0,
     }
     kwargs.update(over)
     if binary is not None:

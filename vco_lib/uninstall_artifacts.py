@@ -20,6 +20,7 @@ the clone (review V02103-FINAL2 M-1):
   script and by the launcher's ``desktop_shortcut.rs``;
 * state files this cycle added under the VCO state root:
   ``state/engine-start.lock`` (``container_engine_start``),
+  ``state/ensure-{hub,gateway,launcher}.lock`` (``ensure_lock``),
   ``state/codegraph-walk-claims/*.lock`` and their ``*.holder`` sidecars
   (``codegraph_walk``),
   ``model-guidance.json`` (``model_selection``) and the engine starter's log
@@ -270,6 +271,11 @@ def _plan_state_files(plan: Plan, vct_root: Path) -> None:
     """VCO state files added this cycle (every OS) — exact names only."""
     state = vct_root / "state"
     _add_file(plan, state / "engine-start.lock", "container-engine start lock", vct_root)
+    # the names have ONE home (review R34-4 posture: imported, not re-typed)
+    from vco_lib.ensure_lock import SERVICES, ensure_lock_path
+
+    for service in SERVICES:
+        _add_file(plan, ensure_lock_path(service, vct_root), f"{service} ensure lock", vct_root)
     claims = state / "codegraph-walk-claims"
     if claims.is_dir() and _through_real_dirs(claims / "x", vct_root):
         for lock in sorted(claims.glob("*.lock")):

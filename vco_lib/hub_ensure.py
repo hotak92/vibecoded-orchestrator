@@ -823,11 +823,17 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
     )
 
 
+#: How long :func:`ensure_running` keeps the ensure lock after a spawn while
+#: it waits for the new hub to claim ``hub.pid`` (normally well under a second).
+HUB_SETTLE_S = 5.0
+
+
 def ensure_running(
     repo_root: Optional[Path] = None,
     extra_dirs: Sequence[Path] = (),
     wait: bool = False,
     probe_repo_dist: bool = True,
+    settle_s: Optional[float] = None,
 ) -> EnsureResult:
     """Start the hub unless it is already running. Idempotent.
 
@@ -837,31 +843,44 @@ def ensure_running(
     ``already_running`` answer and the pid, instead of an opaque
     ``started``.)
 
+    The check and the spawn run under the ``hub`` ensure lock
+    (:func:`vco_lib.ensure_lock.spawn_lock`), held after a spawn until the new
+    hub owns ``hub.pid`` or ``settle_s`` (default :data:`HUB_SETTLE_S`)
+    expires, so concurrent callers start ONE hub and the others answer
+    ``already_running``.
+
     Callers must check the orchestrator update gate themselves — see the
     module docstring.
     """
-    pid = hub_pid()
-    if pid is not None and is_running():
-        return EnsureResult(
-            state=EnsureState.ALREADY_RUNNING,
-            pid=pid,
-            reason=f"vct-hub already running (pid {pid})",
-        )
+    from vco_lib.ensure_lock import spawn_lock, wait_until_up
 
-    binary = find_hub_binary(
-        repo_root=repo_root, extra_dirs=extra_dirs,
-        probe_repo_dist=probe_repo_dist,
-    )
-    if binary is None:
-        return EnsureResult(
-            state=EnsureState.BINARY_NOT_FOUND,
-            reason=(
-                "vct-hub binary not found: no $VCT_HUB_BIN, no copy under "
-                "launcher/dist/, none on $PATH, none in ~/.vct/bin "
-                "(set VCT_HUB_BIN to override, or run install.py to deploy it)"
-            ),
+    bound = HUB_SETTLE_S if settle_s is None else settle_s
+    with spawn_lock("hub", settle_s=bound):
+        pid = hub_pid()
+        if pid is not None and is_running():
+            return EnsureResult(
+                state=EnsureState.ALREADY_RUNNING,
+                pid=pid,
+                reason=f"vct-hub already running (pid {pid})",
+            )
+
+        binary = find_hub_binary(
+            repo_root=repo_root, extra_dirs=extra_dirs,
+            probe_repo_dist=probe_repo_dist,
         )
-    return _spawn(binary, wait=wait)
+        if binary is None:
+            return EnsureResult(
+                state=EnsureState.BINARY_NOT_FOUND,
+                reason=(
+                    "vct-hub binary not found: no $VCT_HUB_BIN, no copy under "
+                    "launcher/dist/, none on $PATH, none in ~/.vct/bin "
+                    "(set VCT_HUB_BIN to override, or run install.py to deploy it)"
+                ),
+            )
+        res = _spawn(binary, wait=wait)
+        if res.state is EnsureState.STARTED:
+            wait_until_up(is_running, bound_s=bound)
+        return res
 
 
 # ---------------------------------------------------------------------------
