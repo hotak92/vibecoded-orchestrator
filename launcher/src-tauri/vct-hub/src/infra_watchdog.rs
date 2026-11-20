@@ -1372,8 +1372,9 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
     let mut gave_up: BTreeMap<String, GaveUp> = BTreeMap::new();
 
     // v0.2.107: heartbeat files a previous tick found stale (see
-    // `crate::mcp_liveness`), kept across ticks for its two-tick confirmation.
-    let mut mcp_suspects: HashMap<PathBuf, std::time::SystemTime> = HashMap::new();
+    // `crate::mcp_liveness`), kept across ticks for its time-based
+    // confirmation (`CONFIRM_SECS`, whatever this loop's interval).
+    let mut mcp_suspects: crate::mcp_liveness::Suspects = HashMap::new();
 
     let base = config.interval.as_secs().max(1);
 

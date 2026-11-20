@@ -21,15 +21,19 @@
 //!   never signal;
 //! * identity cannot be told (unreadable token or cmdline) → leave it;
 //! * heartbeat fresh → leave it;
-//! * heartbeat older than [`STALE_SECS`] on TWO consecutive ticks with the
-//!   same mtime, identity matching → end the process (SIGTERM, then a hard
-//!   kill after [`TERM_GRACE`]; `TerminateProcess` on Windows), log one line,
-//!   delete the file.
+//! * heartbeat older than [`STALE_SECS`], still with the same mtime at a
+//!   tick at least [`CONFIRM_SECS`] after the tick that first found it stale,
+//!   identity matching → end the process (SIGTERM, then a hard kill after
+//!   [`TERM_GRACE`]; `TerminateProcess` on Windows), log one line, delete the
+//!   file.
 //!
-//! The two-tick confirmation is what keeps a laptop resume from ending
-//! healthy servers: after a suspend every heartbeat looks hours old until
-//! its server's next 30 s beat, and the hub's first tick may come first.
-//! The next tick (45 s later by default) sees the refreshed mtime.
+//! The confirmation is what keeps a laptop resume from ending healthy
+//! servers: after a suspend every heartbeat looks hours old until its
+//! server's next 30 s beat, and the hub's first tick may come first. The
+//! confirmation is TIME-based, not a tick count, so it holds whatever the
+//! watchdog interval (`VCT_HUB_INFRA_WATCHDOG_INTERVAL_SECS` may be as low as
+//! 5 s): [`CONFIRM_SECS`] is two and a half beats, so a live server has
+//! refreshed its mtime before any tick may confirm (wave-2 check L-5).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,6 +50,23 @@ use vct_launcher_core::process::{
 /// thread that only checks that the loop is running), so this bound is
 /// about a loop that stopped, not one that is busy.
 pub const STALE_SECS: u64 = 600;
+
+/// How long after the first stale observation of one mtime a tick may
+/// confirm it: 2.5 x the server's 30 s beat
+/// (`vco_lib/mcp_stdio_lifetime.py::HEARTBEAT_SECONDS`; MUST stay at least
+/// twice that), so a server that resumed from a suspend has beaten by then.
+pub const CONFIRM_SECS: u64 = 75;
+
+/// A heartbeat file a tick found stale: the mtime it had then, and when that
+/// tick ran. Kept across ticks by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Suspect {
+    pub mtime: SystemTime,
+    pub since: SystemTime,
+}
+
+/// The caller's cross-tick memory of [`Suspect`]s, one per heartbeat file.
+pub type Suspects = HashMap<PathBuf, Suspect>;
 
 /// Between the graceful signal and the hard kill.
 pub const TERM_GRACE: Duration = Duration::from_secs(5);
@@ -85,7 +106,8 @@ pub enum Identity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Leave,
-    /// Stale for the first time: remembered, confirmed (or cleared) next tick.
+    /// Stale, not yet confirmed: remembered (from its first observation),
+    /// confirmed or cleared by a later tick.
     Suspect,
     DeleteRecord,
     Terminate,
@@ -119,9 +141,15 @@ pub fn identity_of(
     }
 }
 
-/// The decision (pure). `stale_last_tick` = the previous tick already found
-/// this file stale with the same mtime.
-pub fn decide(alive: bool, identity: Identity, age_secs: u64, stale_last_tick: bool) -> Verdict {
+/// The decision (pure). `suspected_for` = seconds since a tick first found
+/// this file stale with the SAME mtime (`None`: not suspected yet). Ending
+/// the process needs [`CONFIRM_SECS`] of that, whatever the tick interval.
+pub fn decide(
+    alive: bool,
+    identity: Identity,
+    age_secs: u64,
+    suspected_for: Option<u64>,
+) -> Verdict {
     if !alive {
         return Verdict::DeleteRecord;
     }
@@ -129,8 +157,10 @@ pub fn decide(alive: bool, identity: Identity, age_secs: u64, stale_last_tick: b
         Identity::Reused => Verdict::DeleteRecord,
         Identity::Unknown => Verdict::Leave,
         Identity::Same if age_secs < STALE_SECS => Verdict::Leave,
-        Identity::Same if !stale_last_tick => Verdict::Suspect,
-        Identity::Same => Verdict::Terminate,
+        Identity::Same => match suspected_for {
+            Some(secs) if secs >= CONFIRM_SECS => Verdict::Terminate,
+            _ => Verdict::Suspect,
+        },
     }
 }
 
@@ -162,11 +192,11 @@ impl ProcessProbe for OsProbe {
 }
 
 /// One pass over `dir`. `suspects` maps a file to the mtime it had when a
-/// tick first found it stale; it lives across ticks in the caller. Returns
-/// how many servers were ended. Soft-fails throughout.
+/// tick first found it stale, and that tick's time; it lives across ticks in
+/// the caller. Returns how many servers were ended. Soft-fails throughout.
 pub fn sweep(
     dir: &Path,
-    suspects: &mut HashMap<PathBuf, SystemTime>,
+    suspects: &mut Suspects,
     now: SystemTime,
     probe: &dyn ProcessProbe,
 ) -> usize {
@@ -204,13 +234,16 @@ pub fn sweep(
         } else {
             Identity::Unknown
         };
-        let stale_last_tick = suspects.get(&path) == Some(&mtime);
-        match decide(alive, identity, age_secs, stale_last_tick) {
+        let prior = suspects.get(&path).filter(|s| s.mtime == mtime).copied();
+        let suspected_for = prior.map(|s| now.duration_since(s.since).map(|d| d.as_secs()).unwrap_or(0));
+        match decide(alive, identity, age_secs, suspected_for) {
             Verdict::Leave => {
                 suspects.remove(&path);
             }
             Verdict::Suspect => {
-                suspects.insert(path.clone(), mtime);
+                // The FIRST observation of this mtime is kept: the window
+                // runs from it, not from the latest tick.
+                suspects.insert(path.clone(), prior.unwrap_or(Suspect { mtime, since: now }));
             }
             Verdict::DeleteRecord => {
                 suspects.remove(&path);
@@ -246,7 +279,7 @@ pub fn sweep(
 
 /// The infra watchdog's call: one sweep of [`heartbeat_dir`] off the async
 /// runtime (it reads `/proc` and may wait out [`TERM_GRACE`]).
-pub async fn sweep_tick(suspects: HashMap<PathBuf, SystemTime>) -> HashMap<PathBuf, SystemTime> {
+pub async fn sweep_tick(suspects: Suspects) -> Suspects {
     let joined = tokio::task::spawn_blocking(move || {
         let mut suspects = suspects;
         sweep(&heartbeat_dir(), &mut suspects, SystemTime::now(), &OsProbe);
@@ -284,35 +317,51 @@ mod tests {
     // ── decide: act and leave-alone ──
 
     #[test]
-    fn stale_and_matching_on_two_ticks_is_terminated() {
-        assert_eq!(decide(true, Identity::Same, STALE_SECS, true), Verdict::Terminate);
+    fn stale_and_matching_for_the_confirm_window_is_terminated() {
+        assert_eq!(decide(true, Identity::Same, STALE_SECS, Some(CONFIRM_SECS)), Verdict::Terminate);
+        assert_eq!(decide(true, Identity::Same, STALE_SECS, Some(CONFIRM_SECS * 40)), Verdict::Terminate);
     }
 
     #[test]
     fn stale_for_the_first_time_is_only_suspected() {
-        assert_eq!(decide(true, Identity::Same, STALE_SECS + 9_999, false), Verdict::Suspect);
+        assert_eq!(decide(true, Identity::Same, STALE_SECS + 9_999, None), Verdict::Suspect);
+    }
+
+    #[test]
+    fn a_confirmation_inside_the_window_is_not_enough_whatever_the_tick_count() {
+        // Wave-2 check L-5: a 5 s watchdog interval reaches its second (and
+        // tenth) tick long before a resumed server's next 30 s beat.
+        for secs in [0, 5, 10, 20, 30, CONFIRM_SECS - 1] {
+            assert_eq!(decide(true, Identity::Same, STALE_SECS * 100, Some(secs)), Verdict::Suspect);
+        }
+    }
+
+    #[test]
+    fn the_window_covers_two_heartbeats() {
+        // MUST stay >= 2 x vco_lib/mcp_stdio_lifetime.py HEARTBEAT_SECONDS (30).
+        const { assert!(CONFIRM_SECS >= 60) };
     }
 
     #[test]
     fn a_fresh_heartbeat_is_left_alone() {
-        assert_eq!(decide(true, Identity::Same, STALE_SECS - 1, true), Verdict::Leave);
-        assert_eq!(decide(true, Identity::Same, 0, false), Verdict::Leave);
+        assert_eq!(decide(true, Identity::Same, STALE_SECS - 1, Some(CONFIRM_SECS)), Verdict::Leave);
+        assert_eq!(decide(true, Identity::Same, 0, None), Verdict::Leave);
     }
 
     #[test]
     fn a_reused_pid_loses_its_record_and_is_never_signalled() {
-        assert_eq!(decide(true, Identity::Reused, STALE_SECS * 10, true), Verdict::DeleteRecord);
+        assert_eq!(decide(true, Identity::Reused, STALE_SECS * 10, Some(CONFIRM_SECS)), Verdict::DeleteRecord);
     }
 
     #[test]
     fn an_identity_that_cannot_be_told_is_left_alone() {
-        assert_eq!(decide(true, Identity::Unknown, STALE_SECS * 10, true), Verdict::Leave);
+        assert_eq!(decide(true, Identity::Unknown, STALE_SECS * 10, Some(CONFIRM_SECS)), Verdict::Leave);
     }
 
     #[test]
     fn a_gone_process_loses_its_record() {
-        assert_eq!(decide(false, Identity::Unknown, 0, false), Verdict::DeleteRecord);
-        assert_eq!(decide(false, Identity::Same, STALE_SECS, true), Verdict::DeleteRecord);
+        assert_eq!(decide(false, Identity::Unknown, 0, None), Verdict::DeleteRecord);
+        assert_eq!(decide(false, Identity::Same, STALE_SECS, Some(CONFIRM_SECS)), Verdict::DeleteRecord);
     }
 
     // ── identity_of ──
@@ -384,15 +433,21 @@ mod tests {
     const SERVER: &[&str] = &["python", "/r/claude_mcp_servers/weaviate_mcp/server.py"];
 
     #[test]
-    fn sweep_ends_a_stale_server_on_the_second_tick_only() {
+    fn sweep_ends_a_stale_server_only_once_the_confirm_window_has_passed() {
         let d = tempfile::tempdir().unwrap();
         let p = write(d.path(), 4242, "proc:9");
         let later = SystemTime::now() + Duration::from_secs(STALE_SECS + 60);
         let os = fake(true, "proc:9", SERVER);
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         assert_eq!(sweep(d.path(), &mut s, later, &os), 0, "first stale tick: suspect only");
         assert!(p.exists() && os.killed.borrow().is_empty());
-        assert_eq!(sweep(d.path(), &mut s, later, &os), 1);
+        // 5 s ticks (the interval floor): many ticks, still inside the window.
+        for k in 1..(CONFIRM_SECS / 5) {
+            let t = later + Duration::from_secs(5 * k);
+            assert_eq!(sweep(d.path(), &mut s, t, &os), 0, "tick {k} is inside the window");
+        }
+        assert!(p.exists() && os.killed.borrow().is_empty());
+        assert_eq!(sweep(d.path(), &mut s, later + Duration::from_secs(CONFIRM_SECS), &os), 1);
         assert_eq!(*os.killed.borrow(), vec![4242]);
         assert!(!p.exists(), "record removed after the kill");
     }
@@ -403,7 +458,7 @@ mod tests {
         let p = write(d.path(), 4243, "proc:9");
         let later = SystemTime::now() + Duration::from_secs(STALE_SECS + 60);
         let os = fake(true, "proc:9", SERVER);
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         sweep(d.path(), &mut s, later, &os);
         // The server beats (a resume from suspend): new mtime.
         std::thread::sleep(Duration::from_millis(20));
@@ -418,7 +473,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = write(d.path(), 4244, "proc:9");
         let os = fake(true, "proc:9", SERVER);
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         for _ in 0..3 {
             assert_eq!(sweep(d.path(), &mut s, SystemTime::now(), &os), 0);
         }
@@ -431,9 +486,9 @@ mod tests {
         let p = write(d.path(), 4245, "proc:9");
         let later = SystemTime::now() + Duration::from_secs(STALE_SECS + 60);
         let os = fake(true, "proc:10", SERVER);
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         sweep(d.path(), &mut s, later, &os);
-        sweep(d.path(), &mut s, later, &os);
+        sweep(d.path(), &mut s, later + Duration::from_secs(CONFIRM_SECS), &os);
         assert!(!p.exists() && os.killed.borrow().is_empty());
         let p2 = write(d.path(), 4246, "proc:9");
         let stranger = fake(true, "proc:9", &["/usr/bin/sleep", "60"]);
@@ -446,7 +501,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = write(d.path(), 4247, "proc:9");
         let os = fake(false, "proc:9", SERVER);
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         sweep(d.path(), &mut s, SystemTime::now(), &os);
         assert!(!p.exists() && os.killed.borrow().is_empty());
     }
@@ -457,15 +512,15 @@ mod tests {
         let p = write(d.path(), 4248, "proc:9");
         let later = SystemTime::now() + Duration::from_secs(STALE_SECS + 60);
         let os = Fake { alive: true, token: Some("proc:9".into()), cmd: None, killed: RefCell::new(vec![]) };
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         sweep(d.path(), &mut s, later, &os);
-        sweep(d.path(), &mut s, later, &os);
+        sweep(d.path(), &mut s, later + Duration::from_secs(CONFIRM_SECS), &os);
         assert!(p.exists() && os.killed.borrow().is_empty());
     }
 
     #[test]
     fn sweep_without_the_directory_is_a_no_op() {
-        let mut s = HashMap::new();
+        let mut s = Suspects::new();
         let os = fake(true, "proc:9", SERVER);
         assert_eq!(sweep(Path::new("/nonexistent/vct/run/mcp"), &mut s, SystemTime::now(), &os), 0);
     }
