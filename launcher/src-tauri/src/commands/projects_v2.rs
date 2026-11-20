@@ -4943,6 +4943,16 @@ pub struct UnregisterOptions {
     /// default, and the GUI offers this only as the second action of that
     /// stop.
     pub leave_unremovable: bool,
+
+    /// Audit A-022 (owner ruling): also delete the project's RL training
+    /// events. Default false: an unregister KEEPS them — the rows stay in
+    /// launcher.db with their project_id and project_name (migration 053),
+    /// so they remain attributable and usable for training. When true they
+    /// are deleted in bounded batches before the project row goes
+    /// ([`RL_EVENTS_DELETE_BATCH`]); the settings page's "Also delete this
+    /// project's N RL training events" checkbox is the only surface that
+    /// sends it.
+    pub delete_rl_events: bool,
 }
 
 impl Default for UnregisterOptions {
@@ -4950,9 +4960,20 @@ impl Default for UnregisterOptions {
     /// `launcher/src/lib/unregister-escape.ts` (what every GUI unregister
     /// sends explicitly).
     fn default() -> Self {
-        Self { purge_launcher_files: true, purge_collections: false, leave_unremovable: false }
+        Self {
+            purge_launcher_files: true,
+            purge_collections: false,
+            leave_unremovable: false,
+            delete_rl_events: false,
+        }
     }
 }
+
+/// How many RL training events one delete batch removes (A-022). Each batch
+/// is its own short transaction on the launcher's single DB connection, which
+/// is released between batches, so the GUI and the hub keep working while a
+/// large corpus (hundreds of thousands of rows, ~150 KB each) is deleted.
+pub(crate) const RL_EVENTS_DELETE_BATCH: usize = 500;
 
 /// Per-call report from `delete_project_v2`. Consumed by the launcher
 /// UI's "Unregister project" toast for a one-line summary plus a
@@ -4996,6 +5017,12 @@ pub struct UnregisterReport {
     /// Names of dropped Weaviate collections (only populated when
     /// `purge_collections: true` and the drop succeeded).
     pub collections_dropped: Vec<String>,
+    /// RL training events of this project left in launcher.db (A-022): every
+    /// one of them unless `delete_rl_events` was set. They keep the project's
+    /// id and name.
+    pub rl_events_kept: u64,
+    /// RL training events deleted because `delete_rl_events` was set.
+    pub rl_events_deleted: u64,
     /// `KEY in <file>` for every value VCO wrote and could not remove, left
     /// in place by "Unregister anyway" (`leave_unremovable`). Names only.
     pub left_in_place: Vec<String>,
@@ -5671,6 +5698,15 @@ pub async fn delete_project_v2(
     unregister_project(db.inner(), &id, options.unwrap_or_default()).await
 }
 
+/// A-022: how many RL training events this project has — the number the
+/// unregister panel names next to "Also delete this project's N RL training
+/// events". Counted on an index (payloads are not read).
+#[command]
+pub async fn count_project_rl_events(id: String, db: State<'_, Db>) -> Result<u64, String> {
+    db.ensure_live()?;
+    db.count_project_rl_events(&id)
+}
+
 /// v0.2.106: the ONE implementation of "Remove from VCO", shared by the GUI
 /// command above and the terminal command `vct-launcher --remove-project`
 /// (`lib.rs::handle_remove_project_cli`). The two surfaces differ only in how
@@ -5835,6 +5871,43 @@ pub(crate) async fn unregister_project(
         }
     };
 
+    // Step 2.9 (A-022): the project's RL training events. Kept by default —
+    // the row delete below no longer reaches rl_events (migration 053), so
+    // they stay with their project_id and project_name. Deleted only when
+    // the user ticked "Also delete this project's N RL training events": in
+    // bounded batches, each its own short transaction, yielding between
+    // batches so the launcher's one DB connection is never held for long.
+    // A batch that fails STOPS the unregister before the row goes — the
+    // project stays registered, so the user can run it again and the events
+    // they asked to delete never outlive the only GUI that can delete them.
+    if opts.delete_rl_events {
+        loop {
+            let n = db
+                .delete_project_rl_events_batch(&id, RL_EVENTS_DELETE_BATCH)
+                .map_err(|e| {
+                    format!(
+                        "Unregister did not finish: deleting this project's RL training events \
+                         failed after {} were deleted ({}). The project is still registered; \
+                         run the unregister again to finish.",
+                        report.rl_events_deleted, e
+                    )
+                })?;
+            if n == 0 {
+                break;
+            }
+            report.rl_events_deleted += n;
+            tokio::task::yield_now().await;
+        }
+    } else {
+        match db.count_project_rl_events(&id) {
+            Ok(n) => report.rl_events_kept = n,
+            Err(e) => report.warnings.push(format!(
+                "could not count this project's RL training events ({}); they are kept",
+                e
+            )),
+        }
+    }
+
     // Step 3 (always): audit + DB delete + change log.
     db.audit(
         "project_delete",
@@ -5848,10 +5921,17 @@ pub(crate) async fn unregister_project(
             "files_kept_modified_count": report.files_kept_modified.len(),
             "keys_purged_from_env_count": report.keys_purged_from_env.len(),
             "collections_dropped_count": report.collections_dropped.len(),
+            "delete_rl_events": opts.delete_rl_events,
+            "rl_events_kept": report.rl_events_kept,
+            "rl_events_deleted_before_row": report.rl_events_deleted,
             "warnings_count": report.warnings.len(),
         }),
     )?;
-    db.delete_project(&id)?;
+    if opts.delete_rl_events {
+        report.rl_events_deleted += db.delete_project_and_rl_events(&id)?;
+    } else {
+        db.delete_project(&id)?;
+    }
     let _ = db.log_change("projects", "delete", Some(&id), Some(&id));
 
     // v0.2.49 Step F MF4: now that the project's own rows are gone
@@ -9671,7 +9751,7 @@ export MY_HELPER_TOKEN=\"keep-me\"
 
         // Simulate `delete_project_v2` with purge_launcher_files=false:
         // the helpers are never invoked. Verify state unchanged.
-        let opts = UnregisterOptions { purge_launcher_files: false, purge_collections: false, leave_unremovable: false };
+        let opts = UnregisterOptions { purge_launcher_files: false, purge_collections: false, leave_unremovable: false, delete_rl_events: false };
         assert!(!opts.purge_launcher_files);
 
         // (Don't call helpers.) State must be intact.
@@ -10239,6 +10319,87 @@ SHARED_KG_OPT_OUT=false\n"),
     //     `update_project_v2` (which returns Err early before any
     //     subprocess), exercising the per-row "failed" + stop_on_error
     //     fan-out semantics.
+
+    // ─── A-022: unregister keeps the RL training events by default ───────
+
+    /// A project registered in an in-memory DB whose folder does not exist,
+    /// with `n` RL events; and one other project with one event.
+    fn seed_unregister_rl(db: &Db, n: usize) {
+        for (id, name) in [("p_rl", "Alpha"), ("p_other", "Beta")] {
+            db.insert_project(
+                id,
+                name,
+                &format!("/nonexistent/unregister-rl/{}/never/exists", id),
+                ProjectHost::Base,
+                id,
+            )
+            .unwrap();
+        }
+        for i in 0..n {
+            db.insert_rl_event("retrieval", 3, i as i64, Some("p_rl"), None, &format!("t{i}"), None, None, None, None, "{}")
+                .unwrap();
+        }
+        db.insert_rl_event("retrieval", 3, 0, Some("p_other"), None, "o0", None, None, None, None, "{}")
+            .unwrap();
+    }
+
+    /// No file purge (nothing outside the DB is touched by these tests).
+    fn rl_only_opts(delete_rl_events: bool) -> UnregisterOptions {
+        UnregisterOptions { purge_launcher_files: false, delete_rl_events, ..Default::default() }
+    }
+
+    /// Leave-alone: the default unregister removes the project and keeps
+    /// every one of its RL events, named, and the report says how many.
+    #[tokio::test]
+    async fn unregister_keeps_the_projects_rl_events_by_default() {
+        let db = Db::open_in_memory().unwrap();
+        seed_unregister_rl(&db, 5);
+        assert!(!UnregisterOptions::default().delete_rl_events, "keep is the default");
+
+        let report = unregister_project(&db, "p_rl", rl_only_opts(false)).await.unwrap();
+
+        assert!(db.get_project("p_rl").unwrap().is_none(), "unregistered");
+        assert_eq!(report.rl_events_kept, 5);
+        assert_eq!(report.rl_events_deleted, 0);
+        assert_eq!(db.count_project_rl_events("p_rl").unwrap(), 5, "events kept");
+        let named: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM rl_events WHERE project_id = 'p_rl' AND project_name = 'Alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(named, 5, "every kept event carries the project's name");
+    }
+
+    /// Act: with the checkbox, every event goes — across several batches —
+    /// and the other project's event stays.
+    #[tokio::test]
+    async fn unregister_with_delete_rl_events_deletes_them_in_batches() {
+        let db = Db::open_in_memory().unwrap();
+        let n = RL_EVENTS_DELETE_BATCH * 2 + 7;
+        seed_unregister_rl(&db, n);
+
+        let report = unregister_project(&db, "p_rl", rl_only_opts(true)).await.unwrap();
+
+        assert!(db.get_project("p_rl").unwrap().is_none(), "unregistered");
+        assert_eq!(report.rl_events_deleted, n as u64);
+        assert_eq!(report.rl_events_kept, 0);
+        assert_eq!(db.count_project_rl_events("p_rl").unwrap(), 0);
+        assert_eq!(db.count_project_rl_events("p_other").unwrap(), 1, "other project untouched");
+    }
+
+    /// The checkbox travels as `deleteRlEvents` and is absent = false on
+    /// every path (`null`, `{}`, the REMOVE flow's JSON).
+    #[test]
+    fn delete_rl_events_option_defaults_off_and_parses_camel_case() {
+        let empty: UnregisterOptions = serde_json::from_str("{}").unwrap();
+        assert!(!empty.delete_rl_events);
+        let on: UnregisterOptions = serde_json::from_str(r#"{"deleteRlEvents":true}"#).unwrap();
+        assert!(on.delete_rl_events);
+        assert!(!crate::remove_project_cli::remove_flow_options().delete_rl_events);
+    }
 
     /// `update_all_projects` over an empty project list returns an empty
     /// report with all counters at 0. Not an error — the GUI's "Update

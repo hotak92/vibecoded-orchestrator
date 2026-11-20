@@ -38,6 +38,11 @@ pub(crate) struct RemovalPreview {
     pub collections: Vec<String>,
     /// `false` when `--keep-collections` was given.
     pub drops_collections: bool,
+    /// The project's RL training events, which a removal keeps (A-022): they
+    /// stay in launcher.db with the project's id and name. `None` when they
+    /// could not be counted (the reason is in `notes`).
+    #[serde(default)]
+    pub rl_events_kept: Option<u64>,
     /// What the preview could not check, and collections it would keep.
     pub notes: Vec<String>,
     /// The human-readable form both terminal surfaces print.
@@ -104,6 +109,21 @@ pub(crate) async fn removal_preview(
             )),
         }
     }
+    // A-022: name the RL training events and what happens to them. Only the
+    // settings page offers to delete them; every terminal removal keeps them.
+    if opts.delete_rl_events {
+        p.notes.push(
+            "this removal also deletes the project's RL training events".to_string(),
+        );
+    } else {
+        match db.count_project_rl_events(id) {
+            Ok(n) => p.rl_events_kept = Some(n),
+            Err(e) => p.notes.push(format!(
+                "could not count the project's RL training events ({}); they are kept",
+                e
+            )),
+        }
+    }
     if opts.purge_collections {
         let (names, notes) = drop_owned_collections(&row.name, &row.id, true).await;
         p.collections = names;
@@ -159,6 +179,12 @@ pub(crate) fn render(p: &RemovalPreview) -> String {
     } else {
         out.push_str("The project's Weaviate collections are kept (--keep-collections).\n");
     }
+    if let Some(n) = p.rl_events_kept.filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "The project's {} RL training events are kept in launcher.db, with its name.\n",
+            n
+        ));
+    }
     list(&mut out, "Notes:", &p.notes);
     out
 }
@@ -205,7 +231,11 @@ mod tests {
         // "you changed".
         assert!(text.contains("you changed — or an older VCO version shipped"));
         assert!(text.contains("These would stay, and why:") && text.contains(".claude/backups/"));
-        let kept = render(&RemovalPreview { drops_collections: false, ..p });
+        assert!(!text.contains("RL training events"), "no events, no line");
+        let kept = render(&RemovalPreview { drops_collections: false, ..p.clone() });
         assert!(kept.contains("collections are kept") && !kept.contains("DROPPED"));
+        // A-022: a removal keeps the project's RL training events and says so.
+        let with_events = render(&RemovalPreview { rl_events_kept: Some(1234), ..p });
+        assert!(with_events.contains("1234 RL training events are kept"));
     }
 }

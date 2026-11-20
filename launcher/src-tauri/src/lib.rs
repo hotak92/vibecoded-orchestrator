@@ -3024,6 +3024,7 @@ pub fn run() {
             // `flipped` = moved, reconciliation owed. Two different sentences.
             commands::projects_v2::list_live_project_moves_v2,
             commands::projects_v2::delete_project_v2,
+            commands::projects_v2::count_project_rl_events,
             commands::projects_v2::launch_project_in_editor,
             // v0.2.49 Phase 6 S-4 — read-only accessor for the boot
             // folder sanity check's cached verdict. The probe itself

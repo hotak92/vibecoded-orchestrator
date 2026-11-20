@@ -278,6 +278,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "code_graph_builds.pending_mode (v0.2.107 UPDATE-ALL fix round, audit U-1). Nullable TEXT holding the pass shape decide_post_bundle_codegraph_pass chose for a queued post-bundle build (JSON: full with prune_stale/force_rewalk, or incremental with since_commit). Written with the PENDING row by the post-bundle path, kept through RUNNING, cleared by every other lifecycle write. At boot a launcher-run RUNNING row that still carries it is requeued (not failed) and resumed with that shape, so an owed forced walk keeps --force-rewalk across a launcher restart. NULL = no decided shape; such rows resume and sweep exactly as before. Also code_graph_builds.pending_requeues (INTEGER NOT NULL DEFAULT 0, audit N-1): the boot requeues of that owed pass, kept through RUNNING and reset by every other lifecycle write; boot requeues only below 3, so a walk that takes the launcher down is failed (Retry) on the fourth start instead of re-run forever. Plain additive ALTER TABLEs — idempotent via the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 51->52 atomically with this migration.",
         sql: include_str!("migrations/052_code_graph_build_pending_mode.sql"),
     },
+    Migration {
+        version: 53,
+        description: "rl_events outlive their project (v0.2.107, audit A-022, owner ruling: an unregister KEEPS the project's RL training events, with the project name in the rows). Migration 025's `FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE` made every project delete remove all of that project's events, silently and in one long transaction. The clause is replaced in the stored CREATE TABLE text by an always-true named CHECK (writable_schema edit, the SQLite-documented way to drop an FK constraint without touching how rows are stored — a create-copy-drop-rename rebuild would need the table's size, tens of GB on a real install, in free disk and hold the boot for the copy), the schema reloaded (writable_schema=RESET) and the schema cookie bumped so the hub's connection reloads it too. Rows keep project_id (every registration gets a fresh UUID, so a stale id is never reused) and project_name, back-filled here from projects.name where the writer sent none. The 'project_id names a registered project' rule moves into the one writer, Db::insert_rl_event (atomic INSERT ... SELECT ... WHERE EXISTS), which also fills project_name from projects.name — so the hub's 422 unknown_project_id answer is unchanged. Indexes untouched. If the clause is not found verbatim nothing changes and Db::delete_project refuses rather than cascade. Not self-transactional: rides the runner's outer transaction. LAUNCHER_DB_TABLE_SET_VERSION bumps 52->53 atomically with this migration.",
+        sql: include_str!("migrations/053_rl_events_outlive_their_project.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -3751,5 +3756,142 @@ mod tests {
             )
             .unwrap();
         assert_eq!(requeues, 0, "a pre-052 row starts with no boot requeues");
+    }
+
+    // ─── Migration 053 — rl_events outlive their project (A-022) ─────────
+
+    fn rl_fk_to_projects(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('rl_events') WHERE \"table\" = 'projects'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn rl_event_row(conn: &Connection, task: &str) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT project_id, project_name FROM rl_events WHERE task_id = ?1",
+            rusqlite::params![task],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    fn insert_raw_rl_event(conn: &Connection, pid: Option<&str>, name: Option<&str>, task: &str) {
+        conn.execute(
+            "INSERT INTO rl_events (event_type, ts, project_id, project_name, task_id, payload_json) \
+             VALUES ('retrieval', 1, ?1, ?2, ?3, '{}')",
+            rusqlite::params![pid, name, task],
+        )
+        .unwrap();
+    }
+
+    /// Upgrade on a POPULATED table: the cascade is gone, names are back-filled
+    /// where the writer sent none, a writer's own name and a free-tier row are
+    /// left alone, and a project delete afterwards keeps every event.
+    #[test]
+    fn migration_053_events_survive_a_project_delete_with_their_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 52).expect("apply through v52");
+        assert_eq!(rl_fk_to_projects(&conn), 1, "pre-053: the cascade FK exists");
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+             VALUES ('p1', 'Alpha', '/tmp/p1', 'base', 'alpha', 0, 0)",
+            [],
+        )
+        .unwrap();
+        insert_raw_rl_event(&conn, Some("p1"), None, "t-unnamed");
+        insert_raw_rl_event(&conn, Some("p1"), Some("writer-name"), "t-named");
+        insert_raw_rl_event(&conn, None, Some("free-slug"), "t-free");
+        insert_raw_rl_event(&conn, None, None, "t-free-unnamed");
+
+        apply(&conn).expect("apply v53");
+        apply(&conn).expect("re-apply is a no-op");
+
+        assert_eq!(rl_fk_to_projects(&conn), 0, "the cascade FK is gone");
+        assert_eq!(rl_event_row(&conn, "t-unnamed"), (Some("p1".into()), Some("Alpha".into())));
+        assert_eq!(rl_event_row(&conn, "t-named"), (Some("p1".into()), Some("writer-name".into())));
+        assert_eq!(rl_event_row(&conn, "t-free"), (None, Some("free-slug".into())));
+        assert_eq!(rl_event_row(&conn, "t-free-unnamed"), (None, None));
+
+        // Every rl_events index is still there.
+        let idx: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'rl_events' AND name LIKE 'idx_%' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            idx,
+            vec![
+                "idx_rl_events_embedding_source_ts",
+                "idx_rl_events_event_type_ts",
+                "idx_rl_events_project_ts",
+                "idx_rl_events_quarantined",
+                "idx_rl_events_task_id",
+            ]
+        );
+
+        // Act: delete the project. Leave-alone: its events stay, named.
+        conn.execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rl_events WHERE project_id = 'p1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "a project delete keeps its RL events");
+        assert_eq!(rl_event_row(&conn, "t-unnamed").1.as_deref(), Some("Alpha"));
+
+        let ok: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(ok, "ok");
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none(),
+            "no FK violation anywhere"
+        );
+    }
+
+    /// The other per-project tables keep their cascade: 053 edits rl_events
+    /// only.
+    #[test]
+    fn migration_053_leaves_other_cascades_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply all");
+        seed_project_row_for_mig(&conn, "p1");
+        conn.execute(
+            "INSERT INTO code_graph_builds (project_id, status, started_at) VALUES ('p1', 'pending', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_graph_builds WHERE project_id = 'p1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "code_graph_builds still cascades");
+        assert_eq!(rl_fk_to_projects(&conn), 0);
+    }
+
+    /// A second connection open across the migration (the hub's) sees the
+    /// edited schema: the cookie bump makes it reload, so ITS project delete
+    /// does not cascade either.
+    #[test]
+    fn migration_053_reaches_a_connection_opened_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("launcher.db");
+        let a = Connection::open(&path).unwrap();
+        a.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&a, 52).expect("apply through v52");
+        let b = Connection::open(&path).unwrap();
+        b.pragma_update(None, "foreign_keys", "ON").unwrap();
+        assert_eq!(rl_fk_to_projects(&b), 1, "b has loaded the pre-053 schema");
+        seed_project_row_for_mig(&a, "p1");
+        insert_raw_rl_event(&a, Some("p1"), None, "t1");
+
+        apply(&a).expect("apply v53 on a");
+
+        b.execute("DELETE FROM projects WHERE id = 'p1'", []).unwrap();
+        assert_eq!(rl_event_row(&b, "t1"), (Some("p1".into()), Some("p1".into())));
+        assert_eq!(rl_fk_to_projects(&b), 0);
     }
 }

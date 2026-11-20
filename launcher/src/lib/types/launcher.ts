@@ -320,6 +320,10 @@ export interface UnregisterOptions {
    *  "Unregister anyway — leave these values". Only ever sent as the SECOND
    *  action of that stop (`$lib/unregister-escape`). */
   leaveUnremovable?: boolean;
+  /** Audit A-022: also delete the project's RL training events (deleted in
+   *  bounded batches before the row goes). Default false — they are kept,
+   *  with the project's id and name. Only the settings page sends it. */
+  deleteRlEvents?: boolean;
 }
 
 /**
@@ -345,6 +349,12 @@ export interface UnregisterReport {
   settingsEntriesRemoved: string[];
   keysPurgedFromEnv: string[];
   collectionsDropped: string[];
+  /** A-022: RL training events left in launcher.db (all of them unless
+   *  `deleteRlEvents` was set). Optional: a report from an older backend
+   *  has no such field. */
+  rlEventsKept?: number;
+  /** A-022: RL training events deleted because `deleteRlEvents` was set. */
+  rlEventsDeleted?: number;
   warnings: string[];
   /** `KEY in <file>` for each value left in place by "Unregister anyway". */
   leftInPlace: string[];
