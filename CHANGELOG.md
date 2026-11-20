@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.107] - 2026-11-20
+
 ### Added
 
 - **A lane worktree is removed once its work is merged.** A worktree VCO created for an isolated subagent that is KEPT
@@ -14767,7 +14769,11 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.103...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...HEAD
+[0.2.107]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.106...v0.2.107
+[0.2.106]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.105...v0.2.106
+[0.2.105]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.104...v0.2.105
+[0.2.104]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.103...v0.2.104
 [0.2.103]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.102...v0.2.103
 [0.2.102]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.101...v0.2.102
 [0.2.101]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.100...v0.2.101
