@@ -934,6 +934,9 @@ struct ModuleRlEventsQuery {
     since_ms: Option<i64>,
     until_ms: Option<i64>,
     limit: Option<u32>,
+    /// MCPREAD-05 keyset cursor — see `rl_events_api::ListEventsQuery`.
+    before_ts: Option<i64>,
+    before_id: Option<i64>,
 }
 
 /// `GET /modules/{module_id}/projects/{project_id}/rl/events`
@@ -991,12 +994,21 @@ async fn list_module_rl_events(
     // corpus fetch) — quarantined rows are unconditionally excluded; the
     // module route deliberately exposes NO include_quarantined escape hatch
     // (poisoned rows must never re-enter training silently).
-    match h.0.list_rl_events(
+    let before = match (q.before_ts, q.before_id) {
+        (Some(t), Some(i)) => Some((t, i)),
+        _ => None,
+    };
+    // MCPREAD-05: newest first, keyset-paged, and bounded in BYTES as well as
+    // rows, so one page never costs the hub or the container more than
+    // `RL_EVENTS_PAGE_MAX_BYTES` of payload.
+    match h.0.list_rl_events_page(
         Some(scope.project_id.as_str()),
         q.event_type.as_deref(),
         q.since_ms,
         q.until_ms,
+        before,
         limit,
+        Some(super::rl_events_api::RL_EVENTS_PAGE_MAX_BYTES),
         false,
     ) {
         Ok(rows) => {

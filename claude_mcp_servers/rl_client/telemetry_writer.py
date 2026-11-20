@@ -58,6 +58,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+from vco_lib.rl_vector_codec import encode_event_vectors
+
 from .hub_writer import post_rl_event
 from .rl_logger import (
     CITATION_LABEL_REGIME,
@@ -908,23 +910,14 @@ class RLTelemetryWriter:
         # dropped embedding is a real, if recoverable, loss of training signal).
         # Normal events never approach the cap — this branch only fires for a
         # runaway/pathological event, never in steady state.
-        max_bytes = _resolve_hub_payload_max_bytes()
-        trimmed_event, dropped = _trim_event_to_payload_cap(event_json, max_bytes)
-        if dropped:
-            logger.warning(
-                "RL telemetry: %s event %s exceeded the %d-byte hub payload cap; "
-                "dropped optional embedding field(s) %s to keep the core label "
-                "(the hub's axum body limit is 16 MiB — see rl_events_api.rs)",
-                event_type, task_id, max_bytes, ", ".join(dropped),
-            )
         # The envelope's denormalized embedding_dim must never disagree with a
         # PRESENT payload vector: the payload's query_emb length is ground
         # truth; the construction-time config dim is only the fallback for
         # events that carry no vector (e.g. citations). Disagreement is logged
-        # so config-vs-actual drift stays visible. (query_emb is in the
-        # never-trim class, so measuring the trimmed event is safe.)
+        # so config-vs-actual drift stays visible. Measured BEFORE the vectors
+        # are encoded below (query_emb is in the never-trim class).
         measured_dim = None
-        _qe = trimmed_event.get("query_emb")
+        _qe = event_json.get("query_emb")
         if isinstance(_qe, list) and _qe:
             measured_dim = len(_qe)
             if self._embedding_dim and measured_dim != self._embedding_dim:
@@ -934,6 +927,21 @@ class RLTelemetryWriter:
                     "length (payload is ground truth)",
                     self._embedding_dim, measured_dim, task_id,
                 )
+        # A-014 (v0.2.107): every vector is stored in its compact half-float
+        # form (``vco_lib.rl_vector_codec`` — the one encoder; the trainer's
+        # loader decodes with the same module), about a third of the decimal
+        # text it replaced. Encoded BEFORE the size cap so the cap measures
+        # the bytes the hub actually receives.
+        encode_event_vectors(event_json)
+        max_bytes = _resolve_hub_payload_max_bytes()
+        trimmed_event, dropped = _trim_event_to_payload_cap(event_json, max_bytes)
+        if dropped:
+            logger.warning(
+                "RL telemetry: %s event %s exceeded the %d-byte hub payload cap; "
+                "dropped optional embedding field(s) %s to keep the core label "
+                "(the hub's axum body limit is 16 MiB — see rl_events_api.rs)",
+                event_type, task_id, max_bytes, ", ".join(dropped),
+            )
         return {
             "event_type": event_type,
             "schema_version": int(trimmed_event.get("schema_version") or RLDataLogger.SCHEMA_VERSION),

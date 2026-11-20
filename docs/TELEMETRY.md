@@ -99,6 +99,8 @@ The local corpus is written to the `rl_events` table in `launcher.db` by `vct-hu
 
 Every event is tagged with its embedding **space** — `embedding_source` / `embedding_dim` / `embedding_model` — in both the payload and denormalized columns, so events from different embedding models never mix in training.
 
+Since v0.2.107 every stored vector is a compact string — `"f16:"` followed by the base64 of its little-endian half floats (`vco_lib/rl_vector_codec.py`) — instead of decimal JSON numbers: about a third of the bytes, at the float16 precision the trainer keeps anyway. The trainer's loader decodes both forms, so rows written earlier still train. A retrieval found by the hooks' background cache warmer is not written until a later hook actually shows it; it is then written under the session that saw it.
+
 ### Dual-embedding write + log (two nets, one search)
 
 When enabled, a single search collects a training example in **two** embedding spaces at once, so a per-model reranker can be trained for each. Three independent per-project toggles, all default off.

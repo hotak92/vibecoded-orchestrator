@@ -332,9 +332,10 @@ Every ranked-retrieval path (MCP `hybrid_search` / `semantic_graph_search` / `se
 
 `rl_events` rows older than `RL_EVENTS_RETENTION_MAX_AGE_DAYS` (default 90) are pruned by `claude_mcp_servers/rl_client/rl_retention.py`, executed hub-side. Until v0.2.91 that prune deleted permanently; it now **archives before it deletes**, and there is no no-archive code path:
 
-1. Victim rows are selected, completing whole `task_id` groups so a retrieval and its citation never separate, oldest-first and capped at `RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS` groups (default 500) — which is what makes the prune incremental rather than a single gigabyte-scale materialization.
-2. They are written to a gzip-JSONL sidecar, fsynced, and re-read to verify before anything is deleted. A failed archive of any kind aborts the prune with an error and deletes nothing.
-3. Only then does the `DELETE` run, and the sidecar is published (renamed off its `.pending` suffix). Readers skip `.pending` files by construction.
+1. Victim rows are selected, completing whole `task_id` groups so a retrieval and its citation never separate, oldest-first and capped at `RL_EVENTS_PRUNE_MAX_TASKS_PER_PASS` groups (default 500) per batch — which is what keeps a batch from becoming a single gigabyte-scale materialization.
+2. They are written to a gzip-JSONL sidecar, fsynced, and re-read to verify before anything is deleted: the row count and the SHA-256 of the bytes read back must equal what was written (v0.2.107). A failed archive of any kind aborts the batch with an error and deletes nothing.
+3. Only then does the `DELETE` run — by the ids that were archived, never by a re-run of the selection — and the sidecar is published (renamed off its `.pending` suffix). Readers skip `.pending` files by construction.
+4. One prune request runs up to `RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS` batches (default 20, so up to 10,000 groups a pass; v0.2.107) on the hub's blocking pool, so the hourly prune keeps up with tens of thousands of rows a day. A pass that deleted rows then hands the freed pages back to the file system when `launcher.db` uses incremental auto-vacuum — every `launcher.db` created since v0.2.107. An older file keeps its size and reuses the freed pages for new rows until one full `VACUUM` switches its mode.
 
 Archives land in `$RL_EVENTS_ARCHIVE_DIR`, else `<VCT_STATE_DIR or ~/.vct>/rl_archive` — resolved hub-side, never from a request body, because a caller-supplied path would be an arbitrary-write surface on an authenticated localhost route and deletion authority must not depend on a caller remembering to name an archive.
 

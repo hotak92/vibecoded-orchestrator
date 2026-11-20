@@ -23,7 +23,11 @@ Shape contract (verified against ``telemetry_writer._wrap_for_hub``):
   dict the JSONL path appended — same keys (``event``, ``task_id``,
   ``embedding_source``, ``schema_version``, the v3 payload fields, …). We DO
   NOT re-derive any field from the denormalized columns; the payload is
-  canonical, exactly as the JSONL line was.
+  canonical, exactly as the JSONL line was. One step is added after the
+  parse: the vectors a row stores in their compact half-float form (A-014,
+  ``vco_lib.rl_vector_codec``) are decoded back to float lists, so everything
+  past ``_reshape_hub_row`` sees the shape it always did. Rows written before
+  that form carry lists and pass through unchanged.
 
 Filtering parity with ``load_events``:
   - schema_version < 2 → refused (same as JSONL; v1 events predate per-source
@@ -45,18 +49,29 @@ import json
 import logging
 from typing import Any
 
+from vco_lib.rl_vector_codec import decode_event_vectors
+
 logger = logging.getLogger(__name__)
 
 # Event types the trainer consumes. PERMANENT — see module docstring.
 _TRAINABLE_EVENT_TYPES = ("retrieval", "citation")
 
+#: MCPREAD-05 (v0.2.107): the rows one training load keeps — the NEWEST of the
+#: window. Every row is held (parsed, as float lists) until pairing, so the
+#: load's memory grows with the row count; this bound keeps it fixed. It is
+#: the number the loader effectively read before (the hub's 10,000-row page
+#: was the only page the old forward cursor ever fetched), now stated and
+#: applied on purpose.
+DEFAULT_MAX_EVENTS = 10_000
+
 
 def _reshape_hub_row(row: "dict[str, Any]") -> "dict[str, Any] | None":
     """Turn one hub row into a load_events()-shape event dict.
 
-    The canonical event is ``json.loads(row["payload_json"])``. Returns None
-    when the row has no parseable payload (skipped, like a malformed JSONL
-    line). The denormalized columns (project_id, embedding_source, …) are
+    The canonical event is ``json.loads(row["payload_json"])`` with its
+    stored vectors decoded to float lists. Returns None when the row has no
+    parseable payload or a damaged stored vector (skipped, like a malformed
+    JSONL line). The denormalized columns (project_id, embedding_source, …) are
     used ONLY as a fallback for fields the older payloads might lack — the
     payload itself is authoritative when present.
     """
@@ -69,6 +84,11 @@ def _reshape_hub_row(row: "dict[str, Any]") -> "dict[str, Any] | None":
         logger.debug("hub_event_loader: skip row with unparseable payload_json (id=%r)", row.get("id"))
         return None
     if not isinstance(ev, dict):
+        return None
+    try:
+        decode_event_vectors(ev)
+    except ValueError:
+        logger.debug("hub_event_loader: skip row with a damaged stored vector (id=%r)", row.get("id"))
         return None
 
     # Backfill fields the JSONL path always had but a sparse payload might
@@ -93,7 +113,7 @@ def load_events_from_hub(
     filter_embedding_source: str = "",
     since_ms: "int | None" = None,
     until_ms: "int | None" = None,
-    max_events: "int | None" = None,
+    max_events: "int | None" = DEFAULT_MAX_EVENTS,
 ) -> "list[dict[str, Any]]":
     """Load trainable RL events for one project from the hub (sync wrapper).
 
@@ -111,7 +131,8 @@ def load_events_from_hub(
         filter_embedding_source: Keep only retrieval events whose
             embedding_source matches (citations pass through). Empty disables.
         since_ms / until_ms: Time-window bounds (unix epoch ms).
-        max_events: Optional cap on total rows fetched.
+        max_events: Cap on the rows fetched — the newest of the window are
+            kept (default :data:`DEFAULT_MAX_EVENTS`; ``None`` = all).
 
     Returns:
         List of event dicts in the same shape ``load_events`` returns, ready

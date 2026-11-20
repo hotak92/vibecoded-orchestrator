@@ -1320,7 +1320,8 @@ def _spawn_leg_warmer(project_root: str, legs_spec: Dict[str, Dict]) -> None:
 
 #: v0.2.105: the folder where the L4 warmer HOLDS the citation ctx its
 #: producer run would have staged (one ``<cache_key>.json`` per warmed key),
-#: instead of staging it into ``rl_pending``. Nobody has seen a warmed
+#: instead of staging it into ``rl_pending`` — and, since v0.2.107, the
+#: retrieval events it would have posted to the hub. Nobody has seen a warmed
 #: retrieval yet; it becomes a real retrieval only when an interactive run
 #: serves that cache entry, which then stages the held ctx
 #: (:func:`_promote_warm_held`). A held file nobody served expires with the
@@ -1334,31 +1335,48 @@ def _warm_held_path(project_root: str, key: str) -> Optional[Path]:
     return Path(project_root) / ".claude" / "state" / _WARM_HELD_DIRNAME / f"{key}.json"
 
 
-def _install_warm_hold_interceptor(held: List[Dict]) -> None:
+def _install_warm_hold_interceptor(held: List[Dict], held_events: List[Dict]) -> None:
     """In the ``--warm-legs`` child ONLY: replace
     ``citation_pending.stage_pending`` so a producer run records its staging
     call into ``held`` and writes NOTHING to ``rl_pending``. Same interception
     point as :func:`_install_staged_ctx_run_id_wrapper` (the producers import
     ``stage_pending`` lazily at call time). Returns ``None`` to the producer,
-    exactly like a soft-failed stage."""
+    exactly like a soft-failed stage.
+
+    A-014 / HOOKS-04 (v0.2.107): the producer's RETRIEVAL EVENTS are held the
+    same way — ``search_pipeline.hand_off_deferred`` (which the KG producer
+    imports at call time and calls after printing) is replaced by a recorder,
+    so a warmer run posts nothing to the hub; :func:`_promote_warm_held` sends
+    them when an interactive run shows the entry. Before, every warmer run
+    wrote its retrieval (and dual-log twin) to ``rl_events`` whether or not
+    anyone ever saw it."""
     import claude_mcp_servers.rl_client.citation_pending as _cp
+    import claude_mcp_servers.rl_client.search_pipeline as _sp
+    from claude_mcp_servers.rl_client.deferred_emit import hold
 
     def _hold(**kwargs):
         held.append(dict(kwargs))
         return None
 
+    def _hold_events(items) -> str:
+        held_events.extend(hold(items))
+        return "held"
+
     _cp.stage_pending = _hold
+    _sp.hand_off_deferred = _hold_events
 
 
-def _write_warm_held(project_root: str, key: str, held: List[Dict]) -> None:
+def _write_warm_held(project_root: str, key: str, held: List[Dict],
+                     events: Optional[List[Dict]] = None) -> None:
     path = _warm_held_path(project_root, key)
-    if path is None or not held:
+    if path is None or not (held or events):
         return
     from vco_lib.atomic import atomic_write_json
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(path, {"held": held}, indent=None, fsync=False)
+        atomic_write_json(path, {"held": held, "events": list(events or [])},
+                          indent=None, fsync=False)
     except (OSError, TypeError, ValueError):
         pass  # the RL label for an unseen retrieval is lost; the cache is not
 
@@ -1413,13 +1431,24 @@ def _promote_warm_held(project_root: str, key: str) -> None:
     if taken is None:
         return  # nothing held (the common case), or a sibling run took it
     try:
-        held = json.loads(taken.read_text(encoding="utf-8")).get("held")
+        doc = json.loads(taken.read_text(encoding="utf-8"))
+        held = doc.get("held")
+        events = doc.get("events")
     except (OSError, ValueError, AttributeError):
-        held = None
+        held = events = None
     finally:
         try:
             taken.unlink()
         except OSError:
+            pass
+    if isinstance(events, list) and events:
+        # The warmer's retrieval events, now that the retrieval is shown —
+        # under THIS run's session (A-014 / HOOKS-04).
+        try:
+            from claude_mcp_servers.rl_client.deferred_emit import release_held
+
+            release_held(events, session_id=session)
+        except Exception:  # noqa: BLE001 — never break the run for RL telemetry
             pass
     if not isinstance(held, list):
         return
@@ -1449,16 +1478,18 @@ def _warm_legs_main() -> int:
     """The ``--warm-legs`` child: re-run the specced producer legs with no
     interactive deadline (each leg is bounded only by
     :data:`WARM_LEG_TIMEOUT_S`, HR-3) and write their output into the query
-    cache. Emits nothing, records no seen-store, charges no budget and
-    stages NO citation ctx — the interactive run owns all of those; this
-    process only warms the cache. A citation ctx the producer would have staged is HELD beside the
-    cache entry instead (:func:`_install_warm_hold_interceptor`): until an
+    cache. Emits nothing, records no seen-store, charges no budget, stages NO
+    citation ctx and posts NO retrieval event — the interactive run owns all
+    of those; this process only warms the cache. A citation ctx and the
+    retrieval events the producer would have staged and posted are HELD beside
+    the cache entry instead (:func:`_install_warm_hold_interceptor`): until an
     interactive run shows that entry, nobody has seen the retrieval, so it
     is not a training label (v0.2.105). A finished empty output is cached for
     300 s and holds no ctx; a timeout/error — partial output included —
     remains uncached (v0.2.107)."""
     held: List[Dict] = []
-    _install_warm_hold_interceptor(held)
+    held_events: List[Dict] = []
+    _install_warm_hold_interceptor(held, held_events)
     try:
         spec = json.loads(sys.stdin.read() or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1489,6 +1520,7 @@ def _warm_legs_main() -> int:
             _run_producer_main(mod)
 
         held.clear()
+        held_events.clear()
         with _query_slot() as acquired:
             if not acquired:
                 continue
@@ -1512,7 +1544,7 @@ def _warm_legs_main() -> int:
         if out:
             cache_leg_output(project_root, key, out + "\n")
             if cache_get(project_root, key) is not None:
-                _write_warm_held(project_root, key, list(held))
+                _write_warm_held(project_root, key, list(held), list(held_events))
         elif cache_get(project_root, key) is None:
             # A warmer's leg that FINISHED with nothing is a finished-empty
             # answer.
