@@ -337,6 +337,12 @@ function Remove-WtrecLanesParent([string]$top, [string]$path) {
 # worktree of the starting session, a record without a session, in_place or
 # reservation_existing; every condition is re-checked right before
 # `git worktree remove` (never --force), and any doubt keeps the worktree.
+# On Windows, where no process's cwd can be read, the in-use check is not a
+# doubt (owner ruling 2026-11-20 "Rely on Windows' lock"): Windows' own lock
+# is asked first, without deleting anything (Test-WtrecFolderFree), and only
+# then the plain `git worktree remove` runs; a refusal at either step keeps
+# the worktree and its record (deferred, retried at the next sweep) and logs
+# the reason.
 $script:WtrecAbandonDays = 7  # MUST MATCH WTREC_ABANDON_DAYS in the .sh
 
 # Invoke-WtrecReap: SubagentStop's step -- decide the agent's worktree WITHOUT
@@ -388,17 +394,29 @@ function Get-WtrecWorktreeBlock([string[]]$listed, [string]$path) {
     return ,($block.ToArray())
 }
 
+# Get-WtrecOsKind -- linux|macos|windows|other. Windows PowerShell 5.1 has no
+# $IsLinux/$IsMacOS (they read as $null there). Must match _wtrec_os_kind.
+function Get-WtrecOsKind {
+    if ($IsLinux) { return "linux" }
+    if ($IsMacOS) { return "macos" }
+    if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) { return "windows" }
+    return "other"
+}
+
 # Test-WtrecInUse PATH -- 'yes' when a process has its cwd at or under PATH,
-# 'no' when none has, 'unknown' when that cannot be told: Linux reads
-# /proc/<pid>/cwd, macOS asks `lsof -d cwd`, anything else (Windows) is
-# unknown. A process whose cwd cannot be read is skipped. Must match
-# _wtrec_in_use in the .sh.
+# 'no' when none has, 'unsupported' on Windows (no cwd query exists there:
+# the removal itself is the check, Windows refusing a folder in use), and
+# 'unknown' when it cannot be told anywhere else: Linux reads
+# /proc/<pid>/cwd, macOS asks `lsof -d cwd`. A process whose cwd cannot be
+# read is skipped. Must match _wtrec_in_use in the .sh.
 function Test-WtrecInUse([string]$path) {
+    $os = Get-WtrecOsKind
+    if ($os -eq "windows") { return "unsupported" }
     try {
         $want = New-Object System.Collections.Generic.List[string]
         $want.Add([System.IO.Path]::GetFullPath($path).TrimEnd('/'))
         $cwds = New-Object System.Collections.Generic.List[string]
-        if ($IsLinux -and (Test-Path -LiteralPath '/proc/self')) {
+        if ($os -eq "linux" -and (Test-Path -LiteralPath '/proc/self')) {
             try { $rp = @(& realpath -- $path 2>$null); if ($LASTEXITCODE -eq 0 -and $rp.Count -gt 0) { $want.Add(([string]$rp[0]).TrimEnd('/')) } } catch { }
             foreach ($d in [System.IO.Directory]::GetDirectories('/proc')) {
                 if ([System.IO.Path]::GetFileName($d) -notmatch '^[0-9]+$') { continue }
@@ -407,7 +425,7 @@ function Test-WtrecInUse([string]$path) {
                 if ($c.EndsWith(" (deleted)")) { $c = $c.Substring(0, $c.Length - 10) }
                 $cwds.Add($c)
             }
-        } elseif ($IsMacOS) {
+        } elseif ($os -eq "macos") {
             try { $rp = @(& realpath -- $path 2>$null); if ($LASTEXITCODE -eq 0 -and $rp.Count -gt 0) { $want.Add(([string]$rp[0]).TrimEnd('/')) } } catch { }
             $lines = @(& lsof -a -d cwd -Fn 2>$null)
             if ($LASTEXITCODE -ne 0) { return "unknown" }
@@ -423,6 +441,39 @@ function Test-WtrecInUse([string]$path) {
         }
         return "no"
     } catch { return "unknown" }
+}
+
+# Test-WtrecFolderFree PATH -- Windows only: 'free' when no process works in
+# the folder tree at PATH or holds a file in it open, 'in_use' when one does
+# (or the probe cannot run), 'stuck' when the probe could not put the folder
+# back. Windows refuses to rename a folder in that state, so the folder is
+# renamed aside and straight back: Windows' lock is tested WITHOUT deleting
+# anything. `git worktree remove` alone is no such test: it deletes every
+# file it can before it meets the lock and unregisters the worktree even
+# then. Must match _wtrec_folder_free in the .sh.
+function Test-WtrecFolderFree([string]$path) {
+    $p = $path.TrimEnd('\', '/')
+    $aside = "$p.vco-reap-probe-$PID"
+    if (Test-Path -LiteralPath $aside) { return "in_use" }
+    try { [System.IO.Directory]::Move($p, $aside) } catch { return "in_use" }
+    for ($i = 0; $i -lt 50; $i++) {
+        try { [System.IO.Directory]::Move($aside, $p); return "free" } catch { Start-Sleep -Milliseconds 100 }
+    }
+    return "stuck"
+}
+
+# Test-WtrecProbeLeftover PATH -- $true when a Test-WtrecFolderFree probe
+# could not put the folder at PATH back (a `<path>.vco-reap-probe-<pid>`
+# folder exists): the worktree is not gone, it is there. Must match
+# _wtrec_probe_leftover in the .sh.
+function Test-WtrecProbeLeftover([string]$path) {
+    try {
+        $p = $path.TrimEnd('\', '/')
+        $dir = Split-Path -Parent $p
+        if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return $false }
+        $leaf = (Split-Path -Leaf $p) + ".vco-reap-probe-*"
+        return (@(Get-ChildItem -LiteralPath $dir -Directory -Filter $leaf -Force -ErrorAction SilentlyContinue).Count -gt 0)
+    } catch { return $true }
 }
 
 # Invoke-WtrecSweep ROOT CURRENT_SESSION -- run the two sweep rules over every
@@ -489,7 +540,8 @@ function Write-WtrecReapLog([string]$log, [string]$hook, [string]$agent, [string
 # for an UNCHANGED worktree (ACTION candidate: mark it; remove: remove it,
 # sweep rule a). Same conditions as _wtrec_reap_rec in the .sh sibling,
 # including `deferred` (record left a candidate) for a locked worktree or one
-# a process works in (or when that cannot be told).
+# a process works in (or when that cannot be told), and on Windows for a
+# removal git could not complete.
 function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$sessionId, [string]$transcript) {
     $rec = Read-WtrecRecord $file
     if (-not $rec) { return $null }
@@ -511,6 +563,7 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
     if ($allowed -cnotcontains $status) { return (& $out "skipped" "already_handled") }
     if (-not $path -or -not $base -or -not $top -or $path -eq $top) { return (& $out "kept" "incomplete_record") }
     if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+        if (Test-WtrecProbeLeftover $path) { return (& $out "deferred" "probe_not_restored") }
         $r = (& $out "removed" "already_gone")
         if ($mode -eq "reservation") { Remove-WtrecLanesParent $top $path }
         return $r
@@ -532,7 +585,12 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
     if (@($block | Where-Object { $_ -like 'locked*' }).Count -gt 0) { return (& $out "deferred" "locked") }
     $use = Test-WtrecInUse $path
     if ($use -eq "yes") { return (& $out "deferred" "in_use") }
-    if ($use -ne "no") { return (& $out "deferred" "in_use_unknown") }
+    if ($use -ne "no" -and $use -ne "unsupported") { return (& $out "deferred" "in_use_unknown") }
+    if ($use -eq "unsupported") {
+        $free = Test-WtrecFolderFree $path
+        if ($free -eq "stuck") { return (& $out "deferred" "probe_not_restored") }
+        if ($free -ne "free") { return (& $out "deferred" "in_use") }
+    }
     $err = (& git -C $top worktree remove $path 2>&1 | Out-String)
     if ($LASTEXITCODE -eq 0) {
         # A reservation worktree's NEW branch goes too, but only while it still
@@ -552,6 +610,9 @@ function Invoke-WtrecReapRecord([string]$file, [string]$action, [string]$session
     }
     $msg = ($err -replace '[\t\r\n]+', ' ').Trim()
     if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) }
+    # Windows (in-use asked of Windows itself): a refusal after the probe
+    # passed keeps the record a candidate, so the next sweep asks again.
+    if ($use -eq "unsupported") { return (& $out "deferred" "git_refused: $msg") }
     return (& $out "kept" "git_refused: $msg")
 }
 
@@ -612,7 +673,12 @@ function Invoke-WtrecReapMerged([string]$file) {
     if ($LASTEXITCODE -ne 0 -or $o.Count -lt 1 -or ([string]$o[0]).Trim() -ne $head) { return (& $defer "head_moved") }
     $use = Test-WtrecInUse $path
     if ($use -eq "yes") { return (& $defer "in_use") }
-    if ($use -ne "no") { return (& $defer "in_use_unknown") }
+    if ($use -ne "no" -and $use -ne "unsupported") { return (& $defer "in_use_unknown") }
+    if ($use -eq "unsupported") {
+        $free = Test-WtrecFolderFree $path
+        if ($free -eq "stuck") { return (& $defer "probe_not_restored") }
+        if ($free -ne "free") { return (& $defer "in_use") }
+    }
     $err = (& git -C $top worktree remove $path 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) {
         $msg = ($err -replace '[\t\r\n]+', ' ').Trim()

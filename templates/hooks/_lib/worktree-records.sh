@@ -469,6 +469,12 @@ _wtrec_lexnorm() {
 #      unborn), a record that does not match the worktree (path not
 #      registered, wrong branch), a `git worktree lock`, or a process whose
 #      cwd is inside the worktree — or no way to tell (_wtrec_in_use).
+#      On Windows (Git Bash) no process's cwd can be read; there the in-use
+#      check is not a doubt (owner ruling 2026-11-20 "Rely on Windows'
+#      lock"): Windows' own lock is asked first, without deleting anything
+#      (_wtrec_folder_free), and only then the plain `git worktree remove`
+#      runs; a refusal at either step keeps the worktree and its record
+#      (deferred: the next sweep asks again) and logs the reason.
 
 # Idle days after which an unchanged candidate is removed. MUST MATCH
 # $script:WtrecAbandonDays in the .ps1.
@@ -495,12 +501,25 @@ _wtrec_wt_block() {
         END { exit found ? 0 : 1 }'
 }
 
+# _wtrec_os_kind — linux|macos|windows|other (Git Bash / MSYS / Cygwin are
+# windows). MUST MATCH Get-WtrecOsKind in the .ps1.
+_wtrec_os_kind() {
+    case "$(uname -s 2>/dev/null)" in
+        Linux) echo linux ;;
+        Darwin) echo macos ;;
+        MINGW*|MSYS*|CYGWIN*) echo windows ;;
+        *) echo other ;;
+    esac
+}
+
 # _wtrec_in_use PATH — print `yes` when a process has its cwd at or under
-# PATH, `no` when none has, `unknown` when that cannot be told: Linux reads
-# /proc/<pid>/cwd, macOS asks `lsof -d cwd`, anything else (Windows) is
-# unknown. A process whose cwd cannot be read (another user's) is skipped.
-# MUST MATCH Test-WtrecInUse in the .ps1.
+# PATH, `no` when none has, `unsupported` on Windows (no cwd query exists
+# there: the removal itself is the check, Windows refusing a folder in use),
+# and `unknown` when it cannot be told anywhere else: Linux reads
+# /proc/<pid>/cwd, macOS asks `lsof -d cwd`. A process whose cwd cannot be
+# read (another user's) is skipped. MUST MATCH Test-WtrecInUse in the .ps1.
 _wtrec_in_use() {
+    [ "$(_wtrec_os_kind)" = windows ] && { echo unsupported; return 0; }
     [ -n "${PY:-}" ] || { echo unknown; return 0; }
     WTREC_PATH="$1" "$PY" -c '
 import os, subprocess, sys
@@ -539,6 +558,39 @@ print("yes" if any(inside(c) for c in cwds) else "no")
 ' 2>/dev/null || echo unknown
 }
 
+# _wtrec_folder_free PATH — Windows only: print `free` when no process works
+# in the folder tree at PATH or holds a file in it open, `in_use` when one
+# does (or the probe cannot run), `stuck` when the probe could not put the
+# folder back. Windows refuses to rename a folder in that state, so the
+# folder is renamed aside and straight back: Windows' lock is tested WITHOUT
+# deleting anything. `git worktree remove` alone is no such test: it deletes
+# every file it can before it meets the lock and unregisters the worktree
+# even then. MUST MATCH Test-WtrecFolderFree in the .ps1.
+_wtrec_folder_free() {
+    local p="${1%/}" aside i
+    aside="$p.vco-reap-probe-$$"
+    if [ -e "$aside" ] || ! mv -T -- "$p" "$aside" 2>/dev/null; then
+        echo in_use; return 0
+    fi
+    for i in $(seq 1 50); do
+        if mv -T -- "$aside" "$p" 2>/dev/null; then echo free; return 0; fi
+        sleep 0.1
+    done
+    echo stuck
+}
+
+# _wtrec_probe_leftover PATH — succeed when a _wtrec_folder_free probe could
+# not put the folder at PATH back (a `<path>.vco-reap-probe-<pid>` folder
+# exists): the worktree is not gone, it is there. MUST MATCH
+# Test-WtrecProbeLeftover in the .ps1.
+_wtrec_probe_leftover() {
+    local f
+    for f in "${1%/}".vco-reap-probe-*; do
+        [ -d "$f" ] && return 0
+    done
+    return 1
+}
+
 # _wtrec_reap_rec RECORD_FILE ACTION [SESSION_ID] [TRANSCRIPT] — the one
 # decision for an UNCHANGED worktree. ACTION `candidate` (SubagentStop) marks
 # it a reap candidate; ACTION `remove` (wtrec_sweep, rule a) removes it.
@@ -557,7 +609,7 @@ print("yes" if any(inside(c) for c in cwds) else "no")
 #   * (remove) the worktree is not locked and no process has its cwd inside
 #     it — otherwise the decision is `deferred` (the record stays a candidate
 #     and the next sweep asks again) — and `git worktree remove` (no --force)
-#     agrees.
+#     agrees (on Windows a refusal is `deferred` too: see the Reaping block).
 # worktree-guard creates DETACHED worktrees for head/snapshot, so there is no
 # branch to delete; a reservation worktree's new branch is deleted with it
 # (compare-and-delete against the base, above), and the lanes directory it
@@ -597,6 +649,10 @@ _wtrec_reap_rec() {
         return 0
     fi
     if [ ! -d "$path" ]; then
+        if _wtrec_probe_leftover "$path"; then
+            _wtrec_out deferred probe_not_restored
+            return 0
+        fi
         _wtrec_out removed already_gone
         [ "$mode" = "reservation" ] && _wtrec_rmdir_lanes_parent "$top" "$path"
         return 0
@@ -628,11 +684,20 @@ _wtrec_reap_rec() {
         _wtrec_out deferred locked
         return 0
     fi
-    case "$(_wtrec_in_use "$path")" in
-        no) ;;
+    local use
+    use="$(_wtrec_in_use "$path")"
+    case "$use" in
+        no|unsupported) ;;
         yes) _wtrec_out deferred in_use; return 0 ;;
         *) _wtrec_out deferred in_use_unknown; return 0 ;;
     esac
+    if [ "$use" = unsupported ]; then
+        case "$(_wtrec_folder_free "$path")" in
+            free) ;;
+            stuck) _wtrec_out deferred probe_not_restored; return 0 ;;
+            *) _wtrec_out deferred in_use; return 0 ;;
+        esac
+    fi
     if err="$(git -C "$top" worktree remove "$path" 2>&1)"; then
         # A lane reservation's worktree (mode reservation) was created on a
         # NEW branch (`worktree add -b`); remove that branch too, but only
@@ -651,6 +716,11 @@ _wtrec_reap_rec() {
             return 0
         fi
         _wtrec_out removed clean
+    elif [ "$use" = unsupported ]; then
+        # Windows (in-use asked of Windows itself): a refusal after the
+        # probe passed keeps the record a candidate, so the next sweep asks
+        # again.
+        _wtrec_out deferred "git_refused: $(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-200)"
     else
         _wtrec_out kept "git_refused: $(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-200)"
     fi
@@ -711,11 +781,20 @@ _wtrec_reap_merged() {
     # Re-check right before the removal: HEAD unchanged since the ancestry test.
     [ "$(git -C "$path" rev-parse --verify -q HEAD 2>/dev/null)" = "$head" ] || {
         _wtrec_defer head_moved; return 0; }
-    case "$(_wtrec_in_use "$path")" in
-        no) ;;
+    local use
+    use="$(_wtrec_in_use "$path")"
+    case "$use" in
+        no|unsupported) ;;
         yes) _wtrec_defer in_use; return 0 ;;
         *) _wtrec_defer in_use_unknown; return 0 ;;
     esac
+    if [ "$use" = unsupported ]; then
+        case "$(_wtrec_folder_free "$path")" in
+            free) ;;
+            stuck) _wtrec_defer probe_not_restored; return 0 ;;
+            *) _wtrec_defer in_use; return 0 ;;
+        esac
+    fi
     if ! err="$(git -C "$top" worktree remove "$path" 2>&1)"; then
         _wtrec_defer "git_refused: $(printf '%s' "$err" | tr '\t\n' '  ' | cut -c1-200)"
         return 0

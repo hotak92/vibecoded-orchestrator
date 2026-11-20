@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -488,6 +489,243 @@ def test_adopted_reservation_worktree_is_never_removed(flavour: str, tmp_path: P
     assert wt.is_dir()
     assert _git(repo, "show-ref", "--verify", "-q", "refs/heads/adopted", check=False).returncode == 0
     assert _record(repo, "res002")["status"] == "kept"
+
+
+# ── Windows: rely on Windows' lock (owner ruling 2026-11-20) ────────────────
+# No process's cwd can be read on Windows, so the in-use check is not a doubt
+# there: Windows' own lock is asked first by renaming the folder aside and
+# back (Windows refuses that while a process works in it), then the plain
+# `git worktree remove` runs; a refusal at either step keeps the worktree and
+# its record and logs the reason. Every other doubt still keeps. The Windows
+# branch is forced here by running a COPY of the hooks whose lib reports the
+# OS as windows (Get-WtrecOsKind / _wtrec_os_kind, the one OS seam); a folder
+# Windows would refuse to rename is simulated by a read-only parent folder.
+# The probe was added because `git worktree remove` is no lock test: it
+# deletes every file it can before it meets the lock and unregisters the
+# worktree even then (seen with a read-only parent: an empty folder is left).
+
+_OS_OVERRIDE = {"ps1": '\nfunction Get-WtrecOsKind { return "windows" }\n',
+                "sh": "\n_wtrec_os_kind() { echo windows; }\n"}
+_PROBE_FREE = {"ps1": '\nfunction Test-WtrecFolderFree([string]$path) { return "free" }\n',
+               "sh": "\n_wtrec_folder_free() { echo free; }\n"}
+
+
+def _windows_hooks(flavour: str, tmp_path: Path, probe_free: bool = False) -> Path:
+    from tests.test_v02102_worktree_guard_no_head import HOOKS
+    dst = tmp_path / "hooks-win"
+    shutil.copytree(HOOKS, dst)
+    lib = dst / "_lib" / f"worktree-records.{flavour}"
+    with lib.open("a", encoding="utf-8") as fh:
+        fh.write(_OS_OVERRIDE[flavour])
+        if probe_free:
+            fh.write(_PROBE_FREE[flavour])
+    return dst
+
+
+def _win_session(flavour: str, hooks: Path, project: Path, sid: str) -> None:
+    from tests.common.pwsh import PWSH_BASE_FLAGS
+    from tests.test_v02102_worktree_guard_no_head import _PS
+    env = {k: v for k, v in os.environ.items() if k not in _LEAK_ENV_KEYS}
+    env["CLAUDE_PROJECT_DIR"] = str(project)
+    env["HOME"] = str(project.parent / "fakehome")
+    path = hooks / f"session-worktree-reap.{flavour}"
+    argv = ["bash", str(path)] if flavour == "sh" else [_PS, *PWSH_BASE_FLAGS, "-File", str(path)]
+    payload = {"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(project),
+               "source": "startup"}
+    proc = subprocess.run(argv, input=json.dumps(payload), capture_output=True, text=True,
+                          env=env, cwd=str(project), timeout=90)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+
+
+def _readonly(folder: Path):
+    folder.chmod(0o555)
+    return folder
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_lib_reports_in_use_as_unsupported(flavour: str, tmp_path: Path) -> None:
+    """The seam itself: with the OS reported as windows the in-use check says
+    `unsupported`, not `unknown` (which still means "keep")."""
+    hooks = _windows_hooks(flavour, tmp_path)
+    lib = hooks / "_lib" / f"worktree-records.{flavour}"
+    if flavour == "sh":
+        argv = ["bash", "-c", f'. "{lib}"; _wtrec_in_use "{tmp_path}"']
+    else:
+        from tests.common.pwsh import PWSH_BASE_FLAGS
+        from tests.test_v02102_worktree_guard_no_head import _PS
+        argv = [_PS, *PWSH_BASE_FLAGS, "-Command", f". '{lib}'; Test-WtrecInUse '{tmp_path}'"]
+    out = subprocess.run(argv, capture_output=True, text=True, env=child_env(), timeout=60)
+    assert out.stdout.strip() == "unsupported", out.stderr
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_idle_candidate_is_removed_once_windows_lets_it_go(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "win001")
+    _stop(flavour, "win001", repo, sid="s1")
+    _age(repo, "win001", 8)
+    _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    assert not wt.exists() and not _registered(repo, wt)
+    assert _record(repo, "win001")["status"] == "removed"
+    assert _rows(repo, "session-worktree-reap")[-1]["decision"] == "reap_removed"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_idle_candidate_in_use_is_kept_whole(flavour: str, tmp_path: Path) -> None:
+    """Windows refuses the rename probe (a process works in the folder):
+    nothing is deleted, the worktree stays registered, the record stays a
+    candidate."""
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "win002")
+    _stop(flavour, "win002", repo, sid="s1")
+    _age(repo, "win002", 8)
+    parent = _readonly(wt.parent)
+    try:
+        _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    finally:
+        parent.chmod(0o755)
+    assert (wt / "app.py").is_file() and _registered(repo, wt), "nothing deleted, still a worktree"
+    rec = _record(repo, "win002")
+    assert rec["status"] == "reap_candidate", "kept as a candidate: the next sweep asks again"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"]) == ("reap_deferred", "in_use"), row
+    assert not list(wt.parent.glob("*.vco-reap-probe-*"))
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_idle_candidate_whose_git_removal_fails_is_kept(flavour: str, tmp_path: Path) -> None:
+    """The probe passes but `git worktree remove` still fails: the record
+    stays a candidate and git's reason is logged."""
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "win004")
+    _stop(flavour, "win004", repo, sid="s1")
+    _age(repo, "win004", 8)
+    parent = _readonly(wt.parent)
+    try:
+        _win_session(flavour, _windows_hooks(flavour, tmp_path, probe_free=True), repo, "s2")
+    finally:
+        parent.chmod(0o755)
+    assert wt.is_dir()
+    assert _record(repo, "win004")["status"] == "reap_candidate"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert row["decision"] == "reap_deferred" and row["reason"].startswith("git_refused:"), row
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_probe_that_could_not_put_the_folder_back_is_not_taken_for_gone(
+        flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "win005")
+    _stop(flavour, "win005", repo, sid="s1")
+    _age(repo, "win005", 8)
+    aside = wt.parent / f"{wt.name}.vco-reap-probe-4242"
+    wt.rename(aside)
+    _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    assert aside.is_dir() and (aside / "app.py").is_file()
+    assert _record(repo, "win005")["status"] == "reap_candidate", "never marked removed"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"]) == ("reap_deferred", "probe_not_restored"), row
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_probe_puts_a_free_folder_back(flavour: str, tmp_path: Path) -> None:
+    hooks = _windows_hooks(flavour, tmp_path)
+    lib = hooks / "_lib" / f"worktree-records.{flavour}"
+    folder = tmp_path / "lane"
+    folder.mkdir()
+    (folder / "f.txt").write_text("x\n", encoding="utf-8")
+    if flavour == "sh":
+        argv = ["bash", "-c", f'. "{lib}"; _wtrec_folder_free "{folder}"']
+    else:
+        from tests.common.pwsh import PWSH_BASE_FLAGS
+        from tests.test_v02102_worktree_guard_no_head import _PS
+        argv = [_PS, *PWSH_BASE_FLAGS, "-Command", f". '{lib}'; Test-WtrecFolderFree '{folder}'"]
+    out = subprocess.run(argv, capture_output=True, text=True, env=child_env(), timeout=60)
+    assert out.stdout.strip() == "free", out.stderr
+    assert (folder / "f.txt").read_text(encoding="utf-8") == "x\n"
+    assert not list(tmp_path.glob("lane.vco-reap-probe-*"))
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_locked_candidate_is_still_deferred(flavour: str, tmp_path: Path) -> None:
+    """Only the in-use check is waived on Windows: a `git worktree lock`
+    still keeps the worktree."""
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _launch(flavour, repo, "win003")
+    _stop(flavour, "win003", repo, sid="s1")
+    _git(repo, "worktree", "lock", str(wt))
+    _age(repo, "win003", 8)
+    _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    assert wt.is_dir() and _registered(repo, wt)
+    assert _rows(repo, "session-worktree-reap")[-1]["reason"] == "locked"
+
+
+def _merged_reservation(repo: Path, tmp_path: Path, name: str) -> Path:
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    wt = (tmp_path / "proj.vco-lanes" / f"{name}-r1").resolve()
+    _git(repo, "worktree", "add", "-q", "-b", name, str(wt), base)
+    (wt / "feature.py").write_text("F = 1\n", encoding="utf-8")
+    _git(wt, "add", "feature.py")
+    _git(wt, "commit", "-qm", "lane work")
+    _handmade(repo, name, "reservation", wt, base, branch=name, branch_created="yes")
+    _merge(repo, wt)
+    return wt
+
+
+def _has_branch(repo: Path, name: str) -> bool:
+    return _git(repo, "show-ref", "--verify", "-q", f"refs/heads/{name}", check=False).returncode == 0
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_merged_lane_is_removed_with_its_branch(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _merged_reservation(repo, tmp_path, "winres1")
+    _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    assert not wt.exists() and not _has_branch(repo, "winres1")
+    assert _record(repo, "winres1")["status_reason"] == "merged"
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_merged_lane_in_use_keeps_worktree_and_branch(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _merged_reservation(repo, tmp_path, "winres2")
+    lanes = _readonly(wt.parent)
+    try:
+        _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    finally:
+        lanes.chmod(0o755)
+    assert (wt / "feature.py").is_file() and _registered(repo, wt), "nothing deleted"
+    assert _has_branch(repo, "winres2")
+    assert _record(repo, "winres2")["status"] == "kept", "record unchanged: retried next sweep"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert (row["decision"], row["reason"]) == ("reap_deferred", "in_use"), row
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_merged_lane_whose_git_removal_fails_keeps_its_branch(
+        flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _merged_reservation(repo, tmp_path, "winres4")
+    lanes = _readonly(wt.parent)
+    try:
+        _win_session(flavour, _windows_hooks(flavour, tmp_path, probe_free=True), repo, "s2")
+    finally:
+        lanes.chmod(0o755)
+    assert wt.is_dir() and _has_branch(repo, "winres4"), "branch -d runs only after a removal"
+    assert _record(repo, "winres4")["status"] == "kept"
+    row = _rows(repo, "session-worktree-reap")[-1]
+    assert row["decision"] == "reap_deferred" and row["reason"].startswith("git_refused:"), row
+
+
+@pytest.mark.parametrize("flavour", FLAVOURS)
+def test_windows_merged_dirty_lane_is_still_kept(flavour: str, tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "proj")
+    wt = _merged_reservation(repo, tmp_path, "winres3")
+    (wt / "notes.md").write_text("unmerged thought\n", encoding="utf-8")
+    _win_session(flavour, _windows_hooks(flavour, tmp_path), repo, "s2")
+    assert (wt / "notes.md").is_file() and _has_branch(repo, "winres3")
+    assert _rows(repo, "session-worktree-reap")[-1]["reason"] == "has_changes"
 
 
 # ── delivery: the bundle update registers the hook in existing installs ─────
