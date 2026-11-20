@@ -396,8 +396,10 @@ def test_launcher_instance_names_match_the_rust_launcher():
     import re
 
     src = (REPO / "launcher" / "src-tauri" / "src" / "instance_lock.rs").read_text(encoding="utf-8")
-    rust = tuple(re.search(rf'const {name}: &str = "([^"]+)";', src).group(1)
-                 for name in ("LOCK_BASENAME", "READY_BASENAME"))
+    found = [re.search(rf'const {name}: &str = "([^"]+)";', src)
+             for name in ("LOCK_BASENAME", "READY_BASENAME")]
+    assert all(found), "instance_lock.rs no longer declares both basenames"
+    rust = tuple(m.group(1) for m in found if m)
     assert rust == ua.LAUNCHER_INSTANCE_FILES
 
 

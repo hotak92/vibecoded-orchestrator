@@ -426,7 +426,7 @@ def _placed_as_the_merge_places_it(
 
     event = entry.get("event")
     groups = user_hooks.get(event) if isinstance(user_hooks, dict) else None
-    if not isinstance(groups, list) or not groups:
+    if not isinstance(event, str) or not isinstance(groups, list) or not groups:
         return entry
     scratch = SettingsDoc(Path("settings.json"),
                           {"hooks": {event: copy.deepcopy(groups)}}, 2, True)
@@ -448,7 +448,7 @@ def _placed_as_the_merge_places_it(
               if isinstance(h, dict) and h.get("command") in commands]
         if not at:
             continue
-        joined = dict(entry, group_removed=False, group_index=g_idx)
+        joined: dict[str, Any] = dict(entry, group_removed=False, group_index=g_idx)
         if "item" in entry:
             joined["hook_index"] = at[0]
         else:
