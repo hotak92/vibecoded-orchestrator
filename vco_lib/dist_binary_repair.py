@@ -554,6 +554,22 @@ def _backup_pid(name: str, canonical_name: str) -> Optional[int]:
     return int(tail) if tail.isdigit() else None
 
 
+def _move_no_overwrite(src: Path, dst: Path) -> None:
+    """Move ``src`` onto ``dst`` only while ``dst`` does not exist.
+
+    A rename-back, not a content write (so not ``vco_lib.atomic``). It must
+    never clobber a canonical binary that reappeared after the caller saw it
+    missing (a concurrent pull or repair): Windows ``os.rename`` refuses an
+    existing target; elsewhere a hard link refuses it, and the backup name is
+    dropped only once the link exists. Raises ``OSError`` when it cannot.
+    """
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    os.link(src, dst)
+    os.unlink(src)
+
+
 def restore_missing_from_backups(
     directory: Path,
     names: Iterable[str],
@@ -594,7 +610,7 @@ def restore_missing_from_backups(
             ):
                 continue
             try:
-                os.replace(backup, canonical)
+                _move_no_overwrite(backup, canonical)
             except OSError:
                 continue
             restored.append(canonical)

@@ -141,3 +141,21 @@ def test_cli_restore_backups(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "restored" in proc.stdout
     assert (tmp_path / "vct-launcher.exe").read_bytes() == b"bytes"
+
+
+def test_the_rename_back_never_clobbers_a_binary_that_reappeared(tmp_path):
+    """The canonical binary can reappear between the caller's check and the
+    move (a concurrent pull or repair): the move must refuse, keeping both."""
+    from vco_lib.dist_binary_repair import _move_no_overwrite
+
+    backup = tmp_path / "vct-hub.exe.old-999999"
+    canonical = tmp_path / "vct-hub.exe"
+    backup.write_bytes(b"old")
+    canonical.write_bytes(b"new")
+    with pytest.raises(OSError):
+        _move_no_overwrite(backup, canonical)
+    assert canonical.read_bytes() == b"new"
+    assert backup.read_bytes() == b"old"
+    canonical.unlink()
+    _move_no_overwrite(backup, canonical)
+    assert canonical.read_bytes() == b"old" and not backup.exists()

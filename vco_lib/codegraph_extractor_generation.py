@@ -252,6 +252,22 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "golden snapshots (tests/fixtures/codegraph_golden) are byte-identical to "
         "v0.2.102. _CHUNKER_REVISION and CODEGRAPH_EMBED_REVISION unchanged."
     ),
+    "0.2.107": (
+        "No extraction-semantics change for a walk: the code-graph golden "
+        "snapshots (tests/test_codegraph_golden.py, test_v0292_golden_corpus_"
+        "audit.py) are unchanged and pass. The extractor-surface diff since "
+        "v0.2.106 is how rows are READ, SCOPED, KEPT and HEALED: bounded per-link "
+        "property reads and the shared cursor (CG-1/CG-2), a scoped run that "
+        "reads only its own files' rows (A-011), a rewrite that carries a "
+        "function's n_callers / call_names over instead of wiping them, surplus "
+        "chunk rows deleted only after the file's writes succeeded, a revision "
+        "heal of only the stale files, codegraph_references doc text, "
+        "codegraph_schema's backfill through the cursor, and schema_versions' "
+        "launcher-DB migrations 052/053. Rows a pre-0.2.107 rewrite left with a "
+        "wiped n_callers heal when their file next changes; a forced re-walk of "
+        "every project for that would be the mass re-index the owner ruled "
+        "against (simple and cheap over fresh, 2026-11-17)."
+    ),
     "0.2.104": (
         "No extraction-semantics change. `git diff v0.2.103..HEAD` across the "
         "extractor surface (analyze_code_graph.py, codegraph_{guards,"
