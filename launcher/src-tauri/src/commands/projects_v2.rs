@@ -5729,6 +5729,16 @@ pub(crate) async fn unregister_project(
         .get_project(&id)?
         .ok_or_else(|| format!("project {} not found", id))?;
 
+    // Wave-2 check L-3: the row delete below refuses while `rl_events` still
+    // has its foreign key to `projects` (migration 053 did not apply) — the
+    // delete would cascade the events the user chose to keep. Ask that FIRST,
+    // so a refusal leaves the project registered with its files, collections,
+    // secrets state and grants untouched. With "delete the events too" the
+    // cascade removes nothing the user wants, so there is nothing to refuse.
+    if !opts.delete_rl_events {
+        db.refuse_if_project_delete_cascades_rl_events()?;
+    }
+
     let mut report = UnregisterReport {
         project_id: row.id.clone(),
         project_name: row.name.clone(),
@@ -10388,6 +10398,71 @@ SHARED_KG_OPT_OUT=false\n"),
         assert_eq!(report.rl_events_kept, 0);
         assert_eq!(db.count_project_rl_events("p_rl").unwrap(), 0);
         assert_eq!(db.count_project_rl_events("p_other").unwrap(), 1, "other project untouched");
+    }
+
+    /// Put back the pre-053 foreign key `rl_events.project_id -> projects`
+    /// (what a DB looks like when migration 053 did not find the clause).
+    fn restore_rl_events_cascade(db: &Db) {
+        db.lock()
+            .execute_batch(
+                "DROP TABLE rl_events;
+                 CREATE TABLE rl_events (
+                     id INTEGER PRIMARY KEY,
+                     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+    }
+
+    fn audit_rows(db: &Db, operation: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE operation = ?1",
+                rusqlite::params![operation],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Leave-alone (wave-2 check L-3): with the cascade still in place the
+    /// unregister refuses BEFORE any step — the files stay, the secret grants
+    /// stay, no delete is audited, the project stays registered.
+    #[tokio::test]
+    async fn unregister_refuses_before_any_step_while_rl_events_would_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        db.insert_project("p_fk", "Alpha", &folder.path().to_string_lossy(), ProjectHost::Base, "p_fk")
+            .unwrap();
+        let env_file = folder.path().join(".claude").join("env");
+        std::fs::create_dir_all(env_file.parent().unwrap()).unwrap();
+        std::fs::write(&env_file, "KG_COLLECTION=Alpha_KnowledgeGraph\n").unwrap();
+        assert!(db.insert_secret_grant("per_project", "p_fk", "u", "K", "p_other", None, None).unwrap());
+        restore_rl_events_cascade(&db);
+
+        let opts = UnregisterOptions { delete_rl_events: false, ..Default::default() };
+        assert!(opts.purge_launcher_files, "the default purges files: the refusal must come first");
+        let err = unregister_project(&db, "p_fk", opts).await.unwrap_err();
+
+        assert!(err.contains("delete refused") && err.contains("053"), "{err}");
+        assert!(db.get_project("p_fk").unwrap().is_some(), "still registered");
+        assert_eq!(
+            std::fs::read_to_string(&env_file).unwrap(),
+            "KG_COLLECTION=Alpha_KnowledgeGraph\n",
+            "no file purged"
+        );
+        assert!(db.has_secret_grant("per_project", "p_fk", "u", "K", "p_other").unwrap(), "grants kept");
+        assert_eq!(audit_rows(&db, "project_delete"), 0, "nothing audited as deleted");
+    }
+
+    /// Act (wave-2 check L-3): asking for the events to go too, the cascade
+    /// removes nothing the user wants kept, so the unregister proceeds.
+    #[tokio::test]
+    async fn unregister_deleting_the_events_too_is_not_refused_by_the_cascade() {
+        let db = Db::open_in_memory().unwrap();
+        seed_unregister_rl(&db, 0);
+        restore_rl_events_cascade(&db);
+        unregister_project(&db, "p_rl", rl_only_opts(true)).await.unwrap();
+        assert!(db.get_project("p_rl").unwrap().is_none(), "unregistered");
     }
 
     /// The checkbox travels as `deleteRlEvents` and is absent = false on
