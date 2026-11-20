@@ -12,9 +12,10 @@ places that must agree with that keying:
   already-indexed copy gets project rows, and removing the folder (a
   ``--prune-stale`` reindex without it) keeps them. Leave-alone: an unchanged
   file in the same root is still skipped with zero writes.
-* D-2 — an extra root always stamps itself (``--canonical-source`` is for the
-  project's own scoped edits); the drain's vanished-file prune uses the same
-  stamp, so an extra's drain never deletes the project's rows of that path.
+* D-2 — every walk stamps the root it walks (an extra root itself; since
+  v0.2.107 no worktree is indexed, so the ``--canonical-source`` remap is
+  gone); a scoped run's vanished-file prune uses the same stamp, so an
+  extra's run never deletes the project's rows of that path.
 * D-3 — the ``--prune-stale`` preserve set is keyed ``(source, path)``.
 * D-4 — the ONE overlap rule (``vco_lib.codegraph_extra_overlap``) and the
   analyzer's refusals.
@@ -280,39 +281,37 @@ def test_d1_invalidation_targets_this_roots_row_not_the_twin(amod, tmp_path):
 # ── D-2: one stamp rule ────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("kw,want", [
-    (dict(canonical_source="/main", scoped=True, extra_root=False), "/main"),
-    (dict(canonical_source="/main", scoped=True, extra_root=True), "/wt"),
-    (dict(canonical_source="/main", scoped=False, extra_root=False), "/wt"),
-    (dict(canonical_source=None, scoped=True, extra_root=False), "/wt"),
-])
-def test_d2_walk_source_stamp(kw, want):
-    assert scope.walk_source_stamp("/wt", **kw) == want
-
-
-def test_d2_extra_scoped_edit_ignores_canonical_source(amod, no_embed, tmp_path):
-    """An extra-path edit (``--as-extra-path``) stamps the extra root even when
-    a caller still passes ``--canonical-source`` (e.g. the git main root of a
-    worktree extra) — the value every other extra producer stamps."""
+def test_d2_extra_scoped_edit_stamps_the_extra_root(amod, no_embed, tmp_path):
+    """An extra-path run (``--as-extra-path``) stamps the extra root — the
+    value every other extra producer stamps."""
     _proj, extra = _trees(tmp_path)
     a = _analyzer(amod)
-    a.analyze_repository(extra, only_file=extra / "pkg" / "same.py",
-                         canonical_source="/somewhere/main", as_extra_path=True)
+    a.analyze_repository(extra, only_file=extra / "pkg" / "same.py", as_extra_path=True)
     assert _module_sources(a, "pkg/same.py") == [extra.as_posix()]
 
 
-def test_d2_project_scoped_edit_keeps_canonical_source(amod, no_embed, tmp_path):
-    """LEAVE-ALONE: the project's own worktree edit still converges on the
-    canonical main root."""
+def test_d2_project_scoped_edit_stamps_the_project_root(amod, no_embed, tmp_path):
+    """The project's own scoped run stamps the project root."""
     proj, _extra = _trees(tmp_path)
     a = _analyzer(amod)
-    a.analyze_repository(proj, only_file=proj / "pkg" / "same.py", canonical_source="/main/root")
-    assert _module_sources(a, "pkg/same.py") == ["/main/root"]
+    a.analyze_repository(proj, only_file=proj / "pkg" / "same.py")
+    assert _module_sources(a, "pkg/same.py") == [proj.as_posix()]
+
+
+def test_d2_canonical_source_is_retired(amod):
+    """v0.2.107 CG-3: no worktree is indexed, so the analyzer has no
+    canonical-source remap (no CLI flag, no ``analyze_repository`` keyword)."""
+    import inspect
+
+    assert "canonical_source" not in inspect.signature(
+        amod.CodeGraphAnalyzer.analyze_repository).parameters
+    assert not hasattr(scope, "walk_source_stamp")
+    assert "--canonical-source" not in _ANALYZER.read_text(encoding="utf-8")
 
 
 def test_d2_extra_drain_vanished_file_prunes_only_the_extras_rows(amod, tmp_path):
-    """The queued Stop drain of an extra (``--only-files-from`` +
-    ``--as-extra-path``, no canonical source) prunes a vanished file's rows
+    """A scoped run of an extra (``--only-files-from`` + ``--as-extra-path``)
+    prunes a vanished file's rows
     under the extra's own source. It used to pass an EMPTY source (=
     unscoped) and deleted the project's rows of the same path too."""
     _proj, extra = _trees(tmp_path)
@@ -608,9 +607,9 @@ def test_r11_02_incremental_union_requeues_only_this_roots_stale_files(amod, tmp
 
 
 def test_r12_1_incremental_union_uses_the_walks_canonical_stamp(amod, tmp_path):
-    """R12-1: a scoped worktree run stamping the MAIN root (--canonical-source)
-    re-queues a stale row written under that main-root form (act); without the
-    stamp only the worktree's own forms count (leave-alone)."""
+    """R12-1: a run whose stamp differs from the walked root's own forms
+    (``stamp=``) re-queues a stale row written under that stamp (act); without
+    it only the root's own forms count (leave-alone)."""
     wt, main = (tmp_path / "wt").resolve(), (tmp_path / "main").resolve()
     a = _analyzer(amod)
     a._analyze_repo_root_raw, a._strict_source = wt.as_posix(), False
@@ -636,24 +635,23 @@ def test_d4_cli_as_extra_path_nested_in_primary_root_exits_2(tmp_path):
 
 
 def test_d4_cli_as_extra_path_external_is_not_refused(tmp_path):
-    """LEAVE-ALONE: a folder beside the project passes the overlap check. The
-    lone ``--canonical-source`` makes the run stop at the NEXT argument check
-    (exit 1, before any walk or ledger write), proving the overlap check let
-    it through."""
+    """LEAVE-ALONE: a folder beside the project passes the overlap check. A
+    worktree-segment project name makes the run stop at the NEXT argument
+    check (exit 1, before any walk or ledger write), proving the overlap check
+    let it through."""
     proj, clone = tmp_path / "proj", tmp_path / "clone"
     proj.mkdir()
     clone.mkdir()
-    r = _run_analyzer_cli([str(clone), "--project", "W6", "--as-extra-path",
-                           "--primary-root", str(proj), "--canonical-source", "/x"], tmp_path)
+    r = _run_analyzer_cli([str(clone), "--project", "worktrees/W6", "--as-extra-path",
+                           "--primary-root", str(proj)], tmp_path)
     assert "refusing --as-extra-path" not in r.stderr
-    assert r.returncode == 1 and "--canonical-source requires" in r.stderr, r.stderr[-800:]
-    assert "--canonical-source ignored with --as-extra-path" in r.stderr
+    assert r.returncode == 1 and "worktree-relative project name" in r.stderr, r.stderr[-800:]
 
 
 def test_r11_04_lone_primary_root_is_rejected_loudly(tmp_path):
     """ACT (v0.2.102 R11-04). ``--primary-root`` without ``--as-extra-path`` used
     to be silently ignored (no overlap check, no warning). It is now refused
-    like a lone ``--canonical-source``: exit 1 and a stderr line, before any
+    with exit 1 and a stderr line, before any
     walk — so the nested root below is never indexed as the project."""
     proj = tmp_path / "proj"
     (proj / "sub").mkdir(parents=True)
@@ -688,5 +686,3 @@ def test_d4_refresh_skips_a_nested_row_with_a_log_line(tmp_path):
     out = cer.refresh_extras(str(tmp_path), "/x/a.py", "/x/py", tmp_path / "st", lines.append, deps=deps)
     assert out == {nested: "overlaps_project"} and ran == []
     assert any("already indexed" in ln for ln in lines), lines
-    out = cer.refresh_queued(str(tmp_path), "/x/a.py", "/x/py", tmp_path / "st", lines.append, deps=deps)
-    assert out == {nested: "overlaps_project"} and ran == []

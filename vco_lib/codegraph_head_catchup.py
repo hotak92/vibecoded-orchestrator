@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""HEAD-diff catch-up for the PRIMARY code-graph root (v0.2.105 #512A).
+"""HEAD-diff catch-up: the ONE writer of the PRIMARY code-graph root (v0.2.105 #512A; v0.2.107 CG-3).
 
-Why this exists (field report, 2026-10-29): a project's code graph went SIX
-DAYS stale. The binding's ``last_analyzed_commit`` stayed at a commit from
-10-23 while HEAD moved 1,070 commits ahead, because the only thing that ever
-queued a file was the Edit/Write hook — and it queues only edits made through
-the Edit tool in the MAIN checkout (worktree edits are dropped on purpose,
-FIX-A'). Code that lands through a ``git merge`` of lane branches, a
-``git pull``, a commit made from a shell, or a GUI merge is never queued, so
-the graph silently stops tracking the repository.
+The code graph of a project reflects the files at HEAD of its MAIN checkout's
+current branch (owner rulings 2026-11-17 and 2026-11-19). Since v0.2.107 this
+module is the only path by which the main checkout's code reaches the graph:
+an Edit/Write queues nothing, an edit in a linked git worktree (a lane) is
+never indexed, and both arrive when their commit — or the merge of the lane
+branch — moves the main checkout's HEAD. One analyzer run per HEAD move;
+coalescing is inherent (ten commits between two runs are one range).
+Uncommitted edits in the main checkout are not indexed as such: the commit
+that carries them is (the analyzer reads the files of the range from the
+working tree at that moment).
+
+(History: v0.2.105 added this catch-up because a field project's graph went
+six days and 1,070 commits stale — only Edit-tool edits were ever queued.)
 
 The catch-up closes that gap WITHOUT installing git hooks into user repos:
 
@@ -17,10 +22,9 @@ The catch-up closes that gap WITHOUT installing git hooks into user repos:
    ``code_graph_last_analyzed_commit``) and the main checkout's HEAD;
 2. equal → nothing to do (the leave-alone case);
 3. behind, and the recorded commit is an ANCESTOR of HEAD → the files in
-   ``git diff --name-only <recorded>..HEAD`` are filtered exactly the way the
-   drain and the analyzer filter (code extension, no transient
-   ``.claude/state`` scratch, existing files only) and analyzed in ONE scoped
-   ``--only-files-from`` run — the drain's own batched shape. A FAILED diff
+   ``git diff --name-only <recorded>..HEAD`` are filtered (code extension, no
+   transient ``.claude/state`` scratch, existing files only) and analyzed in
+   ONE scoped ``--only-files-from`` run. A FAILED diff
    (timeout, git error) records nothing: failure is distinct from empty;
 4. behind by MORE than ``--max-files`` → the same efficient path the analyzer
    already has: one ``--incremental --since-commit <recorded>`` walk (which
@@ -50,17 +54,22 @@ A project with no ENABLED code-graph binding is skipped entirely (the
 prefix even for an unbound project, and the catch-up must never create
 collections on an unbound project's behalf.
 
-The trigger lives in the Stop hook (``templates/hooks/stop-codegraph-drain.
-{sh,ps1}``), which spawns this module DETACHED at most once per
-``VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS`` (default 600) — a Stop hook
-must never block the turn, and a merge produces no queue entry, so the check
-must run whether or not the turn queued anything.
+8. once a day, the path-existence reconciliation
+   (:mod:`vco_lib.codegraph_path_reconcile`) removes rows of code deleted
+   outside any diffed range — also for a project that is not a git
+   repository (whose graph is otherwise updated by a manual re-analysis
+   only).
+
+The trigger lives in ``templates/hooks/stop-codegraph-drain.{sh,ps1}``,
+registered on Stop and on SessionStart (a pull made outside a session is
+picked up when the next one starts); it spawns this module DETACHED at most
+once per ``VCO_CODEGRAPH_HEAD_CATCHUP_INTERVAL_SECONDS`` (default 600).
 
 Deliberately NOT covered: a session whose checkout is a linked git WORKTREE
-(``worktree_session``). Worktree edits are dropped from the index on purpose
-(FIX-A'), worktree lanes share the main repo's commit graph, and stamping the
-binding from a worktree HEAD would advance it to a commit the main checkout
-does not have. The main checkout's own session runs the catch-up.
+(``worktree_session``, checked first). Worktrees are never indexed, and
+stamping the binding from a worktree HEAD would advance it to a commit the
+main checkout does not have. The main checkout's own session runs the
+catch-up.
 
 Every decision is one line in
 ``<project>/.claude/logs/codegraph_head_catchup.log`` (size-capped). Exit
@@ -69,7 +78,6 @@ status is always 0.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -79,6 +87,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from vco_lib import codegraph_root_lock as _root_lock
 from vco_lib.codegraph_extras_refresh import (
     AnalyzerResult,
     RunLog,
@@ -91,7 +100,7 @@ from vco_lib.paths import looks_like_orchestrator_root
 #: hand the diff to the analyzer's own ``--incremental --since-commit`` walk
 #: instead of a per-turn batch (an argv + list file of thousands of paths).
 DEFAULT_MAX_DIFF_FILES = 2000
-#: Hard ceiling on one analyzer run — the same 30 min the drain/extras use.
+#: Hard ceiling on one analyzer run — the same 30 min the extras refresh uses.
 DEFAULT_TIMEOUT_SECONDS = 1800
 #: Wall-clock ceiling for the ONE ``git diff --name-only`` call. The module's
 #: other git calls are plumbing and keep ``git_meta``'s 5 s default, but a
@@ -115,28 +124,24 @@ BACKOFF_BASE_SECONDS = 3600
 #: Ceiling of the doubling window.
 BACKOFF_MAX_SECONDS = 6 * 3600
 
-#: The drain's extension gate, byte for byte
-#: (``templates/hooks/stop-codegraph-drain.sh :: CODE_RE``). MUST MATCH.
+#: The extensions a changed file must carry to be handed to the analyzer
+#: (the analyzer applies its own language and ignore rules on top).
 CODE_RE = re.compile(
     r"\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|json|ini|tweakers|sh|bash)$"
 )
 
 
-# ── Share the drain's / extras' interpreter + analyzer runner ─────────────
+# ── Share the extras' interpreter + analyzer runner ──────────────────────
 # ``run_analyzer`` / ``AnalyzerResult`` / ``RunLog`` are imported from
 # ``vco_lib.codegraph_extras_refresh``: one home for "run the analyzer, parse
 # its final report, decide ok/failed" and for the size-capped decision log.
-# The argv builders below ARE specific to this catch-up and MUST match the
-# drain's own spawn line (see their docstrings).
 
 
 def path_key(path: str) -> str:
-    """md5 of a path — the key the drain's per-root lock uses
-    (``codegraph_drain_root_<md5>.lock``), so a catch-up run serialises with a
-    drain batch over the same checkout. Callers pass the CANONICAL root
-    (git-resolved realpath), which is what the drain keys on — not the
-    session's spelling of it."""
-    return hashlib.md5(path.encode("utf-8")).hexdigest()  # noqa: S324 — a key, not security
+    """The per-checkout lock key (:mod:`vco_lib.codegraph_root_lock`). Callers
+    pass the CANONICAL root (git-resolved realpath), so every writer over the
+    same checkout serialises however the session spelled the root."""
+    return _root_lock.path_key(path)
 
 
 # ── Git plumbing (one home: vco_lib.git_meta) ─────────────────────────────
@@ -186,9 +191,8 @@ def diff_paths(root: str, old: str, new: str) -> Optional[list[str]]:
 def canonical_repo_root(root: str) -> Optional[str]:
     """The MAIN checkout root a linked worktree shares, or None.
 
-    Python twin of ``templates/hooks/_lib/canonical-repo-root.sh``
-    (``git rev-parse --path-format=absolute --git-common-dir`` → dirname →
-    strip ``/.git`` → normalise). Used ONLY to tell a worktree session from
+    ``git rev-parse --path-format=absolute --git-common-dir`` → dirname →
+    strip ``/.git`` → normalise. Used ONLY to tell a worktree session from
     the main checkout; a resolution failure is read as "not a worktree".
     """
     repo = Path(root)
@@ -211,19 +215,15 @@ def canonical_repo_root(root: str) -> Optional[str]:
     return str(resolved) if resolved.is_dir() else None
 
 
-# ── The drain's argv shapes ───────────────────────────────────────────────
+# ── The analyzer argv shapes ─────────────────────────────────────────────
 
 
 def index_dot_claude_flag(root: str) -> str:
     """``--index-dot-claude`` for the orchestrator clone, else
     ``--no-index-dot-claude``.
 
-    MUST MATCH ``stop-codegraph-drain.sh :: _drain_index_dot_claude``'s
-    fallback branch. (Its hub-resolver branch reads a
-    ``code_graph_index_dot_claude`` field the resolver does not serve today,
-    so the shell hook always lands on the same root-autodetect heuristic —
-    ``vco_lib.paths.looks_like_orchestrator_root`` is the ONE home for it,
-    shared with the analyzer's own default.)
+    ``vco_lib.paths.looks_like_orchestrator_root`` is the ONE home for the
+    heuristic, shared with the analyzer's own default.
     """
     return (
         "--index-dot-claude"
@@ -237,20 +237,12 @@ def build_scoped_argv(
 ) -> list[str]:
     """Analyzer argv (after the script) for ONE scoped batch over a file list.
 
-    MUST MATCH the drain's detached spawn:
-    ``"$1" "$2" "$3" --project "$4" --only-files-from "$5"
-    --canonical-source "$3" $6`` — same flags, same order.
+    Every shape carries ``--json-progress``: without it the analyzer prints no
+    ``{"final": true}`` report, so :func:`run_analyzer` could not see insert
+    errors (a partial index would be recorded as current) nor the walk tally
+    the log line carries.
     """
-    return [
-        root,
-        "--project",
-        prefix,
-        "--only-files-from",
-        list_file,
-        "--canonical-source",
-        root,
-        dot_flag,
-    ]
+    return [root, "--project", prefix, "--json-progress", "--only-files-from", list_file, dot_flag]
 
 
 def build_incremental_argv(
@@ -261,11 +253,8 @@ def build_incremental_argv(
     ``since`` set → restrict to ``<since>..HEAD`` (and prune the entities of
     deleted/renamed files, ``--since-commit`` is what enables that prune).
     ``since`` None → the analyzer's default ``HEAD~1..HEAD`` bound.
-
-    ``--canonical-source`` is deliberately ABSENT: the analyzer REFUSES it
-    (exit 1) unless a single-file/``--only-files-from`` mode is in force.
     """
-    argv = [root, "--project", prefix, "--incremental"]
+    argv = [root, "--project", prefix, "--json-progress", "--incremental"]
     if since:
         argv += ["--since-commit", since]
     return argv + [dot_flag]
@@ -281,7 +270,7 @@ def build_full_argv(root: str, prefix: str, dot_flag: str) -> list[str]:
     commit's worth of files, recorded nothing and re-ran every interval
     forever (review M3).
     """
-    return [root, "--project", prefix, dot_flag]
+    return [root, "--project", prefix, "--json-progress", dot_flag]
 
 
 # ── Recording the new baseline (hub = the single launcher.db writer) ─────
@@ -327,6 +316,10 @@ class Deps:
     canonical_root: Callable[[str], Optional[str]] = canonical_repo_root
     #: Wall clock for the backoff window (review LOW) — a test moves it.
     now: Callable[[], float] = time.time
+    #: The daily path-existence reconciliation (v0.2.107 CG-3, A-013):
+    #: ``(project_root, prefix, state_dir, log) -> outcome``. None → the real
+    #: :func:`vco_lib.codegraph_path_reconcile.reconcile_if_due`.
+    reconcile: "Optional[Callable[[str, str, Path, Callable[[str], None]], str]]" = None
 
 
 def _str_or_none(value: object) -> Optional[str]:
@@ -338,8 +331,7 @@ def _str_or_none(value: object) -> Optional[str]:
 def indexable_files(root: str, rel_paths: Sequence[str]) -> tuple[list[str], int]:
     """``(absolute paths to index, count of vanished code files)``.
 
-    Same rules the drain applies per queued line, in the same order:
-    a code extension (``CODE_RE``), no transient ``.claude/state`` scratch, and
+    A code extension (``CODE_RE``), no transient ``.claude/state`` scratch, and
     the file must still exist. A path that no longer exists is counted, never
     queued — the brief's "existing, indexable files only". Deletions are the
     incremental walk's job (it prunes by ``--since-commit``), not this batch's.
@@ -365,30 +357,13 @@ def indexable_files(root: str, rel_paths: Sequence[str]) -> tuple[list[str], int
 
 
 def _acquire_lock(state_dir: Path, key: str) -> Optional[Path]:
-    """Atomic mkdir per-root lock (the drain's own lock name). None = busy."""
-    lock = state_dir / f"codegraph_drain_root_{key}.lock"
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        lock.mkdir()
-    except FileExistsError:
-        return None
-    except OSError:
-        return None
-    try:
-        (lock / "pid").write_text(str(os.getpid()), encoding="utf-8")
-    except OSError:
-        pass
-    return lock
+    """The per-checkout analyzer lock (:mod:`vco_lib.codegraph_root_lock`,
+    which also breaks a provably dead holder's lock). None = busy."""
+    return _root_lock.acquire(state_dir, key)
 
 
 def _release_lock(lock: Optional[Path]) -> None:
-    if lock is None:
-        return
-    try:
-        (lock / "pid").unlink(missing_ok=True)
-        lock.rmdir()
-    except OSError:
-        pass
+    _root_lock.release(lock)
 
 
 # ── Backoff after consecutive failures (review LOW) ───────────────────────
@@ -503,10 +478,10 @@ def _run_walk(
     twins a launcher/driver walk of the same project — the 2026-10-14 field
     defect).
 
-    ``lock_root`` is the CANONICAL root (git-resolved realpath) the drain
-    keys its own per-root lock on, so a catch-up walk serialises with a
-    drain batch over the same checkout even when this session spelled the
-    root differently (symlink, trailing-dot form) — review LOW.
+    ``lock_root`` is the CANONICAL root (git-resolved realpath) the lock is
+    keyed on, so a catch-up walk serialises with every other analyzer run
+    over the same checkout even when this session spelled the root
+    differently (symlink, trailing-dot form) — review LOW.
     """
     from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
 
@@ -551,8 +526,9 @@ def catchup(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     deps: Optional[Deps] = None,
 ) -> str:
-    """Bring the PRIMARY root's code graph up to HEAD. Returns the outcome
-    (one of ``up_to_date``, ``no_git_head``, ``no_config``, ``not_bound``,
+    """Bring the PRIMARY root's code graph up to HEAD, then run the daily
+    path reconciliation when it is due. Returns the catch-up outcome (one of
+    ``up_to_date``, ``no_git_head``, ``no_config``, ``not_bound``,
     ``worktree_session``, ``diff_failed``, ``busy``, ``backoff``,
     ``analyzer_failed``, ``record_failed``, ``recorded``). Never raises."""
     if deps is None:
@@ -585,195 +561,245 @@ def catchup(
         )
         return "not_bound"
 
-    head = deps.git_head(root)
-    if not head:
-        log(f"skip project={root}: no git HEAD (not a repo, no commits, or git missing)")
-        return "no_git_head"
-    if recorded and recorded == head:
-        # Nothing to converge, so any earlier failure chain is over: drop the
-        # backoff state (review LOW) so the NEXT real difference starts fresh.
-        _clear_backoff(state_dir, project_id)
-        return "up_to_date"
-
+    # A linked worktree (a lane) is never indexed and never stamps the
+    # binding (owner ruling 2026-11-19): checked before anything else.
     canonical = deps.canonical_root(root)
     if canonical and Path(canonical) != Path(root).resolve():
         log(
-            f"skip project={root}: linked worktree of {canonical} — the main "
-            "checkout's own session owns this catch-up (FIX-A')"
+            f"skip project={root}: linked worktree of {canonical} — worktrees "
+            "are never indexed; the main checkout's own session owns this catch-up"
         )
         return "worktree_session"
-    # The lock key follows the drain's canonical root (same resolution), so
-    # the catch-up and the drain serialise however the root was spelled.
+    # The lock key follows the canonical root, so every writer over this
+    # checkout serialises however the root was spelled.
     lock_root = canonical or root
 
-    # Review LOW: the Stop hook spawns this module once per interval (600 s),
-    # and a walk that CANNOT converge (a full walk past the timeout on a huge
-    # tree, a recording the hub keeps refusing) used to restart on every Stop
-    # forever — each run holding the project's walk claim. After
-    # BACKOFF_AFTER_FAILURES consecutive failed runs, skip until the doubling
-    # window elapses. Any recorded outcome (or an up-to-date tree) clears it.
-    remaining = _backoff_remaining(state_dir, project_id, deps.now())
-    if remaining > 0:
-        log(
-            f"backoff project={project_id}: {int(remaining) + 1}s left before "
-            "the next attempt after consecutive failed catch-up run(s); the "
-            "baseline is unchanged — skipping this one"
-        )
-        return "backoff"
+    def _advance() -> str:
+        head = deps.git_head(root)
+        if not head:
+            log(f"skip project={root}: no git HEAD (not a repo, no commits, or git missing)")
+            return "no_git_head"
+        if recorded and recorded == head:
+            # Nothing to converge, so any earlier failure chain is over: drop the
+            # backoff state (review LOW) so the NEXT real difference starts fresh.
+            _clear_backoff(state_dir, project_id)
+            return "up_to_date"
 
-    def _recorded() -> str:
-        _clear_backoff(state_dir, project_id)
-        return "recorded"
-
-    def _failed(outcome: str, label: str) -> str:
-        _note_failure(state_dir, project_id, log, label, deps.now())
-        return outcome
-
-    def _result(ok: bool, label: str) -> str:
-        return _recorded() if ok else _failed("record_failed", label)
-
-    if not recorded:
-        log(
-            f"no recorded commit for project={project_id} prefix={prefix} — "
-            "running ONE full analyzer walk, then recording HEAD (the "
-            "converging fallback: an unprovable baseline is re-proven, not "
-            "advanced blind)"
-        )
-        res = _run_walk(
-            root, prefix, head, None, full=True, lock_root=lock_root,
-            analyzer=analyzer, python=python, state_dir=state_dir, log=log,
-            timeout=timeout, deps=deps, label="no_recorded",
-        )
-        if res.reason == "busy":
-            return "busy"
-        if not res.ok:
+        # Review LOW: the Stop hook spawns this module once per interval (600 s),
+        # and a walk that CANNOT converge (a full walk past the timeout on a huge
+        # tree, a recording the hub keeps refusing) used to restart on every Stop
+        # forever — each run holding the project's walk claim. After
+        # BACKOFF_AFTER_FAILURES consecutive failed runs, skip until the doubling
+        # window elapses. Any recorded outcome (or an up-to-date tree) clears it.
+        remaining = _backoff_remaining(state_dir, project_id, deps.now())
+        if remaining > 0:
             log(
-                f"no_recorded: FAILED project={project_id} full walk at "
-                f"{head[:12]}: {res.reason}; baseline unchanged"
+                f"backoff project={project_id}: {int(remaining) + 1}s left before "
+                "the next attempt after consecutive failed catch-up run(s); the "
+                "baseline is unchanged — skipping this one"
             )
-            return _failed("analyzer_failed", "no_recorded")
-        ok, why = deps.record(project_id, head)
-        log(
-            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
-            f"via full walk (no prior baseline) at {head[:12]}: {why}",
-        )
-        return _result(ok, "no_recorded")
+            return "backoff"
 
-    if not deps.is_ancestor(root, recorded, head):
-        log(
-            f"recorded commit {recorded[:12]} is NOT an ancestor of HEAD "
-            f"{head[:12]} (rewritten history or unknown object) — running ONE "
-            "full analyzer walk, then recording HEAD (the converging fallback: "
-            "a baseline that cannot be diffed is re-proven, not advanced blind)"
-        )
-        res = _run_walk(
-            root, prefix, head, None, full=True, lock_root=lock_root,
-            analyzer=analyzer, python=python, state_dir=state_dir, log=log,
-            timeout=timeout, deps=deps, label="not_ancestor",
-        )
-        if res.reason == "busy":
-            return "busy"
-        if not res.ok:
+        def _recorded() -> str:
+            _clear_backoff(state_dir, project_id)
+            return "recorded"
+
+        def _failed(outcome: str, label: str) -> str:
+            _note_failure(state_dir, project_id, log, label, deps.now())
+            return outcome
+
+        def _result(ok: bool, label: str) -> str:
+            return _recorded() if ok else _failed("record_failed", label)
+
+        if not recorded:
             log(
-                f"not_ancestor: FAILED project={project_id} full walk at "
-                f"{head[:12]}: {res.reason}; baseline unchanged"
+                f"no recorded commit for project={project_id} prefix={prefix} — "
+                "running ONE full analyzer walk, then recording HEAD (the "
+                "converging fallback: an unprovable baseline is re-proven, not "
+                "advanced blind)"
             )
-            return _failed("analyzer_failed", "not_ancestor")
-        ok, why = deps.record(project_id, head)
-        log(
-            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
-            f"via full walk (rewritten history) at {head[:12]}: {why}",
-        )
-        return _result(ok, "not_ancestor")
-
-    paths = deps.diff_paths(root, recorded, head)
-    if paths is None:
-        # M2: a FAILED diff (timeout, git error) is not an empty one. Nothing
-        # is analyzed and nothing recorded — the next eligible catch-up
-        # retries the same diff instead of silently advancing the baseline.
-        log(
-            f"skip project={project_id} {recorded[:12]}..{head[:12]}: "
-            "git diff failed (timeout or git error); baseline unchanged"
-        )
-        return "diff_failed"
-    files, vanished = indexable_files(root, paths)
-
-    # A code file that vanished in the range must be PRUNED, and only the
-    # analyzer's ``--incremental --since-commit`` walk does that (its
-    # deleted-file pass). Same route as a huge diff: one incremental walk
-    # instead of a scoped batch that cannot express a deletion.
-    if not files and vanished == 0:
-        ok, why = deps.record(project_id, head)
-        log(
-            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
-            f"{recorded[:12]}..{head[:12]}: no indexable file changed: {why}"
-        )
-        return _result(ok, "empty_diff")
-
-    if vanished > 0 or len(files) > max_files:
-        label = "deleted_files" if vanished > 0 else "huge_diff"
-        res = _run_walk(
-            root, prefix, head, recorded, full=False, lock_root=lock_root,
-            analyzer=analyzer, python=python, state_dir=state_dir, log=log,
-            timeout=timeout, deps=deps, label=label,
-        )
-        if res.reason == "busy":
-            return "busy"
-        if not res.ok:
+            res = _run_walk(
+                root, prefix, head, None, full=True, lock_root=lock_root,
+                analyzer=analyzer, python=python, state_dir=state_dir, log=log,
+                timeout=timeout, deps=deps, label="no_recorded",
+            )
+            if res.reason == "busy":
+                return "busy"
+            if not res.ok:
+                log(
+                    f"no_recorded: FAILED project={project_id} full walk at "
+                    f"{head[:12]}: {res.reason}; baseline unchanged"
+                )
+                return _failed("analyzer_failed", "no_recorded")
+            ok, why = deps.record(project_id, head)
             log(
-                f"{label}: FAILED project={project_id} {recorded[:12]}..{head[:12]}: "
-                f"{res.reason}; baseline unchanged"
+                f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+                f"via full walk (no prior baseline) at {head[:12]} {res.tally}: {why}",
             )
-            return _failed("analyzer_failed", label)
-        ok, why = deps.record(project_id, head)
-        log(
-            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
-            f"{recorded[:12]}..{head[:12]} via incremental walk ({label}, "
-            f"{vanished} deleted code file(s)): files={res.files_analyzed} "
-            f"deleted_files={res.deleted_files} removed_entities={res.deleted_entities} "
-            f"ms={res.duration_ms}: {why}",
-        )
-        return _result(ok, label)
+            return _result(ok, "no_recorded")
 
-    key = path_key(lock_root)
-    lock = _acquire_lock(state_dir, key)
-    if lock is None:
-        log(f"busy: another analyzer run holds the root lock for {root}; nothing recorded")
-        return "busy"
-    list_file = state_dir / f"codegraph_head_catchup_files_{key}.txt"
-    try:
+        if not deps.is_ancestor(root, recorded, head):
+            log(
+                f"recorded commit {recorded[:12]} is NOT an ancestor of HEAD "
+                f"{head[:12]} (rewritten history or unknown object) — running ONE "
+                "full analyzer walk, then recording HEAD (the converging fallback: "
+                "a baseline that cannot be diffed is re-proven, not advanced blind)"
+            )
+            res = _run_walk(
+                root, prefix, head, None, full=True, lock_root=lock_root,
+                analyzer=analyzer, python=python, state_dir=state_dir, log=log,
+                timeout=timeout, deps=deps, label="not_ancestor",
+            )
+            if res.reason == "busy":
+                return "busy"
+            if not res.ok:
+                log(
+                    f"not_ancestor: FAILED project={project_id} full walk at "
+                    f"{head[:12]}: {res.reason}; baseline unchanged"
+                )
+                return _failed("analyzer_failed", "not_ancestor")
+            ok, why = deps.record(project_id, head)
+            log(
+                f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+                f"via full walk (rewritten history) at {head[:12]} {res.tally}: {why}",
+            )
+            return _result(ok, "not_ancestor")
+
+        paths = deps.diff_paths(root, recorded, head)
+        if paths is None:
+            # M2: a FAILED diff (timeout, git error) is not an empty one. Nothing
+            # is analyzed and nothing recorded — the next eligible catch-up
+            # retries the same diff instead of silently advancing the baseline.
+            log(
+                f"skip project={project_id} {recorded[:12]}..{head[:12]}: "
+                "git diff failed (timeout or git error); baseline unchanged"
+            )
+            return "diff_failed"
+        files, vanished = indexable_files(root, paths)
+
+        # A code file that vanished in the range must be PRUNED, and only the
+        # analyzer's ``--incremental --since-commit`` walk does that (its
+        # deleted-file pass). Same route as a huge diff: one incremental walk
+        # instead of a scoped batch that cannot express a deletion.
+        if not files and vanished == 0:
+            ok, why = deps.record(project_id, head)
+            log(
+                f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+                f"{recorded[:12]}..{head[:12]}: no indexable file changed: {why}"
+            )
+            return _result(ok, "empty_diff")
+
+        if vanished > 0 or len(files) > max_files:
+            label = "deleted_files" if vanished > 0 else "huge_diff"
+            res = _run_walk(
+                root, prefix, head, recorded, full=False, lock_root=lock_root,
+                analyzer=analyzer, python=python, state_dir=state_dir, log=log,
+                timeout=timeout, deps=deps, label=label,
+            )
+            if res.reason == "busy":
+                return "busy"
+            if not res.ok:
+                log(
+                    f"{label}: FAILED project={project_id} {recorded[:12]}..{head[:12]}: "
+                    f"{res.reason}; baseline unchanged"
+                )
+                return _failed("analyzer_failed", label)
+            ok, why = deps.record(project_id, head)
+            log(
+                f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+                f"{recorded[:12]}..{head[:12]} via incremental walk ({label}, "
+                f"{vanished} deleted code file(s)): files={res.files_analyzed} "
+                f"deleted_files={res.deleted_files} removed_entities={res.deleted_entities} "
+                f"ms={res.duration_ms} {res.tally}: {why}",
+            )
+            return _result(ok, label)
+
+        key = path_key(lock_root)
+        lock = _acquire_lock(state_dir, key)
+        if lock is None:
+            log(f"busy: another analyzer run holds the root lock for {root}; nothing recorded")
+            return "busy"
+        list_file = state_dir / f"codegraph_head_catchup_files_{key}.txt"
         try:
-            list_file.write_text("\n".join(files) + "\n", encoding="utf-8")
-        except OSError as exc:
-            log(f"skip project={root}: cannot write the file list ({exc})")
-            return "busy"
-        argv = build_scoped_argv(
-            root, prefix, str(list_file), index_dot_claude_flag(root)
-        )
-        log(
-            f"batch project={project_id} prefix={prefix} {recorded[:12]}..{head[:12]} "
-            f"files={len(files)} vanished={vanished}"
-        )
-        res = deps.run_analyzer(python, analyzer, argv, timeout)
-        if not res.ok:
-            log(
-                f"FAILED project={project_id} {recorded[:12]}..{head[:12]}: "
-                f"{res.reason}; baseline unchanged"
+            try:
+                list_file.write_text("\n".join(files) + "\n", encoding="utf-8")
+            except OSError as exc:
+                log(f"skip project={root}: cannot write the file list ({exc})")
+                return "busy"
+            argv = build_scoped_argv(
+                root, prefix, str(list_file), index_dot_claude_flag(root)
             )
-            return _failed("analyzer_failed", "batch")
-        ok, why = deps.record(project_id, head)
-        log(
-            f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
-            f"{recorded[:12]}..{head[:12]}: files={res.files_analyzed} "
-            f"entities={res.entities_indexed} ms={res.duration_ms}: {why}"
-        )
-        return _result(ok, "batch")
-    finally:
+            log(
+                f"batch project={project_id} prefix={prefix} {recorded[:12]}..{head[:12]} "
+                f"files={len(files)} vanished={vanished}"
+            )
+            res = deps.run_analyzer(python, analyzer, argv, timeout)
+            if not res.ok:
+                log(
+                    f"FAILED project={project_id} {recorded[:12]}..{head[:12]}: "
+                    f"{res.reason}; baseline unchanged"
+                )
+                return _failed("analyzer_failed", "batch")
+            ok, why = deps.record(project_id, head)
+            log(
+                f"{'recorded' if ok else 'NOT RECORDED'} project={project_id} "
+                f"{recorded[:12]}..{head[:12]}: files={res.files_analyzed} "
+                f"entities={res.entities_indexed} ms={res.duration_ms} {res.tally}: {why}"
+            )
+            return _result(ok, "batch")
+        finally:
+            try:
+                list_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _release_lock(lock)
+
+    outcome = _advance()
+    # v0.2.107 (CG-3, A-013): the daily path-existence reconciliation, also
+    # for a project without a git HEAD. Skipped while another analyzer run
+    # holds this checkout ("busy" — it retries at the next catch-up).
+    if outcome != "busy":
+        reconcile = deps.reconcile
+        if reconcile is None:
+            from vco_lib.codegraph_path_reconcile import reconcile_if_due as reconcile
         try:
-            list_file.unlink(missing_ok=True)
+            reconcile(lock_root, prefix, state_dir, log)
+        except Exception as exc:  # noqa: BLE001 — the reconcile never fails the catch-up
+            log(f"path-reconcile: ERROR unexpected: {exc!r}")
+    return outcome
+
+
+#: State files of the per-edit drain queue retired in v0.2.107 (CG-3). No
+#: reader is left; :func:`retire_drain_queue_files` removes them so they do
+#: not sit under ``.claude/state`` forever. The analyzer lock directories
+#: (``codegraph_drain_root_*.lock``) are NOT among them — they are live.
+RETIRED_DRAIN_GLOBS = (
+    "codegraph_drain_*.txt",
+    "codegraph_drain_*.draining.*",
+    "codegraph_drain_last_sync.ts",
+)
+
+
+def retire_drain_queue_files(state_dir: Path, log: Callable[[str], None]) -> int:
+    """Delete the retired drain-queue state files under ``state_dir``.
+    Returns how many were removed. Soft-fail per file."""
+    removed = 0
+    for pattern in RETIRED_DRAIN_GLOBS:
+        try:
+            hits = sorted(state_dir.glob(pattern))
         except OSError:
-            pass
-        _release_lock(lock)
+            continue
+        for hit in hits:
+            if not hit.is_file():
+                continue
+            try:
+                hit.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log(f"retired {removed} drain-queue state file(s) (the per-edit queue is gone since v0.2.107)")
+    return removed
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -807,6 +833,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # the backoff state file.
     log(f"run start: root={root} state_dir={state_dir} analyzer={args.analyzer} "
         f"max_files={max_files} timeout={args.timeout}s")
+    retire_drain_queue_files(state_dir, log)
     try:
         outcome = catchup(
             str(root), args.analyzer, sys.executable, state_dir, log,

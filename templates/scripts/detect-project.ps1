@@ -13,9 +13,9 @@
 # If not, looks for a sibling project folder under the common parent
 # (e.g. ~/dev/) and returns that project's name.
 #
-# SCOPE (v0.2.100 W5R-03): the ONLY remaining consumer is the UNREGISTERED
-# code-graph-incremental hook (kept for users who wire it themselves; its
-# registered successor is stop-codegraph-drain, which does not use this).
+# SCOPE (v0.2.100 W5R-03; v0.2.107): no shipped hook sources this any more --
+# its last consumer, the per-edit code-graph-incremental hook, was retired in
+# v0.2.107 (the code graph follows commits). It stays a standalone helper.
 # It must NEVER pick a code graph to SEARCH: a folder name is not a grant.
 # Every search path (pre-edit included) runs as the CALLING project -- its own
 # binding prefix (which holds its extra paths) plus its own

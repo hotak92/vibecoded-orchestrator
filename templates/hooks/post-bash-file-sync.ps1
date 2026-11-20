@@ -22,7 +22,8 @@
 # KNOWN MISSES (identical to the .sh sibling -- read its header for the
 # reasoning): interpreter-internal writes (`python - <<EOF ... open(p,'w')`)
 # are recovered for knowledge/ and docs/ by a bounded watermarked mtime
-# scan and are a REAL MISS for code files; a relative path written after an
+# scan; code files reach the code graph through their commit (v0.2.107
+# CG-3), not through this hook; a relative path written after an
 # unresolvable `cd` is dropped rather than guessed.
 #
 # That scan runs only when the parser found nothing AND the command text

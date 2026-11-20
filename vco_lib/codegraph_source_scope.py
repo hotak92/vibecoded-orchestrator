@@ -6,16 +6,12 @@ Every code-graph row carries ``project_source``: the absolute POSIX root it was
 indexed from (the project's own folder, or one of its extra code folders). The
 deterministic row UUID mixes that root in (V52-O.3), so the project's copy of
 a file and an extra folder's copy of the same file are two separate row sets.
-This module is the ONE home for the three per-walk decisions that must agree
+A walk stamps the root it walks — the project's folder, or the registered
+extra root (v0.2.107 CG-3: no worktree is ever indexed, so the former
+``--canonical-source`` remap of a worktree edit onto the main checkout is
+gone). This module is the ONE home for the per-walk decisions that must agree
 with that keying:
 
-* :func:`walk_source_stamp` — the ``project_source`` a walk writes. An extra
-  folder's rows always carry the registered extra root, whoever runs the walk
-  (the per-edit hook, the panel's Sync button, the automatic refresh, the
-  queued Stop drain). A worktree canonical root (``--canonical-source``) is
-  honoured only for the project's OWN scoped edits. Before this rule the
-  per-edit hook stamped a worktree extra with its git main root while every
-  other producer stamped the extra path, so one file got two identities (D-2).
 * :func:`row_owned_by_walk` — does a stored row belong to the root being
   walked? The unchanged-file gate (``_get_existing_module``) skips a file only
   when the walking root's OWN row is current. It used to accept any root's row
@@ -59,35 +55,7 @@ __all__ = [
     "row_owned_by_walk",
     "stale_hit",
     "walk_own_sources",
-    "walk_source_stamp",
 ]
-
-
-def walk_source_stamp(
-    source_root: str,
-    *,
-    canonical_source: Optional[str] = None,
-    scoped: bool = False,
-    extra_root: bool = False,
-) -> str:
-    """The ``project_source`` value a walk of ``source_root`` writes.
-
-    ``source_root`` is the walked root's POSIX form (``Path.as_posix()``).
-    ``extra_root`` is True when that root is an extra code folder: either the
-    analyzer was started with ``--as-extra-path`` (the root IS the extra) or
-    the root is an ``--extra-path`` of a combined walk. An extra root always
-    stamps itself — the registered path every other extra producer stamps —
-    and ignores ``canonical_source``. Otherwise ``canonical_source`` (the
-    edited file's git main root, passed by the per-edit hook and the primary
-    Stop drain) wins for a ``scoped`` (``--only-file`` / ``--only-files-from``)
-    run, so a worktree edit of the project converges on the main checkout's
-    rows. Everything else stamps ``source_root``.
-    """
-    if extra_root:
-        return source_root
-    if scoped and canonical_source:
-        return canonical_source
-    return source_root
 
 
 def walk_own_sources(source_root: Any, stamp: str) -> Set[str]:

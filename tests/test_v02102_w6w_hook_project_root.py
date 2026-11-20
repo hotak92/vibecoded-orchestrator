@@ -66,7 +66,7 @@ WRITES = {
 }
 
 UNEXECUTED = ("session-start-ensure-hub", "session-start-kg-loader",
-              "code-graph-incremental", "check-no-fork-bomb")
+              "check-no-fork-bomb")
 
 FLAVOURS = ["sh"] + (["ps1"] if PWSH else [])
 

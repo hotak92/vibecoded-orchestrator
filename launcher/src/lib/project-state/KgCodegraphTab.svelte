@@ -495,14 +495,24 @@ Continue?`;
             <code>{snapshot.codegraph_binding.last_analyzed_commit.slice(0, 8)}</code>
           </div>
         {/if}
+        <!-- v0.2.107 (CG-3): the code graph follows commits of the main
+             checkout; the text says so, because hook lookups show the
+             committed version of code edited minutes ago. -->
+        <div class="ps-meta">
+          The code graph follows the main checkout's current branch: it is
+          updated when HEAD moves (a commit, merge or pull). Uncommitted edits
+          and edits in git worktrees are not indexed until they are committed
+          or merged there. A folder that is not a git repository is updated
+          by Re-analyze only.
+        </div>
       </div>
       <div class="ps-btn-row">
         <button class="ps-btn-primary" onclick={saveCg}>Save codegraph binding</button>
         <!-- v0.2.18 (Plan C): Re-analyze button. Forces a full multi-
              language re-walk + global prune via analyze_code_graph.py.
-             The hook does language-scoped incremental updates on every
-             file save; this button is the explicit "authoritative
-             refresh" path. -->
+             The Stop/SessionStart catch-up indexes each HEAD move; this
+             button is the explicit "authoritative refresh" path (and the
+             only one for a folder that is not a git repository). -->
         <button
           class="ps-btn-secondary"
           onclick={openReanalysisModal}

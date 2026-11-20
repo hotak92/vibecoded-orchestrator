@@ -367,19 +367,20 @@ if ((`$null -eq `$lvl) -or ((([string]`$lvl).Trim()) -eq 'write')) { $SyncExpr }
 
 
 # --- v0.2.102 S16-7: enabled-extra-path membership (cached list, option B) ---
-# MUST MATCH _lib/route-touched-path.sh's block of the same name. A code file
-# under an ENABLED extra code-graph path goes to a PER-EXTRA queue
-# (codegraph_drain_extra_<md5(extra)>_<session>.txt), never the primary
-# queue; the Stop hook drains it via `vco_lib.codegraph_extras_refresh
-# --queued`. The membership decision is computed by Python (the hub /config
-# resolver) and cached as a plain table both shells read -- option B of the
-# A>B>C rule, because this runs PER EDIT and the list changes only on a
-# launcher-GUI extras toggle.
+# MUST MATCH _lib/route-touched-path.sh's block of the same name. Is a code
+# file under an ENABLED extra code-graph path? Only the end-of-turn reminder
+# asks: an edit there is "this project's work item". Since v0.2.107 (CG-3) no
+# edit is queued for the code graph -- an extra folder is re-indexed when ITS
+# HEAD moves (vco_lib.codegraph_extras_refresh, spawned by the Stop hook).
+# The membership decision is computed by Python (the hub /config resolver)
+# and cached as a plain table both shells read -- option B of the A>B>C rule,
+# because this runs PER EDIT and the list changes only on a launcher-GUI
+# extras toggle.
 #   cache : .claude/state/codegraph_extra_paths_cache.txt (one path per line)
 #   stale : missing, older than VCO_CODEGRAPH_EXTRAS_LIST_TTL_SECONDS
 #           (default 300), or older than launcher.db
-# A failed refresh keeps the stale cache; no cache at all -> nothing routes
-# to the extra queues (the commit-stamp refresh at Stop still re-indexes).
+# A failed refresh keeps the stale cache; no cache at all -> no edit counts
+# as an extra-folder edit.
 $script:VcoRouteExtrasCacheName = "codegraph_extra_paths_cache.txt"
 
 function Get-VcoRouteExtrasDbPath {
@@ -462,28 +463,18 @@ function Resolve-VcoRoutePhysicalPath {
     } catch { return $Path }
 }
 
-# Route a code edit under an ENABLED extra path to its per-extra drain queue:
-# appends the PHYSICAL path to codegraph_drain_extra_<md5(extra)>_<session>.txt
-# and returns that queue path; returns $null (caller then uses the primary
-# queue) when the edit is not under any enabled extra.
-#
-# v0.2.102 fix-round (M-A1) precedence, MUST MATCH route-touched-path.sh:
-#   1. PRIMARY-ROOT CONTAINMENT WINS -- an edit inside the project root always
-#      goes to the primary queue, even when a registered extra is an ANCESTOR
-#      of the root (registration rejects ancestor extras too, but a pre-fix
-#      row can still be on disk).
-#   2. Among extras the LONGEST matching prefix wins -- nested extras route to
-#      the inner one regardless of cache order.
-#   3. Matching is on the SYMLINK-RESOLVED path; trailing separators on the
-#      cache line are ignored for the match but the RAW line is hashed (the
-#      queue name must equal vco_lib.path_key(row.path), trailing slash and
-#      all, or the Python drain's glob never finds it).
-function Add-VcoRouteExtraQueue {
-    param([string]$Path, [string]$SessionId)
+# The ENABLED extra path a code edit sits under: returns the first matching
+# cache line (trailing separators trimmed), or $null when the edit is not
+# under any enabled extra. Only membership matters (the reminder lists the
+# edit either way). MUST MATCH _vco_route_extra_member in
+# route-touched-path.sh:
+#   * an edit inside the project root is the project's -- not an extra edit
+#     (the reminder's own root check lists it), so the cache is not read;
+#   * matching is on the SYMLINK-RESOLVED path; trailing separators on the
+#     cache line are ignored.
+function Get-VcoRouteExtraMember {
+    param([string]$Path)
     $stateDir = Join-Path (Join-Path $script:VcoRouteProjectRoot ".claude") "state"
-
-    # 1. Primary-root containment wins -- checked on the resolved path so a
-    # symlinked route INTO the root also lands in the primary queue.
     $resolved = Resolve-VcoRoutePhysicalPath -Path $Path
     $projSep = $script:VcoRouteProjectRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     if ($resolved.StartsWith($projSep, [StringComparison]::OrdinalIgnoreCase)) { return $null }
@@ -498,32 +489,13 @@ function Add-VcoRouteExtraQueue {
     if (-not (Test-Path -LiteralPath $cache)) { return $null }
     $lines = @()
     try { $lines = @(Get-Content -LiteralPath $cache -ErrorAction Stop) } catch { return $null }
-    # 2. Longest matching prefix wins.
-    $bestRaw = $null
-    $bestLen = 0
     foreach ($ep in $lines) {
-        $ep = ([string]$ep).TrimEnd("`r")
+        $ep = ([string]$ep).TrimEnd("`r").TrimEnd('\', '/')
         if (-not $ep) { continue }
-        # 3. Trailing separators ignored for the MATCH; the raw line is hashed.
-        $epSep = $ep.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
-        if ($epSep.Length -eq 1) { continue }  # the line was all separators
-        if ($resolved.StartsWith($epSep, [StringComparison]::OrdinalIgnoreCase)) {
-            if ($epSep.Length -gt $bestLen) { $bestLen = $epSep.Length; $bestRaw = $ep }
-        }
+        $epSep = $ep + [System.IO.Path]::DirectorySeparatorChar
+        if ($resolved.StartsWith($epSep, [StringComparison]::OrdinalIgnoreCase)) { return $ep }
     }
-    if (-not $bestRaw) { return $null }
-    # MD5 of the RAW extra path -- the SAME key vco_lib.path_key() computes,
-    # so the queue name matches the Python drain's glob.
-    $md5 = [System.Security.Cryptography.MD5]::Create()
-    try {
-        $digest = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($bestRaw))
-        $hash = -join ($digest | ForEach-Object { $_.ToString('x2') })
-    } finally {
-        $md5.Dispose()
-    }
-    $queue = Join-Path $stateDir ("codegraph_drain_extra_{0}_{1}.txt" -f $hash, $SessionId)
-    try { Add-Content -LiteralPath $queue -Value $resolved -ErrorAction SilentlyContinue } catch { }
-    return $queue
+    return $null
 }
 
 
@@ -538,12 +510,12 @@ function Add-VcoRouteExtraQueue {
 #     per-agent accumulator would have no drainer and grow forever).
 #   - path outside the project root (raw OR symlink-resolved) and not under
 #     an enabled extra code folder -> NOT listed.
-# The code-graph drain queues are NOT gated by this. MUST MATCH
-# _vco_route_reminder_wanted in route-touched-path.sh.
+# MUST MATCH _vco_route_reminder_wanted in route-touched-path.sh.
+# -ExtraPath: the enabled extra path the edit sits under ("" = none).
 function Test-VcoRouteReminderWanted {
-    param([string]$Path, [string]$AgentId = "", [string]$ExtraQueue = "")
+    param([string]$Path, [string]$AgentId = "", [string]$ExtraPath = "")
     if ($AgentId) { return $false }
-    if ($ExtraQueue) { return $true }
+    if ($ExtraPath) { return $true }
     # Containment: Test-VcoPathUnderRoot (_lib/project-root.ps1, the one
     # home); absent helper (partial install) -> not listed.
     if (-not (Get-Command Test-VcoPathUnderRoot -ErrorAction SilentlyContinue)) { return $false }
@@ -721,32 +693,18 @@ try {
     # 2b. Diagram auto-index: REMOVED in v0.2.102 with the diagrams
     # integrations (owner ruling 2026-10-07) — mirror of the .sh sibling.
 
-    # 3. Code file changes: code graph incremental update + LLM nudge.
-    # v0.2.21 Step 18 (caller migration): resolve the code-graph collection
-    # prefix via the launcher's vct-hub first (`vct_project_config.ps1 -Field
-    # code_graph_collection_prefix`); fall back to the legacy env chain when
-    # the hub is unreachable. Mirrors the .sh sibling at the same line.
+    # 3. Code file changes: the end-of-turn "[Code edit reminder]" only.
+    # v0.2.107 (CG-3, owner rulings 2026-11-17 / 2026-11-19): the code graph
+    # follows the COMMITTED state of the main checkout -- an edit queues
+    # nothing for it. The edit reaches the graph when its commit moves the
+    # main checkout's HEAD (stop-codegraph-drain -> vco_lib.codegraph_head_catchup);
+    # an edit in a linked worktree (a lane) when it is merged there.
+    # MUST MATCH the .sh sibling.
     #
-    # v0.2.23 field switch: previously this read `code_graph_project`, which
-    # the hub returns as a legacy alias for `project_slug` — NOT the canonical
-    # Weaviate prefix. The analyzer's `_sanitize_collection_prefix` then
-    # re-canonicalised the slug, producing a prefix that diverged from the
-    # launcher's `project_codegraph_bindings.collection_prefix`. Incremental
-    # writes landed in zombie collections (e.g. `Orchestrator_root_Code*`)
-    # while consumers queried the canonical prefix and saw 0 results.
-    # `code_graph_collection_prefix` is the binding-row truth and the only
-    # correct source for the write target.
-    #
-    # Pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
-    # polluted the legacy collection from every project install. Do NOT
-    # re-introduce a hardcoded literal in this position.
     # v0.2.95: the extension test comes from _lib/code-extensions.ps1 (ONE
-    # home). A partial install without that helper routes NOTHING to the drain
-    # rather than matching every path on an empty regex -- and SAYS so
-    # (ship-gate review MAJOR-2: routing no code file at all, silently and by
-    # stated choice, is the same silent-no-op class as a missing routing lib).
-    # The notice goes through this lib's existing nudge channel, so the
-    # calling hook still emits exactly ONE envelope.
+    # home). A partial install without that helper lists no code file in the
+    # reminder -- and SAYS so through this lib's nudge channel, so the calling
+    # hook still emits exactly ONE envelope.
     if (-not (Get-Command Test-VcoIsCodeFile -ErrorAction SilentlyContinue)) {
         if (Get-Command Emit-VcoMissingHookLibNotice -ErrorAction SilentlyContinue) {
             $missingCodeExt = Emit-VcoMissingHookLibNotice -HooksDir $ScriptDir `
@@ -755,47 +713,23 @@ try {
         }
     }
     elseif (Test-VcoIsCodeFile $Path) {
-        $bn = Split-Path $Path -Leaf
-        # v0.2.73 (FIX-B, MUST MATCH post-file-edit.sh): the per-EDIT code-graph
-        # sync is REMOVED. It used to Invoke-KgDebounceSchedule a
-        # code-graph-incremental.ps1 run on every edit; each run hit the big
-        # CodeFunction collection's insert-time churn, and parallel worktrees
-        # multiplied it into the measured Weaviate disk write-amplification.
-        # Instead, the edited path is appended to a per-turn drain queue below and
-        # drained ONCE at end-of-turn (stop-codegraph-drain.ps1) over ALL the
-        # turn's files in one analyzer pass, rate-limited to once per 120s per
-        # project. KG/docs debounce paths are UNCHANGED (this fix targets the CODE
-        # path only, the amplifier).
-        # v0.2.72 P6 + v0.2.73 FIX-B: append the edited path to BOTH the reminder
-        # accumulator (drained + cleared EVERY turn by stop-codegraph-reminder.ps1)
-        # AND the code-graph drain queue (drained by the rate-limited
-        # stop-codegraph-drain.ps1, which persists the union across rate-limited
-        # turns). Distinct files avoid a two-consumer race. Soft-fail: unkeyable
-        # session / write error just skips.
+        # v0.2.72 P6: reminder AGGREGATION -- the Stop hook
+        # (stop-codegraph-reminder.ps1) emits ONE reminder naming all edited
+        # files. v0.2.104 E-1: only the MAIN agent's edits inside the project
+        # (its root, or an enabled extra code folder) are listed. Soft-fail:
+        # unkeyable session / write error just skips.
         if ($SessionId) {
             $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
             try {
-                if (-not (Test-Path -LiteralPath $stateDir)) {
-                    New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction Stop | Out-Null
+                $extraPath = ""
+                if (-not $AgentId) {
+                    $member = Get-VcoRouteExtraMember -Path $Path
+                    if ($member) { $extraPath = [string]$member }
                 }
-                # v0.2.102 S16-7: a code file under an ENABLED extra code-graph
-                # path goes to the PER-EXTRA queue instead -- a path outside
-                # the primary root must never be analyzed under the primary's
-                # collection. Drained by stop-codegraph-drain.ps1 through
-                # `vco_lib.codegraph_extras_refresh --queued`. MUST MATCH the
-                # .sh sibling. Add-VcoRouteExtraQueue appends the RESOLVED path
-                # itself and returns the queue it used; $null -> primary queue.
-                # Precedence (M-A1): primary-root containment wins, then
-                # longest extra prefix.
-                $extraQueue = Add-VcoRouteExtraQueue -Path $Path -SessionId $SessionId
-                if (-not $extraQueue) {
-                    $cgQueue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
-                    Add-Content -LiteralPath $cgQueue -Value $Path -ErrorAction SilentlyContinue
-                }
-                # v0.2.104 E-1: only the MAIN agent's edits inside the project
-                # (its root, or an enabled extra code folder) feed the
-                # reminder. The drain queues above are unaffected.
-                if (Test-VcoRouteReminderWanted -Path $Path -AgentId $AgentId -ExtraQueue $extraQueue) {
+                if (Test-VcoRouteReminderWanted -Path $Path -AgentId $AgentId -ExtraPath $extraPath) {
+                    if (-not (Test-Path -LiteralPath $stateDir)) {
+                        New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction Stop | Out-Null
+                    }
                     $accum = Join-Path $stateDir ("edit_reminder_{0}.txt" -f $SessionId)
                     Add-Content -LiteralPath $accum -Value $Path -ErrorAction Stop
                 }

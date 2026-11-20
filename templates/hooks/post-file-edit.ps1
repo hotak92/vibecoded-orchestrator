@@ -13,9 +13,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 # VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
 #   Calls .claude/scripts/kg-sync (writes to the project's own
-#   KG_COLLECTION / DEVELOPMENT_COLLECTION) and code-graph-incremental.ps1
-#   (writes to the project's own code-graph collections via
-#   analyze_code_graph.py). Writes do NOT consult VCT_KG_ACCESS_LIST or
+#   KG_COLLECTION / DEVELOPMENT_COLLECTION); the code graph is written by
+#   the HEAD catch-up, not by an edit (v0.2.107). Writes do NOT consult VCT_KG_ACCESS_LIST or
 #   VCT_CODE_GRAPH_ACCESS_LIST — those env vars are read-side only
 #   (fan-out search across peer KGs). This hook is correct as-is; no
 #   centralization needed: writes always target the project's OWN
@@ -43,7 +42,8 @@ $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
 if (Test-Path $EmitContextLib) { . $EmitContextLib }
 
 # v0.2.95 (lane F10): the ROUTING - knowledge/ -> kg-sync, docs/ ->
-# upload_docs, code files -> the end-of-turn code-graph drain queue -
+# upload_docs, code files -> the end-of-turn edit reminder (v0.2.107: an
+# edit queues nothing for the code graph, which follows commits) -
 # plus the Phase-8 access gate and
 # the per-file debounce now live in _lib/route-touched-path.ps1, because a
 # SECOND hook needs exactly the same decision: post-bash-file-sync.ps1,
@@ -84,7 +84,7 @@ $HookStdin = ""
 try { $HookStdin = Read-VcoHookStdin } catch { }
 $EditedFile = ""
 # V52-L.2 Fix 2b: parse subagent identity + session_id. We don't write
-# a JSONL log directly, but the kg-sync / code-graph-incremental child
+# a JSONL log directly, but the kg-sync child
 # processes DO emit retrieval/sync telemetry — exporting these as env
 # vars (VCT_AGENT_ID / VCT_AGENT_TYPE / VCT_SESSION_ID) lets the
 # canonical emit path attribute those rows to the agent that triggered
@@ -108,7 +108,7 @@ try {
 } catch {
     # Empty/malformed stdin — keep variables at defaults
 }
-# Export for child processes (kg-sync, code-graph-incremental.ps1, etc.)
+# Export for child processes (kg-sync, etc.)
 # so their emit paths can attribute telemetry to the originating agent.
 # Skip empty exports — downstream readers treat unset and empty
 # identically, but unset keeps the env listing clean.
@@ -135,7 +135,7 @@ $DocsDirSep = $DocsDir.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorCh
 
 if (-not $EditedFile) { exit 0 }
 
-# === Routing: knowledge/ + docs/ + the code-graph drain queue ===
+# === Routing: knowledge/ + docs/ + the code-edit reminder ===
 # ONE home - _lib/route-touched-path.ps1 - shared with
 # post-bash-file-sync.ps1 so a CLI write routes identically to an
 # Edit/Write. Initialize-VcoRoute resolves the debounce helper, the

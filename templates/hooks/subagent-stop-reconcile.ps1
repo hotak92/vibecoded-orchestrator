@@ -3,8 +3,10 @@
 #
 # subagent-stop-reconcile.ps1 — Windows sibling of subagent-stop-reconcile.sh.
 # SubagentStop hook that reconciles a subagent's filesystem changes back
-# into the project's KG / code-graph / credential-scan / nudge-counter
-# state, plus the V52-L.2 JSONL audit row.
+# into the project's KG / credential-scan / nudge-counter state, plus the
+# V52-L.2 JSONL audit row. Code files are not queued for the code graph
+# (Step 3 retired in v0.2.107, CG-3: the graph follows the main checkout's
+# commits; a subagent's code reaches it through the commit or merge).
 #
 # V52-L.1 (v0.2.52): side effects, all soft-fail. See .sh sibling for the
 # full design rationale. MUST MATCH the .sh sibling, in particular
@@ -48,13 +50,6 @@ $SnapshotHelper = Join-Path $ScriptDir "_lib/snapshot.ps1"
 if (Test-Path $SnapshotHelper) { . $SnapshotHelper }
 $CredScanHelper = Join-Path $ScriptDir "_lib/credscan.ps1"
 if (Test-Path $CredScanHelper) { . $CredScanHelper }
-# v0.2.73 HIGH-2: the canonical-root resolver + FIX-A' worktree gate — the SAME
-# shared libs the per-edit code-graph hook + the Stop drain use (mirror-don't-
-# fork). Optional; when absent Step-3 falls back to CONSERVATIVE enqueue-all.
-$CanonHelper = Join-Path $ScriptDir "_lib/canonical-repo-root.ps1"
-if (Test-Path $CanonHelper) { . $CanonHelper }
-$WorktreeGateHelper = Join-Path $ScriptDir "_lib/worktree-gate.ps1"
-if (Test-Path $WorktreeGateHelper) { . $WorktreeGateHelper }
 
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     $env:CLAUDE_PROJECT_DIR
@@ -66,9 +61,6 @@ $LogDir = Join-Path $ProjectRoot ".claude/logs"
 $StateDir = Join-Path $ProjectRoot ".claude/state"
 $LogFile = Join-Path $LogDir "subagent-reconciliation.jsonl"
 $AlertLog = Join-Path $LogDir "credential_alerts.jsonl"
-# v0.2.73 HIGH-2: the session-agnostic drain queue the Stop-hook batched drain
-# consumes (replaces the orphan code-graph-queue.jsonl that nothing drained).
-$CgDrainShared = Join-Path $StateDir "codegraph_drain_shared.txt"
 
 try {
     if (-not (Test-Path $LogDir)) {
@@ -397,10 +389,7 @@ if (-not $changedAbs -or $changedAbs.Count -eq 0) {
 $fileCount = 0
 $totalBytes = [int64]0
 $kgFiles = New-Object System.Collections.Generic.List[string]    # absolute; shared tree only
-$codeFiles = New-Object System.Collections.Generic.List[string]  # relative; shared tree only
 $allFiles = New-Object System.Collections.Generic.List[string]   # absolute; credential scan
-
-$codeExtRe = '\.(py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql)$'
 
 foreach ($abs in $changedAbs) {
     if (-not $abs) { continue }
@@ -411,15 +400,13 @@ foreach ($abs in $changedAbs) {
         } catch {}
     }
     $allFiles.Add($abs) | Out-Null
-    # Indexing for SHARED-TREE files only: a worktree agent's files reach the
-    # KG / code graph when its work is merged.
+    # KG/docs sync for SHARED-TREE files only: a worktree agent's files reach
+    # the KG when its work is merged. Code files are not routed (Step 3
+    # retired in v0.2.107, CG-3).
     if ($Attribution -eq "agent_worktree") { continue }
     $rel = $abs.Substring($ProjectRoot.Length).TrimStart('\', '/') -replace '\\', '/'
     if ($rel -match '^knowledge/.*\.md$' -or $rel -match '^docs/.*\.md$') {
         $kgFiles.Add($abs) | Out-Null
-    }
-    if ($rel -match $codeExtRe) {
-        $codeFiles.Add($rel) | Out-Null
     }
 }
 
@@ -461,55 +448,6 @@ if ($kgFiles.Count -gt 0) {
             $skip = [ordered]@{ event = "kg_sync_skipped"; reason = "_lib/route-touched-path.ps1 missing"; agent_id = $safeId }
             Add-Content -LiteralPath $FilesLog -Value ($skip | ConvertTo-Json -Compress) -ErrorAction Stop
         } catch { }
-    }
-}
-
-# -------------------- Step 3: Code-graph drain enqueue --------------------
-# MUST MATCH subagent-stop-reconcile.sh Step 3. Route modified code files into
-# the SAME batched, worktree-gated path the Stop drain consumes — NOT the old
-# orphan code-graph-queue.jsonl (nothing drained it — v0.2.73 HIGH-2). Apply
-# the FIX-A' worktree gate (drop ephemeral/unregistered worktree edits), resolve
-# + gate ONCE per distinct canonical root, and append gated-IN ABSOLUTE paths
-# (newline-delimited) to the session-agnostic shared drain queue. Never run the
-# analyzer synchronously; only enqueue. Soft-fail throughout.
-if ($codeFiles.Count -gt 0) {
-    $gateCache = @{}   # canonical root -> 'SKIP' | 'INDEX'
-    $toEnqueue = New-Object System.Collections.Generic.List[string]
-    $canonAvail = [bool](Get-Command Get-CanonicalRepoRoot -ErrorAction SilentlyContinue)
-    $gateAvail  = [bool](Get-Command Test-EphemeralWorktreeEdit -ErrorAction SilentlyContinue)
-    foreach ($rel in $codeFiles) {
-        if (-not $rel) { continue }
-        $abs = Join-Path $ProjectRoot $rel
-
-        # Canonical MAIN root (empty when unresolved → gate treats as non-worktree/INDEX).
-        $canon = ""
-        if ($canonAvail) {
-            try { $canon = Get-CanonicalRepoRoot -File $abs } catch { $canon = "" }
-            if (-not $canon) { $canon = "" }
-        }
-
-        $key = $canon
-        if (-not $gateCache.ContainsKey($key)) {
-            $verdict = "INDEX"
-            if ($gateAvail) {
-                try {
-                    if (Test-EphemeralWorktreeEdit -EditedFile $abs -RepoPath $ProjectRoot -CanonRoot $canon) {
-                        $verdict = "SKIP"
-                    }
-                } catch { $verdict = "INDEX" }
-            }
-            $gateCache[$key] = $verdict
-        }
-        if ($gateCache[$key] -eq "INDEX") { [void]$toEnqueue.Add($abs) }
-    }
-
-    if ($toEnqueue.Count -gt 0) {
-        try {
-            $sb = New-Object System.Text.StringBuilder
-            foreach ($p in $toEnqueue) { [void]$sb.AppendLine($p) }
-            # No BOM (Encoding.UTF8 writes one into a NEW file, glued to the first path).
-            Add-VcoUtf8Content -Path $CgDrainShared -Value $sb.ToString() -NoNewline
-        } catch {}
     }
 }
 

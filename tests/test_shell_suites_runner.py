@@ -5,16 +5,16 @@
 CI runs ``pytest tests/``; a ``*.sh`` test file is invisible to it unless a
 pytest file shells out to it. Before v0.2.102 seven bash suites had no such
 runner, so they ran only when someone remembered to run them by hand — and
-one of them, ``tests/test_code_graph_incremental_hook.sh``, had been failing
-9 of 11 asserts for many releases without anyone noticing.
+one of them (the code-graph hook suite, retired with its hook in v0.2.107)
+had been failing 9 of 11 asserts for many releases without anyone noticing.
 
 This module is the ONE runner for every bash suite that has no dedicated
 pytest wrapper of its own, and :func:`test_every_shell_suite_has_a_runner`
 keeps it that way: a new ``test_*.sh`` must either be listed in
 ``SUITES`` here or be named, with its runner file, in ``EXTERNAL_RUNNERS``.
 
-Skipped on hosts without bash (native Windows); the PowerShell flavor of the
-code-graph hook suite is additionally skipped without ``pwsh``.
+Skipped on hosts without bash (native Windows); a suite flagged as needing
+PowerShell is additionally skipped without ``pwsh``.
 """
 from __future__ import annotations
 
@@ -30,9 +30,6 @@ _PWSH = shutil.which("pwsh")
 
 # (suite path relative to the repo root, extra argv, needs pwsh)
 SUITES: list[tuple[str, tuple[str, ...], bool]] = [
-    # The unregistered standalone code-graph hook, both siblings, same scenarios.
-    ("tests/test_code_graph_incremental_hook.sh", ("sh",), False),
-    ("tests/test_code_graph_incremental_hook.sh", ("ps1",), True),
     ("tests/test_apple_silicon_homebrew_path_probe.sh", (), False),
     ("tests/test_install_sh_no_args.sh", (), False),
     ("tests/test_kde_plasma6_desktop_launch.sh", (), False),

@@ -169,24 +169,24 @@ def _build_world():
     }
     classes = {
         "c-child": _StoredRow("c-child", {
-            "full_name": "pkg.Child",
+            "full_name": "pkg.Child", "name": "Child",
             "signature": "class Child(Base)",
         }),
         "c-base": _StoredRow("c-base", {
-            "full_name": "pkg.Base",
+            "full_name": "pkg.Base", "name": "Base",
             "signature": "class Base",
         }),
     }
     functions = {
         "f-caller": _StoredRow("f-caller", {
-            "full_name": "mod.caller",
+            "full_name": "mod.caller", "name": "caller",
             "function_body": "def caller():\n    target()\n",
             "language": "python",
             "file_path": "pkg/a.py",
             "total_chunks": 1,
         }),
         "f-target": _StoredRow("f-target", {
-            "full_name": "mod.target",
+            "full_name": "mod.target", "name": "target",
             "function_body": "def target():\n    return 1\n",
             "language": "python",
             "file_path": "pkg/b.py",

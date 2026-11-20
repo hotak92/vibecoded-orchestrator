@@ -506,6 +506,7 @@ try:
         purge_incompatible_import_edges as _purge_incompatible_import_edges,
         resolve_import_targets as _resolve_import_targets,
     )
+    from vco_lib.codegraph_xref_scope import ScopedXref as _ScopedXref  # v0.2.107 A-011
 except ImportError as _exc:  # noqa: F841 — used in the message below
     sys.stderr.write(
         "analyze_code_graph: vco_lib not importable — VCO install is broken; "
@@ -1269,10 +1270,10 @@ def generate_embedding(text: str) -> Optional[Any]:
         print("⚠️  Embedding requested but EmbeddingService not initialised", file=sys.stderr)
         return None
     try:
-        if DUAL_EMBEDDING_ENABLED:
-            slots = svc.embed_code_all_configured(text)
-            return slots if slots else None
-        return svc.embed_code(text)
+        vec = svc.embed_code_all_configured(text) if DUAL_EMBEDDING_ENABLED else svc.embed_code(text)
+        if vec:
+            _guards.walk_count("embeds")  # CGWRITE-11
+        return vec if vec else None
     except ChunkOverflowError:
         raise  # v0.2.106: inside a row scope the caller splits the entity into rows
     except Exception as e:
@@ -2624,12 +2625,12 @@ class CodeGraphAnalyzer:
             except Exception:  # noqa: BLE001 — a patch failure → re-embed (safe)
                 return False
             _note_written_uuid(self, getattr(collection, "name", ""), cu)
-            self._embed_revision_patched = (
-                getattr(self, "_embed_revision_patched", 0) + 1
-            )
+            patched.append(cu)
+            _guards.walk_count("stamped")  # CGWRITE-11
             return True
 
-        return _guards.skip_or_stamp_all_chunks(
+        patched: List[str] = []
+        handled = _guards.skip_or_stamp_all_chunks(
             chunk_uuids, chunk_hashes, total,
             current_revision=CODEGRAPH_EMBED_REVISION,
             floor_revision=_EMBED_SPACE_COMPATIBLE_FROM_REVISION,
@@ -2646,6 +2647,9 @@ class CodeGraphAnalyzer:
                 if chunk_texts else None
             ),
         )
+        if handled and not patched:
+            _guards.walk_count("skipped", len(chunk_uuids))  # CGWRITE-11
+        return handled
 
     def _may_have_been_refused(self, text: Any) -> bool:
         """v0.2.106 rev-2 STAMP veto (`_guards.may_have_been_refused`) against this
@@ -2854,9 +2858,7 @@ class CodeGraphAnalyzer:
                     "uuid": det_uuid, "content_hash": content_hash,
                     "stored_total_chunks": fp.get("total_chunks"), "heal": fp.get("heal"),
                 }
-                self._embed_revision_patched = (
-                    getattr(self, "_embed_revision_patched", 0) + 1
-                )
+                _guards.walk_count("stamped")  # CGWRITE-11
                 return
             except Exception:  # noqa: BLE001 — patch failed → re-embed (safe)
                 pass
@@ -3083,6 +3085,7 @@ class CodeGraphAnalyzer:
             # just because we skipped its write.
             _note_written_uuid(self, collection.name, det_uuid)
             _guards.heal_skipped_row(collection, det_uuid, props, _heal)  # W6-O
+            _guards.walk_count("skipped")  # CGWRITE-11
             return det_uuid
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
@@ -3124,6 +3127,7 @@ class CodeGraphAnalyzer:
                 # write-to-Weaviate problem (vs. a parse / read / regex
                 # issue elsewhere in the analyze_*_file path). bug 0.2.
                 raise _DedupInsertError(exc, collection.name, det_uuid) from exc
+        _guards.walk_count("rows_written")  # CGWRITE-11
         # Track for --prune-stale (only populated when caller opted in; see
         # main()'s argparse + analyze_repository's prune logic) AND for the
         # WP-C per-file reconcile (always).
@@ -3311,7 +3315,6 @@ class CodeGraphAnalyzer:
                           since_commit: Optional[str] = None,
                           only_file: Optional[Path] = None,
                           only_files_from: Optional[Path] = None,
-                          canonical_source: Optional[str] = None,
                           as_extra_path: bool = False) -> Dict[str, Any]:
         """Analyze repository and extract code entities.
 
@@ -3356,13 +3359,6 @@ class CodeGraphAnalyzer:
                 ``HEAD~1..HEAD`` re-churn (dozens of files re-parsed per
                 keystroke) AND the correctness bug (the edited file is
                 uncommitted, so it was never in the diff range at all).
-            canonical_source: v0.2.66 (Bug 3, part b) — stamp this root (the
-                edited file's git MAIN repo root, from the per-edit hook / the
-                primary Stop drain) as ``project_source`` and UUID seed instead
-                of ``source_root``, so a worktree edit of the project converges
-                on the main checkout's rows. Scoped file modes only, and never
-                for an extra path (W6-CGD D-2: an extra's rows always carry the
-                extra's own root) — ``_src_scope.walk_source_stamp`` decides.
 
         Returns:
             Dictionary with analysis statistics. v0.2.16 adds:
@@ -3398,7 +3394,6 @@ class CodeGraphAnalyzer:
         # files and MUST NOT sweep the whole collection (they'd delete rows for
         # files simply not in this narrow batch). See `_build_stale_file_set`.
         self._analyze_whole_repo = (only_file is None and only_files_from is None)
-        self._stamp_scope = (canonical_source, not self._analyze_whole_repo)  # for _root_stamp
 
         # v0.2.47 (extras): validate + canonicalise extras up-front so
         # downstream loops can assume each entry is an existing absolute
@@ -3432,9 +3427,7 @@ class CodeGraphAnalyzer:
             if _ov.refused:  # overlaps the project: not walked, and --prune-stale keeps its rows
                 print(f"❌ Extra path refused, not walked: {_ov.message}", file=sys.stderr)
                 self._refused_extra_sources |= _src_scope.refused_extra_keep_sources(  # never the project's (R11-01)
-                    resolved, extra.as_posix(), repo_path, project_stamp=_src_scope.walk_source_stamp(
-                        repo_path.as_posix(), canonical_source=canonical_source,
-                        scoped=not self._analyze_whole_repo, extra_root=bool(as_extra_path)))
+                    resolved, extra.as_posix(), repo_path, project_stamp=repo_path.as_posix())
                 continue
             canonical_extras.append(resolved)
             self._walked_extra_roots.add(resolved.as_posix())
@@ -3555,15 +3548,13 @@ class CodeGraphAnalyzer:
                 only_file, repo_path, lang_dispatch, lang,
             )
         elif only_files_from is not None:
-            # v0.2.73 (FIX-B): batched multi-file scope for the Stop-hook drain.
+            # Batched multi-file scope (the HEAD catch-up's changed files).
             # Read the newline-delimited absolute paths, prune any that vanished
-            # from disk (edited-then-deleted in the turn), and build the union
-            # dispatch from the survivors via the SAME `_single_file_dispatch`
-            # per file (so every per-file skip / ignore-dir / relativization
-            # guard applies identically). All files share ONE canonical source
-            # (the drain groups by canonical root before calling), so a single
-            # `_current_source` covers the whole batch. Soft-fail: an unreadable
-            # list file is a clean no-op (empty dispatch).
+            # from disk, and build the union dispatch from the survivors via the
+            # SAME `_single_file_dispatch` per file (so every per-file skip /
+            # ignore-dir / relativization guard applies identically). Every file
+            # is under repo_path, so a single `_current_source` covers the whole
+            # batch. Soft-fail: an unreadable list file is a clean no-op.
             try:
                 raw = only_files_from.read_text(encoding="utf-8")
             except Exception as exc:  # noqa: BLE001 — unreadable list → no-op
@@ -3582,16 +3573,13 @@ class CodeGraphAnalyzer:
                 fpath = Path(p)
                 if not fpath.is_file():
                     # Vanished path → PRUNE its objects, keyed on the repo-relative
-                    # path + the SAME source the write path stamps (W6-CGD: an extra's
-                    # queued drain never reaches the project's rows of that path).
+                    # path + the SAME source the write path stamps (the walked root).
                     try:
                         rel = fpath.resolve().relative_to(repo_path.resolve()).as_posix()
                     except Exception:  # noqa: BLE001 — outside root / unresolved
                         rel = ""
                     if rel:
-                        self._prune_deleted_file_objects(rel, _src_scope.walk_source_stamp(
-                            repo_path.as_posix(), canonical_source=canonical_source,
-                            scoped=True, extra_root=self._strict_source))
+                        self._prune_deleted_file_objects(rel, repo_path.as_posix())
                     continue
                 # Existing file → route through the single-file dispatch and
                 # merge its (0-or-1) entry into the union.
@@ -3714,9 +3702,8 @@ class CodeGraphAnalyzer:
             # The dispatcher restores the prior value (in practice always "") on
             # exit so back-to-back lang_dispatch iterations don't leak state.
             self._current_language = lang_name
-            # `project_source` (POSIX) + the rows this root owns: ONE rule in
-            # vco_lib.codegraph_source_scope (W6-CGD D-1/D-2) — an extra root
-            # stamps itself; --canonical-source only for the project's scoped edits.
+            # `project_source` (POSIX) = the walked root itself; the rows this
+            # root owns: ONE rule in vco_lib.codegraph_source_scope (W6-CGD D-1).
             _xroot = self._strict_source or is_extra
             self._current_source = self._root_stamp(source_root, is_extra)
             self._walk_own = (_src_scope.walk_own_sources(source_root, self._current_source), _xroot)
@@ -4403,9 +4390,11 @@ class CodeGraphAnalyzer:
             getattr(self, "modules_collection", None), source_root,
             extra_stamp=self._root_stamp(source_root, True) if is_extra else None)
 
-    def _root_stamp(self, root: Path, is_extra: bool) -> str:  # one rule: codegraph_source_scope
-        cs, scoped = getattr(self, "_stamp_scope", (None, False))
-        return _src_scope.walk_source_stamp(root.as_posix(), canonical_source=cs, scoped=scoped, extra_root=self._strict_source or is_extra)
+    def _root_stamp(self, root: Path, is_extra: bool) -> str:
+        """The ``project_source`` a walk of ``root`` writes: the root itself
+        (v0.2.107 CG-3: no worktree is ever indexed, so no canonical remap)."""
+        del is_extra
+        return root.as_posix()
 
     def _analyze_lua_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
         """P2f stage 2 (v0.2.76): moved verbatim to
@@ -4909,20 +4898,20 @@ class CodeGraphAnalyzer:
             )
 
     def _prune_deleted_file_objects(
-        self, rel_path: str, canonical_source: str = "",
+        self, rel_path: str, project_source: str = "",
     ) -> int:
-        """Delete ALL code-graph objects of a file that vanished from disk (the
-        batched drain's edited-then-deleted path; v0.2.73 FIX-B). Thin shim over
+        """Delete ALL code-graph objects of a file that vanished from disk (a
+        ``--only-files-from`` path that no longer exists). Thin shim over
         ``vco_lib.codegraph_deleted_files.prune_file_rows`` — the ONE
         deleted-file prune, shared with the ``--incremental`` git-deleted pass:
         exact-``==`` match on the raw stored path via ``_delete_file_rows_exact``
         (never a tokenized DELETE), scoped to this project (+ the canonical
-        source when known), all five file-anchored collections. Returns the row
+        ``project_source`` when given), all five file-anchored collections. Returns the row
         count; failures feed ``self._prune_failures`` (success→partial)."""
         targets = [(getattr(self, a, None), p) for a, p in _FILE_ANCHORED_COLLECTIONS]
         deleted, failures = _prune_file_rows(
             targets, [rel_path], project=self.project_name or "",
-            project_source=canonical_source or "", deleter=_delete_file_rows_exact,
+            project_source=project_source or "", deleter=_delete_file_rows_exact,
             log_prefix="deleted-file prune",
         )
         if failures:
@@ -5313,14 +5302,15 @@ class CodeGraphAnalyzer:
         except Exception:  # noqa: BLE001 — degrade to the chunk-0 body
             return fallback
 
-    def _populate_caches_from_weaviate(self):
-        """Load all existing objects into caches from Weaviate.
-
-        This allows cross-reference creation even when no files were re-analyzed
-        (e.g., all skipped as unchanged in incremental mode).
+    def _populate_caches_from_weaviate(self) -> bool:
+        """Load all existing objects into caches from Weaviate (whole-repo
+        walks only; a scoped run reads through ``vco_lib.codegraph_xref_scope``).
+        False when any class could not be read: the caller then skips the
+        cross-reference pass rather than run it on a partial map (A-011).
         """
         if not self.client:
-            return
+            return False
+        ok = True
 
         print("   Loading existing entities from Weaviate (merging with analysis cache)...")
 
@@ -5343,6 +5333,7 @@ class CodeGraphAnalyzer:
                         self.module_imports[path] = import_names
         except Exception as e:
             print(f"   ⚠️  Failed to load modules: {e}")
+            ok = False
 
         # Classes: cache the canonical chunk and its file for scoped xref reads.
         self._xref_class_file_path: Dict[str, str] = {}
@@ -5358,6 +5349,7 @@ class CodeGraphAnalyzer:
                     self.class_cache[full_name] = str(obj.uuid)
         except Exception as e:
             print(f"   ⚠️  Failed to load classes: {e}")
+            ok = False
 
         # Functions: one bounded scan supplies canonical ids, stored call data,
         # source roots and call beacons for the cross-reference pass.
@@ -5393,8 +5385,11 @@ class CodeGraphAnalyzer:
                     ).strip()
         except Exception as e:
             print(f"   ⚠️  Failed to load functions: {e}")
+            ok = False
 
         print(f"   Loaded {len(self.module_cache)} modules, {len(self.class_cache)} classes, {len(self.function_cache)} functions")
+        _guards.walk_count("xref_reads", 3)
+        return ok
 
     def _resolve_call_target(
         self,
@@ -5405,7 +5400,9 @@ class CodeGraphAnalyzer:
     ) -> Optional[str]:
         """Seam over :func:`vco_lib.codegraph_references.resolve_call_target`
         (the ONE home for name → target resolution; v0.2.105 #512C added the
-        caller-root preference there)."""
+        caller-root preference there). A scoped run first looks the name up."""
+        if getattr(self, "_xref_scope", None) is not None:
+            self._xref_scope.ensure_call(call_name, func_name_to_full)
         return _resolve_call_target_impl(
             call_name, caller_full_name, self.function_cache,
             func_name_to_full, getattr(self, "_xref_source", {}) or {},
@@ -5455,10 +5452,17 @@ class CodeGraphAnalyzer:
 
         print("\n🔗 Creating cross-references...")
 
-        # If caches are empty (all files skipped), populate from Weaviate
-        # Always populate caches from Weaviate to ensure all entities are available
-        # for cross-reference resolution (not just the ones analyzed this run)
-        self._populate_caches_from_weaviate()
+        # v0.2.107 (A-011): a scoped run reads only the rows of its files and the
+        # names they use (vco_lib.codegraph_xref_scope); a whole-repo run loads
+        # every class. A failed load skips the pass — never link on a partial map.
+        _scope = self._xref_scope = _ScopedXref(
+            self, changed_files, (_primary_sources_for(getattr(self, "_analyze_repo_root", None)) or set())
+            | {str(getattr(self, "_analyze_repo_root_raw", "") or "")},
+            getattr(self, "_analyze_repo_root", None)) if incremental_scope else None
+        if not (_scope.load() if _scope else self._populate_caches_from_weaviate()):
+            print("   ⚠️  Stored references could not be read; cross-reference pass skipped")
+            stats['skipped'] = 1
+            return stats
 
         if not self.function_cache and not self.class_cache and not self.module_cache:
             print("   ⚠️  No entities found, skipping cross-references")
@@ -5480,7 +5484,8 @@ class CodeGraphAnalyzer:
         for _k, _uuid in self.module_cache.items():
             _p = _k[1] if isinstance(_k, tuple) and len(_k) == 2 else _k
             module_uuid_by_path[_p] = _uuid
-        import_index = _build_import_index(module_uuid_by_path, repo_root=getattr(self, "_analyze_repo_root", None))
+        import_index = _build_import_index(_scope.module_paths() if _scope else module_uuid_by_path,
+                                           repo_root=getattr(self, "_analyze_repo_root", None))
 
         # --- 1. Function calls ---
         print("   Linking function calls...")
@@ -5501,9 +5506,7 @@ class CodeGraphAnalyzer:
         # read from side-dicts (zero extra reads), and a body point-read only
         # happens for functions whose FILE changed (or every function on a
         # whole-repo run — same total work as before, just sourced once).
-        stored_counts: Dict[str, Any] = dict(
-            getattr(self, "_xref_stored_ncallers", {}) or {}
-        )
+        stored_counts: Dict[str, Any] = getattr(self, "_xref_stored_ncallers", {}) or {}
         stored_call_names: Dict[str, Any] = dict(
             getattr(self, "_xref_stored_calls", {}) or {}
         )
@@ -5511,7 +5514,7 @@ class CodeGraphAnalyzer:
         # which degrades to adding everything, never to skipping a real edge.
         stored_call_refs: Dict[str, Any] = dict(getattr(self, "_xref_stored_call_refs", {}) or {})
         _file_by_uuid: Dict[str, str] = getattr(self, "_xref_file_path", {}) or {}
-        for full_name, func_uuid in self.function_cache.items():
+        for full_name, func_uuid in list(self.function_cache.items()):
             try:
                 _row_file = _file_by_uuid.get(func_uuid, "")
 
@@ -5541,6 +5544,7 @@ class CodeGraphAnalyzer:
                 # (chunk 0) UUID from the cache. F7: reassemble the FULL body
                 # from all chunk rows before AST parse (chunk-0 alone could be a
                 # partial slice → SyntaxError → lost calls on big hub functions).
+                _guards.walk_count("xref_reads")
                 canonical = self.functions_collection.query.fetch_object_by_id(
                     func_uuid,
                     return_properties=["function_body", "total_chunks", "language"],
@@ -5670,8 +5674,9 @@ class CodeGraphAnalyzer:
         #     caller corrects its targets on the next analyze).
         # Soft-fail per update (mirrors the call_names update above).
         n_callers_written = 0
-        for target_uuid in set(self.function_cache.values()):
-            new_count = inbound.get(target_uuid, 0)
+        _counts = _scope.caller_counts(inbound, func_name_to_full) if _scope else None  # scoped: a delta
+        for target_uuid in (set(_counts) if _counts is not None else set(self.function_cache.values())):
+            new_count = _counts[target_uuid] if _counts is not None else inbound.get(target_uuid, 0)
             stored_raw = stored_counts.get(target_uuid)
             try:
                 stored_int: Optional[int] = (
@@ -5698,7 +5703,7 @@ class CodeGraphAnalyzer:
         # --- 2. Class extends ---
         print("   Linking class inheritance...")
         class_file_by_uuid = getattr(self, "_xref_class_file_path", {}) or {}
-        for full_name, class_uuid in self.class_cache.items():
+        for full_name, class_uuid in list(self.class_cache.items()):
             if incremental_scope and class_file_by_uuid.get(class_uuid, "") not in changed_files:
                 continue
             try:
@@ -5706,12 +5711,15 @@ class CodeGraphAnalyzer:
                 # read, but `fetch_objects(full_name==, limit=1)` returned an
                 # ARBITRARY chunk, so both `signature` and the stored `extends`
                 # beacons could come from a row other than the write target.
+                _guards.walk_count("xref_reads")
                 canonical = self.classes_collection.query.fetch_object_by_id(
                     class_uuid, return_properties=["signature"],
                     return_references=QueryReference(
                         link_on="extends", return_properties=["full_name"]))
                 if canonical is None:
                     continue
+                if _scope:
+                    _scope.ensure_bases((canonical.properties or {}).get("signature", ""), class_name_to_full)
                 bases_to_add = _resolve_base_class_targets(
                     (canonical.properties or {}).get("signature", ""),
                     self.class_cache, class_name_to_full)
@@ -5740,7 +5748,8 @@ class CodeGraphAnalyzer:
             imports_to_add: List[str] = []
             for imp_name in import_names:
                 for target_path in _resolve_import_targets(mod_path, imp_name, import_index):
-                    target_uuid = module_uuid_by_path.get(target_path)  # C-12
+                    target_uuid = module_uuid_by_path.get(target_path) or (  # C-12
+                        _scope.ensure_module(target_path, module_uuid_by_path) if _scope else None)
                     if target_uuid:
                         imports_to_add.append(target_uuid)
 
@@ -6179,44 +6188,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                             'root; non-git roots fall back to full scan.')
     # v0.2.66 (Bug 3): scope the analyze to EXACTLY one file. `repo_path`
     # stays the relativization root (collections key on repo-relative
-    # paths); the file must live under it. The per-edit code-graph hook
-    # passes the file the user just edited here instead of `--incremental`
-    # (which re-churned every HEAD~1..HEAD file AND missed the actual,
-    # still-uncommitted edit). Routes through the same per-file +
-    # per-object hash skips, so an unchanged file writes 0 objects.
+    # paths); the file must live under it. A manual CLI re-analysis of one
+    # file (the per-edit hook that used it was retired in v0.2.107: the code
+    # graph follows commits). Routes through the same per-file + per-object
+    # hash skips, so an unchanged file writes 0 objects.
     # Mutually exclusive with --incremental, --extra-path, --prune-stale.
     parser.add_argument('--only-file', type=Path, default=None,
                        help='Analyze EXACTLY this one file (under repo_path) '
-                            'instead of walking the tree. Used by the per-edit '
-                            'hook. Mutually exclusive with --incremental, '
+                            'instead of walking the tree (a manual re-analysis '
+                            'of one file). Mutually exclusive with --incremental, '
                             '--extra-path, --prune-stale.')
-    # v0.2.73 (FIX-B): batched multi-file mode. The end-of-turn Stop-hook drain
-    # collects ALL of a turn's edited files (grouped by canonical root) and
-    # runs ONE analyzer pass over them instead of one process per edit. Reads
+    # Batched multi-file mode (v0.2.73; since v0.2.107 its caller is the HEAD
+    # catch-up, which hands it the changed files of a commit range). Reads
     # newline-delimited ABSOLUTE paths from <file>; every path must live under
     # repo_path (same relativization contract as --only-file). Each path routes
     # through the SAME per-file + per-object skips as --only-file; a path that
-    # vanished from disk (edited-then-deleted in the turn) is PRUNED (its
-    # objects deleted) rather than skipped/errored. All files in one invocation
-    # share ONE --canonical-source (the drain groups by canonical root before
-    # calling). Mutually exclusive with --only-file / --incremental /
+    # vanished from disk is PRUNED (its objects deleted) rather than
+    # skipped/errored. Mutually exclusive with --only-file / --incremental /
     # --extra-path / --prune-stale.
     parser.add_argument('--only-files-from', type=Path, default=None,
                        help='Batched per-turn mode: analyze the newline-'
                             'delimited absolute paths listed in <file> (all '
                             'under repo_path), one analyzer pass. Vanished '
-                            'paths are pruned. Used by the Stop-hook drain.')
-    # v0.2.66 (Bug 3, part b): canonical source root for worktree dedup. The
-    # per-edit hook resolves the edited file's git MAIN repo root and passes
-    # it here so a worktree edit stamps the SAME project_source / UUID seed
-    # as a main-checkout edit (one canonical object, not a per-worktree dup).
-    # Only meaningful with --only-file.
-    parser.add_argument('--canonical-source', type=str, default=None,
-                       help='With --only-file: stamp this canonical root as '
-                            'project_source (and the UUID seed) instead of the '
-                            'on-disk repo_path. Used by the per-edit hook to '
-                            'dedup git-worktree edits onto the main-checkout '
-                            'object.')
+                            'paths are pruned. Used by the HEAD catch-up.')
     parser.add_argument('--create-collections', action='store_true',
                        help='Create Weaviate collections before analysis')
     parser.add_argument('--force-recreate', action='store_true',
@@ -6367,15 +6361,6 @@ def main():
         if _ov is not None and _ov.refused:  # W6-CGD D-4: vco_lib.codegraph_extra_overlap is the one rule
             print(f"❌ refusing --as-extra-path: {_ov.message}", file=sys.stderr)
             return 2
-        if args.canonical_source:  # an extra's rows carry its own root (walk_source_stamp)
-            print("ℹ️  --canonical-source ignored with --as-extra-path", file=sys.stderr)
-    if args.canonical_source and args.only_file is None and args.only_files_from is None:
-        # Meaningful only in a scoped file mode (it stamps project_source): a lone flag is refused.
-        print(
-            "❌ --canonical-source requires --only-file or --only-files-from",
-            file=sys.stderr,
-        )
-        return 1
 
     project_name: Optional[str] = None
     if args.from_resolver:
@@ -6680,6 +6665,7 @@ def main():
         # Analyze repository
         if not args.json_progress:
             print("🔍 Analyzing codebase...")
+        _guards.walk_tally_reset()  # CGWRITE-11: this run's counters + times
         stats = analyzer.analyze_repository(
             repo_path,
             language=args.language,
@@ -6693,11 +6679,8 @@ def main():
             # v0.2.66 (Bug 3): single-file scope for the per-edit hook.
             # None (the default) preserves the whole-tree walk.
             only_file=args.only_file,
-            # v0.2.73 (FIX-B): batched multi-file scope for the Stop-hook drain.
+            # Batched multi-file scope (the HEAD catch-up's diffed range).
             only_files_from=args.only_files_from,
-            # v0.2.66 (Bug 3, part b): canonical source root for worktree
-            # dedup (honoured alongside only_file OR only_files_from).
-            canonical_source=args.canonical_source,
             as_extra_path=args.as_extra_path,
         )
 
@@ -6724,7 +6707,9 @@ def main():
                 file=sys.stderr,
             )
             _changed_rel = None
+        _guards.walk_tally_mark_xref()
         ref_stats = analyzer.create_cross_references(changed_files=_changed_rel)
+        _tally_line = _guards.walk_tally_line()
 
         # v0.2.18 (Plan C): final progress emit so the modal's progress bar
         # snaps to 100% before the report is rendered.
@@ -6763,6 +6748,7 @@ def main():
                 "chunk_plan_failures": stats.get("chunk_plan_failures", 0),
                 "language": args.language or "",
                 "prune_stale": bool(args.prune_stale),
+                "tally": _tally_line,  # CGWRITE-11 (logged by the catch-up / extras refresh)
             }
             print(json.dumps(final_payload), flush=True)
 
@@ -6788,6 +6774,7 @@ def main():
         print(f"   APIs: {stats['apis']}")
         print(f"   Files analyzed: {stats['files_analyzed']}")
         print(f"   Files skipped: {stats['files_skipped']}")
+        print(f"   Walk tally: {_tally_line}")
         # v0.2.16: surface granular error + prune stats so operators
         # can see at a glance whether the run was clean (and the
         # launcher's wizard polling can read the same numbers via
