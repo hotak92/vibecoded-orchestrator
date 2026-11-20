@@ -924,9 +924,22 @@ impl Db {
         let before: i64 = guard
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
             .map_err(|e| format!("incremental_vacuum (freelist): {}", e))?;
-        guard
-            .execute_batch(&format!("PRAGMA incremental_vacuum({})", max_pages.max(1)))
-            .map_err(|e| format!("incremental_vacuum: {}", e))?;
+        // `PRAGMA incremental_vacuum(N)` frees ONE page per step, so it must be
+        // stepped to completion: `execute_batch` steps it once and released a
+        // single page (6,007 free pages left after a 400-row prune).
+        {
+            let mut stmt = guard
+                .prepare(&format!("PRAGMA incremental_vacuum({})", max_pages.max(1)))
+                .map_err(|e| format!("incremental_vacuum: {}", e))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| format!("incremental_vacuum: {}", e))?;
+            while rows
+                .next()
+                .map_err(|e| format!("incremental_vacuum: {}", e))?
+                .is_some()
+            {}
+        }
         let after: i64 = guard
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
             .map_err(|e| format!("incremental_vacuum (freelist): {}", e))?;
