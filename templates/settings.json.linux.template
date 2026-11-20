@@ -139,6 +139,16 @@
             "async": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-worktree-reap.sh\"",
+            "timeout": 600,
+            "async": true
+          }
+        ]
       }
     ],
     "PreCompact": [
@@ -840,6 +850,11 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-drain-citations.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-worktree-reap.sh\"",
             "timeout": 5
           }
         ]
