@@ -145,3 +145,18 @@ def test_ps1_scrub_uses_the_lib_and_falls_back(hook, lib_present, tmp_path):
     extra, gh, vercel = res.stdout.strip().split("|")
     assert (gh, vercel) == ("unset", "unset"), (res.stdout, res.stderr)
     assert extra == ("unset" if lib_present else "x1"), (res.stdout, res.stderr)
+
+
+def test_no_ps1_hook_clears_an_env_var_with_a_bare_null():
+    """A bare ``$null`` passed to ``SetEnvironmentVariable`` reaches .NET as
+    ``""`` (PowerShell's [string] conversion); since .NET 9 (pwsh 7.5) that
+    SETS an empty variable instead of removing it. Clears pass
+    ``[NullString]::Value``."""
+    bad = []
+    for p in sorted(HOOKS.rglob("*.ps1")):
+        for n, ln in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), 1):
+            if ln.lstrip().startswith("#"):
+                continue
+            if re.search(r"SetEnvironmentVariable\([^,]+,\s*\$null\s*[,)]", ln):
+                bad.append(f"{p.relative_to(HOOKS)}:{n}")
+    assert not bad, bad

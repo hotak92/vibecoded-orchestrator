@@ -20,12 +20,13 @@
 # tests/test_scrub_env_parity_v0273.py; order gate tests/test_hooks_disable_guard.py:
 # the scrub precedes the VCT_DISABLE_HOOKS guard in every hook). Plain .NET calls,
 # no Test-Path/Remove-Item, so the no-pending fast path below pays no cmdlet
-# module autoload for it. Setting a variable to $null removes it for this process
-# and every child it starts.
+# module autoload for it. [NullString]::Value (a real null; a bare $null becomes ""
+# and, on .NET 9, sets an empty variable) removes it for this process and every
+# child it starts.
 # Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
 if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
-    [System.Environment]::SetEnvironmentVariable($v, $null)
+    [System.Environment]::SetEnvironmentVariable($v, [NullString]::Value)
 }
 }
 

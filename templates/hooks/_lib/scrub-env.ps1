@@ -18,11 +18,13 @@ $VctScrubSecretKeys = @(
 # Every templates/hooks/*.ps1 dot-sources this file and calls
 # Invoke-VctScrubSecretEnv; its inline list runs only when this file is
 # missing (v0.2.107, the same shape as the .sh hooks with scrub-env.sh).
-# Plain .NET, no cmdlet: setting a variable to $null removes it for this
-# process and every child it starts (what `Remove-Item Env:X` does), and the
-# hooks' fast paths pay no module autoload for it.
+# Plain .NET, no cmdlet: passing a REAL null ([NullString]::Value) removes the
+# variable for this process and every child it starts (what `Remove-Item Env:X`
+# does), and the hooks' fast paths pay no module autoload for it. A bare $null is
+# converted to "" for a [string] parameter, and since .NET 9 (pwsh 7.5) "" SETS
+# an empty variable instead of removing it.
 function Invoke-VctScrubSecretEnv {
     foreach ($k in $VctScrubSecretKeys) {
-        [System.Environment]::SetEnvironmentVariable($k, $null)
+        [System.Environment]::SetEnvironmentVariable($k, [NullString]::Value)
     }
 }

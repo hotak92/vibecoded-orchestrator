@@ -83,9 +83,11 @@ def _readers() -> list[Path]:
 
 def test_the_payload_readers_are_the_hooks_that_read_stdin():
     names = {p.name for p in _readers()}
-    # The pre-v0.2.107 readers of [Console]::In (40 hooks) -- a guard that
-    # the sweep missed none and that the static test above is not vacuous.
-    assert len(names) == 40, sorted(names)
+    # The pre-v0.2.107 readers of [Console]::In (40 hooks) plus
+    # session-worktree-reap.ps1 (new in v0.2.107, reads its payload through the
+    # helper from the start) -- a guard that the sweep missed none and that the
+    # static test above is not vacuous.
+    assert len(names) == 41, sorted(names)
     for must in ("pre-tool-use.ps1", "post-tool-security.ps1",
                  "lean-ctx-rewrite.ps1", "wait-guard.ps1",
                  "post-file-edit.ps1", "py-compile-check.ps1"):
