@@ -1097,7 +1097,8 @@ pub fn run() {
             // or a failed-to-revert pull on any OS. Per file:
             //   1. Parse the pid suffix.
             //   2. Check whether that PID is still alive.
-            //   3. If dead, delete the file.
+            //   3. If dead: restore a `.old-<pid>` whose canonical binary is
+            //      missing (UPDATER-02), delete everything else.
             // Bounded space cost: ≤1 per release in steady state.
             // Soft-fail throughout — sweep failure must NOT block boot.
             if let Ok(exe) = std::env::current_exe() {
@@ -3911,17 +3912,29 @@ pub(crate) use vct_launcher_core::process::pid_is_alive;
 /// `<binary>.pending-<pid>` siblings from the launcher dist
 /// directory. These are left behind by the pre-pull-rename path in
 /// the update pipeline (Windows) or a failed-revert path on any
-/// OS. The PID suffix is parsed; files whose PID is no longer alive
-/// are deleted. Files with malformed names, unparseable PIDs, or
-/// alive PIDs are skipped.
+/// OS. The PID suffix is parsed; files with malformed names,
+/// unparseable PIDs, or alive PIDs are skipped. Per dead-PID file the
+/// pure `binary_freshness::decide_stale_sibling` decides:
+///
+/// * UPDATER-02 (v0.2.107): a `.old-<pid>` whose canonical binary is
+///   MISSING is the only copy of that binary (an update died between the
+///   pre-pull rename and the refill) — it is renamed BACK to the canonical
+///   name, never deleted. When several backups of one binary qualify, the
+///   newest (by mtime) is restored and the older ones are then deleted.
+/// * every other dead-PID sibling is deleted.
 ///
 /// Soft-fail throughout — sweep MUST NOT block launcher boot.
 fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
+    use crate::services::binary_freshness::{decide_stale_sibling, StaleSiblingAction};
+
     let entries = match std::fs::read_dir(dist_dir) {
         Ok(e) => e,
         Err(_) => return, // dist_dir missing or unreadable — skip silently
     };
 
+    // (path, is_old_backup, pid, mtime)
+    let mut candidates: Vec<(std::path::PathBuf, bool, u32, Option<std::time::SystemTime>)> =
+        Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let fname = match path.file_name().and_then(|s| s.to_str()) {
@@ -3931,10 +3944,10 @@ fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
         // Match `*.old-<digits>` or `*.pending-<digits>`. The split is
         // on the LAST dot before the suffix so files like
         // `vct-launcher.exe.old-1234` parse correctly.
-        let pid_str = if let Some((_, p)) = fname.rsplit_once(".old-") {
-            p
+        let (is_old, pid_str) = if let Some((_, p)) = fname.rsplit_once(".old-") {
+            (true, p)
         } else if let Some((_, p)) = fname.rsplit_once(".pending-") {
-            p
+            (false, p)
         } else {
             continue;
         };
@@ -3942,21 +3955,58 @@ fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
             Ok(n) => n,
             Err(_) => continue, // not a PID-suffixed file, leave alone
         };
-        if pid_is_alive(pid) {
-            continue;
-        }
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!(
-                "[vct] boot sweep: could not delete stale sibling {}: {} (will retry next boot)",
-                path.display(),
-                e,
-            );
+        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+        candidates.push((path, is_old, pid, mtime));
+    }
+    // Newest first, so the restore picks the most recent backup of a binary.
+    candidates.sort_by(|a, b| b.3.cmp(&a.3));
+
+    for (path, is_old, pid, _) in candidates {
+        let canonical = if is_old {
+            crate::services::binary_freshness::canonical_path_for_backup(&path)
         } else {
-            tracing::info!(
-                "[vct] boot sweep: removed stale {} (pid {} no longer alive)",
-                path.display(),
-                pid,
-            );
+            None
+        };
+        let canonical_exists = canonical
+            .as_deref()
+            .map(|c| std::fs::symlink_metadata(c).is_ok())
+            .unwrap_or(true);
+        match decide_stale_sibling(is_old && canonical.is_some(), pid_is_alive(pid), canonical_exists) {
+            StaleSiblingAction::Keep => {}
+            StaleSiblingAction::RestoreToCanonical => {
+                // `canonical` is Some on this leg (is_old && canonical.is_some()).
+                let Some(canonical) = canonical else { continue };
+                match std::fs::rename(&path, &canonical) {
+                    Ok(()) => tracing::info!(
+                        "[vct] boot sweep: {} was missing; restored it from {} (an update \
+                         ended before the binary was put back)",
+                        canonical.display(),
+                        path.display(),
+                    ),
+                    Err(e) => tracing::warn!(
+                        "[vct] boot sweep: {} is missing and could not be restored from {}: {} \
+                         (will retry next boot)",
+                        canonical.display(),
+                        path.display(),
+                        e,
+                    ),
+                }
+            }
+            StaleSiblingAction::Delete => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    tracing::warn!(
+                        "[vct] boot sweep: could not delete stale sibling {}: {} (will retry next boot)",
+                        path.display(),
+                        e,
+                    );
+                } else {
+                    tracing::info!(
+                        "[vct] boot sweep: removed stale {} (pid {} no longer alive)",
+                        path.display(),
+                        pid,
+                    );
+                }
+            }
         }
     }
 }
@@ -4239,6 +4289,54 @@ mod boot_sweep_tests {
         );
         assert!(canonical.exists(), "canonical binary MUST be preserved");
         assert!(metadata.exists(), "metadata.json MUST be preserved");
+    }
+
+    /// UPDATER-02 ACT: a dead pid's `.old-<pid>` whose canonical binary is
+    /// missing is renamed BACK (never deleted); with two such backups the
+    /// newest wins and the older one is then deleted.
+    #[test]
+    fn sweep_restores_a_dead_pid_backup_when_the_canonical_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead = i32::MAX as u32;
+        let older = dir.path().join(format!("vct-hub.exe.old-{}", dead - 1));
+        fs::write(&older, "older bytes").unwrap();
+        let t_old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(t_old)
+            .unwrap();
+        let newest = dir.path().join(format!("vct-hub.exe.old-{}", dead));
+        fs::write(&newest, "newest bytes").unwrap();
+
+        sweep_stale_binary_siblings(dir.path());
+
+        let canonical = dir.path().join("vct-hub.exe");
+        assert_eq!(fs::read_to_string(&canonical).unwrap(), "newest bytes");
+        assert!(!newest.exists(), "the restored backup is now the canonical file");
+        assert!(!older.exists(), "the older backup is deleted once the canonical is back");
+    }
+
+    /// UPDATER-02 LEAVE-ALONE: canonical present → the dead backup is deleted
+    /// and the canonical bytes are untouched; a live pid's backup is kept even
+    /// when the canonical is missing (an update in progress owns it).
+    #[test]
+    fn sweep_never_overwrites_a_present_canonical_nor_touches_a_live_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical = dir.path().join("vct-launcher.exe");
+        fs::write(&canonical, "current").unwrap();
+        let dead = dir.path().join(format!("vct-launcher.exe.old-{}", i32::MAX as u32));
+        fs::write(&dead, "stale").unwrap();
+        let live = dir.path().join(format!("vct-hub.exe.old-{}", std::process::id()));
+        fs::write(&live, "in-flight").unwrap();
+
+        sweep_stale_binary_siblings(dir.path());
+
+        assert_eq!(fs::read_to_string(&canonical).unwrap(), "current");
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert!(!dir.path().join("vct-hub.exe").exists());
     }
 
     /// `sweep_stale_binary_siblings` is a silent no-op on a missing

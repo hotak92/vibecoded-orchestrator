@@ -191,6 +191,22 @@ keeps that container running on its current image instead of letting compose \
 remove it with nothing to replace it. Added to the install run's report, so a \
 run whose pull succeeds does not re-emit it (owned/drop-when-absent)."""
 
+[conditions.service_image_no_disk_space]
+class = "action_required"
+owner = "vco_lib.compose_image_prepull"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.107 (A-021). Before step 5 pulls the pinned image of a service it \
+is about to force-recreate, `compose_image_prepull.split_no_space` compares the \
+free space where the container engine stores images (its graph root on a native \
+engine, the host folder of the VM disk under Docker Desktop / podman machine) \
+with an estimate of the pull (the installed image of the same repository x 1.5 \
++ the doctor's free-space floor). When it does not fit, the service keeps \
+running on its current image and this row names both numbers and the drive to \
+free. action_required: only the user can free the space. Added to the install \
+run's report, so the next update re-checks and a run whose pull fits does not \
+re-emit it (owned/drop-when-absent)."""
+
 [conditions.weaviate_vector_index_update_failed]
 class = "auto_retryable"
 owner = "vco_lib.weaviate_vector_index"

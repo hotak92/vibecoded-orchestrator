@@ -350,6 +350,9 @@ _V02107_OWNED_ADDITIONS = frozenset({
     "container_upgrade_refused",
     "container_upgrade_rolled_back",
     "container_upgrade_backup_kept",
+    # A-021: step 5's disk-space check before an image pull
+    # (vco_lib.compose_image_prepull), same shape as service_image_pull_failed.
+    "service_image_no_disk_space",
 })
 
 

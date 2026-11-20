@@ -535,6 +535,25 @@ def _first_executable_in(
     return None
 
 
+def _restore_from_update_backup(
+    directory: Path, names: Sequence[str]
+) -> Optional[Path]:
+    """UPDATER-02: an interrupted Windows update can leave the binary only as
+    ``<name>.old-<pid>`` next to an empty canonical path. Put it back (the one
+    write :func:`find_dist_binary` may do — a rename, only onto a MISSING
+    canonical path, only for a dead PID; see
+    :func:`vco_lib.dist_binary_repair.restore_missing_from_backups`) and return
+    it when it is executable."""
+    if not directory.is_dir():
+        return None
+    from vco_lib.dist_binary_repair import restore_missing_from_backups
+
+    for restored in restore_missing_from_backups(directory, names):
+        if _is_executable(restored):
+            return restored
+    return None
+
+
 def find_dist_binary(
     stem: str,
     *,
@@ -552,7 +571,9 @@ def find_dist_binary(
     SAME chain for ``vct-launcher``: the alternative was a fifth hand-written
     copy of a walk that had already drifted once across its first three.
 
-    Never raises and never spawns anything.
+    Never raises and never spawns anything. Its one write: in step 2, when a
+    ``launcher/dist`` directory holds no binary but a dead update's
+    ``<name>.old-<pid>`` backup, the backup is renamed back (UPDATER-02).
 
     :param stem: binary stem, e.g. ``"vct-hub"`` / ``"vct-launcher"``.
     :param env_override: name of the env var that pins an explicit path
@@ -586,13 +607,13 @@ def find_dist_binary(
         for root in _repo_dist_roots(repo_root, environ):
             dist = root / "launcher" / "dist"
             arch = dist_arch_dir()
-            if arch:
-                found = _first_executable_in(dist / arch, names)
+            dirs = [dist / arch, dist] if arch else [dist]
+            for directory in dirs:
+                found = _first_executable_in(directory, names)
+                if found is None:
+                    found = _restore_from_update_backup(directory, names)
                 if found is not None:
                     return found
-            found = _first_executable_in(dist, names)
-            if found is not None:
-                return found
 
     # 3. PATH.
     for name in names:
