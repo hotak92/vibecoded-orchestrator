@@ -66,6 +66,9 @@ pub mod infra_watchdog;
 pub mod lifecycle;
 pub mod lifecycle_api;
 pub mod lockfile;
+// v0.2.107: ends a stdio MCP server that is alive with a stale heartbeat
+// (runs inside the infra watchdog's tick).
+pub mod mcp_liveness;
 pub mod mcp_tool_grants_api;
 pub mod module_identity;
 // v0.2.97 (lane V): the `runtime.health_check` poller — module up/down/unknown.

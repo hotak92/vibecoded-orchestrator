@@ -101,7 +101,16 @@ def register_sighup_exit_handler(logger: Logger) -> bool:
         )
         return False
 
+    # v0.2.107: the exit backstop lives with the serving wrapper (one home).
+    # Imported here, on the registering (main) thread, so a broken install
+    # fails loudly at registration rather than inside a signal handler.
+    from vco_lib.mcp_stdio_lifetime import arm_exit_backstop
+
     def _exit_for_env_reload(_signum: int, _frame: object) -> None:
+        # Armed before anything else: whatever later swallows or outlives the
+        # SystemExit (a broad ``except BaseException`` in a tool, a blocked
+        # log write), the process is gone within EXIT_BACKSTOP_SECONDS.
+        arm_exit_backstop("mcp-env-reload", 0)
         logger.info(
             "Received SIGHUP — exiting cleanly for env reload (PR-42). "
             "Claude Code will respawn this MCP with fresh env on the next request."

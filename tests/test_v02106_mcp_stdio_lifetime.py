@@ -248,10 +248,14 @@ def test_run_stdio_server_reports_the_eof_and_a_crash():
     async def bad():
         raise RuntimeError("boom")
 
+    # ``_exit_fn``: the stdin-EOF path arms the exit backstop (v0.2.107),
+    # which must not end the test process.
     lt.run_stdio_server(ok, name="x", grace_s=0.1, watchdog_interval_s=60,
-                        _finish_fn=lambda n, r, c: calls.append((r, c)))
+                        _finish_fn=lambda n, r, c: calls.append((r, c)),
+                        _exit_fn=lambda code: None)
     lt.run_stdio_server(bad, name="x", grace_s=0.1, watchdog_interval_s=60,
-                        _finish_fn=lambda n, r, c: calls.append((r, c)))
+                        _finish_fn=lambda n, r, c: calls.append((r, c)),
+                        _exit_fn=lambda code: None)
     assert calls[0][1] == 0 and "stdin closed" in calls[0][0]
     assert calls[1] == ("the stdio server loop failed", 1)
 
