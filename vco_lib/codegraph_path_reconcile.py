@@ -129,7 +129,7 @@ def committed_tree(root: Path) -> "tuple[str, Optional[set[str]]]":
     return "git", paths
 
 
-def _rel_posix(raw: str, root: Path) -> Optional[str]:
+def rel_posix(raw: str, root: Path) -> Optional[str]:
     """``raw`` (as stored: relative to the root, or absolute) as a normalised
     POSIX path relative to ``root``; None when it lies outside the root."""
     text = raw.replace("\\", "/")
@@ -219,7 +219,7 @@ def reconcile_collections(
     if tracked is not None:
         for raw, present in memo.items():
             if not present:
-                rel = _rel_posix(raw, root)
+                rel = rel_posix(raw, root)
                 in_head[raw] = rel is not None and rel in tracked
         result.kept_committed = sum(1 for v in in_head.values() if v)
 

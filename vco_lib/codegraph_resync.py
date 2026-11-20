@@ -186,6 +186,7 @@ from vco_lib.log_setup import configure_logging  # noqa: E402 — grouped with t
 # v0.2.107 (CG-2): the ONE whole-class listing (cursor from the nil uuid; a
 # 0-row pass is checked against the class count, never read as "empty").
 from vco_lib.codegraph_cursor import iter_class as _iter_class  # noqa: E402
+from vco_lib import codegraph_revision_heal as _revheal  # noqa: E402
 
 # v0.2.82 (WP-2 task 3): the resync's "owed work" staleness + the convergence
 # report's embed-vs-stamp split delegate to the ONE pure guards module, so the
@@ -1160,8 +1161,14 @@ def _count_stale_in_collection(
     reachable_fn=None,
     primary_sources: "Optional[set]" = None,
     index_dot_claude: bool = True,
+    owed_paths: "Optional[set]" = None,
 ) -> Optional[int]:
     """Count rows a re-walk is genuinely OWED in one collection.
+
+    ``owed_paths`` (v0.2.107, the revision heal): when given, the stored path
+    of every row counted owed is added to it (classified tier only — it needs
+    ``reachable_fn``), so the driver lists the owed files in the same cursor
+    pass that counts them.
 
     v0.2.75 (P1b-1): the per-row decision routes through the ONE shared
     classifier (``vco_lib.codegraph_row_classify.classify_row`` — the same
@@ -1253,6 +1260,8 @@ def _count_stale_in_collection(
             )
             if verdict == "owed":
                 stale += 1
+                if owed_paths is not None and props.get(path_prop):
+                    owed_paths.add(str(props.get(path_prop)))
         return stale
     except Exception as exc:  # noqa: BLE001 — undeterminable
         logger.warning(
@@ -1276,8 +1285,13 @@ def count_stale_rows(
     weaviate_url: Optional[str] = None,
     grpc_port: Optional[int] = None,
     index_dot_claude: bool = True,
+    owed_paths: "Optional[set]" = None,
 ) -> Optional[dict]:
     """R-6 (v0.2.73): per-collection count of rows owed a re-embed.
+
+    ``owed_paths`` (v0.2.107): a set the stored path of every owed row is
+    added to (needs ``repo_root``) — the revision heal's file listing, taken
+    in the same pass (:mod:`vco_lib.codegraph_revision_heal`).
 
     Probes ``<Prefix>_{CodeModule,CodeClass,CodeFunction}`` (the collections
     a re-walk can actually converge — MUST MATCH the analyzer's
@@ -1348,6 +1362,7 @@ def count_stale_rows(
                 # owed forever, while the orchestrator root (which indexes
                 # `.claude/` as first-party source) keeps counting them.
                 index_dot_claude=index_dot_claude,
+                owed_paths=owed_paths,
             )
             if n is None:
                 return None
@@ -4446,6 +4461,16 @@ def _run_resync_and_verify_slotted(
        v0.2.103 — the single-flight every walk spawner takes; a held claim
        skips this run with a log line, never a twin). ``--prune-stale``
        is forwarded only when the spawn confirmed it safe (no extra paths).
+       v0.2.107 (revision heal): unless the run is forced (``--force-rewalk``,
+       an extractor-generation rung) or pruning, the walk is ONE scoped
+       ``--only-files-from <owed files> --revision-heal`` run — the pre-walk
+       owed count lists the owed rows' files by cursor and
+       :mod:`vco_lib.codegraph_revision_heal` keeps the ones this checkout
+       may re-extract (committed, unchanged, present). On any doubt, or with
+       nothing eligible, no analyzer runs (nothing changed, nothing deleted,
+       a ``skipped`` terminal report) and step 3 keeps the heal owed. Nothing
+       owed but deleted-file rows awaiting the sweep, or a code-model slot
+       fill owed → the whole-repo walk.
     2. Posts the TERMINAL build status to the hub (v0.2.91 #31 — the
        completion half of the R-4 spawn registration; without it the
        pid-aliveness reconciler false-failed every successful walk).
@@ -4600,16 +4625,67 @@ def _run_resync_and_verify_slotted(
     # aggregate short-circuits at zero); this path only runs inside the detached
     # driver, which the owed gate already decided has work to do. Soft-fail: an
     # unavailable pre-probe simply disables the no-progress branch.
-    try:
-        pre_counts = count_stale_rows(
-            project_name,
-            analyzer_path=Path(analyzer_path),
-            repo_root=Path(repo_root),
-            index_dot_claude=index_dot_claude,
+    #
+    # v0.2.107 (CG-3, revision heal): a run that is neither forced (an
+    # extractor-generation rung needs every file), nor pruning, nor owed a
+    # code-model slot fill (the analyzer's whole-graph walk fills the new
+    # model's vector on EVERY row, current ones included) takes the count
+    # as a HEAL PLAN — the same cursor pass lists the owed rows' files, and
+    # only those files are re-extracted (`vco_lib.codegraph_revision_heal`).
+    # On any doubt the plan runs nothing and the verifier below keeps the
+    # heal owed.
+    heal_plan = None
+    if force_rewalk or prune_stale or _code_model_fill_owed(project_name):
+        try:
+            pre_counts = count_stale_rows(
+                project_name,
+                analyzer_path=Path(analyzer_path),
+                repo_root=Path(repo_root),
+                index_dot_claude=index_dot_claude,
+            )
+        except Exception as exc:  # noqa: BLE001 — never gate the walk on the probe
+            print(f"[resync-driver] pre-walk probe raised: {exc}", flush=True)
+            pre_counts = None
+    else:
+        heal_plan = _plan_revision_heal(
+            project_name, Path(repo_root), Path(analyzer_path), index_dot_claude,
         )
-    except Exception as exc:  # noqa: BLE001 — never gate the walk on the probe
-        print(f"[resync-driver] pre-walk probe raised: {exc}", flush=True)
-        pre_counts = None
+        pre_counts = heal_plan.counts
+        if heal_plan.verdict == _revheal.NOTHING_OWED and _cleanup_sweep_owed(
+                project_name, Path(repo_root)):
+            # No owed row, but primary rows of deleted files (at the current
+            # revision) wait for the whole-repo walk's deleted-file sweep —
+            # the work the spawn gate launched this driver for.
+            print(
+                "[resync-driver] no revision-owed row; deleted-file rows owe "
+                "the whole-repo walk's sweep — running it",
+                flush=True,
+            )
+            heal_plan = None
+    heal_list: Optional[Path] = None
+    if heal_plan is not None and heal_plan.runs_analyzer:
+        heal_list = _revheal.write_list_file(Path(repo_root), heal_plan.files)
+        if heal_list is None:
+            heal_plan.verdict = _revheal.UNDETERMINABLE
+            heal_plan.reason = "the file list could not be written"
+    if heal_plan is not None and not heal_plan.runs_analyzer:
+        print(
+            f"[resync-driver] revision heal: {heal_plan.describe()} — no "
+            "analyzer run; nothing changed, nothing deleted",
+            flush=True,
+        )
+        _report_skip_to_hub(
+            project_name, repo_root,
+            f"revision heal: nothing re-extracted ({heal_plan.verdict}"
+            + (f": {heal_plan.reason}" if heal_plan.reason else "") + ")",
+        )
+        return _verify_resync_outcome(
+            project_name, Path(repo_root), Path(analyzer_path),
+            index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+            rc="not run", pre_counts=pre_counts,
+            exposure_heal_ok=exposure_heal_ok,
+            python_exe=_python_exe.resolve_or_current(),
+        )
 
     # v0.2.94: the ONE resolver, not `sys.executable`. This process was itself
     # spawned with a preflighted venv python by `spawn_background_resync`, so
@@ -4621,6 +4697,13 @@ def _run_resync_and_verify_slotted(
         _python_exe.resolve_or_current(), str(analyzer_path), str(repo_root),
         "--project", project_name,
     ]
+    if heal_list is not None and heal_plan is not None:
+        # The revision heal: ONE scoped run over the owed files.
+        # `--revision-heal` bypasses the per-file gate for them (every listed
+        # file owns an owed row) and keeps the rows of a listed file that
+        # vanished meanwhile (never a delete on a missing file).
+        print(f"[resync-driver] revision heal: {heal_plan.describe()}", flush=True)
+        argv += ["--only-files-from", str(heal_list), "--revision-heal"]
     if prune_stale:
         argv.append("--prune-stale")
     # v0.2.92: the extractor-generation re-index needs the analyzer's per-FILE
@@ -4643,15 +4726,16 @@ def _run_resync_and_verify_slotted(
     # running RIGHT NOW: skip this run — never queue, never kill, never wait
     # on a walk that may legitimately run for hours. The ledger stays as it
     # is; the concurrent walk's own completion converges it, exactly the
-    # driver-claim skip's accepted posture above. Scoped --only-file(s)
-    # runs never reach this function — the driver only ever requests full
-    # walks.
+    # driver-claim skip's accepted posture above. The revision heal's scoped
+    # --only-files-from run takes the same claim (v0.2.107): it is this
+    # driver's walk, never a second one beside it.
     from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
 
     try:
         with walk_claim(project_name):
             rc = subprocess.run(argv, cwd=str(repo_root)).returncode  # noqa: S603
     except WalkAlreadyRunning:
+        _revheal.drop_list_file(heal_list)
         print(
             f"[resync-driver] {project_name}: another code-graph walk is "
             f"already running for this project — skipping this run (no twin "
@@ -4692,6 +4776,7 @@ def _run_resync_and_verify_slotted(
         print(f"[resync-driver] analyzer failed to start: {exc}", flush=True)
         start_error = f"could not start the analyzer: {exc}"
         rc = -1
+    _revheal.drop_list_file(heal_list)
     analyzer_duration_ms = int((time.monotonic() - analyzer_started) * 1000)
 
     # v0.2.105 (fix round): the POST-WALK half of the backend-reachability
@@ -4782,6 +4867,74 @@ def _run_resync_and_verify_slotted(
     except Exception as exc:  # noqa: BLE001 — observability, never a gate
         logger.debug("codegraph resync: terminal report raised: %s", exc)
 
+    return _verify_resync_outcome(
+        project_name, Path(repo_root), Path(analyzer_path),
+        index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
+        rc=rc, pre_counts=pre_counts, exposure_heal_ok=exposure_heal_ok,
+        python_exe=argv[0],
+    )
+
+
+def _plan_revision_heal(
+    project_name: str, repo_root: Path, analyzer_path: Path, index_dot_claude: bool,
+) -> "_revheal.HealPlan":
+    """The driver's revision heal plan (v0.2.107): the pre-walk owed count
+    (:func:`count_stale_rows`) also lists the owed rows' files, and
+    :func:`vco_lib.codegraph_revision_heal.plan_revision_heal` picks the ones
+    this checkout may re-extract. Never raises."""
+
+    def _count(paths: set) -> Optional[dict]:
+        return count_stale_rows(
+            project_name, analyzer_path=analyzer_path, repo_root=repo_root,
+            index_dot_claude=index_dot_claude, owed_paths=paths,
+        )
+
+    return _revheal.plan_revision_heal(repo_root, _count)
+
+
+def _code_model_fill_owed(project_name: str) -> bool:
+    """A selected code model whose slot is still being filled needs the
+    whole-graph walk (:func:`vco_lib.code_embed_model.fill_owed`, which reads
+    an unreadable state as "not owed"); a scoped heal run would only hand the
+    fill back to a new driver."""
+    try:
+        from vco_lib.code_embed_model import fill_owed
+
+        return bool(fill_owed(project_name))
+    except Exception as exc:  # noqa: BLE001 — never crash the child
+        logger.debug("resync driver: code-model fill read failed: %s", exc)
+        return False
+
+
+def _cleanup_sweep_owed(project_name: str, repo_root: Path) -> bool:
+    """True only on a POSITIVE count of deleted-file primary rows
+    (:func:`count_cleanup_owed_rows`); unknown → False (no walk, no sweep)."""
+    try:
+        owed = count_cleanup_owed_rows(project_name, repo_root=repo_root)
+    except Exception as exc:  # noqa: BLE001 — probe must never crash the child
+        print(f"[resync-driver] cleanup-owed probe raised: {exc}", flush=True)
+        return False
+    return bool(owed and owed > 0)
+
+
+def _verify_resync_outcome(
+    project_name: str,
+    repo_root: Path,
+    analyzer_path: Path,
+    *,
+    index_dot_claude: bool,
+    force_rewalk: bool,
+    rc: object,
+    pre_counts: Optional[dict],
+    exposure_heal_ok: bool,
+    python_exe: str,
+) -> int:
+    """Steps 3-4 of the driver (moved out of
+    :func:`_run_resync_and_verify_slotted` in v0.2.107 so the revision heal's
+    no-run outcomes reach the same verifier): re-probe the owed rows, clear
+    the ledger entry on a positive zero, otherwise record the one-time
+    unconverged entry. ``rc`` is the analyzer's exit status, or ``"not run"``.
+    Always returns 0."""
     try:
         counts = count_stale_rows(
             project_name,
@@ -4919,7 +5072,7 @@ def _run_resync_and_verify_slotted(
     # post-walk probe is what clears this entry once the rows converge.
     _record_unconverged_deferral(
         repo_root, project_name, counts, driver_resume_command(
-            argv[0], Path(repo_root), Path(analyzer_path), project_name,
+            python_exe, Path(repo_root), Path(analyzer_path), project_name,
             index_dot_claude=index_dot_claude, force_rewalk=force_rewalk,
         ), stuck,
     )
@@ -5173,13 +5326,15 @@ def spawn_background_resync(
     index_dot_claude: bool = True,
     wait_for_starting_backend: bool = False,
 ) -> ResyncTriggerResult:
-    """Launch a BACKGROUND, revision-gated full re-analyze of ``repo_root``.
+    """Launch the BACKGROUND resync driver for ``repo_root``.
 
-    A full (no ``--incremental``, no ``--only-file``) analyze is intentional:
-    the revision gate inside the analyzer makes it LIGHT — only rows whose
-    stored ``embed_revision`` differs from the current one re-embed; the 90%+
-    already-current rows hash-skip. This is the host-agnostic, revision-based
-    resync (it re-embeds the root project too, not just non-root projects).
+    The driver (:func:`run_resync_and_verify`) heals revision-owed rows by
+    re-extracting ONLY the files that own them (v0.2.107 revision heal, one
+    scoped analyzer run; :mod:`vco_lib.codegraph_revision_heal`); with
+    ``force_rewalk`` (an extractor-generation rung) it runs the whole-repo
+    walk, whose per-entity gates still keep unchanged rows from re-embedding.
+    This is the host-agnostic, revision-based resync (it re-embeds the root
+    project too, not just non-root projects).
 
     Non-blocking: the analyzer is spawned detached via ``Popen`` and this
     function returns immediately with ``status="launched"``. NO global timeout
@@ -5408,8 +5563,9 @@ def spawn_background_resync(
         )
 
     # Build the DRIVER argv (R-7): the detached child is this module in
-    # --run-resync mode. It runs the analyzer as a blocking subprocess (full
-    # walk; the revision gate keeps it light), then re-probes convergence and
+    # --run-resync mode. It runs the analyzer as a blocking subprocess (the
+    # revision heal's scoped run over the owed files, or the whole-repo walk
+    # when forced), then re-probes convergence and
     # records the one-time deferral when stale rows remain — the RT-5 walk
     # died silently precisely because nothing verified it. We do NOT pass
     # --force-recreate (that would DROP + rebuild the schema, losing all

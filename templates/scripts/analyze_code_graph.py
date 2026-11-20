@@ -3070,7 +3070,9 @@ class CodeGraphAnalyzer:
 
         # F3: the entity shrank — delete the stale tail rows. Runs on BOTH the
         # skip and write paths (the cleanup itself soft-fails; see helper).
-        if stale_chunk_min is not None and isinstance(props, dict):
+        # v0.2.107: inside a file's open reconcile scope the tail goes AFTER every write of the file
+        # succeeded (`reconcile_walked_file_rows` deletes the unwritten chunk uuids), never before.
+        if stale_chunk_min is not None and isinstance(props, dict) and getattr(self, "_reconcile_pending", None) is None:
             self._delete_stale_chunk_rows(
                 collection,
                 props.get("full_name") or identity_key,
@@ -3581,7 +3583,7 @@ class CodeGraphAnalyzer:
                         rel = fpath.resolve().relative_to(repo_path.resolve()).as_posix()
                     except Exception:  # noqa: BLE001 — outside root / unresolved
                         rel = ""
-                    if rel:
+                    if rel and not getattr(self, "revision_heal", False):  # a heal never deletes on a missing file
                         self._prune_deleted_file_objects(rel, repo_path.as_posix())
                     continue
                 # Existing file → route through the single-file dispatch and
@@ -6207,8 +6209,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # repo_path (same relativization contract as --only-file). Each path routes
     # through the SAME per-file + per-object skips as --only-file; a path that
     # vanished from disk is PRUNED (its objects deleted) rather than
-    # skipped/errored. Mutually exclusive with --only-file / --incremental /
-    # --extra-path / --prune-stale.
+    # skipped/errored — except under --revision-heal, which keeps them. Mutually
+    # exclusive with --only-file / --incremental / --extra-path / --prune-stale.
     parser.add_argument('--only-files-from', type=Path, default=None,
                        help='Batched per-turn mode: analyze the newline-'
                             'delimited absolute paths listed in <file> (all '
@@ -6268,6 +6270,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                             'content-hash gating is unaffected: unchanged entities '
                             'are neither re-written nor re-embedded. Env: '
                             'VCT_CODEGRAPH_FORCE_REWALK=1.')
+    parser.add_argument('--revision-heal', action='store_true', default=False,  # vco_lib/codegraph_revision_heal.py
+                       help='With --only-files-from (the resync driver): re-extract every listed file; '
+                            'a listed file that vanished keeps its rows.')
     # v0.2.91 wave-3 (MAJOR-A): the LEDGER-root seam — see
     # `_resolve_deferral_root`. Absent ⇒ resolution is exactly what it was.
     parser.add_argument('--deferral-root', type=Path, default=None,
@@ -6338,6 +6343,9 @@ def main():
             "(pick single-file or batched-file mode)",
             file=sys.stderr,
         )
+        return 1
+    if args.revision_heal and args.only_files_from is None:
+        print("❌ --revision-heal needs --only-files-from (the heal's file list)", file=sys.stderr)
         return 1
     _scoped_flag = "--only-file" if args.only_file is not None else "--only-files-from"
     if args.only_file is not None or args.only_files_from is not None:
@@ -6577,9 +6585,10 @@ def main():
         args.index_dot_claude, repo_path
     )
     # v0.2.92: CLI flag OR its env transport (ONE resolver, in vco_lib).
-    analyzer.force_rewalk = _extractor_gen.resolve_force_rewalk(args.force_rewalk) or _cem_plan.rewalk  # a fill visits every row
+    analyzer.force_rewalk = _extractor_gen.resolve_force_rewalk(args.force_rewalk) or _cem_plan.rewalk or args.revision_heal  # a fill visits every row
+    analyzer.revision_heal = bool(args.revision_heal)  # the listed files all own owed rows
     if analyzer.force_rewalk:
-        print("🔁 Force re-walk: re-extracting every file (per-entity "
+        print("🔁 Force re-walk: re-extracting every file in scope (per-entity "
               "content-hash gating unchanged — unchanged rows do NOT re-embed).")
 
     # Connect to Weaviate
