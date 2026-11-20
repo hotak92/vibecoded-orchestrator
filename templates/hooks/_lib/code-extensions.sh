@@ -4,7 +4,8 @@
 # Before this file the same extension alternation was written out in
 # pre-edit-context-inject.sh, pre-bash-context-inject.sh (indirectly, via
 # codegraph-query.sh), post-file-edit.sh, pre-tool-use.sh,
-# code-graph-incremental.sh and stop-codegraph-drain.sh — a C-tier mirror
+# code-graph-incremental.sh and stop-codegraph-drain.sh (both mirrors retired
+# since) — a C-tier mirror
 # per consumer, each with a "MUST MATCH the other two" comment that could
 # only ever be enforced by a human reading all of them. Lane F10 added a
 # further consumer (the Bash-write routing), which is the point at which

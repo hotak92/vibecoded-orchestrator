@@ -69,7 +69,13 @@ Deliberately NOT covered: a session whose checkout is a linked git WORKTREE
 (``worktree_session``, checked first). Worktrees are never indexed, and
 stamping the binding from a worktree HEAD would advance it to a commit the
 main checkout does not have. The main checkout's own session runs the
-catch-up.
+catch-up. A worktree is told by its git dir differing from the common dir
+(:func:`vco_lib.git_meta.linked_worktree_main`), so a project folder NESTED
+inside a larger repository (a monorepo sub-project, a folder under a
+home-directory repository) is a main checkout like any other: its HEAD is the
+enclosing repository's, its diff is limited to its own folder and relative to
+it (``git diff --relative``), and the reconciliation judges its rows against
+the project folder (WAVE2-CHECK M-2).
 
 Every decision is one line in
 ``<project>/.claude/logs/codegraph_head_catchup.log`` (size-capped). Exit
@@ -93,7 +99,7 @@ from vco_lib.codegraph_extras_refresh import (
     RunLog,
     run_analyzer,
 )
-from vco_lib.git_meta import git_head_sha, run_git
+from vco_lib.git_meta import git_head_sha, linked_worktree_main, run_git
 from vco_lib.paths import looks_like_orchestrator_root
 
 #: Above this many changed files one scoped analyzer run is the wrong shape —
@@ -139,8 +145,9 @@ CODE_RE = re.compile(
 
 def path_key(path: str) -> str:
     """The per-checkout lock key (:mod:`vco_lib.codegraph_root_lock`). Callers
-    pass the CANONICAL root (git-resolved realpath), so every writer over the
-    same checkout serialises however the session spelled the root."""
+    pass :func:`checkout_lock_root` (the project folder's realpath), so every
+    writer over the same project serialises however the session spelled the
+    root."""
     return _root_lock.path_key(path)
 
 
@@ -149,8 +156,9 @@ def path_key(path: str) -> str:
 
 def git_head(root: str) -> Optional[str]:
     """FULL SHA of ``root``'s HEAD, or None (not a repo / no commits / git
-    missing)."""
-    return git_head_sha(Path(root))
+    missing). A project folder nested inside a larger repository (no ``.git``
+    of its own) has the enclosing repository's HEAD (M-2)."""
+    return git_head_sha(Path(root), require_dot_git=False)
 
 
 def is_ancestor(root: str, ancestor: str, descendant: str) -> bool:
@@ -168,8 +176,13 @@ def is_ancestor(root: str, ancestor: str, descendant: str) -> bool:
 
 
 def diff_paths(root: str, old: str, new: str) -> Optional[list[str]]:
-    """``git diff --name-only -z <old>..<new>`` → repo-relative paths.
+    """``git diff --name-only --relative -z <old>..<new>`` → paths relative to
+    ``root``.
 
+    ``--relative`` (run from ``root``) limits the diff to ``root``'s subtree
+    and prints the paths relative to it: for a project nested inside a larger
+    repository the toplevel-relative paths would name the wrong files (M-2);
+    at the toplevel it changes nothing.
     NUL-separated (``-z``) so a path holding a space or a quote survives
     verbatim. ``None`` on any git failure (non-zero exit, timeout, git not
     runnable) — FAILURE is distinct from an empty diff: an empty list means
@@ -180,7 +193,7 @@ def diff_paths(root: str, old: str, new: str) -> Optional[list[str]]:
     """
     rc, out, _err = run_git(
         Path(root),
-        ["diff", "--name-only", "-z", f"{old}..{new}"],
+        ["diff", "--name-only", "--relative", "-z", f"{old}..{new}"],
         timeout=DIFF_TIMEOUT_SECONDS,
     )
     if rc != 0:
@@ -188,31 +201,27 @@ def diff_paths(root: str, old: str, new: str) -> Optional[list[str]]:
     return [p for p in out.split("\0") if p]
 
 
-def canonical_repo_root(root: str) -> Optional[str]:
-    """The MAIN checkout root a linked worktree shares, or None.
+def linked_worktree_of(root: str) -> Optional[str]:
+    """The main checkout ``root`` is a linked worktree of, or None.
 
-    ``git rev-parse --path-format=absolute --git-common-dir`` → dirname →
-    strip ``/.git`` → normalise. Used ONLY to tell a worktree session from
-    the main checkout; a resolution failure is read as "not a worktree".
+    The rule lives in :func:`vco_lib.git_meta.linked_worktree_main` (git dir
+    ≠ common dir): a project folder NESTED inside a larger repository is the
+    main checkout, not a worktree (WAVE2-CHECK M-2). A resolution failure is
+    read as "not a worktree".
     """
-    repo = Path(root)
-    rc, common, _err = run_git(
-        repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]
-    )
-    if rc != 0 or not common:
-        rc, common, _err = run_git(repo, ["rev-parse", "--git-common-dir"])
-        if rc != 0 or not common:
-            return None
-        if not os.path.isabs(common):
-            common = os.path.join(str(repo), common)
-    base = common.rstrip("/")
-    if base.endswith("/.git"):
-        base = base[: -len("/.git")]
+    main = linked_worktree_main(Path(root))
+    return None if main is None else str(main)
+
+
+def checkout_lock_root(root: str) -> str:
+    """The spelling of ``root`` the per-checkout lock is keyed on: its
+    realpath, so every writer over this project folder serialises however the
+    session spelled it (symlink, trailing-dot form). The daily reconciliation
+    keys its lock the same way."""
     try:
-        resolved = Path(base).resolve()
-    except OSError:
-        return None
-    return str(resolved) if resolved.is_dir() else None
+        return str(Path(root).resolve())
+    except (OSError, RuntimeError):
+        return str(Path(root))
 
 
 # ── The analyzer argv shapes ─────────────────────────────────────────────
@@ -313,7 +322,8 @@ class Deps:
     diff_paths: Callable[[str, str, str], Optional[list[str]]] = diff_paths
     run_analyzer: Callable[..., AnalyzerResult] = run_analyzer
     record: Callable[[str, str], tuple[bool, str]] = record_analyzed_commit
-    canonical_root: Callable[[str], Optional[str]] = canonical_repo_root
+    #: ``root -> main checkout`` when ``root`` is a linked worktree, else None.
+    linked_worktree: Callable[[str], Optional[str]] = linked_worktree_of
     #: Wall clock for the backoff window (review LOW) — a test moves it.
     now: Callable[[], float] = time.time
     #: The daily path-existence reconciliation (v0.2.107 CG-3, A-013):
@@ -478,10 +488,10 @@ def _run_walk(
     twins a launcher/driver walk of the same project — the 2026-10-14 field
     defect).
 
-    ``lock_root`` is the CANONICAL root (git-resolved realpath) the lock is
-    keyed on, so a catch-up walk serialises with every other analyzer run
-    over the same checkout even when this session spelled the root
-    differently (symlink, trailing-dot form) — review LOW.
+    ``lock_root`` is :func:`checkout_lock_root` (the project folder's
+    realpath) the lock is keyed on, so a catch-up walk serialises with every
+    other analyzer run over the same project even when this session spelled
+    the root differently (symlink, trailing-dot form) — review LOW.
     """
     from vco_lib.codegraph_walk import WalkAlreadyRunning, walk_claim
 
@@ -563,16 +573,19 @@ def catchup(
 
     # A linked worktree (a lane) is never indexed and never stamps the
     # binding (owner ruling 2026-11-19): checked before anything else.
-    canonical = deps.canonical_root(root)
-    if canonical and Path(canonical) != Path(root).resolve():
+    # A project folder nested inside a larger repository is NOT a worktree
+    # (M-2): the test is git dir ≠ common dir, never toplevel ≠ project.
+    main_checkout = deps.linked_worktree(root)
+    if main_checkout:
         log(
-            f"skip project={root}: linked worktree of {canonical} — worktrees "
+            f"skip project={root}: linked worktree of {main_checkout} — worktrees "
             "are never indexed; the main checkout's own session owns this catch-up"
         )
         return "worktree_session"
-    # The lock key follows the canonical root, so every writer over this
-    # checkout serialises however the root was spelled.
-    lock_root = canonical or root
+    # The lock key follows the project folder's realpath, so every writer over
+    # this project serialises however the root was spelled (the reconcile
+    # keys its lock the same way).
+    lock_root = checkout_lock_root(root)
 
     def _advance() -> str:
         head = deps.git_head(root)
@@ -763,7 +776,9 @@ def catchup(
         if reconcile is None:
             from vco_lib.codegraph_path_reconcile import reconcile_if_due as reconcile
         try:
-            reconcile(lock_root, prefix, state_dir, log)
+            # The PROJECT folder, never the repository toplevel: the rows'
+            # paths are relative to the folder the analyzer walked (M-2).
+            reconcile(root, prefix, state_dir, log)
         except Exception as exc:  # noqa: BLE001 — the reconcile never fails the catch-up
             log(f"path-reconcile: ERROR unexpected: {exc!r}")
     return outcome

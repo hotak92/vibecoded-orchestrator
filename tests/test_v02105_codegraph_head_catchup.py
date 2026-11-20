@@ -126,8 +126,9 @@ class _Recorder:
     def diff_paths(self, _root, _old, _new):
         return None if self.diff is None else list(self.diff)
 
-    def canonical_root(self, root):
-        return self.canonical if self.canonical is not None else str(Path(root).resolve())
+    def linked_worktree(self, _root):
+        """The main checkout when this "session" is a linked worktree."""
+        return self.canonical
 
     def run_analyzer(self, python, analyzer, argv, timeout):
         # Capture the list file's contents while it still exists.
@@ -154,7 +155,7 @@ def _drive(tmp_path: Path, rec: _Recorder, now=None, **kw):
         diff_paths=rec.diff_paths,
         run_analyzer=rec.run_analyzer,
         record=rec.record,
-        canonical_root=rec.canonical_root,
+        linked_worktree=rec.linked_worktree,
         now=now or time.time,
     )
     root = tmp_path / "proj"
@@ -363,7 +364,7 @@ def test_unbound_or_disabled_project_is_skipped(tmp_path: Path) -> None:
 
 
 def test_the_root_lock_keys_on_the_canonical_root(tmp_path: Path) -> None:
-    """LOW: the per-checkout lock keys on the git-resolved canonical root; a
+    """LOW: the per-checkout lock keys on the project folder's realpath; a
     catch-up keyed on the session's spelling of the path let two analyzer
     runs over the same repo run at once. A lock held at the CANONICAL key
     must read as busy even when the project root was spelled through the
@@ -388,7 +389,7 @@ def test_the_root_lock_keys_on_the_canonical_root(tmp_path: Path) -> None:
         deps=chc.Deps(resolve=rec.resolve, git_head=rec.git_head,
                       is_ancestor=rec.is_ancestor, diff_paths=rec.diff_paths,
                       run_analyzer=rec.run_analyzer, record=rec.record,
-                      canonical_root=rec.canonical_root),
+                      linked_worktree=rec.linked_worktree),
     )
     assert out == "busy"
     assert rec.runs == [] and rec.records == []
@@ -448,7 +449,7 @@ def test_held_root_lock_is_busy_and_records_nothing(tmp_path: Path) -> None:
         deps=chc.Deps(resolve=rec.resolve, git_head=rec.git_head,
                       is_ancestor=rec.is_ancestor, diff_paths=rec.diff_paths,
                       run_analyzer=rec.run_analyzer, record=rec.record,
-                      canonical_root=rec.canonical_root),
+                      linked_worktree=rec.linked_worktree),
     )
     assert out == "busy"
     assert rec.runs == [] and rec.records == []
@@ -727,7 +728,7 @@ def _real_runner_deps(rec: _Recorder) -> "chc.Deps":
     return chc.Deps(
         resolve=rec.resolve, git_head=rec.git_head, is_ancestor=rec.is_ancestor,
         diff_paths=rec.diff_paths, run_analyzer=chc.run_analyzer,
-        record=rec.record, canonical_root=rec.canonical_root,
+        record=rec.record, linked_worktree=rec.linked_worktree,
     )
 
 

@@ -5,14 +5,15 @@ migration for the code graph (v0.2.82 G7 + G3 engine).
 
 WHY THIS EXISTS
 ---------------
-Two writers stamp the code-graph ``project`` property differently: the per-edit
-hooks stamp the SANITIZED ``collection_prefix`` while the launcher stamps the
+Two writers stamped the code-graph ``project`` property differently: the
+per-edit hooks (retired in v0.2.107; the HEAD catch-up writes the same prefix)
+stamped the SANITIZED ``collection_prefix`` while the launcher stamped the
 project's DISPLAY NAME. Because the deterministic UUID mixes ``project`` into
 its seed (:func:`analyze_code_graph._deterministic_uuid`), a project whose
 display name differs from its canonical prefix (any spaced name — "Old Name")
 accumulates DUPLICATE rows: the SAME source entity indexed under two different
-``project`` seeds mints two different UUIDs. Left alone the two writers keep
-minting dupes on every edit + rebuild.
+``project`` seeds mints two different UUIDs. Left alone the two identities
+kept minting dupes on every write.
 
 The v0.2.82 G3 decision (option b) is: pick ONE identity SSOT (the codegraph
 binding ``collection_prefix``) and, when the display-name identity is detected,

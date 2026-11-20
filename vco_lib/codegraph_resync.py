@@ -828,8 +828,9 @@ def _delete_is_already_gone(exc: BaseException) -> bool:
     v0.2.91 fix-round (NIT-3). ``delete_by_id`` is IDEMPOTENT in intent: the
     post-condition the caller wants is "this UUID no longer exists". A narrowed
     read pages with ``offset`` (see :func:`_fetch_narrowed_rows`), so under
-    concurrent mutation — the per-edit hook drain running while a resync walk
-    reconciles — the same row can legitimately be listed twice, or vanish
+    concurrent mutation — another code-graph writer (the HEAD catch-up, a
+    launcher build) running while a resync walk reconciles — the same row can
+    legitimately be listed twice, or vanish
     between the read and the delete. Counting that as a FAILURE propagates
     ``success -> partial`` through ``_prune_failures``, which defers the
     revision advance and re-spawns the whole background resync next update: a

@@ -5,7 +5,8 @@
 # WHY THIS EXISTS (write-amplification, 2026-06-18)
 # -------------------------------------------------
 # post-file-edit.ps1 fired an IMMEDIATE background sync (kg-sync /
-# upload_docs.py / code-graph-incremental) on EVERY edit. An agent that
+# upload_docs.py / code-graph-incremental — that code leg is retired since
+# v0.2.107, the code graph follows commits) on EVERY edit. An agent that
 # edits the same file 5x in a minute therefore produced 5 Weaviate
 # upserts of (mostly) the same object — a primary driver of write
 # amplification. The Weaviate-side tuning landed in d43acf1f; this is

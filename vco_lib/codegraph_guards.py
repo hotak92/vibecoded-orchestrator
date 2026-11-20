@@ -319,9 +319,47 @@ def anchor_heal_props_for(collection: Any,
     soft-failed). The class schema is read once per collection name and
     cached; an unreadable schema yields ``()`` — no heal, never a failed read.
     """
+    return _declared_subset(collection, ANCHOR_HEAL_PROPS, declared_cache)
+
+
+#: v0.2.107 (WAVE2-CHECK A-011): properties the CROSS-REFERENCE pass owns on a
+#: row, which a content REPLACE of that row must carry over. ``data.replace``
+#: writes the whole object, and the walk's properties never hold these, so a
+#: changed function's rewrite used to null its ``n_callers`` (its inbound
+#: count from UNCHANGED callers, which a scoped run cannot recount) and its
+#: ``call_names`` (the old edges a scoped run subtracts — without them each
+#: target was counted twice). They ride the ONE fingerprint point-read.
+XREF_CARRY_PROPS: Dict[str, Tuple[str, ...]] = {
+    "CodeFunction": ("call_names", "n_callers"),
+}
+
+
+def xref_carry_props_for(collection: Any,
+                         declared_cache: Optional[Dict[str, Any]] = None) -> Tuple[str, ...]:
+    """The :data:`XREF_CARRY_PROPS` entry for ``collection``'s class, limited
+    to the props it declares (same rule as :func:`anchor_heal_props_for`)."""
+    return _declared_subset(collection, XREF_CARRY_PROPS, declared_cache)
+
+
+def carry_xref_props(props: Any, stored: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Copy the stored cross-reference props a replace would drop into
+    ``props`` (in place). Only a prop the write does not set, and only a
+    stored non-NULL value. Returns what was carried."""
+    if not stored or not isinstance(props, dict):
+        return {}
+    carried = {k: v for k, v in stored.items() if v is not None and k not in props}
+    props.update(carried)
+    return carried
+
+
+def _declared_subset(collection: Any, table: Mapping[str, Tuple[str, ...]],
+                     declared_cache: Optional[Dict[str, Any]]) -> Tuple[str, ...]:
+    """``table``'s entry for ``collection``'s class (by name suffix); with
+    ``declared_cache``, only the props the class DECLARES (schema read once
+    per class name; an unreadable schema yields ``()``)."""
     name = str(getattr(collection, "name", "") or "")
     wanted: Tuple[str, ...] = ()
-    for suffix, props in ANCHOR_HEAL_PROPS.items():
+    for suffix, props in table.items():
         if name.endswith(suffix):
             wanted = props
             break
@@ -377,6 +415,7 @@ def read_object_fingerprint(
     want_total_chunks: bool = False,
     vector_slot: Optional[str] = None,
     heal_props: Sequence[str] = (),
+    carry_props: Sequence[str] = (),
 ) -> Optional[dict]:
     """Point-read an object's tombstone-skip fingerprint by UUID (I/O helper).
 
@@ -402,13 +441,16 @@ def read_object_fingerprint(
     v0.2.102 (W6-O): ``heal_props`` (:func:`anchor_heal_props_for`) rides the
     SAME read and returns as ``"heal": {name: stored value}`` for
     :func:`heal_skipped_row`. Empty (default) → no extra key, no extra prop.
+
+    v0.2.107 (A-011): ``carry_props`` (:func:`xref_carry_props_for`) the same
+    way, returned as ``"carry"`` for :func:`carry_xref_props`.
     """
     try:
         query = getattr(collection, "query", None)
         fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
         if not callable(fetch_by_id):
             return None
-        read_props = ["content_hash", embed_revision_prop, *heal_props]
+        read_props = ["content_hash", embed_revision_prop, *heal_props, *carry_props]
         if want_total_chunks:
             read_props.append("total_chunks")
         if vector_slot:
@@ -434,6 +476,8 @@ def read_object_fingerprint(
         }
         if heal_props:
             fingerprint["heal"] = {p: existing_props.get(p) for p in heal_props}
+        if carry_props:
+            fingerprint["carry"] = {p: existing_props.get(p) for p in carry_props}
         if vector_slot:
             fingerprint["vector_present"] = slot_vector_present(
                 getattr(existing, "vector", None), vector_slot,

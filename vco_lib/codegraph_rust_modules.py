@@ -32,7 +32,7 @@ resolves each to its file by Rust's module path rules (``x.rs`` /
   re-walks it even though its own bytes did not change;
 * :func:`rust_module_dependents` — the files whose test-only status a changed
   file can flip (its transitive module descendants), which ``--incremental``
-  and the per-edit single-file scope add to the re-walk set.
+  and the single-file scope (``--only-file``) add to the re-walk set.
 
 Test-only: a file reached from a crate root only through at least one gated
 declaration (or through a test-only file). A file nothing declares is a crate
@@ -312,7 +312,7 @@ def add_rust_module_dependents(selected: List[Path], candidates: List[Path],
 
 def single_file_scope(file_path: Path, repo_root: Path,
                       excluded: Callable[[Path], bool]) -> List[Path]:
-    """The analyzer's per-edit (``--only-file`` / drain) re-walk set for one
+    """The analyzer's single-file (``--only-file``) re-walk set for one
     file: the file itself, plus — for a Rust file — its module dependents the
     directory walk would also index (``excluded`` is the walk's own
     ignored-directory verdict)."""

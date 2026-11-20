@@ -477,7 +477,7 @@ pub async fn code_graph_reanalyze_current(
 
     // v0.2.82 (WP-3 G3 task 1, pipeline J): feed the CANONICAL code-graph
     // identity, not the raw display name — the SSOT helper resolves the binding
-    // prefix (== what per-edit hooks stamp) so this reanalyze does not mint a
+    // prefix (== what the HEAD catch-up stamps) so this reanalyze does not mint a
     // second identity's worth of duplicate rows.
     let identity = crate::commands::codegraph::resolve_codegraph_identity(
         &db,

@@ -5,8 +5,8 @@
 keeps thin aliases ``_path_is_excluded`` / ``_keep_source_file`` /
 ``_is_under_transient_state``).
 
-Shared by the directory walk AND the single-file / drain path
-(mirror-don't-fork, v0.2.73): a per-edit ``--only-file`` must never index
+Shared by the directory walk AND the scoped paths (mirror-don't-fork,
+v0.2.73): an ``--only-file`` / ``--only-files-from`` run must never index
 something the whole-tree walk skips, or vice versa.
 
 v0.2.105 (silent zero-module walk, Windows field report: 146 source files,
