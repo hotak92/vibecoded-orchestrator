@@ -134,9 +134,14 @@ def _min_ms(argv: list, env: dict, n: int) -> float:
     return best
 
 
-def ps1_no_pending_overhead_ms(hook: Path, project: Path, n: int = 7) -> tuple:
+def ps1_no_pending_overhead_ms(hook: Path, project: Path, n: int = 15) -> tuple:
     """(hook min ms, bare pwsh min ms) for the no-pending path. Shared with
-    the lane's red-proof, which points ``hook`` at the pre-change file."""
+    the lane's red-proof, which points ``hook`` at the pre-change file.
+
+    v0.2.107: min of 15 runs (was 7). On shared CI runners min-of-7 still
+    carried a few ms of scheduling noise and sat at the bound (55 ms) with a
+    pre-check code path byte-identical to v0.2.106's; more samples steady the
+    minimum without moving the bound."""
     empty = project / "empty.ps1"
     empty.write_text("", encoding="utf-8")
     env = _env(project)
