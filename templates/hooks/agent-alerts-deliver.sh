@@ -27,6 +27,10 @@
 # MUST MATCH agent-alerts-deliver.ps1.
 
 # Canonical list: _lib/scrub-env.sh; the inline unset is the fallback for a missing lib.
+# (The .ps1 sibling runs its inline list first and loads _lib/scrub-env.ps1 only
+# on the pending path: dot-sourcing a second file costs PowerShell ~10 ms per call
+# on this every-prompt hook. Sourcing is cheap in bash, so this file keeps the
+# canonical scrub first; either way the canonical list runs before any child.)
 { . "${BASH_SOURCE[0]%/*}/_lib/scrub-env.sh" && vct_scrub_secret_env; } 2>/dev/null ||
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0

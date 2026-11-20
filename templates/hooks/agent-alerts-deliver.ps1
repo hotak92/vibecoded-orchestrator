@@ -23,11 +23,12 @@
 # module autoload for it. [NullString]::Value (a real null; a bare $null becomes ""
 # and, on .NET 9, sets an empty variable) removes it for this process and every
 # child it starts.
-# Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
-if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
+# Canonical list: _lib/scrub-env.ps1 (parity test pins the inline copy to it).
+# Hot path (fires on every prompt / tool result): the inline list first, plain
+# .NET, no second file to parse; the canonical lib (which may carry extra names)
+# is loaded below, only on the path that goes on to start anything.
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     [System.Environment]::SetEnvironmentVariable($v, [NullString]::Value)
-}
 }
 
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
@@ -58,6 +59,13 @@ try {
     }
 } catch { $hasPending = $false }
 if (-not $hasPending) { exit 0 }
+# Something is pending and children may start: the canonical scrub (its list can
+# carry names the inline one lacks) before anything else.
+if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
+foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
+    [System.Environment]::SetEnvironmentVariable($v, [NullString]::Value)
+}
+}
 . "$PSScriptRoot/_lib/hook-stdin.ps1"  # UTF-8 payload read + UTF-8 output (before stderr-cap)
 
 # Something is pending: the rest lives in _lib/ so PowerShell does not parse
