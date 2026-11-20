@@ -278,13 +278,21 @@ def drain_state_dir(project_root: "str | Path | None" = None) -> Optional[Path]:
     return out
 
 
-def session_may_drain(session_id: str, project_root: "str | Path | None" = None) -> bool:
+def session_may_drain(session_id: str, project_root: "str | Path | None" = None,
+                      *, session_end: bool = False) -> bool:
     """Whether a drain for ``session_id`` has anything to look at: a pending
     file of that session, or one staged without a session id (which may be
     its retrieval). An empty ``session_id`` asks about any pending file (an
     empty id drains them all). The rule the Stop hook applies before it
     spawns a drain — ``templates/hooks/stop-drain-citations.{sh,ps1}`` MUST
-    MATCH it (locked by ``tests/test_v02107_rl_drain_single_flight.py``)."""
+    MATCH it (locked by ``tests/test_v02107_rl_drain_single_flight.py``).
+
+    ``session_end`` (the main chat's SessionEnd): a file of this session
+    still under a CLAIM (``<name>.json.draining.<pid>``, the MCP monitor's)
+    counts too. That drain must run to record the session's end
+    (:func:`mark_session_ended`, kept while a claim is left), so the file the
+    claim hands back is finalized by the next drain instead of waiting for
+    the abandoned-file collection (v0.2.107 wave-2 check L-4)."""
     d = pending_dir(project_root)
     if d is None or not d.exists():
         return False
@@ -292,7 +300,12 @@ def session_may_drain(session_id: str, project_root: "str | Path | None" = None)
     patterns = ([f"{glob.escape(safe)}__*.json", f"{NO_SESSION_PREFIX}__*.json"]
                 if safe else ["*.json"])
     try:
-        return any(p.suffix == ".json" for pat in patterns for p in d.glob(pat))
+        if any(p.suffix == ".json" for pat in patterns for p in d.glob(pat)):
+            return True
+        if session_end and safe:
+            return any(CLAIM_MARK in p.name
+                       for p in d.glob(f"{glob.escape(safe)}__*.json{CLAIM_MARK}*"))
+        return False
     except OSError:
         return True
 

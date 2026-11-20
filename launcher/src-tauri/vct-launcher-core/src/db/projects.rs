@@ -258,6 +258,16 @@ impl Db {
         Ok(())
     }
 
+    /// The refusal [`Self::delete_project`] makes, on its own: `Err` (same
+    /// message) while `rl_events` still has its foreign key to `projects`.
+    /// The unregister asks it FIRST, before it purges files or drops
+    /// collections, so a refusal leaves the project fully registered and
+    /// untouched (wave-2 check L-3); `delete_project` keeps its own check
+    /// for every other caller.
+    pub fn refuse_if_project_delete_cascades_rl_events(&self) -> Result<(), String> {
+        refuse_if_rl_events_cascade(&self.lock())
+    }
+
     /// How many RL training events carry this project_id — what the unregister
     /// panel names ("Also delete this project's N RL training events").
     /// Counted on the `(project_id, ts)` index; payloads are not read.

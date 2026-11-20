@@ -264,7 +264,8 @@ def test_a_warmer_run_holds_its_retrieval_events_instead_of_posting(tmp_path: Pa
     import hook_context_router as hcr  # pyright: ignore[reportMissingImports]
 
     proj = _project(tmp_path)
-    key = hcr.cache_key("kgi", "prompt", "q", "3")
+    # The interactive run hands the warmer the KG leg's per-turn key.
+    key = hcr._kg_cache_key(_plan(hcr), "p1")
     r = _warm_emitting(tmp_path, proj, key)
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "handoff.txt").read_text() == "held", "the warmer posted its events"
@@ -283,18 +284,23 @@ def test_an_interactive_run_still_hands_its_events_off(monkeypatch) -> None:
     assert seen == [("x",)]
 
 
-def _hit(hcr, proj: Path, monkeypatch, run_id: str, session: str):
+def _plan(hcr):
     plan = hcr._Plan()
     plan.kg_query = "q"
     plan.kg_profile = "prompt"
     plan.kg_limit = 3
+    return plan
+
+
+def _hit(hcr, proj: Path, monkeypatch, run_id: str, session: str, prompt_id: str = "p1"):
+    plan = _plan(hcr)
     hcr._install_staged_ctx_run_id_wrapper()
     monkeypatch.setattr(hcr, "_CURRENT_RUN_ID", run_id)
     for var in ("VCT_SESSION_ID", "CLAUDE_SESSION_ID", "VCT_AGENT_ID"):
         monkeypatch.delenv(var, raising=False)
     if session:
         monkeypatch.setenv("VCT_SESSION_ID", session)
-    return hcr._run_legs(plan, session, "p1", str(proj), "", time.monotonic() + 6.0)
+    return hcr._run_legs(plan, session, prompt_id, str(proj), "", time.monotonic() + 6.0)
 
 
 def test_the_run_that_shows_the_entry_sends_the_held_events_under_its_session(
@@ -306,8 +312,14 @@ def test_the_run_that_shows_the_entry_sends_the_held_events_under_its_session(
     from claude_mcp_servers.rl_client import deferred_emit
 
     proj = _project(tmp_path)
-    key = hcr.cache_key("kgi", "prompt", "q", "3")
+    # The warmer was started in turn "p1" and holds its events under that
+    # turn's key (KG keys are per turn, R31); a showing run in the SAME turn
+    # serves that entry. A later turn's key differs, so it never serves (or
+    # sends) turn p1's held events — they expire with the query cache.
+    key = hcr._kg_cache_key(_plan(hcr), "p1")
+    assert hcr._kg_cache_key(_plan(hcr), "p2") != key
     assert _warm_emitting(tmp_path, proj, key).returncode == 0
+    assert hcr.cache_get(str(proj), hcr._kg_cache_key(_plan(hcr), "p2")) is None
     released: list = []
     monkeypatch.setattr(deferred_emit, "release_held",
                         lambda batch, session_id="", emit=None: released.append((batch, session_id)) or "inline")

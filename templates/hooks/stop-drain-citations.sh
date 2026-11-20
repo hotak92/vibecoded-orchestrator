@@ -83,13 +83,16 @@ HOOK_STDIN=$(cat 2>/dev/null || echo "")
 # nothing — not even the payload parse below. The exact per-session rule
 # follows the parse. MUST MATCH citation_pending.session_may_drain.
 PENDING_DIR="$PROJECT_ROOT/.claude/state/rl_pending"
-_any_pending() {  # $1: a glob under PENDING_DIR (ends in .json: claims excluded)
+_any_pending() {  # $1: a glob under PENDING_DIR (*.json: claims excluded)
     for _f in "$PENDING_DIR"/$1; do
         [ -f "$_f" ] && return 0
     done
     return 1
 }
-_any_pending '*.json' || exit 0
+# A claim (<name>.json.draining.<pid>) passes this cheap gate too: on
+# SessionEnd a session whose only file the MCP monitor holds still drains, to
+# record its end (wave-2 check L-4). The per-session rule below decides.
+_any_pending '*.json' || _any_pending '*__*.json.draining.*' || exit 0
 
 # Parse session_id + transcript_path from the Stop stdin JSON in one call.
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
@@ -126,9 +129,14 @@ AGENT_FINISHED=$(printf '%s' "$_PARSED" | sed -n '9p')
 # The session id as it names its pending files (citation_pending._safe).
 SAFE_SID=$(printf '%s' "$_PARSED" | sed -n '10p')
 # A drain of this session reads its own files and the ones staged without a
-# session (the MCP / kg-search CLI path); an empty id drains every file.
+# session (the MCP / kg-search CLI path); an empty id drains every file. The
+# main chat's SessionEnd also drains for a file of its own under a claim.
 if [ -n "$SAFE_SID" ]; then
-    _any_pending "${SAFE_SID}__*.json" || _any_pending 'nosession__*.json' || exit 0
+    _any_pending "${SAFE_SID}__*.json" || _any_pending 'nosession__*.json' \
+        || { [ "$HOOK_EVENT" = "SessionEnd" ] && [ -z "$AGENT_ID" ] \
+             && _any_pending "${SAFE_SID}__*.json.draining.*"; } || exit 0
+else
+    _any_pending '*.json' || exit 0
 fi
 # PostToolUse:Agent (R4c-8): re-tag the brief's citations — main chat only
 # (a subagent's own Agent call is not a brief the parent staged), and only

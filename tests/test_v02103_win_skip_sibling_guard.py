@@ -111,7 +111,13 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: ``#!/usr/bin/env bash`` lean-ctx binary on PATH for the .ps1 hook — a
 #: POSIX-only primitive, and the test IS the .ps1 leg, so there is no sibling
 #: to name. The file's other bash legs use the sibling convention.
-NON_CONVENTION_BASELINE = 195
+#: 195 -> 196 (v0.2.107 wave 2): tests/test_v02107_rl_drain_single_flight.py
+#: ::test_hook_spawns_exactly_when_the_rule_says drives BOTH hook flavours
+#: (its own [sh]/[ps1] params) through a fake ``#!/bin/sh`` venv python that
+#: records the drain argv — a POSIX-only primitive with no sibling to name. The
+#: spawn rule itself (``session_may_drain``) runs on every OS in
+#: ::test_session_may_drain_rule.
+NON_CONVENTION_BASELINE = 196
 
 
 # -- which conditions skip on Windows --------------------------------------

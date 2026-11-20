@@ -85,7 +85,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Persistent memory across sessions | No | Yes (Copilot Memory, repo-scoped, 28-day expiry) | Partial (team memory) | Partial (session-bound) | No | No | No | **Yes (KG, no expiry)** |
 | Code graph (AST/tree-sitter, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
 | Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
-| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (50 hooks, 7 skills, 11 agents)** |
+| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (51 hooks, 7 skills, 11 agents)** |
 | Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
@@ -254,7 +254,7 @@ The whole repository is AGPL-3.0. The codebase you see here is the Free tier —
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
-| **Free**        | €0                   | Full orchestrator: KG, code graph, 50 hooks, 11 agents, 7 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 51 hooks, 11 agents, 7 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 
 The Free tier is the whole repository — no source-level dual licensing, no feature gating in the OSS code. RL retrieval falls back to cosine ordering when the reranker container isn't installed or running.

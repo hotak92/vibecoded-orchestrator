@@ -240,6 +240,15 @@ def _disable_on_stop(user: dict) -> dict:
     return user
 
 
+def _without_drain(groups: list) -> list:
+    out = []
+    for g in groups:
+        inner = [h for h in g["hooks"] if STEM not in h["command"]]
+        if inner:
+            out.append({**g, "hooks": inner})
+    return out
+
+
 def _events_running(settings: dict) -> list:
     return sorted(ev for ev, groups in settings["hooks"].items()
                   for g in groups for h in g.get("hooks", []) if STEM in h["command"])
@@ -277,7 +286,19 @@ def test_a_hook_parked_on_stop_stays_off_on_its_new_events(os_name: str) -> None
     merged = settings_merge.smart_merge_settings(
         user, template, parked=_readable(ParkedHook("Stop", "", cmd)), kept_out=kept)
     assert _events_running(merged) == [], "off everywhere, as the user left it"
-    assert "SessionEnd" not in merged["hooks"], "an event emptied by the filter is not added"
+    # The filter drops ONLY the parked hook: SessionEnd is added with the
+    # template's other SessionEnd hooks (v0.2.107 ships session-worktree-reap
+    # beside the drain), and an event the filter empties is not added at all.
+    rest = _without_drain(template["hooks"]["SessionEnd"])
+    assert merged["hooks"].get("SessionEnd") == (rest or None)
+    drain_only = copy.deepcopy(template)
+    drain_only["hooks"]["SessionEnd"] = [
+        {**g, "hooks": [h for h in g["hooks"] if STEM in h["command"]]}
+        for g in drain_only["hooks"]["SessionEnd"]]
+    emptied = settings_merge.smart_merge_settings(
+        _disable_on_stop(_pre_0_2_102(drain_only)), drain_only,
+        parked=_readable(ParkedHook("Stop", "", cmd)))
+    assert "SessionEnd" not in emptied["hooks"], "an event emptied by the filter is not added"
     carried = sorted((r["event"], r.get("carried_from_event")) for r in kept)
     assert carried == [("SessionEnd", "Stop"), ("Stop", None), ("SubagentStop", "Stop")]
     assert {r["reason"] for r in kept} == {"parked"}
