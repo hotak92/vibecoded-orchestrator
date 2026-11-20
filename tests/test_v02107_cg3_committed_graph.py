@@ -462,7 +462,7 @@ def test_a_worktree_session_is_skipped_before_head_is_read(tmp_path: Path) -> No
 
     root = tmp_path / "wt"
     out, lines = _catchup(root, hub, git_head=_head,
-                          canonical_root=lambda _r: str(tmp_path / "main"))
+                          linked_worktree=lambda _r: str(tmp_path / "main"))
     assert out == "worktree_session" and read_head == [] and hub.reconciles == []
     assert any("worktrees are never indexed" in ln for ln in lines), lines
 
@@ -478,7 +478,7 @@ def test_a_busy_checkout_skips_the_reconciliation(tmp_path: Path) -> None:
     hub = _Hub(recorded="a" * 40)
     out, _ = _catchup(root, hub, git_head=lambda _r: "b" * 40,
                       is_ancestor=lambda *_a: True, diff_paths=lambda *_a: ["src/a.py"],
-                      canonical_root=lambda r: str(Path(r).resolve()))
+                      linked_worktree=lambda _r: None)
     assert out == "busy" and hub.reconciles == []
 
 
@@ -487,7 +487,7 @@ def test_a_project_without_git_still_gets_the_reconciliation(tmp_path: Path) -> 
     its deleted files are still removed by the daily reconciliation."""
     root = tmp_path / "proj"
     hub = _Hub(recorded="a" * 40)
-    out, _ = _catchup(root, hub, git_head=lambda _r: None, canonical_root=lambda _r: None)
+    out, _ = _catchup(root, hub, git_head=lambda _r: None, linked_worktree=lambda _r: None)
     assert out == "no_git_head" and hub.runs == [] and hub.reconciles == [str(root)]
 
 

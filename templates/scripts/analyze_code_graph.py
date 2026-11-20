@@ -838,8 +838,8 @@ def _canonical_lang_id(label: Optional[str]) -> str:
 # v0.2.66 (Bug 3): file-extension → lang_dispatch name map for the
 # single-file analyze path (`analyze_repository(only_file=...)`).
 #
-# The per-edit code-graph hook now hands the analyzer exactly ONE file
-# (the file the user just edited) instead of the whole repo. To route
+# A single-file run (`--only-file`; its per-edit hook caller was retired in
+# v0.2.107) hands the analyzer exactly ONE file, not the whole repo. To route
 # that file to the right `_analyze_*_file` method WITHOUT re-walking the
 # tree with rglob, we need an extension → dispatch-name lookup. The
 # dispatch NAMES below match the first element of each `lang_dispatch`
@@ -993,7 +993,7 @@ def _dispatch_name_for_file(file_path: Path) -> str:
     Name-based skips mirror the ``_find_*_files`` rules via the SHARED
     ``_JS_SKIP_SUFFIXES`` / ``_TS_SKIP_SUFFIXES`` sets (pre-gate audit F8 —
     this function previously only knew ``.d.ts``/``.min.js`` and let a
-    per-edit ``--only-file x.bundle.js`` re-index build output the walkers
+    single-file ``--only-file x.bundle.js`` re-index build output the walkers
     skip), plus the ``vite.config*`` name-prefix rule.
     """
     name = file_path.name
@@ -2706,6 +2706,7 @@ class CodeGraphAnalyzer:
         fp = _guards.read_object_fingerprint(
             collection, det_uuid, _EMBED_REVISION_PROP, want_total_chunks=want_total_chunks,
             vector_slot=slot, heal_props=_guards.anchor_heal_props_for(collection, self.__dict__.setdefault("_declared_props", {})),
+            carry_props=_guards.xref_carry_props_for(collection, self.__dict__["_declared_props"]),  # A-011
         )
         if fp is not None and fp.get("vector_present") is False:
             fp["embed_revision"] = _EMBED_REVISION_VECTORLESS
@@ -2951,7 +2952,7 @@ class CodeGraphAnalyzer:
         # collection), empty stored hash — FALLS THROUGH to the normal
         # replace()/insert(). A read failure must never cause a stale index.
         props = insert_params.get("properties")
-        skip_replace, _heal = False, None
+        skip_replace, _heal, _carry = False, None, None
         # F3 (pre-gate audit): chunk-shrink detection. When the CANONICAL
         # (chunk 0) write of a Function/Class finds the stored row was chunked
         # into MORE chunks than this run is writing, the tail rows
@@ -3045,6 +3046,7 @@ class CodeGraphAnalyzer:
                     self, collection, det_uuid, want_total_chunks=_is_chunkable,
                 )  # class-bound: stub-safe (light analyzer stubs bind this method)
                 if fp is not None:
+                    _carry = fp.get("carry")  # A-011: xref-owned props a replace keeps
                     # F3 shrink detector — canonical (chunk 0 / legacy None)
                     # writes only, so the per-chunk fan-out doesn't re-trigger.
                     if _is_chunkable and props.get("chunk_num") in (0, None):
@@ -3105,6 +3107,7 @@ class CodeGraphAnalyzer:
         # the cold-start / post-rename / post-cleanup repopulate path
         # WITHOUT changing the behaviour for genuine incremental
         # re-writes.
+        _guards.carry_xref_props(props, _carry)
         try:
             collection.data.replace(uuid=det_uuid, **insert_params)
         except BaseException as exc:
@@ -3353,8 +3356,8 @@ class CodeGraphAnalyzer:
                 Mutually exclusive with ``extra_paths``, ``incremental``,
                 and ``prune_stale`` — single-file mode never walks other
                 roots and never prunes (a prune scoped to one file could
-                only ever delete other files' rows). The per-edit
-                code-graph hook is the primary caller: it scopes the
+                only ever delete other files' rows). Its v0.2.66 caller,
+                the per-edit hook (retired in v0.2.107), scoped the
                 analyze to the file the user just edited, killing the old
                 ``HEAD~1..HEAD`` re-churn (dozens of files re-parsed per
                 keystroke) AND the correctness bug (the edited file is
@@ -4098,8 +4101,8 @@ class CodeGraphAnalyzer:
     ) -> List[Tuple[str, Any, List[Path], Path]]:
         """Build the one-entry per-language dispatch for single-file mode.
 
-        v0.2.66 (Bug 3): the per-edit hook hands the analyzer exactly the
-        file the user just edited. This maps that file to its
+        v0.2.66 (Bug 3): a single-file run hands the analyzer exactly one
+        file (``--only-file``). This maps that file to its
         ``lang_dispatch`` entry by extension (via ``_dispatch_name_for_file``,
         which mirrors the ``_find_*_files`` glob/skip rules) WITHOUT
         re-walking the tree. ``repo_path`` is the relativization root:
@@ -4178,10 +4181,10 @@ class CodeGraphAnalyzer:
         # whole-tree walk would have skipped, using the EXACT SAME decision
         # (`_path_is_excluded`) — mirror-don't-fork. Covers two classes:
         #   * ignored directories (`.wt`, `vendor`, `node_modules`, `.claude` on
-        #     a user project, …) — a per-edit `--only-file .wt/a/b.py` bypassed
+        #     a user project, …) — an `--only-file .wt/a/b.py` run bypassed
         #     the walkers and re-indexed noise rows (the F8 bug);
         #   * `.claude/state/` transient scratch (tool_backups snapshots) — a
-        #     direct `--only-file .claude/state/...` (or a drain-queue entry
+        #     direct `--only-file .claude/state/...` (or a scoped list entry
         #     pointing at one) must be a no-op. The old code did this as a
         #     separate `_is_under_transient_state` early-check; folding it into
         #     the one predicate keeps the single-file verdict byte-identical to
@@ -4556,7 +4559,7 @@ class CodeGraphAnalyzer:
 
         Cost model: a cheap filtered-aggregate pre-check per collection
         short-circuits the converged steady state (3 aggregates, no scan —
-        this is what the per-edit single-file hook pays). Only collections
+        this is what a small scoped catch-up run pays). Only collections
         with stale rows (or an undeterminable count) pay one full scan
         returning two tiny properties per row, classified client-side
         (NULL-safe; Weaviate's cursor iterator cannot combine with filters).
@@ -6676,7 +6679,7 @@ def main():
             # as the pre-v0.2.47 single-root behaviour.
             extra_paths=extra_paths or None,
             since_commit=args.since_commit,
-            # v0.2.66 (Bug 3): single-file scope for the per-edit hook.
+            # v0.2.66 (Bug 3): single-file scope (``--only-file``).
             # None (the default) preserves the whole-tree walk.
             only_file=args.only_file,
             # Batched multi-file scope (the HEAD catch-up's diffed range).

@@ -22,7 +22,14 @@ It needs no walk and no embedding:
 3. ``stat`` each distinct path once (:func:`path_reachable_on_disk`, fail-safe
    toward keeping: only ``ENOENT``/``ENOTDIR`` under a non-empty root is
    "absent");
-4. delete, by id, the rows whose path is determinately absent.
+4. delete, by id, the rows whose path is determinately absent AND, when the
+   root is a git work tree, is not in HEAD's committed tree
+   (:func:`vco_lib.git_meta.committed_paths`, one ``git ls-tree`` per run).
+   The graph follows the main checkout's COMMITS: a tracked file that is
+   missing only from the working tree (deleted or moved, not committed) keeps
+   its rows — nothing would restore them when the file comes back without a
+   HEAD move (WAVE2-CHECK L-1). Its rows go when the commit that deletes it
+   is caught up.
 
 The guards that make a delete possible at all (each one tested both ways):
 
@@ -33,7 +40,16 @@ The guards that make a delete possible at all (each one tested both ways):
   deletes NOTHING (``all_paths_missing``): that is a moved or replaced root,
   not deleted code;
 * a class whose listing is undeterminable (:class:`CursorUndeterminable`)
-  authorises no delete in that class.
+  authorises no delete in that class;
+* a git work tree whose committed tree cannot be read (git cannot run, no
+  HEAD, an error) deletes NOTHING (``git_unknown``). A folder that is not a
+  git work tree keeps the disk-only rule.
+
+The root is the PROJECT folder the analyzer walked, never the toplevel of a
+repository it is nested in: the rows' paths are relative to that folder
+(WAVE2-CHECK M-2). Rows whose ``project_source`` is a different spelling of
+the root (a symlinked path) are not owned by :func:`primary_sources` and are
+never judged — the safe direction (N-2).
 
 The run holds a free machine-wide bulk slot (:func:`vco_lib.atomic.try_machine_slot`)
 and the per-checkout analyzer lock (:mod:`vco_lib.codegraph_root_lock`); when
@@ -43,6 +59,7 @@ A run that could not reach Weaviate stamps nothing.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +93,8 @@ class ReconcileResult:
     absent_paths: int = 0
     deleted: int = 0
     failures: int = 0
+    #: Absent paths kept because HEAD's tree still has them (L-1).
+    kept_committed: int = 0
     unreadable: "list[str]" = field(default_factory=list)
 
     def line(self) -> str:
@@ -83,8 +102,46 @@ class ReconcileResult:
         return (
             f"path-reconcile: outcome={self.outcome} rows={self.rows_listed} "
             f"paths={self.distinct_paths} absent={self.absent_paths} "
+            f"kept_committed={self.kept_committed} "
             f"deleted={self.deleted} failures={self.failures}{extra}"
         )
+
+
+#: :func:`committed_tree` verdicts.
+NOT_GIT = "not_git"
+GIT_UNKNOWN = "git_unknown"
+
+
+def committed_tree(root: Path) -> "tuple[str, Optional[set[str]]]":
+    """``(verdict, paths)`` for ``root``: ``("git", {posix paths of HEAD's
+    tree under root})``, ``(NOT_GIT, None)`` when git ran and says ``root`` is
+    not in a work tree, ``(GIT_UNKNOWN, None)`` when it cannot tell."""
+    from vco_lib.git_meta import committed_paths, is_git_work_tree
+
+    inside = is_git_work_tree(root)
+    if inside is False:
+        return NOT_GIT, None
+    if inside is None:
+        return GIT_UNKNOWN, None
+    paths = committed_paths(root)
+    if paths is None:
+        return GIT_UNKNOWN, None
+    return "git", paths
+
+
+def _rel_posix(raw: str, root: Path) -> Optional[str]:
+    """``raw`` (as stored: relative to the root, or absolute) as a normalised
+    POSIX path relative to ``root``; None when it lies outside the root."""
+    text = raw.replace("\\", "/")
+    if os.path.isabs(text):
+        for base in (root, root.resolve()):
+            try:
+                return Path(os.path.normpath(text)).relative_to(base).as_posix()
+            except ValueError:
+                continue
+        return None
+    norm = os.path.normpath(text).replace("\\", "/")
+    return None if norm.startswith("../") or norm == ".." else norm
 
 
 def primary_sources(repo_root: Path) -> "set[str]":
@@ -102,17 +159,22 @@ def reconcile_collections(
     repo_root: Path,
     *,
     reachable: Optional[Callable[[str], bool]] = None,
+    committed: Callable[[Path], "tuple[str, Optional[set[str]]]"] = committed_tree,
 ) -> ReconcileResult:
     """Reconcile ``[(collection, path_prop), …]`` against ``repo_root``.
 
     ``reachable`` is a test seam (default: :func:`path_reachable_on_disk`,
-    memoised per path). See the module docstring for the guards.
+    memoised per path); ``committed`` another (default :func:`committed_tree`).
+    See the module docstring for the guards.
     """
     from vco_lib.codegraph_cursor import CursorUndeterminable, iter_class
 
     root = Path(repo_root)
     if not root_holds_entries(root):
         return ReconcileResult("root_missing")
+    verdict, tracked = committed(root)
+    if verdict == GIT_UNKNOWN:
+        return ReconcileResult(GIT_UNKNOWN)
     sources = primary_sources(root)
     probe = reachable or (lambda p: path_reachable_on_disk(p, root))
     memo: "dict[str, bool]" = {}
@@ -153,9 +215,17 @@ def reconcile_collections(
     if result.unreadable:
         result.outcome = "partial"
 
+    in_head: "dict[str, bool]" = {}
+    if tracked is not None:
+        for raw, present in memo.items():
+            if not present:
+                rel = _rel_posix(raw, root)
+                in_head[raw] = rel is not None and rel in tracked
+        result.kept_committed = sum(1 for v in in_head.values() if v)
+
     for coll, rows in plan:
         for uid, raw in rows:
-            if memo.get(raw, True):
+            if memo.get(raw, True) or in_head.get(raw, False):
                 continue
             try:
                 coll.data.delete_by_id(uuid=uid)
@@ -215,13 +285,13 @@ def reconcile_if_due(
     t = now()
     if not due(state_dir, t):
         return "not_due"
-    if slot is None:
+    def _machine_slot() -> Any:
         from vco_lib.atomic import bulk_slot_dir, machine_slot_count, try_machine_slot
 
-        def slot() -> Any:
-            return try_machine_slot(bulk_slot_dir(), slots=machine_slot_count())
+        return try_machine_slot(bulk_slot_dir(), slots=machine_slot_count())
 
-    with slot() as held:
+    take_slot = slot if slot is not None else _machine_slot
+    with take_slot() as held:
         if held is None:
             log("path-reconcile: every machine-wide bulk slot is busy; retried at the next catch-up")
             return "slot_busy"

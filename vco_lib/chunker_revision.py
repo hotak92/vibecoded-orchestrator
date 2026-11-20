@@ -505,7 +505,7 @@ def resync_commands(folder: Path, tail_comment: str) -> str:
       analyzer's last resolution rung is the folder BASENAME (``.claude/env``
       is shell-sourced for hooks, not for the terminal the user pastes this
       into) — which walks the wrong family for any moved/renamed project.
-      This is the flag the per-edit hooks and the launcher already use.
+      It resolves the binding prefix the HEAD catch-up and the launcher use.
     * Absolute wrapper paths via :mod:`vco_lib.remedy_shell` instead of
       ``cd <folder>`` + relative paths. The old form was POSIX-only three
       times over (``cd`` with an unquoted path, a ``.claude/scripts/`` wrapper

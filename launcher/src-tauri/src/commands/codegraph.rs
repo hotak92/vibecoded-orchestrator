@@ -840,7 +840,7 @@ async fn run_build_task(
     // the ONE SSOT helper (binding prefix → sanitized display name → raw name
     // + WARN). `project_name` here is the DISPLAY name every caller passed
     // (rebuild / create-update / boot-resume). Feeding it raw to `--project`
-    // was the dual-writer bug: the per-edit hooks stamp the binding prefix, so
+    // was the dual-writer bug: the HEAD catch-up stamps the binding prefix, so
     // the launcher must too. From here on `canonical_identity` is what we feed
     // the analyzer AND what we use for the post-build backfill / provenance.
     let canonical_identity = {
@@ -1539,15 +1539,16 @@ pub(crate) fn success_or_partial_status(prune_failures: Option<u32>) -> &'static
 //
 // The analyzer stamps every row's `project` PROPERTY with the raw `--project`
 // value it was given (`CodeGraphAnalyzer.project_name`), NOT the sanitized
-// collection prefix. The per-edit hooks resolve `--from-resolver` →
-// `code_graph_collection_prefix` (= the binding's `collection_prefix`), so a
-// hook-driven row lands with `project = "VibeCodedOrchestrator"`. When the
+// collection prefix. The HEAD catch-up passes `--project` the hub's
+// `code_graph_collection_prefix` (= the binding's `collection_prefix`, the
+// value `--from-resolver` also resolves), so a catch-up row lands with
+// `project = "VibeCodedOrchestrator"`. When the
 // launcher spawned the analyzer with the DISPLAY name ("VibeCoded
 // Orchestrator") the launcher-driven rows landed with a DIFFERENT `project`
 // property in the SAME collection — every spaced-name project accumulated
 // duplicate UUIDs, and each run's `--prune-stale` reaped the OTHER writer's
 // rows. The identity SSOT below makes every launcher spawn surface stamp the
-// SAME identity the hooks do (the binding prefix), closing the dual-writer.
+// SAME identity the catch-up does (the binding prefix), closing the dual-writer.
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Where a resolved code-graph identity came from — surfaced in the WARN log
@@ -1555,7 +1556,7 @@ pub(crate) fn success_or_partial_status(prune_failures: Option<u32>) -> &'static
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdentitySource {
     /// The project's `project_codegraph_bindings.collection_prefix` (canonical
-    /// — matches what the per-edit hooks stamp via `--from-resolver`).
+    /// — matches what the HEAD catch-up stamps, and what `--from-resolver` resolves).
     BindingPrefix,
     /// No non-empty binding prefix; derived from the display name via the same
     /// Rust sanitizer that produces the KG-collection basename (fixture-locked
@@ -1619,7 +1620,7 @@ pub(crate) fn resolve_codegraph_identity(db: &Db, project_id: &str, display_name
             "[vct] warning: code-graph identity for project {} could not be \
              derived from a binding prefix or a sanitizable display name \
              ('{}'); falling back to the raw display name. Rows may not match \
-             the per-edit hooks' identity — set a code-graph collection prefix \
+             the HEAD catch-up's identity — set a code-graph collection prefix \
              in the launcher's Identity tab.",
             project_id, display_name
         );
@@ -2200,7 +2201,7 @@ fn short_sha(sha: &str) -> &str {
 /// 7. no recorded commit → one full pass (the baseline is re-proven);
 /// 8. HEAD equals the recorded commit → nothing. A dirty tree does not change
 ///    that: the analyzer indexes committed content (`<since>..HEAD`), and
-///    uncommitted edits are the per-edit drain's;
+///    uncommitted edits are never indexed (the graph follows commits);
 /// 9. HEAD moved and the recorded commit is its ancestor → incremental since
 ///    the recorded commit;
 /// 10. otherwise (rewritten history, unknown object) → one full pass.
