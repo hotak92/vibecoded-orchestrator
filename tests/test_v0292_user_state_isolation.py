@@ -414,3 +414,13 @@ def test_stand_aside_list_is_exactly_the_reviewed_set():
         "the rationale next to the list in tests/conftest.py and update this "
         "pin deliberately"
     )
+
+
+def test_the_suite_hides_the_machines_gpu():
+    """v0.2.107 W-GPU: no test allocates on the developer's GPU (the one the
+    live Ollama / code-embed services hold). The RL suites' `device="auto"`
+    models used to land on `cuda:0` and stay allocated in-process, which made
+    `tests/test_v0279_code_embed_idle_unload.py` fail only in a full run."""
+    assert os.environ.get("CUDA_VISIBLE_DEVICES") == ""
+    torch = pytest.importorskip("torch")
+    assert torch.cuda.is_available() is False

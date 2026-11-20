@@ -135,8 +135,11 @@ needs_non_utf8_console = pytest.mark.skipif(
     reason=("PowerShell not installed" if not _PS else
             f"console input encoding is {_ENC or 'unknown'}: no non-UTF-8 "
             "code page to reproduce the defect under"))
-needs_bash = pytest.mark.skipif(_WIN or shutil.which("bash") is None,
-                                reason="the .sh sibling arm needs POSIX bash")
+#: The .sh arm drives the hook through POSIX bash; on Windows the same test's
+#: [ps1] param (the leg this file exists for) covers the behaviour.
+needs_bash = pytest.mark.skipif(
+    _WIN or shutil.which("bash") is None,
+    reason="bash .sh leg; Windows runs the .ps1 sibling: this test's [ps1] param")
 
 
 def _raw(payload: dict) -> bytes:

@@ -273,6 +273,11 @@ class World:
     def __init__(self, tmp, *, gpu=False, owning_exists=True,
                  user_override=False, drop_gpu_overlays=False):
         self.root = Path(tmp) / "root"
+        # The adoption writes launcher.db rows (service_endpoints) under
+        # VCT_STATE_DIR; adopt() pins it here so no borrower of World can
+        # write into the suite's shared redirected launcher.db (v0.2.107: one
+        # that did left the weaviate row at :8081 for the rest of the run).
+        self.state_dir = Path(tmp) / "state"
         self.infra = self.root / "infrastructure"
         self.infra.mkdir(parents=True, exist_ok=True)
         (self.infra / "docker-compose.yml").write_text(BASE_COMPOSE, encoding="utf-8")
@@ -405,8 +410,9 @@ class World:
         kw.setdefault("fetch", self.fetch)
         lines: list = []
         kw.setdefault("log", lines.append)
-        with mock.patch.object(containers, "find_existing_container",
-                               self.find_existing_container), \
+        with mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(self.state_dir)}), \
+                mock.patch.object(containers, "find_existing_container",
+                                  self.find_existing_container), \
                 mock.patch.object(containers, "_resolve_runtime",
                                   return_value="podman"), \
                 mock.patch.object(service_adoption, "_derive_embed_config",
