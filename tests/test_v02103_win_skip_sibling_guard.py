@@ -117,7 +117,10 @@ SAME_TEST_PS1 = "this test's [ps1] param"
 #: records the drain argv — a POSIX-only primitive with no sibling to name. The
 #: spawn rule itself (``session_may_drain``) runs on every OS in
 #: ::test_session_may_drain_rule.
-NON_CONVENTION_BASELINE = 196
+#: 196 -> 197 (v0.2.107 fix round): tests/test_v02107_fixcg_codegraph.py skips
+#:   the checkout-lock pid-reuse test off Linux — it reads a process start token
+#:   from /proc, a Linux-only primitive with no .ps1 sibling to name.
+NON_CONVENTION_BASELINE = 197
 
 
 # -- which conditions skip on Windows --------------------------------------
