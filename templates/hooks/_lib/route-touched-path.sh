@@ -15,9 +15,9 @@
 # WHAT "ROUTING" MEANS HERE, exactly:
 #   knowledge/**             -> .claude/scripts/kg-sync           (KG_COLLECTION)
 #   docs/**.md               -> .claude/scripts/kg-sync           (DEVELOPMENT_COLLECTION)
-#   <code extension>         -> the per-turn code-graph drain queue, OR the
-#                               per-EXTRA queue when the path sits under an
-#                               enabled extra code-graph path (v0.2.102 S16-7)
+#   <code extension>         -> the end-of-turn "[Code edit reminder]" only;
+#                               the code graph follows COMMITS, not edits
+#                               (v0.2.107 CG-3: nothing is queued for it)
 # ...each gated by the Phase-8 access matrix and coalesced by the
 # per-file debounce, which is why "route", "gate" and "debounce" are one
 # concern and live in one file.
@@ -232,13 +232,11 @@ _kg_build_gated_sync_cmd() {
 # ===========================================================================
 # v0.2.102 S16-7: enabled-extra-path membership (cached list, option B)
 # ===========================================================================
-# A code file under an ENABLED extra code-graph path (launcher → project →
-# Codegraph → "Extra codegraph paths") must be queued for re-index as
-# promptly as a primary-root file — but into a PER-EXTRA queue
-# (codegraph_drain_extra_<md5(extra)>_<session>.txt), never the primary
-# queue: a path outside the primary root must never be analyzed under the
-# primary's collection. The Stop hook (stop-codegraph-drain.sh) drains those
-# queues through `python -m vco_lib.codegraph_extras_refresh --queued`.
+# Is a code file under an ENABLED extra code-graph path (launcher → project →
+# Codegraph → "Extra codegraph paths")? Only the end-of-turn reminder asks:
+# an edit there is "this project's work item". Since v0.2.107 (CG-3) no edit
+# is queued for the code graph — an extra folder is re-indexed when ITS HEAD
+# moves (vco_lib.codegraph_extras_refresh, spawned by the Stop hook).
 #
 # The membership DECISION is computed by Python (the hub /config resolver is
 # the one reader of the extras rows) and cached as a plain table both shells
@@ -252,8 +250,7 @@ _kg_build_gated_sync_cmd() {
 #   refresh: "$venv_py" -m vco_lib.codegraph_extras_refresh \
 #              --list-enabled-extra-paths --project-root <root>
 # A failed refresh (no venv, hub down — the CLI exits non-zero) keeps the
-# stale cache; with no cache at all nothing routes to the extra queues (the
-# commit-stamp refresh at Stop still re-indexes stale extras — soft-fail).
+# stale cache; with no cache at all no edit counts as an extra-folder edit.
 # MUST MATCH route-touched-path.ps1.
 _VCO_ROUTE_EXTRAS_CACHE_NAME="codegraph_extra_paths_cache.txt"
 
@@ -339,30 +336,20 @@ _vco_route_resolve_physical() {
     return 0
 }
 
-# Route a code edit under an ENABLED extra path to its per-extra drain queue:
-# appends the PHYSICAL path to codegraph_drain_extra_<md5(extra)>_<session>.txt
-# and echoes that queue path; echoes nothing (caller then uses the primary
-# queue) when the edit is not under any enabled extra. $1 = absolute touched
-# path, $2 = session id.
-#
-# v0.2.102 fix-round (M-A1) precedence, MUST MATCH route-touched-path.ps1:
-#   1. PRIMARY-ROOT CONTAINMENT WINS — an edit inside the project root always
-#      goes to the primary queue, even when a registered extra is an ANCESTOR
-#      of the root (registration rejects ancestor extras too, but a pre-fix
-#      row can still be on disk).
-#   2. Among extras the LONGEST matching prefix wins — nested extras route to
-#      the inner one regardless of cache order.
-#   3. Matching is on the SYMLINK-RESOLVED path; trailing separators on the
-#      cache line are ignored for the match but the RAW line is hashed (the
-#      queue name must equal vco_lib.path_key(row.path), trailing slash and
-#      all, or the Python drain's glob never finds it).
-_vco_route_extra_enqueue() {
-    local touched="$1" session_id="$2"
+# The ENABLED extra path a code edit sits under: echoes the first matching
+# cache line (trailing separators trimmed), or nothing when the edit is not
+# under any enabled extra. $1 = absolute touched path. Only membership
+# matters (the reminder lists the edit either way), so no precedence between
+# nested extras is needed. MUST MATCH Get-VcoRouteExtraMember in
+# route-touched-path.ps1:
+#   * an edit inside the project root is the project's — not an extra edit
+#     (the reminder's own root check lists it), so the cache is not read;
+#   * matching is on the SYMLINK-RESOLVED path; trailing separators on the
+#     cache line are ignored.
+_vco_route_extra_member() {
+    local touched="$1"
     local state_dir="$_VCO_ROUTE_PROJECT_ROOT/.claude/state"
     local cache="$state_dir/$_VCO_ROUTE_EXTRAS_CACHE_NAME"
-
-    # 1. Primary-root containment wins — checked on the resolved path so a
-    # symlinked route INTO the root also lands in the primary queue.
     local resolved
     resolved="$(_vco_route_resolve_physical "$touched")"
     case "$resolved" in
@@ -374,36 +361,17 @@ _vco_route_extra_enqueue() {
         _vco_route_refresh_extras_cache "$cache"
     fi
     [ -f "$cache" ] || return 0
-    # 2. Longest matching prefix wins.
-    local _ep _epm _best="" _best_raw=""
+    local _ep
     while IFS= read -r _ep; do
         # A CRLF cache (a refresh written by a Windows-side Python, read back
-        # under WSL/Git-bash) must not poison the prefix match or the hash.
+        # under WSL/Git-bash) must not poison the prefix match.
         _ep="${_ep%$'\r'}"
+        while [ "${_ep%/}" != "$_ep" ]; do _ep="${_ep%/}"; done
         [ -n "$_ep" ] || continue
-        # 3. Trailing separators are ignored for the MATCH (the .ps1 sibling's
-        # TrimEnd); the raw line is kept for the hash.
-        _epm="$_ep"
-        while [ "${_epm%/}" != "$_epm" ]; do _epm="${_epm%/}"; done
-        [ -n "$_epm" ] || continue
         case "$resolved" in
-            "$_epm"/*)
-                if [ ${#_epm} -gt ${#_best} ]; then
-                    _best="$_epm"
-                    _best_raw="$_ep"
-                fi
-                ;;
+            "$_ep"/*) printf '%s\n' "$_ep"; return 0 ;;
         esac
     done < "$cache"
-    [ -n "$_best" ] || return 0
-    # md5 of the RAW extra path — the SAME key vco_lib's path_key() computes,
-    # so the queue name matches what the Python drain globs for. Unkeyable
-    # (no python) → no extra routing.
-    local _hash
-    _hash=$(printf '%s' "$_best_raw" | "$_VCO_ROUTE_PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null || echo "")
-    [ -n "$_hash" ] || return 0
-    printf '%s\n' "$resolved" >> "$state_dir/codegraph_drain_extra_${_hash}_${session_id}.txt" 2>/dev/null || return 0
-    printf '%s\n' "$state_dir/codegraph_drain_extra_${_hash}_${session_id}.txt"
     return 0
 }
 
@@ -490,18 +458,16 @@ vco_route_init() {
 #   - path outside the project root (raw OR symlink-resolved) and not under
 #     an enabled extra code folder -> NOT listed: a /tmp scratch script is
 #     not "this project's work item"; a registered code folder is.
-# The code-graph drain queues are NOT gated by this — a lane's edit still
-# reaches the code graph exactly as before. MUST MATCH
-# Test-VcoRouteReminderWanted in route-touched-path.ps1.
-# $1 = absolute touched path, $2 = agent_id, $3 = the extra queue the edit
-# was routed to (empty = none). Returns 0 = list it.
+# MUST MATCH Test-VcoRouteReminderWanted in route-touched-path.ps1.
+# $1 = absolute touched path, $2 = agent_id, $3 = the enabled extra path the
+# edit sits under (empty = none). Returns 0 = list it.
 # Containment is decided by vco_path_under_root (_lib/project-root.sh, the
 # one home for "is this path inside the project"); without that helper (a
 # partial install) nothing outside an extra is listed — the conservative side.
 _vco_route_reminder_wanted() {
-    local touched="$1" agent_id="${2:-}" extra_queue="${3:-}"
+    local touched="$1" agent_id="${2:-}" extra_path="${3:-}"
     [ -z "$agent_id" ] || return 1
-    [ -z "$extra_queue" ] || return 0
+    [ -z "$extra_path" ] || return 0
     command -v vco_path_under_root >/dev/null 2>&1 || return 1
     vco_path_under_root "$_VCO_ROUTE_PROJECT_ROOT" "$touched"
 }
@@ -555,23 +521,17 @@ vco_route_touched_path() {
         _kg_debounce_schedule "$PROJECT_ROOT" "$touched" "$PY" "$PROJECT_ROOT" "$_DOCS_SYNC_CMD" "docs"
     fi
 
-    # 3. Code file changes: end-of-turn batched code graph drain + reminder.
-    # v0.2.73 (FIX-B): the per-edit code-graph sync is REMOVED. The edited
-    # path is APPENDED to a per-turn drain queue (+ the reminder accumulator),
-    # and the Stop hook `stop-codegraph-drain.sh` runs ONE analyzer pass at
-    # end-of-turn over ALL the turn's files, GROUPED BY CANONICAL ROOT,
-    # rate-limited to once per 120 s per project. The per-edit sync hit the
-    # big CodeFunction collection's insert-time HNSW churn on every keystroke
-    # and drove a measured 857 GB/8 h of disk write-amplification.
+    # 3. Code file changes: the end-of-turn "[Code edit reminder]" only.
+    # v0.2.107 (CG-3, owner rulings 2026-11-17 / 2026-11-19): the code graph
+    # follows the COMMITTED state of the main checkout — an edit queues
+    # nothing for it. The edit reaches the graph when its commit moves the
+    # main checkout's HEAD (stop-codegraph-drain → vco_lib.codegraph_head_catchup);
+    # an edit in a linked worktree (a lane) when it is merged there.
     #
     # v0.2.95: the extension test comes from _lib/code-extensions.sh (ONE
-    # home). A partial install without that helper routes NOTHING to the
-    # drain rather than matching every path on an empty regex — and SAYS so
-    # (ship-gate review MAJOR-2: routing no code file at all, silently and by
-    # stated choice, is the same silent-no-op class as a missing routing lib;
-    # the SessionStart probe covers the file too). The notice goes through
-    # this lib's existing nudge channel, so the calling hook still emits
-    # exactly ONE envelope.
+    # home). A partial install without that helper lists no code file in the
+    # reminder — and SAYS so through this lib's nudge channel, so the calling
+    # hook still emits exactly ONE envelope.
     if ! command -v vco_is_code_file >/dev/null 2>&1; then
         if command -v vco_report_missing_hook_lib >/dev/null 2>&1; then
             vco_report_missing_hook_lib "$_VCO_ROUTE_HOOKS_DIR" "$PROJECT_ROOT" \
@@ -580,45 +540,18 @@ vco_route_touched_path() {
                 && _vco_route_add_nudge "$VCO_MISSING_LIB_NOTICE"
         fi
     elif vco_is_code_file "$touched"; then
-        # NOTE: the accumulator append serves BOTH the end-of-turn reminder
-        # (P6) AND the batched code-graph drain (FIX-B). Keep the FULL path
-        # (the drain needs it to resolve the canonical root; the reminder
-        # reduces to basenames itself).
-        #
         # v0.2.72 P6: reminder AGGREGATION — appending here instead of
-        # emitting means the Stop hook emits ONE reminder naming all edited
-        # files rather than ~15 per busy turn. Soft-fail: an unkeyable
-        # session (empty id) just skips accumulation.
+        # emitting means the Stop hook (stop-codegraph-reminder.sh) emits ONE
+        # reminder naming all edited files rather than ~15 per busy turn.
+        # Soft-fail: an unkeyable session (empty id) just skips accumulation.
+        # v0.2.104 E-1: only the MAIN agent's edits inside the project (its
+        # root, or an enabled extra code folder) are listed — see
+        # _vco_route_reminder_wanted.
         if [ -n "$session_id" ]; then
-            mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
-            # v0.2.73 (FIX-B): SEPARATE code-graph drain queue. The reminder
-            # accumulator above is drained + cleared EVERY turn by
-            # stop-codegraph-reminder.sh; the drain queue below is drained by
-            # stop-codegraph-drain.sh, which is RATE-LIMITED (once per 120 s)
-            # and must PERSIST the union of edited paths across turns inside
-            # the window (it clears the queue only when it actually runs the
-            # analyzer). A distinct file avoids a two-consumer race.
-            #
-            # v0.2.102 S16-7: a code file under an ENABLED extra code-graph
-            # path goes to the PER-EXTRA queue instead — a path outside the
-            # primary root must never be analyzed under the primary's
-            # collection. The extra queue is drained by the same Stop hook
-            # through `vco_lib.codegraph_extras_refresh --queued` (scoped
-            # --only-files-from, the extra's own --project prefix).
-            # _vco_route_extra_enqueue appends the RESOLVED path itself and
-            # echoes the queue it used; empty → primary queue. Precedence
-            # (M-A1): primary-root containment wins, then longest extra prefix.
-            local _EXTRA_QUEUE
-            _EXTRA_QUEUE="$(_vco_route_extra_enqueue "$touched" "$session_id")"
-            if [ -z "$_EXTRA_QUEUE" ]; then
-                local _CG_DRAIN_QUEUE="$PROJECT_ROOT/.claude/state/codegraph_drain_${session_id}.txt"
-                printf '%s\n' "$touched" >> "$_CG_DRAIN_QUEUE" 2>/dev/null || true
-            fi
-            # v0.2.104 E-1: only the MAIN agent's edits inside the project
-            # (its root, or an enabled extra code folder) feed the reminder —
-            # see _vco_route_reminder_wanted. The drain queues above are
-            # unaffected, so a lane's edit still reaches the code graph.
-            if _vco_route_reminder_wanted "$touched" "$agent_id" "$_EXTRA_QUEUE"; then
+            local _EXTRA_PATH=""
+            [ -z "$agent_id" ] && _EXTRA_PATH="$(_vco_route_extra_member "$touched")"
+            if _vco_route_reminder_wanted "$touched" "$agent_id" "$_EXTRA_PATH"; then
+                mkdir -p "$PROJECT_ROOT/.claude/state" 2>/dev/null || true
                 local _EDIT_ACCUM="$PROJECT_ROOT/.claude/state/edit_reminder_${session_id}.txt"
                 printf '%s\n' "$touched" >> "$_EDIT_ACCUM" 2>/dev/null || true
             fi

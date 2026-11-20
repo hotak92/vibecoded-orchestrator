@@ -7,10 +7,9 @@
 #
 # Background:
 #   The SubagentStop reconciler needs to know which files the subagent
-#   modified during its run so it can drive KG-sync, the code-graph drain
-#   enqueue (v0.2.73: the worktree-gated shared drain queue, replacing the
-#   old orphan code-graph-queue.jsonl), credential-scan, and nudge-counter
-#   side effects. The SubagentStop
+#   modified during its run so it can drive KG-sync, credential-scan, and
+#   nudge-counter side effects (code files are not queued for the code
+#   graph since v0.2.107 — it follows commits). The SubagentStop
 #   payload alone is not sufficient — the wire format doesn't reliably
 #   ship a "files modified" list (and even when it does, content hashing
 #   is the only way to detect modifications that don't go through the
@@ -60,7 +59,7 @@
 # caller is expected to be a hook that MUST exit 0 regardless.
 
 # Default code-file extensions. Conservative subset — extend as needed.
-# Mirrors the language coverage of code-graph-incremental.sh.
+# Mirrors the language coverage the code graph indexes.
 _SNAPSHOT_CODE_EXTS_DEFAULT='py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql'
 
 # Default directories to walk. Includes both "code-ish" dirs and the KG

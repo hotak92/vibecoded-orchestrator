@@ -1508,13 +1508,12 @@ def test_ps1_work_record_respects_a_held_lock(tmp_path: Path) -> None:
     row = json.loads(counter.read_text().splitlines()[-1])
     assert row["subagent_work_units"] > 0 and row["baseline"] == 7
     assert lock.exists() and lock.read_text() == "held by the nudge"
-    # Found by this test: both ps1 writers emitted a UTF-8 BOM, which the
-    # Python readers (the nudge's json.loads per line; the drain's path list)
-    # glue onto the first row.
+    # Found by this test: the ps1 writer emitted a UTF-8 BOM, which the
+    # Python reader (the nudge's json.loads per line) glues onto the first row.
     bom = b"\xef\xbb\xbf"
     assert not counter.read_bytes().startswith(bom)
-    queue = project / ".claude" / "state" / "codegraph_drain_shared.txt"
-    assert queue.exists() and not queue.read_bytes().startswith(bom)
+    # v0.2.107 (CG-3): the reconciler queues nothing for the code graph.
+    assert not (project / ".claude" / "state" / "codegraph_drain_shared.txt").exists()
 
 
 # ── R4c-7: a worktree file with a space in its name ───────────────────────

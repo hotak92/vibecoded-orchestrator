@@ -84,6 +84,12 @@
           },
           {
             "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-codegraph-drain.sh\"",
+            "timeout": 15,
+            "async": true
+          },
+          {
+            "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-start-kg-loader.sh\"",
             "timeout": 10
           },
@@ -146,6 +152,17 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session-worktree-reap.sh\"",
             "timeout": 600,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/stop-codegraph-drain.sh\"",
+            "timeout": 15,
             "async": true
           }
         ]

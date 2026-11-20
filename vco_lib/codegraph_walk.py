@@ -40,14 +40,14 @@ Who takes it (every spawner of a full or pruning walk):
     (``vct_launcher_core::process::claimed_walk_args``). Rust never mirrors
     the lock logic — it only interprets the exit code.
 
-SCOPED incremental runs (``--only-file`` / ``--only-files-from`` — the
-Stop-hook drain batches) deliberately do NOT claim, with evidence:
+SCOPED incremental runs (``--only-file`` / ``--only-files-from`` — the HEAD
+catch-up's batch over a commit range) deliberately do NOT claim, with
+evidence:
 
-  * the drain already serializes per canonical root
-    (``codegraph_drain_root_<md5>.lock`` mkdir, requeue-on-contention) and
-    rate-limits to one batch per 2 min — a multi-hour full walk holding the
-    claim would otherwise silently drop consumed queue entries (the detached
-    drain shell deletes its list file unconditionally);
+  * the catch-up already serializes per checkout
+    (:mod:`vco_lib.codegraph_root_lock`) and records nothing when it cannot
+    run, so the next catch-up retries the same range — a multi-hour full walk
+    holding the claim would only delay it;
   * correctness: a pruning walk's prune set is keyed on the files IT visited
     (``visited_uuids``; hash-skipped-but-current files are still marked
     visited — see ``analyze_code_graph._note_written_uuid``), and a scoped
@@ -103,8 +103,7 @@ _SCOPED_FLAGS = ("--only-file", "--only-files-from")
 #: value flags (store/action append options).
 _VALUE_FLAGS = frozenset({
     "--project", "-p", "--language", "-l", "--extra-path", "--primary-root",
-    "--since-commit", "--only-file", "--only-files-from", "--canonical-source",
-    "--deferral-root",
+    "--since-commit", "--only-file", "--only-files-from", "--deferral-root",
 })
 
 

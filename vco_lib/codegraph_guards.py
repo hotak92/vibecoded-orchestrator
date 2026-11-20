@@ -228,6 +228,70 @@ def _tally_read(collection: Any, det_uuid: str, vector_slot: Optional[str],
         tally["rows"][key] = present
 
 
+# ---------------------------------------------------------------------------
+# v0.2.107 (CGWRITE-11): the WALK TALLY — what one analyzer run cost. A walk
+# used to report modules/classes/functions and files, not how many rows it
+# embedded, stamped (revision PATCH, no embed), skipped (content-identical),
+# wrote, or read back for the cross-reference pass, and nothing with a time.
+# The analyzer counts through :func:`walk_count` at the one site of each
+# decision and prints :func:`walk_tally_line` at the end (also the final JSON
+# report's ``tally`` key, which the HEAD catch-up and extras refresh log).
+# ---------------------------------------------------------------------------
+
+WALK_TALLY_KEYS: Tuple[str, ...] = ("embeds", "stamped", "skipped", "rows_written", "xref_reads")
+_WALK_TALLY: Dict[str, int] = dict.fromkeys(WALK_TALLY_KEYS, 0)
+#: ``started`` (UTC ISO), ``t0`` (walk start) and ``t1`` (cross-reference
+#: pass start), both ``time.monotonic()``.
+_WALK_TIMES: Dict[str, Any] = {}
+
+
+def _utc_iso_now() -> str:
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def walk_tally_reset() -> None:
+    """Zero every counter and note the start time (the start of a run)."""
+    import time as _time
+
+    for key in WALK_TALLY_KEYS:
+        _WALK_TALLY[key] = 0
+    now = _time.monotonic()
+    _WALK_TIMES.update(started=_utc_iso_now(), t0=now, t1=None)
+
+
+def walk_tally_mark_xref() -> None:
+    """Note the start of the cross-reference pass (the end of the walk)."""
+    import time as _time
+
+    _WALK_TIMES["t1"] = _time.monotonic()
+
+
+def walk_count(key: str, n: int = 1) -> None:
+    """Add ``n`` to one counter of :data:`WALK_TALLY_KEYS` (an unknown key is
+    ignored: a counter must never fail a write)."""
+    if key in _WALK_TALLY:
+        _WALK_TALLY[key] += int(n)
+
+
+def walk_tally() -> Dict[str, int]:
+    """A copy of the counters."""
+    return dict(_WALK_TALLY)
+
+
+def walk_tally_line() -> str:
+    """The one summary line: UTC start/end, phase seconds, counters."""
+    import time as _time
+
+    now = _time.monotonic()
+    t0 = _WALK_TIMES.get("t0") or now
+    t1 = _WALK_TIMES.get("t1") or now
+    counts = " ".join(f"{k}={_WALK_TALLY[k]}" for k in WALK_TALLY_KEYS)
+    return (f"started={_WALK_TIMES.get('started') or _utc_iso_now()} ended={_utc_iso_now()} "
+            f"walk_s={max(0.0, t1 - t0):.1f} xref_s={max(0.0, now - t1):.1f} {counts}")
+
+
 #: v0.2.102 W6-O: hash-EXCLUDED metadata a SKIPPED (content-identical) row
 #: still has to receive. ``file_path`` and ``is_test`` are excluded from the
 #: content hash (they never feed the vector), so a row written before the stamp

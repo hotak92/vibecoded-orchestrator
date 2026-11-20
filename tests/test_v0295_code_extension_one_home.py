@@ -39,10 +39,10 @@ REMAINING_MIRRORS: dict[str, str] = {
     # retirement rows and test_v02101_pretool_use_read_branch_removed.py),
     # and the codegraph-query / command-noise-strip mirrors were retired
     # WITH those libs (wave-2 review SF-2).
-    "code-graph-incremental.sh": "standalone entry point, not sourced by the context hooks",
-    "code-graph-incremental.ps1": "sibling of the above",
-    "stop-codegraph-drain.sh": "Stop-hook entry point, not sourced by the context hooks",
-    "stop-codegraph-drain.ps1": "sibling of the above",
+    # v0.2.107 (CG-3): the code-graph-incremental.{sh,ps1} and the Stop
+    # drain's queue mirrors were retired with the per-edit queue; the HEAD
+    # catch-up's Python twin is pinned by
+    # test_the_catchup_extension_gate_matches_the_home below.
     # v0.2.101 Wave 2: the _lib/codegraph-query.{sh,ps1} mirrors (_CGQ_SOURCE_EXT_RE)
     # were RETIRED with the shell gates they served — the extension decision
     # for injection surfaces now lives in vco_lib/inject_intent.EXT_TO_LANG
@@ -176,3 +176,13 @@ def test_the_mirror_inventory_is_complete() -> None:
         "in REMAINING_MIRRORS — either read _lib/code-extensions or declare the "
         f"mirror with its reason: {offenders}"
     )
+
+
+def test_the_catchup_extension_gate_matches_the_home() -> None:
+    """``vco_lib.codegraph_head_catchup.CODE_RE`` filters a commit range's
+    changed files with the same extension set the hooks use for the edit
+    reminder (A>B>C rule C: a mirror pinned by this test)."""
+    from vco_lib import codegraph_head_catchup as chc
+
+    inner = _ALTERNATION.search(chc.CODE_RE.pattern)
+    assert inner and inner.group("body") == _home_alternation()

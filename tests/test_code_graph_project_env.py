@@ -629,8 +629,8 @@ class VscodeExcludesRetireBuildOutputsTests(unittest.TestCase):
 
 class PostFileEditHookEnvResolutionTests(unittest.TestCase):
     """Functional check on `post-file-edit.sh`: the resolved
-    CODE_GRAPH_PROJECT_RESOLVED value is what the hook would pass as
-    arg 3 to `code-graph-incremental.sh`. We isolate the resolution
+    CODE_GRAPH_PROJECT_RESOLVED value is what the (since retired) per-edit
+    code-graph hook would have been handed. We isolate the resolution
     expression itself by sourcing only the relevant bash logic — no
     actual code-graph subprocess invocation.
 
@@ -662,10 +662,8 @@ class PostFileEditHookEnvResolutionTests(unittest.TestCase):
 
     def test_hook_resolves_explicit_code_graph_project_env(self):
         # v0.2.73 (FIX-B): post-file-edit.sh no longer resolves the code-graph
-        # write-target project — the per-edit code-graph sync moved to the
-        # end-of-turn batched drain (stop-codegraph-drain.sh), which resolves
-        # the prefix per canonical root via the hub resolver
-        # (code_graph_collection_prefix) then a basename fallback. The old
+        # write-target project; since v0.2.107 (CG-3) the HEAD catch-up reads
+        # it in Python (code_graph_collection_prefix). The old
         # `${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename ...)}}` chain was
         # specific to post-file-edit's now-removed block; the CODE_GRAPH_PROJECT
         # env precedence itself is still honoured by the analyzer's own

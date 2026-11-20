@@ -4,8 +4,8 @@
 #
 # Before this file the same extension alternation was written out in
 # pre-edit-context-inject.ps1, post-file-edit.ps1, pre-tool-use.ps1,
-# code-graph-incremental.ps1 and stop-codegraph-drain.ps1 -- a C-tier
-# mirror per consumer. Lane F10 added a further consumer (the Bash-write
+# code-graph-incremental.ps1 and stop-codegraph-drain.ps1 (both mirrors
+# retired since) -- a C-tier mirror per consumer. Lane F10 added a further consumer (the Bash-write
 # routing), which is the point at which the project's A>B>C rule requires
 # ONE home instead of another copy.
 #

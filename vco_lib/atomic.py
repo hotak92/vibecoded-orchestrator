@@ -978,6 +978,36 @@ def machine_slot(
         time.sleep(max(0.05, float(poll_s)))
 
 
+@contextlib.contextmanager
+def try_machine_slot(slot_dir: Path, *, slots: int) -> Iterator[Optional[int]]:
+    """Take a FREE :func:`machine_slot` slot without waiting, or none.
+
+    Yields the slot index when one of ``slots`` was free (held for the block,
+    with the same holder record :func:`machine_slot` writes), else ``None`` —
+    the caller then skips its work and retries at its next chance. For
+    low-priority periodic jobs (v0.2.107 CG-3: the daily code-graph path
+    reconciliation) that must neither run beside a bulk writer nor queue a
+    detached waiter behind one.
+    """
+    for i in range(max(1, int(slots))):
+        cm = exclusive_file_lock(Path(slot_dir) / f"slot-{i}.lock", timeout_s=0)
+        try:
+            cm.__enter__()
+        except LockTimeout:
+            continue
+        holder_path = _slot_holder_path(slot_dir, i)
+        mine = _this_process_holder(takeover=False)
+        _write_slot_holder(holder_path, mine)
+        try:
+            yield i
+        finally:
+            if _read_slot_holder(holder_path) == json.loads(json.dumps(mine)):
+                _write_slot_holder(holder_path, None)
+            cm.__exit__(None, None, None)
+        return
+    yield None
+
+
 #: v0.2.107 (A-003): the ONE pool every machine-wide bulk writer counts
 #: against — the code-graph resync drivers (``codegraph_resync``) and the
 #: owed-work worker (``owed_work``). The directory name predates the second

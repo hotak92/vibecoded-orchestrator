@@ -486,10 +486,12 @@ def test_sed_i_on_a_docs_file_routes_to_the_development_collection(
 
 
 @pytest.mark.skipif(not _have_bash(), reason="bash unavailable")
-def test_sed_i_on_a_code_file_queues_the_drain_and_never_calls_kg_sync(
+def test_sed_i_on_a_code_file_queues_nothing_and_never_calls_kg_sync(
     tmp_path: Path,
 ) -> None:
-    """A code file is a code-graph concern, NOT a KG-sync concern."""
+    """A code file is not a KG-sync concern, and since v0.2.107 (CG-3) an edit
+    queues nothing for the code graph either: the commit that carries it
+    does. The routing still runs (the edit reminder lists the file)."""
     project = _project(tmp_path)
     marker = tmp_path / "kg.log"
     _stub_kg_sync(project, marker)
@@ -499,9 +501,12 @@ def test_sed_i_on_a_code_file_queues_the_drain_and_never_calls_kg_sync(
     result = _run_hook(project, "sed -i 's/1/2/' vco_lib/mod.py", session="s-code")
     assert result.returncode == 0, result.stderr
 
-    queue = project / ".claude" / "state" / "codegraph_drain_s-code.txt"
-    assert queue.exists(), result.stderr
-    assert str(module) in queue.read_text(encoding="utf-8")
+    state = project / ".claude" / "state"
+    assert not list(state.glob("codegraph_drain_*")), result.stderr
+    reminder = state / "edit_reminder_s-code.txt"
+    assert reminder.exists() and str(module) in reminder.read_text(encoding="utf-8"), (
+        "the routing must still see the write (the end-of-turn edit reminder)"
+    )
     time.sleep(1)
     assert not marker.exists(), "a .py file must not reach kg-sync"
 

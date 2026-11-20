@@ -111,8 +111,8 @@ logger = logging.getLogger(__name__)
 #:          `ModuleNotFoundError: No module named 'vco_lib'` (the detached child
 #:          got a bare-PATH `python3`; see `vco_lib.python_exe`). Those runs
 #:          wrote no completion stamp — correctly — but they DID advance each
-#:          project's recorded manifest version to 0.2.93, and rule 3 of
-#:          :func:`decide` ("prev_version at/past the newest bump ⇒ the graph
+#:          project's recorded manifest version to 0.2.93, and the then rule 3
+#:          of :func:`decide` (retired in v0.2.107) ("prev_version at/past the newest bump ⇒ the graph
 #:          was produced by an analyzer that already had the fixes") would then
 #:          have stamped them as done WITHOUT ever walking. Appending 0.2.94 is
 #:          how the ladder re-owes work it never actually delivered.
@@ -566,7 +566,6 @@ def describe_rung(rungs: object) -> "Optional[str]":
 #: on them rather than on prose.
 REASON_STAMP_CURRENT = "stamp_current"
 REASON_NO_GRAPH = "no_graph"
-REASON_VERSION_AT_OR_PAST_BUMP = "version_at_or_past_bump"
 REASON_CROSSES_BUMP = "crosses_bump"
 REASON_UNKNOWN_GENERATION = "unknown_generation"
 
@@ -629,17 +628,22 @@ def decide(
     2. **Positively no code graph** → nothing to repair. Whatever builds the
        graph next uses the current analyzer, so stamp and stop asking. (This
        is also what stops a first-install from spawning a surprise full build.)
-    3. **``prev_version`` recorded and at/past the newest bump** → the graph
-       was produced by an analyzer that already had the fixes. Stamp, stop.
-    4. **``prev_version`` crosses a bump** → the migration case. OWED;
+    3. **``prev_version`` crosses a bump** → the migration case. OWED;
        ``bumps`` carries EVERY rung crossed (oldest first), so the
        user-facing reason can name the newest change, not just the first.
-    5. **Anything else** — no manifest version, an unparseable one, a
-       ``running_version`` we cannot parse — is UNKNOWN, and unknown with a
-       graph present (or unprovable) is OWED. Re-walking an
-       already-current project costs one cheap re-extraction pass and zero
-       embeds; skipping a stale one leaves the user permanently broken with no
-       error. The asymmetry decides it.
+    4. **Anything else** — a manifest version already at/past the newest
+       bump, no manifest version, an unparseable one, a ``running_version``
+       we cannot parse — is UNKNOWN, and unknown with a graph present (or
+       unprovable) is OWED. Re-walking an already-current project costs one
+       cheap re-extraction pass and zero embeds; skipping a stale one leaves
+       the user permanently broken with no error. The asymmetry decides it.
+
+    A manifest version proves nothing about a walk (v0.2.107, owner answer
+    14 to CGWRITE-02): the manifest advances on every bundle update, also
+    when the forced walk that update owed was skipped (it met another walk's
+    claim) or died. The former rule "``prev_version`` at/past the newest bump
+    ⇒ stamp without walking" therefore stamped exactly those projects as done
+    — a skipped forced walk now stays owed until a walk writes the stamp.
     """
     if generation_is_current(stamp_generation, bumps):
         return Verdict(False, REASON_STAMP_CURRENT, stamp_now=False)
@@ -648,12 +652,6 @@ def decide(
         return Verdict(False, REASON_NO_GRAPH, stamp_now=True)
 
     newest = bumps[-1] if bumps else CURRENT_EXTRACTOR_GENERATION
-    prev = parse_semver(prev_version or "")
-    newest_parsed = parse_semver(newest)
-    if prev is not None and newest_parsed is not None and prev >= newest_parsed:
-        return Verdict(
-            False, REASON_VERSION_AT_OR_PAST_BUMP, stamp_now=True, generation=newest
-        )
 
     crossed = tuple(
         bump
@@ -1570,7 +1568,6 @@ __all__ = [
     "REASON_NO_GRAPH",
     "REASON_STAMP_CURRENT",
     "REASON_UNKNOWN_GENERATION",
-    "REASON_VERSION_AT_OR_PAST_BUMP",
     "ReindexResult",
     "Verdict",
     "code_graph_exists",

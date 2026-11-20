@@ -2,10 +2,11 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.105 #512A — HEAD-diff catch-up for the PRIMARY code-graph root.
 
-Field defect: a project's code graph was six days / 1,070 commits stale. The
-end-of-turn drain only ever indexes files the EDIT hook queued, so code that
-arrives through a lane merge, a `git pull`, a shell commit or a GUI merge is
-never indexed and nothing ever notices.
+Field defect: a project's code graph was six days / 1,070 commits stale — only
+files the EDIT hook queued were ever indexed, so code that arrived through a
+lane merge, a `git pull`, a shell commit or a GUI merge never was. Since
+v0.2.107 (CG-3) this catch-up is the ONLY writer of the primary root: the
+per-edit queue is retired.
 
 `vco_lib.codegraph_head_catchup` compares the binding's recorded
 `last_analyzed_commit` (hub /config) with the main checkout's HEAD and indexes
@@ -23,12 +24,12 @@ exactly the `git diff --name-only <recorded>..HEAD` files. Covered here:
     hub's name-derived fallback prefix never authorizes a walk (M3);
   * a huge diff, or a deleted code file → the analyzer's incremental walk
     (which prunes deletions) instead of a per-turn batch;
-  * the per-root lock keys on the drain's CANONICAL root, so a symlinked
-    spelling of the checkout still serialises with a drain batch (LOW);
-  * a linked-worktree session → skipped (FIX-A' territory);
+  * the per-root lock keys on the CANONICAL root, so a symlinked spelling of
+    the checkout still serialises with another analyzer run (LOW);
+  * a linked-worktree session → skipped before anything else (worktrees are
+    never indexed, owner ruling 2026-11-19);
   * a failed analysis → nothing recorded, so the next catch-up retries;
-  * the drain hook spawns the module detached, once per interval — even when
-    the turn queued no file (a merge queues none);
+  * the Stop/SessionStart hook spawns the module detached, once per interval;
   * end-to-end against a REAL git repo with a merge commit.
 """
 from __future__ import annotations
@@ -48,11 +49,27 @@ from typing import Optional
 import pytest
 
 from vco_lib import codegraph_head_catchup as chc
+from vco_lib import codegraph_path_reconcile as cpr
 from tests.common.pwsh import PWSH_BASE_FLAGS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DRAIN_SH = REPO_ROOT / "templates" / "hooks" / "stop-codegraph-drain.sh"
 DRAIN_PS1 = REPO_ROOT / "templates" / "hooks" / "stop-codegraph-drain.ps1"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_reconcile(monkeypatch):
+    """Every catch-up here ends with the daily path reconciliation; the real
+    one would connect to Weaviate and take a machine slot. Record the calls
+    instead (tests/test_v02107_cg3_committed_graph.py covers the real one)."""
+    calls: list = []
+
+    def _fake(project_root, prefix, state_dir, log):
+        calls.append((project_root, prefix, state_dir))
+        return "not_due"
+
+    monkeypatch.setattr(cpr, "reconcile_if_due", _fake)
+    return calls
 
 
 @dataclass(frozen=True)
@@ -157,38 +174,34 @@ A = "a" * 40
 B = "b" * 40
 
 
-# ── the shared argv shapes (MUST MATCH the drain's spawn line) ─────────────
+# ── the analyzer argv shapes ───────────────────────────────────────────────
 
 
-def test_scoped_argv_matches_the_drain_spawn(tmp_path: Path) -> None:
+def test_scoped_argv_is_one_batch_over_the_list(tmp_path: Path) -> None:
     got = chc.build_scoped_argv("/srv/proj", "Acme", "/s/l.txt", "--no-index-dot-claude")
     assert got == [
-        "/srv/proj", "--project", "Acme", "--only-files-from", "/s/l.txt",
-        "--canonical-source", "/srv/proj", "--no-index-dot-claude",
+        "/srv/proj", "--project", "Acme", "--json-progress", "--only-files-from",
+        "/s/l.txt", "--no-index-dot-claude",
     ]
 
 
-def test_incremental_argv_never_carries_canonical_source() -> None:
-    # The analyzer REFUSES --canonical-source outside a scoped file mode
-    # (exit 1), so the incremental shapes must not carry it.
+def test_incremental_argv_shapes() -> None:
     assert chc.build_incremental_argv("/p", "Acme", None, "--no-index-dot-claude") == [
-        "/p", "--project", "Acme", "--incremental", "--no-index-dot-claude",
+        "/p", "--project", "Acme", "--json-progress", "--incremental", "--no-index-dot-claude",
     ]
     argv = chc.build_incremental_argv("/p", "Acme", A, "--index-dot-claude")
-    assert argv == ["/p", "--project", "Acme", "--incremental", "--since-commit", A,
-                    "--index-dot-claude"]
-    assert "--canonical-source" not in argv
+    assert argv == ["/p", "--project", "Acme", "--json-progress", "--incremental",
+                    "--since-commit", A, "--index-dot-claude"]
 
 
 def test_full_argv_is_one_plain_walk() -> None:
     # The converging fallback (M3): a FULL walk — no --incremental (which
     # would bound it to HEAD~1..HEAD), no --since-commit, no scoped batch.
     assert chc.build_full_argv("/p", "Acme", "--no-index-dot-claude") == [
-        "/p", "--project", "Acme", "--no-index-dot-claude",
+        "/p", "--project", "Acme", "--json-progress", "--no-index-dot-claude",
     ]
     argv = chc.build_full_argv("/p", "Acme", "--index-dot-claude")
     assert "--incremental" not in argv and "--only-files-from" not in argv
-    assert "--canonical-source" not in argv
 
 
 def test_dot_claude_flag_follows_the_shared_root_heuristic(tmp_path: Path) -> None:
@@ -199,29 +212,6 @@ def test_dot_claude_flag_follows_the_shared_root_heuristic(tmp_path: Path) -> No
     (orch / ".claude").mkdir(parents=True)
     (orch / "vco_lib").mkdir(parents=True)
     assert chc.index_dot_claude_flag(str(orch)) == "--index-dot-claude"
-
-
-def test_code_extension_gate_never_drifts_from_the_drain_siblings() -> None:
-    """The module's extension gate is a MIRROR of the drain's (A>B>C rule C):
-
-    ``stop-codegraph-drain.{sh,ps1}`` decide which queued path is a code file
-    in shell, and this module applies the SAME rule to a git diff. A drift
-    here would index a different set of files depending on how a change
-    arrived, so both sibling literals are pinned to this module's pattern.
-    """
-    import re as _re
-
-    sh = DRAIN_SH.read_text(encoding="utf-8")
-    ps1 = DRAIN_PS1.read_text(encoding="utf-8")
-    sh_pat = _re.search(r"^CODE_RE='([^']+)'$", sh, _re.M)
-    ps1_pat = _re.search(r"^\$codeRe ='([^']+)'$", ps1, _re.M)
-    assert sh_pat and ps1_pat, "the drain siblings no longer declare their gate"
-    assert sh_pat.group(1) == ps1_pat.group(1), "the two siblings already drifted"
-    assert chc.CODE_RE.pattern == sh_pat.group(1), (
-        "vco_lib.codegraph_head_catchup.CODE_RE drifted from "
-        f"templates/hooks/stop-codegraph-drain.sh ({chc.CODE_RE.pattern!r} != "
-        f"{sh_pat.group(1)!r})"
-    )
 
 
 # ── the decision table ─────────────────────────────────────────────────────
@@ -372,12 +362,12 @@ def test_unbound_or_disabled_project_is_skipped(tmp_path: Path) -> None:
     assert rec2.runs == [] and rec2.records == []
 
 
-def test_the_root_lock_keys_on_the_drains_canonical_root(tmp_path: Path) -> None:
-    """LOW: the drain keys its per-root lock on the git-resolved canonical
-    root; the catch-up keyed on the session's spelling of the path, so a
-    symlinked checkout let a catch-up walk and a drain batch run over the
-    same repo at once. A lock held at the CANONICAL key must read as busy
-    even when the project root was spelled through the symlink."""
+def test_the_root_lock_keys_on_the_canonical_root(tmp_path: Path) -> None:
+    """LOW: the per-checkout lock keys on the git-resolved canonical root; a
+    catch-up keyed on the session's spelling of the path let two analyzer
+    runs over the same repo run at once. A lock held at the CANONICAL key
+    must read as busy even when the project root was spelled through the
+    symlink."""
     real = tmp_path / "real-proj"
     (real / ".claude" / "state").mkdir(parents=True)
     (real / "src").mkdir()
@@ -386,8 +376,10 @@ def test_the_root_lock_keys_on_the_drains_canonical_root(tmp_path: Path) -> None
     link.symlink_to(real, target_is_directory=True)
     state = real / ".claude" / "state"
 
-    # The drain's own key: canonical (realpath) root.
-    (state / f"codegraph_drain_root_{chc.path_key(str(real))}.lock").mkdir()
+    # The lock at the canonical (realpath) key, held by a LIVE process.
+    held = state / f"codegraph_drain_root_{chc.path_key(str(real))}.lock"
+    held.mkdir()
+    (held / "pid").write_text(str(os.getpid()))
 
     rec = _Recorder(head=B, recorded=A, diff=["src/a.py"])
     lines: list = []
@@ -944,3 +936,13 @@ def test_a_refusing_hub_is_retried_once_with_the_scoped_token(
         srv.shutdown()
         from vco_lib import project_config
         project_config._test_clear_cache()
+
+
+def test_every_catchup_shape_asks_for_the_final_report() -> None:
+    """CG-3: without ``--json-progress`` the analyzer prints no final report,
+    so ``run_analyzer`` read ``insert_errors`` as 0 and recorded a partial
+    index as current (RED before: no shape carried it)."""
+    for argv in (chc.build_scoped_argv("/p", "A", "/l", "--no-index-dot-claude"),
+                 chc.build_incremental_argv("/p", "A", None, "--no-index-dot-claude"),
+                 chc.build_full_argv("/p", "A", "--no-index-dot-claude")):
+        assert "--json-progress" in argv, argv

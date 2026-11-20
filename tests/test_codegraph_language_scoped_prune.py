@@ -37,7 +37,6 @@ import pytest
 _THIS_DIR = Path(__file__).parent
 _REPO_ROOT = _THIS_DIR.parent
 _ANALYZER_PATH = _REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
-_HOOK_PATH = _REPO_ROOT / "templates" / "hooks" / "code-graph-incremental.sh"
 
 
 def _load_analyzer_module() -> types.ModuleType:
@@ -707,8 +706,8 @@ def test_dispatch_name_for_file(
 ) -> None:
     """`_dispatch_name_for_file` maps an edited file to its `lang_dispatch`
     name (or "" for an unknown / deliberately-skipped extension). This is
-    the single source of truth the per-edit hook relies on via
-    `--only-file`; the parity contract is that the returned value equals a
+    the single source of truth the scoped ``--only-file`` /
+    ``--only-files-from`` modes rely on; the parity contract is that the returned value equals a
     `lang_dispatch` first-element in `analyze_repository`.
     """
     assert (
@@ -716,85 +715,21 @@ def test_dispatch_name_for_file(
     )
 
 
-def test_hook_sh_uses_single_file_invocation() -> None:
-    """v0.2.66 (Bug 3): the hook must pass `--only-file "$EDITED_FILE"` and
-    must NOT use `--incremental` (which re-churned every HEAD~1..HEAD file
-    per edit AND missed the actual uncommitted edit). This catches an
-    accidental revert to the whole-repo incremental invocation."""
-    sh = _HOOK_PATH.read_text(encoding="utf-8")
-    import re
+def test_the_catchup_never_passes_prune_stale_or_language_v52_o7() -> None:
+    """V52-O.7 (v0.2.52): a language-scoped ``--prune-stale`` iterated the
+    WHOLE collection and deleted every row of that language not visited THIS
+    run. The per-edit hook that once carried it is retired (v0.2.107 CG-3);
+    the analyzer's caller on the commit path is the HEAD catch-up, whose argv
+    shapes must never carry either flag."""
+    from vco_lib import codegraph_head_catchup as chc
 
-    inv = re.search(
-        r'\(\s*\n\s*cd "\$REPO_PATH"\s*\n(.*?)\) &',
-        sh,
-        re.DOTALL,
-    )
-    assert inv, "could not locate analyzer-invocation subshell in the hook"
-    invocation = inv.group(1)
-    assert "--only-file" in invocation and '"$EDITED_FILE"' in invocation, (
-        "Hook must pass `--only-file \"$EDITED_FILE\"` (single-file scope). "
-        "See v0.2.66 Bug 3."
-    )
-    assert "--incremental" not in invocation, (
-        "v0.2.66 regression: `--incremental` must NOT be in the analyzer "
-        "invocation — it re-analyzed every HEAD~1..HEAD file per edit and "
-        "never indexed the actual (uncommitted) edit. Use `--only-file`."
-    )
-
-
-def test_hook_ps1_uses_single_file_invocation() -> None:
-    """Mirror of `test_hook_sh_uses_single_file_invocation` for the .ps1
-    sibling — cross-language logic must not drift (the .ps1 path is what
-    fires for native-Windows users without WSL)."""
-    ps1 = (
-        _REPO_ROOT / "templates" / "hooks" / "code-graph-incremental.ps1"
-    ).read_text(encoding="utf-8")
-    assert "'--only-file'" in ps1 and "$EditedFile" in ps1, (
-        "code-graph-incremental.ps1 must pass `--only-file $EditedFile`. "
-        "See v0.2.66 Bug 3."
-    )
-    assert "'--incremental'" not in ps1, (
-        "v0.2.66 regression: the .ps1 must NOT pass `--incremental`."
-    )
-
-
-def test_hook_sh_does_not_pass_prune_stale_v52_o7() -> None:
-    """V52-O.7 (v0.2.52, 2026-06-09) dropped `--prune-stale --language`
-    from the incremental analyzer invocation. Audit a97f0d9 found that
-    the language-scoped prune iterated the WHOLE collection and deleted
-    every row of that language not visited THIS run — so every Python
-    edit destroyed all OTHER Python rows, driving the collection's
-    Python coverage to zero.
-
-    The LANG mapping stays in place (load-bearing for v0.2.53's proper
-    fix — scope prune to the EDITED FILE only) but the analyzer
-    invocation must NOT pass either flag. This regression test prevents
-    accidental re-addition before the v0.2.53 follow-up lands.
-    """
-    sh = _HOOK_PATH.read_text(encoding="utf-8")
-    # Extract the analyzer invocation block (between the V52-O.7 comment
-    # banner and the closing `) &`). Find any line that's a continuation
-    # of the analyzer command and assert --prune-stale / --language
-    # aren't present.
-    import re
-    # Match the actual invocation, not the comment block above it.
-    inv = re.search(
-        r'\(\s*\n\s*cd "\$REPO_PATH"\s*\n(.*?)\) &',
-        sh,
-        re.DOTALL,
-    )
-    assert inv, "could not locate analyzer-invocation subshell in the hook"
-    invocation = inv.group(1)
-    assert "--prune-stale" not in invocation, (
-        "V52-O.7 regression: --prune-stale must NOT be in the analyzer "
-        "invocation (it destroys collection-wide rows on every edit). "
-        "See v0.2.52 backlog § V52-O.7."
-    )
-    assert "--language" not in invocation, (
-        "V52-O.7 regression: --language must NOT be in the analyzer "
-        "invocation (it scopes the destructive --prune-stale to one "
-        "language). See v0.2.52 backlog § V52-O.7."
-    )
+    shapes = [
+        chc.build_scoped_argv("/p", "P", "/l.txt", "--no-index-dot-claude"),
+        chc.build_incremental_argv("/p", "P", "a" * 40, "--no-index-dot-claude"),
+        chc.build_full_argv("/p", "P", "--no-index-dot-claude"),
+    ]
+    for argv in shapes:
+        assert "--prune-stale" not in argv and "--language" not in argv, argv
 
 
 # ---------------------------------------------------------------------------

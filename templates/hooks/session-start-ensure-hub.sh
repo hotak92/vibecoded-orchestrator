@@ -130,7 +130,7 @@ fi
 # Reports (v0.2.104). This hook is registered ASYNC, and an async hook's plain
 # stdout is NOT handed to the session: Claude Code delivers only the JSON
 # `additionalContext` of an async hook, on the next turn (vendor hooks doc,
-# "How async hooks execute" — the same channel stop-codegraph-drain uses). A
+# "How async hooks execute"). A
 # hub that could not be found or started was therefore reported to nobody
 # (owner 2026-10-22: after a reboot the hub stayed down and a lane failed on
 # "no key found for vendor"). Every leg's report is collected here and

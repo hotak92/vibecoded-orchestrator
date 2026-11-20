@@ -218,6 +218,9 @@ def test_owed_audits_keep_the_driver_which_walks_once_for_both(tmp_path):
 
 
 def test_nothing_owed_hands_nothing_off(tmp_path):
+    # Only a stamp at the ladder's head means "not owed" (CGWRITE-02): a
+    # manifest version at/past the newest bump proves nothing about a walk.
+    assert ceg.write_stamp(tmp_path, note="force-rewalk completed")
     spawn = _Spawn()
     out = _owed(tmp_path, spawn=spawn, walk_owner="launcher",
                 prev_version="0.2.107", audits_owed=lambda *_a: False)

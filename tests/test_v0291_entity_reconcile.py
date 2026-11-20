@@ -471,32 +471,28 @@ def test_leave_alone_when_a_files_walk_failed_part_way(
     )
 
 
-def test_leave_alone_worktree_scoped_walk_never_deletes_canonical_rows(
-    analyzer_mod, tmp_path, monkeypatch
-):
-    """The per-edit hook analyses a git WORKTREE file while stamping the
-    CANONICAL main-repo root (``--canonical-source``, v0.2.66 Bug 3) so both
-    checkouts converge on one row. That walk read a DIFFERENT tree than the
-    tenant it stamps — the worktree's branch may legitimately lack an entity the
-    canonical checkout still has — so it must never authorise a delete."""
-    _stub_embeddings(analyzer_mod, monkeypatch)
+def test_leave_alone_rows_of_a_root_the_walk_did_not_read(tmp_path):
+    """A row stamped with a root this walk did NOT read (``walked_sources``)
+    is never judged by it — the walked tree may legitimately lack an entity
+    that root still has. (v0.2.107: the per-edit worktree canonicalisation
+    that produced this shape is retired; the guard stays for any caller.)"""
     worktree = tmp_path / "wt"
-    worktree.mkdir()
-    (worktree / "install.py").write_text(
-        "def main():\n    return 1\n", encoding="utf-8"
-    )
     canonical = (tmp_path / "main-checkout").as_posix()
-    analyzer = _wire(analyzer_mod)
-    canonical_row = _seed_stale_function(
-        analyzer, analyzer_mod, "install.py",
-        "install.only_on_the_main_branch", canonical,
+    guarded = _Coll(f"{PROJECT}_CodeFunction", "file_path", ("full_name",))
+    kept = guarded.seed(
+        "canon", file_path="install.py", project=PROJECT,
+        project_source=canonical, full_name="install.only_on_the_main_branch",
+        embed_revision=None,
     )
-
-    analyzer.analyze_repository(
-        worktree, only_file=worktree / "install.py", canonical_source=canonical,
+    cr.reconcile_walked_file_rows(
+        ((guarded, "file_path"),),
+        {(canonical, "install.py"): {guarded.name: {"live"}}},
+        project_name=PROJECT,
+        primary_sources={worktree.as_posix()},
+        deleter=cr.delete_file_rows_exact,
+        walked_sources={worktree.as_posix()},
     )
-
-    assert canonical_row not in analyzer.functions_collection.deleted, (
+    assert kept not in guarded.deleted, (
         "a walk that stamped a root whose files it did not read must not delete"
     )
 

@@ -7,7 +7,7 @@ Background
 Three hooks previously hardcoded the venv at
 `<repo_root>/claude_mcp_servers/.venv`:
 
-  - templates/hooks/code-graph-incremental.{sh,ps1}
+  - templates/hooks/code-graph-incremental.{sh,ps1} (retired in v0.2.107)
   - templates/hooks/kg-summary-generator.{sh,ps1}
   - templates/hooks/pre-edit-context-inject.{sh,ps1}
 
@@ -51,7 +51,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 HOOKS_UNDER_TEST = [
-    "code-graph-incremental",
+    # code-graph-incremental was retired in v0.2.107 (CG-3).
     "kg-summary-generator",
     "pre-edit-context-inject",
 ]
@@ -326,43 +326,6 @@ class NoVenvPresentSoftFailContract(unittest.TestCase):
             cp.returncode, 0,
             f"hook crashed: stderr={cp.stderr!r}",
         )
-
-    def test_code_graph_incremental_no_venv_exits_zero(self) -> None:
-        # This hook takes positional args, not stdin JSON. Pass a
-        # made-up code file as arg 1.
-        bash = shutil.which("bash")
-        if not bash:
-            self.skipTest("bash not on PATH")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            project = Path(tmpdir) / "fakeproj"
-            hooks_dest = project / ".claude" / "hooks"
-            hooks_dest.mkdir(parents=True)
-            # PR-39 (v0.2.12): templates/ is the single source of truth.
-            # Before PR-39 this read from .claude/hooks/_lib (byte-identical
-            # mirror); the duplicate was removed when install.py started
-            # rendering .claude/ from templates/ at install time.
-            src_lib = REPO_ROOT / "templates" / "hooks" / "_lib"
-            if src_lib.exists():
-                shutil.copytree(src_lib, hooks_dest / "_lib")
-            src_hook = REPO_ROOT / "templates/hooks/code-graph-incremental.sh"
-            shutil.copy2(src_hook, hooks_dest / src_hook.name)
-            env = os.environ.copy()
-            env.pop("VCT_VENV", None)
-            env.pop("VCT_INSTALL_ROOT", None)
-            (project / "test.py").write_text("# noop\n")
-            # §3.16: deliberately unpinned — asserts the hook soft-fails when NO
-            # venv resolves; a pinned child env would not exercise that path.
-            cp = subprocess.run(
-                [bash, str(hooks_dest / src_hook.name), "test.py", str(project)],
-                env=env,
-                capture_output=True, text=True, check=False,
-                cwd=str(project),
-                timeout=10,
-            )
-            self.assertEqual(
-                cp.returncode, 0,
-                f"hook crashed: stderr={cp.stderr!r}",
-            )
 
 
 class VctVenvOverrideAcceptedWhenSet(unittest.TestCase):

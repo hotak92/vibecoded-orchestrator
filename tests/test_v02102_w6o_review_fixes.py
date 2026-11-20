@@ -237,8 +237,14 @@ def test_one_ordinary_walk_converges_a_stale_install(harness, analyzer_mod, chan
     # wrong edges gone; the right one, the undecidable ones and the unseen
     # target are untouched (and the module's ref set was never replaced)
     assert harness._beacons(mods, "m-usage", "imports") == ["m-log", "m-odd", "m-ghost"]
-    assert harness._beacons(mods, "m-svelte", "imports") == []
-    assert stats["imports_deleted"] == 3
+    if changed_files is None:
+        assert harness._beacons(mods, "m-svelte", "imports") == []
+        assert stats["imports_deleted"] == 3
+    else:
+        # v0.2.107 (A-011): a scoped run reads only its changed modules, so an
+        # unchanged module's wrong edge waits for the next whole-repo walk.
+        assert harness._beacons(mods, "m-svelte", "imports") == ["m-usage"]
+        assert stats["imports_deleted"] == 2
     # idempotent: the next walk finds nothing to delete and makes no call
     mods.data.reference_delete = lambda **kw: pytest.fail("second walk deleted again")
     again = harness._analyzer(analyzer_mod, mods, classes, funcs).create_cross_references(

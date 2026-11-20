@@ -7,7 +7,7 @@
 # Copyright (c) 2026 VibeCoded Tools
 #
 # subagent-stop-reconcile.sh — SubagentStop hook that reconciles a
-# subagent's filesystem changes back into the project's KG / code-graph
+# subagent's filesystem changes back into the project's KG
 # / credential-scan / nudge-counter state. Also writes a JSONL audit
 # row to .claude/logs/subagent-reconciliation.jsonl (the V52-L.2
 # logging-only baseline — preserved exactly).
@@ -22,13 +22,11 @@
 #      with no timeout). v0.2.102 W6-C2 (census L1): it ran
 #      `timeout 30 kg-sync` (and a `sleep 30 && kill -9` fallback) inline,
 #      killing slow-but-working syncs and bypassing the access matrix.
-#   3. Code-graph drain enqueue — for any modified code file, apply the
-#      FIX-A' worktree gate (drop edits in ephemeral/unregistered
-#      worktrees) and append the gated-IN paths to the SESSION-AGNOSTIC
-#      drain queue `.claude/state/codegraph_drain_shared.txt` that the
-#      Stop-hook batched drain (stop-codegraph-drain.{sh,ps1}) consumes.
-#      We never run analyze synchronously and we never write the old orphan
-#      code-graph-queue.jsonl (nothing ever drained it — v0.2.73 HIGH-2).
+#   3. (retired in v0.2.107, CG-3) Code files are NOT queued for the code
+#      graph: it follows the COMMITTED state of the main checkout, so a
+#      subagent's code edits reach it through the commit (or the merge of
+#      its worktree branch) that moves the main checkout's HEAD —
+#      stop-codegraph-drain → vco_lib.codegraph_head_catchup.
 #   4. Credential scan — run the shared `_lib/credscan.sh` scanner on
 #      every modified file. On hit, append an entry to
 #      `.claude/logs/credential_alerts.jsonl` (post-tool-security's schema)
@@ -115,27 +113,12 @@ if [ -f "$SCRIPT_DIR/_lib/credscan.sh" ]; then
     # shellcheck source=_lib/credscan.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/credscan.sh"
 fi
-# v0.2.73 HIGH-2: the canonical-root resolver + FIX-A' worktree gate — the SAME
-# shared libs the per-edit code-graph hook and the Stop drain use (mirror-don't-
-# fork). Optional sourcing; when absent the Step-3 enqueue falls back to
-# CONSERVATIVE (enqueue-all — never silently lose a real project's edits).
-if [ -f "$SCRIPT_DIR/_lib/canonical-repo-root.sh" ]; then
-    # shellcheck source=_lib/canonical-repo-root.sh disable=SC1091
-    . "$SCRIPT_DIR/_lib/canonical-repo-root.sh"
-fi
-if [ -f "$SCRIPT_DIR/_lib/worktree-gate.sh" ]; then
-    # shellcheck source=_lib/worktree-gate.sh disable=SC1091
-    . "$SCRIPT_DIR/_lib/worktree-gate.sh"
-fi
 
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 LOG_DIR="$PROJECT_ROOT/.claude/logs"
 STATE_DIR="$PROJECT_ROOT/.claude/state"
 LOG_FILE="$LOG_DIR/subagent-reconciliation.jsonl"
 ALERT_LOG="$LOG_DIR/credential_alerts.jsonl"
-# v0.2.73 HIGH-2: the session-agnostic drain queue the Stop-hook batched drain
-# consumes (replaces the orphan code-graph-queue.jsonl that nothing drained).
-CG_DRAIN_SHARED="$STATE_DIR/codegraph_drain_shared.txt"
 
 mkdir -p "$LOG_DIR" 2>/dev/null || exit 0
 mkdir -p "$STATE_DIR" 2>/dev/null || true
@@ -489,12 +472,7 @@ fi
 FILE_COUNT=0
 TOTAL_BYTES=0
 KG_FILES=()     # absolute; shared tree only (knowledge/** and docs/**.md)
-CODE_FILES=()   # project-relative; shared tree only
 ALL_FILES=()    # absolute; every changed file (credential scan)
-
-# Code-file extension set (mirrors snapshot.sh's _SNAPSHOT_CODE_EXTS_DEFAULT).
-# Used here to classify which queue/sync path each modified file lands in.
-_CODE_EXT_RE='\.(py|rs|ts|tsx|js|jsx|go|java|cs|c|cpp|h|hpp|rb|php|swift|kt|scala|sh|ps1|sql)$'
 
 while IFS= read -r abs; do
     [ -z "$abs" ] && continue
@@ -507,19 +485,15 @@ while IFS= read -r abs; do
         TOTAL_BYTES=$((TOTAL_BYTES + ${sz:-0}))
     fi
     ALL_FILES+=("$abs")
-    # Indexing happens for SHARED-TREE files only: a worktree agent's files
-    # reach the KG / code graph when its work is merged (and the FIX-A' gate
-    # drops ephemeral-worktree edits anyway).
+    # KG/docs sync happens for SHARED-TREE files only: a worktree agent's
+    # files reach the KG when its work is merged.
     [ "$ATTRIBUTION" = "agent_worktree" ] && continue
     rel="${abs#"$PROJECT_ROOT"/}"
-    # Classify: knowledge/** or docs/**.md → KG/docs sync, code-extension →
-    # code-graph queue. Regex rather than case-glob so the rule is consistent
-    # regardless of bash globstar setting.
+    # Classify: knowledge/** or docs/**.md → KG/docs sync. Regex rather than
+    # case-glob so the rule is consistent regardless of bash globstar setting.
+    # Code files are not routed (Step 3 retired in v0.2.107, CG-3).
     if printf '%s' "$rel" | grep -qE '^knowledge/.*\.md$|^docs/.*\.md$'; then
         KG_FILES+=("$abs")
-    fi
-    if printf '%s' "$rel" | grep -qE "$_CODE_EXT_RE"; then
-        CODE_FILES+=("$rel")
     fi
 done <<CHANGEDEOF
 $CHANGED_ABS
@@ -565,84 +539,6 @@ if [ "${#KG_FILES[@]}" -gt 0 ]; then
         # record it where the reconciliation is recorded.
         printf '{"event":"kg_sync_skipped","reason":"_lib/route-touched-path.sh missing","agent_id":"%s"}\n' \
             "$(printf '%s' "$AGENT_ID" | tr -c 'a-zA-Z0-9_-' '_')" >> "$FILES_LOG" 2>/dev/null || true
-    fi
-fi
-
-# -------------------- Step 3: Code-graph drain enqueue --------------------
-# Route modified code files into the SAME batched, worktree-gated path the
-# main-session Stop drain (stop-codegraph-drain.{sh,ps1}) consumes — NOT the
-# old orphan code-graph-queue.jsonl (nothing ever drained it, so subagent code
-# edits never reached the code graph AND that file grew unbounded — v0.2.73
-# I/O-audit HIGH-2).
-#
-# We apply the FIX-A' worktree gate here so an EPHEMERAL/unregistered worktree
-# edit (the exact multi-agent-worktree churn v0.2.73 kills) is DROPPED — the
-# main session re-indexes the merged result. A gated-IN file is appended
-# (newline-delimited, ABSOLUTE path — matching the drain's format + how
-# post-file-edit.sh stores paths) to the session-agnostic shared drain queue.
-#
-# Performance: the gate's registered-project probe shells out to
-# vct_project_config.sh once per DISTINCT canonical root (not per file), so a
-# subagent touching many files under one repo pays ONE probe. We NEVER run the
-# analyzer synchronously (embedding-model init is 5-30s, over the <10s
-# budget); we only ENQUEUE. Soft-fail throughout.
-if [ "${#CODE_FILES[@]}" -gt 0 ]; then
-    # Per-canonical-root gate cache: canon-root -> "SKIP" | "INDEX". Resolve +
-    # gate ONCE per distinct canonical root; reuse the verdict for every file
-    # sharing that root. (Associative arrays need bash 4+; fall back to a
-    # linear pair-list scan for bash 3.2 / macOS system bash.)
-    _CG_GATE_ROOTS=()   # parallel arrays: root[i] -> verdict[i]
-    _CG_GATE_VERDICTS=()
-    _cg_gate_lookup() {
-        # $1 = canonical root; echoes cached verdict or empty if unseen.
-        _i=0
-        while [ "$_i" -lt "${#_CG_GATE_ROOTS[@]}" ]; do
-            if [ "${_CG_GATE_ROOTS[$_i]}" = "$1" ]; then
-                printf '%s' "${_CG_GATE_VERDICTS[$_i]}"; return 0
-            fi
-            _i=$((_i + 1))
-        done
-        printf ''
-    }
-
-    _CG_ENQUEUE=()
-    for _rel in "${CODE_FILES[@]}"; do
-        [ -n "$_rel" ] || continue
-        _abs="$PROJECT_ROOT/$_rel"
-
-        # Resolve the canonical MAIN root for this file. When the resolver lib
-        # is absent or resolution fails, _canon stays empty → the gate treats
-        # it as "not a worktree" (INDEX) — conservative (never drop on doubt).
-        _canon=""
-        if command -v _canonical_repo_root >/dev/null 2>&1; then
-            _canon="$(_canonical_repo_root "$_abs" 2>/dev/null)" || _canon=""
-        fi
-
-        # Cached gate verdict for this canonical root?
-        _verdict="$(_cg_gate_lookup "$_canon")"
-        if [ -z "$_verdict" ]; then
-            # Compute once for this root. REPO_PATH = PROJECT_ROOT (the on-disk
-            # session root); the gate compares it against the canonical root.
-            # SKIP only on a definitive "ephemeral/unregistered worktree";
-            # INDEX otherwise (incl. main tree, registered worktree, no gate).
-            if command -v _worktree_gate_should_skip >/dev/null 2>&1 \
-                && _worktree_gate_should_skip "$_abs" "$PROJECT_ROOT" "$_canon"; then
-                _verdict="SKIP"
-            else
-                _verdict="INDEX"
-            fi
-            _CG_GATE_ROOTS+=("$_canon")
-            _CG_GATE_VERDICTS+=("$_verdict")
-        fi
-
-        [ "$_verdict" = "INDEX" ] && _CG_ENQUEUE+=("$_abs")
-    done
-
-    # Append the gated-IN absolute paths to the session-agnostic shared drain
-    # queue. Plain newline-delimited append (the drain reads paths, one per
-    # line) — matches post-file-edit.sh's convention. Soft-fail on any error.
-    if [ "${#_CG_ENQUEUE[@]}" -gt 0 ]; then
-        printf '%s\n' "${_CG_ENQUEUE[@]}" >> "$CG_DRAIN_SHARED" 2>/dev/null || true
     fi
 fi
 

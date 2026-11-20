@@ -606,7 +606,7 @@ _NARROW_MAX_PAGES = 20
 _RECONCILE_NARROW_MAX_PATHS = 32
 
 
-def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
+def _fetch_narrowed_rows(coll, read_props, narrow_filter, return_references=None) -> "Optional[list]":
     """Read back ONLY the rows matching ``narrow_filter`` (candidate selection).
 
     Returns the COMPLETE candidate list, or ``None`` when the narrowed read
@@ -618,8 +618,12 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
     SUPERSET of the exact-string rows (identical token set), so it can
     over-fetch (harmless — the Python exact-compare predicate rejects those)
     but can never miss an exact-path row.
+
+    ``return_references`` (v0.2.107 CG-3: the analyzer's scoped cross-reference
+    read) resolves links with their own bounded property lists.
     """
     rows: list = []
+    extra = {} if return_references is None else {"return_references": return_references}
     try:
         for page in range(_NARROW_MAX_PAGES):
             res = coll.query.fetch_objects(
@@ -627,6 +631,7 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
                 limit=_NARROW_PAGE_SIZE,
                 offset=page * _NARROW_PAGE_SIZE,
                 return_properties=list(read_props),
+                **extra,
             )
             objs = list(getattr(res, "objects", None) or [])
             rows.extend(objs)
@@ -643,6 +648,11 @@ def _fetch_narrowed_rows(coll, read_props, narrow_filter) -> "Optional[list]":
         getattr(coll, "name", "?"),
     )
     return None
+
+
+def fetch_narrowed_rows(coll, read_props, narrow_filter, return_references=None) -> "Optional[list]":
+    """Public name of :func:`_fetch_narrowed_rows` (the ONE narrowed read)."""
+    return _fetch_narrowed_rows(coll, read_props, narrow_filter, return_references)
 
 
 def narrowed_or_all_rows(coll, read_props, narrow_filter, call_site: str):
@@ -989,16 +999,13 @@ def reconcile_walked_file_rows(
     * **Project scoping.** ``project`` is compared in Python by the deleter;
       identity-drifted rows (a different ``project`` value) belong to the
       identity sweep, not here.
-    * **Stamped-but-not-read roots are skipped** (``walked_sources``). The
-      per-edit hook analyses a git WORKTREE file while stamping the CANONICAL
-      main-repo root (``--canonical-source``, v0.2.66 Bug 3) so both checkouts
-      converge on ONE row. That walk read a DIFFERENT tree than the tenant it
-      stamps — the worktree's branch may legitimately lack an entity the
-      canonical checkout still has — so its entity set is NOT authoritative and
-      the reconcile skips it entirely. Overwriting is the hook's design;
-      DELETING on that evidence is not. The canonical repo's own walks (update
-      resync, main-checkout edits, the batched drain — which passes the
-      canonical root as BOTH the repo path and the source) still converge it.
+    * **Stamped-but-not-read roots are skipped** (``walked_sources``). A
+      walked file keyed under a root the walk did NOT read is never judged:
+      its entity set is not authoritative for that root (the walked tree may
+      legitimately lack an entity the other root still has). Its shape once
+      came from the per-edit worktree canonicalisation (``--canonical-source``,
+      retired in v0.2.107); the guard stays so no caller can reintroduce the
+      delete.
     * **One deleter.** Every delete goes through ``deleter``
       (``delete_file_rows_exact``) — exact-Python-compare + ``delete_by_id``.
     * **Audited.** Every deleted identity is printed (UUID + full_name + path)
@@ -1057,11 +1064,11 @@ def reconcile_walked_file_rows(
     audit_lines: list = []
     for src, paths in by_source.items():
         if walked_sources is not None and src and src not in walked_sources:
-            # Stamped a root this walk did not read files from (the worktree
-            # `--canonical-source` dedup): not authoritative — never delete.
+            # Stamped a root this walk did not read files from: not
+            # authoritative — never delete.
             logger.info(
                 "%s: skipping %d walked path(s) stamped %r — this walk read a "
-                "different tree (worktree canonical-source dedup)",
+                "different tree",
                 log_prefix, len(paths), src,
             )
             continue
