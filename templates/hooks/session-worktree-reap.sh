@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# session-worktree-reap.sh — SessionEnd + SessionStart hook: the point where
-# an isolated agent's UNCHANGED worktree is removed (v0.2.107 REAP-INTERIM).
-# MUST MATCH session-worktree-reap.ps1.
+# session-worktree-reap.sh — SessionStart hook: the point where an isolated
+# agent's worktree is removed (v0.2.107 REAP-INTERIM; owner rulings
+# 2026-11-20). MUST MATCH session-worktree-reap.ps1.
 #
 # WHY
 # ---
@@ -16,20 +16,18 @@
 # background work or a lock and resumes later), and the payload cannot tell
 # interim from final, so the worktree was removed under a paused agent and
 # SendMessage could no longer resume it. SubagentStop now only marks the
-# worktree a reap CANDIDATE (_lib/worktree-records.sh :: wtrec_reap). This
-# hook removes candidates once no session can resume their agent:
-#
-#   SessionEnd   records that this session ended (wtrec_session_ended — a
-#                marker file only: SessionEnd hooks get a short harness
-#                budget, and a `git worktree remove` killed mid-way would
-#                leave half a worktree behind).
-#   SessionStart a resumed session withdraws its own end marker
-#                (wtrec_session_resumed; a resume keeps the session id), then
-#                wtrec_sweep removes the candidates of ENDED sessions (and of
-#                sessions idle for days that never recorded an end), never
-#                those of the current session, and only after re-checking
-#                that each worktree is still unchanged. Each decision is a row
-#                in .claude/logs/worktree-guard.jsonl.
+# worktree (a reap CANDIDATE when unchanged, `kept` when changed —
+# _lib/worktree-records.sh :: wtrec_reap). At every SessionStart this hook
+# runs wtrec_sweep, which removes
+#   * an UNCHANGED candidate once it has been idle for 7 days (not when its
+#     chat ends: a chat can be resumed later), and
+#   * a KEPT worktree whose commits are merged into the main checkout's
+#     current branch and that has nothing uncommitted or untracked, with the
+#     branch VCO created for it (`git branch -d`),
+# never a worktree of the session that is starting, and only after
+# re-checking every condition; any doubt (a lock, a process working in it, a
+# git failure, an unknown main branch, a record that does not match) keeps
+# it. Each decision is a row in .claude/logs/worktree-guard.jsonl.
 #
 # Prints NOTHING on stdout (SessionStart stdout becomes model context);
 # always exits 0.
@@ -64,20 +62,15 @@ except Exception:
     sys.exit(0)
 if not isinstance(d, dict):
     sys.exit(0)
-for k in ("hook_event_name", "session_id", "source"):
+for k in ("hook_event_name", "session_id"):
     v = d.get(k)
     sys.stdout.write((v if isinstance(v, str) else "").replace("\n", " ") + "\n")
 ' 2>/dev/null || true)"
 EVENT="$(printf '%s\n' "$PARSED" | sed -n '1p')"
 SESSION_ID="$(printf '%s\n' "$PARSED" | sed -n '2p')"
-SOURCE="$(printf '%s\n' "$PARSED" | sed -n '3p')"
 
 case "$EVENT" in
-    SessionEnd)
-        wtrec_session_ended "$PROJECT_ROOT" "$SESSION_ID"
-        ;;
     SessionStart)
-        [ "$SOURCE" = "resume" ] && wtrec_session_resumed "$PROJECT_ROOT" "$SESSION_ID"
         wtrec_sweep "$PROJECT_ROOT" "$SESSION_ID" | while IFS="$(printf '\t')" read -r dec reason path name; do
             [ -n "$dec" ] || continue
             wtrec_log_reap "$PROJECT_ROOT/.claude/logs/worktree-guard.jsonl" session-worktree-reap \

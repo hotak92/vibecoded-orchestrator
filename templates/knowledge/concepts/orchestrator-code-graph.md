@@ -3,7 +3,7 @@ title: Orchestrator Code Graph
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, code-analysis, weaviate, semantic-search]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-11-19T00:00:00Z
 status: active
 ---
 
@@ -194,11 +194,11 @@ The `--incremental` flag makes analysis fast enough to run on every commit:
 3. Re-analyze only those files.
 4. Upsert new/updated entities, delete removed ones.
 
-The PostToolUse file-edit hook (`post-file-edit.sh`) appends edited code files to a per-session queue in `.claude/state/`, and the `Stop` hook `stop-codegraph-drain.sh` drains that queue at end-of-turn: ONE analyzer pass per canonical root over the turn's files, rate-limited to once per 120 s. `code-graph-incremental.sh` ships **unregistered and uninvoked** — it re-analyzes a single file and is kept for users who want to wire it themselves; its scheduling moved into the drain hook, which mirrors its resolution logic and calls the analyzer directly.
+Since v0.2.107 the graph follows the COMMITTED state of the main checkout's current branch: an edit queues nothing, and an edit in a linked git worktree (a lane) is never indexed. The `Stop`/`SessionStart` hook `stop-codegraph-drain.sh` spawns the HEAD catch-up (`vco_lib/codegraph_head_catchup.py`): when HEAD moved since the recorded commit, ONE analyzer run over the changed files of the range (`--only-files-from`); a scoped run's cross-reference pass reads only the rows its files need. Once a day the path reconciliation (`vco_lib/codegraph_path_reconcile.py`) deletes rows whose file is gone from the project folder and from HEAD's tree (a tracked file missing only from the working tree keeps its rows) — never when the root is missing or empty, every path is missing, or git cannot read HEAD. A project folder nested inside a larger repository is indexed like any main checkout; only a linked worktree is skipped. The per-edit queue, its worktree gate and `code-graph-incremental.sh` were retired.
 
 ## Integration Points
 
-- **Hook system**: the PostToolUse file-edit hook queues code files for analysis after edits.
+- **Hook system**: the Stop/SessionStart catch-up indexes each HEAD move of the main checkout.
 - **MCP server**: the `weaviate-kg` server exposes `search_code_graph` and `query_code_structure`.
 - **Knowledge Graph**: code graph and KG are separate collections in the same Weaviate instance.
 - **Pre-edit hook**: `pre-edit-context-inject.sh` runs a code-graph search before file edits to provide relevant context.

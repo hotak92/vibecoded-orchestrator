@@ -412,8 +412,7 @@ def _placed_as_the_merge_places_it(
     VCO's into one group in the template's order
     (:func:`vco_lib.settings_merge.fold_event_groups`). So when the event
     already holds such a group — the template ships the carried hook beside
-    another one, as SessionEnd ships ``stop-drain-citations`` beside
-    ``session-worktree-reap`` — the merge JOINS that group, and a restore
+    another one in the same matcher group — the merge JOINS that group, and a restore
     that founds a second group would leave a shape the next update folds.
     Simulated on a copy: restore the entry, fold the event, and when the
     group count did not grow, record the joined group and the folded

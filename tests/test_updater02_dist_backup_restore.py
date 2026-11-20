@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.child_env import child_env
+
 from vco_lib import dist_binary_repair as dbr
 from vco_lib import hub_ensure
 
@@ -134,7 +136,7 @@ def test_cli_restore_backups(tmp_path):
             "--dir", str(tmp_path), "--name", "vct-launcher.exe", "--name", "vct-hub.exe",
         ],
         cwd=repo, capture_output=True, text=True, timeout=60,
-        env={**os.environ, "PYTHONPATH": str(repo)},
+        env=child_env(),
     )
     assert proc.returncode == 0, proc.stderr
     assert "restored" in proc.stdout

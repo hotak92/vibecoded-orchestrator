@@ -293,8 +293,9 @@ if ($AgentId -and (Test-Path -LiteralPath $WtrecHelper)) {
 # a subagent finishes, and SubagentStop also fires on an INTERIM stop that the
 # payload cannot tell from a final one - removing here lost paused agents). A
 # provably unchanged worktree is only marked a reap candidate;
-# session-worktree-reap removes it at a later SessionStart once its session
-# ended, re-checking it first. Conditions live in _lib/worktree-records.ps1 ::
+# session-worktree-reap removes it at a SessionStart once it has been idle
+# for 7 days (a kept one once its commits are merged into the main
+# checkout's branch), re-checking it first. Conditions live in _lib/worktree-records.ps1 ::
 # Invoke-WtrecReap. Every decision is logged; a kept worktree is also named on
 # stderr. Never blocks. A kept worktree's notice reaches the parent ONCE per
 # path per session (v0.2.105) and says the agent may still be running.

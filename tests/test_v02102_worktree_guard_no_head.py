@@ -42,6 +42,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -296,8 +297,8 @@ def test_user_tuned_timeout_is_left_alone(os_name: str) -> None:
 # docs/features/03) was false while worktree-guard creates the worktrees: the
 # harness keeps a hook-created worktree and runs no WorktreeRemove when a
 # subagent finishes (hooks reference, WorktreeRemove). subagent-stop-reconcile
-# marks it a reap candidate and session-worktree-reap removes it after the
-# session ends (v0.2.107 REAP-INTERIM) — only when provably unchanged.
+# marks it a reap candidate and session-worktree-reap removes it after 7 idle
+# days (v0.2.107 REAP-INTERIM) — only when provably unchanged.
 
 
 def _stop(flavour: str, agent_id: str, project: Path) -> subprocess.CompletedProcess:
@@ -307,12 +308,15 @@ def _stop(flavour: str, agent_id: str, project: Path) -> subprocess.CompletedPro
 
 
 def _end_session(flavour: str, project: Path) -> None:
-    """Session s1 ends and s2 starts: the v0.2.107 REAP-INTERIM reap point
-    (SubagentStop only marks an unchanged worktree a reap candidate)."""
-    for payload in ({"hook_event_name": "SessionEnd", "session_id": "s1", "reason": "other"},
-                    {"hook_event_name": "SessionStart", "session_id": "s2", "source": "startup"}):
-        proc = _run("session-worktree-reap", flavour, payload, project)
-        assert proc.returncode == 0, proc.stderr
+    """The candidates have been idle for 8 days and session s2 starts: the
+    v0.2.107 REAP-INTERIM reap point (SubagentStop only marks an unchanged
+    worktree a reap candidate; it goes after 7 idle days, owner 2026-11-20)."""
+    old = time.time() - 8 * 86400
+    for rec in (project / ".claude" / "state" / "worktree-guard").glob("wt-*.json"):
+        os.utime(rec, (old, old))
+    proc = _run("session-worktree-reap", flavour,
+                {"hook_event_name": "SessionStart", "session_id": "s2", "source": "startup"}, project)
+    assert proc.returncode == 0, proc.stderr
 
 
 def _committed_repo(root: Path) -> Path:
@@ -344,7 +348,7 @@ def _reap_rows(project: Path) -> list[dict]:
 
 
 @pytest.mark.parametrize("flavour", FLAVOURS)
-def test_unchanged_worktree_is_removed_after_its_session_ends(flavour: str, tmp_path: Path) -> None:
+def test_unchanged_worktree_is_removed_after_seven_idle_days(flavour: str, tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "proj")
     wt = _launch(flavour, repo, "aaa111")
     assert _record(repo, "aaa111")["mode"] == "head"
