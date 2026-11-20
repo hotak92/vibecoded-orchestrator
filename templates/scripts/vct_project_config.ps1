@@ -796,7 +796,8 @@ function Get-Config {
                 # last_indexed_commit?} on the wire, newline-delimited
                 # paths of `enabled=true` rows on stdout. Matches the
                 # bash sibling's shape so cross-OS callers see identical
-                # output. Empty enabled set → no stdout + exit 0.
+                # output (shell consumers want plain paths, not JSON).
+                # Empty enabled set → no stdout + exit 0.
                 if ($FieldName -eq "code_graph_extra_paths") {
                     if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
                         foreach ($row in $val) {
