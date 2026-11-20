@@ -30,6 +30,11 @@
 # deleted).
 # This hook only parses stdin and spawns the DETACHED drain, so the short
 # SessionEnd budget never cuts the drain off. MUST MATCH the .sh sibling.
+#
+# v0.2.107 RL-DRAIN (A-024): no drain is spawned while the session has no
+# pending file (its own, or one staged without a session id); a spawned drain
+# runs single-flight per transcript and reads only the transcript bytes
+# appended since the last drain (rl_drain_citations.py). MUST MATCH the .sh.
 
 # Canonical list: _lib/scrub-env.ps1; the inline list is the fallback for a missing lib.
 if ([System.IO.File]::Exists("$PSScriptRoot/_lib/scrub-env.ps1")) { . "$PSScriptRoot/_lib/scrub-env.ps1"; Invoke-VctScrubSecretEnv } else {
@@ -51,6 +56,22 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
 
 $HookStdin = ""
 try { $HookStdin = Read-VcoHookStdin } catch { }
+
+# RL-DRAIN (v0.2.107, A-024): no drain without a pending file. A drain only
+# ever acts on staged citations, so a project whose queue is empty spawns
+# nothing. The exact per-session rule follows the parse. MUST MATCH
+# citation_pending.session_may_drain and the .sh sibling.
+$PendingDir = Join-Path $ProjectRoot ".claude/state/rl_pending"
+function Test-VcoPendingFile([string]$Pattern) {
+    # Names ending in .json only: a claim (.json.draining.<pid>) is not pending.
+    try {
+        foreach ($f in [System.IO.Directory]::EnumerateFiles($PendingDir, $Pattern)) {
+            if ($f.EndsWith(".json")) { return $true }
+        }
+    } catch { }
+    return $false
+}
+if (-not (Test-VcoPendingFile "*.json")) { exit 0 }
 
 $SessionId = ""
 $TranscriptPath = ""
@@ -78,6 +99,15 @@ try {
         }
     }
 } catch { }
+
+# The session id as it names its pending files (citation_pending._safe;
+# -creplace: case-sensitive, exactly the Python class). A drain of this
+# session reads its own files and the ones staged without a session (the MCP /
+# kg-search CLI path); an empty id drains every file.
+$SafeSid = $SessionId -creplace '[^A-Za-z0-9._-]', '-'
+if ($SafeSid) {
+    if (-not (Test-VcoPendingFile "$($SafeSid)__*.json") -and -not (Test-VcoPendingFile "nosession__*.json")) { exit 0 }
+}
 
 # PostToolUse:Agent (R4c-8): re-tag the brief's citations - main chat only,
 # and only when the payload names both the call and the agent.

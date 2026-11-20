@@ -223,7 +223,7 @@ def test_g5_drain_soft_labels_below_terminal_floor(monkeypatch, tmp_path):
     # window is returned for our task regardless of transcript contents.
     import claude_mcp_servers.rl_client.answer_window as aw
 
-    monkeypatch.setattr(aw, "load_messages_cached", lambda p: [{"role": "assistant"}])
+    monkeypatch.setattr(aw, "load_transcript_skeleton", lambda p, d=None: [{"role": "assistant"}])
     monkeypatch.setattr(aw, "find_kg_positions", lambda m: [])
     monkeypatch.setattr(aw, "match_position_for_query", lambda *a, **k: None)
     monkeypatch.setattr(aw, "match_position_by_timestamp", lambda *a, **k: (0, 0))

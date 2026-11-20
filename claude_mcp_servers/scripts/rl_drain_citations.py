@@ -178,9 +178,13 @@ def _score_payload(
     ``("skipped", "bad_payload")`` exactly as an eager read would be.
     """
     from claude_mcp_servers.rl_client.answer_window import (
+        TranscriptChanged,
+        TranscriptSkeleton,
         extract_answer_window,
         match_position_by_timestamp,
         match_position_for_query,
+        token_estimate,
+        window_token_estimate,
     )
 
     task_id = payload.get("task_id") or ""
@@ -231,7 +235,19 @@ def _score_payload(
             return "left", "no_anchor"
 
     start_msg_idx, start_blk_idx = matched
-    answer, _complete = extract_answer_window(messages, start_msg_idx, start_blk_idx)
+    if (not final_window and isinstance(messages, TranscriptSkeleton)
+            and token_count_fn is token_estimate
+            and window_token_estimate(messages, start_msg_idx, start_blk_idx) < gate):
+        # RL-DRAIN (A-024): a live chat's window below the gate, decided by
+        # subtraction from the transcript's skeleton — the outcome the text
+        # below would reach, without reading the window. ACCUMULATE-DON'T-DROP.
+        return "left", "below_floor"
+    try:
+        answer, _complete = extract_answer_window(messages, start_msg_idx, start_blk_idx)
+    except TranscriptChanged:
+        # Replaced or truncated since its skeleton was read: the next drain
+        # indexes it again. Never "unscorable" — the file is only left.
+        return "left", "transcript_changed"
     tok = token_count_fn(answer) if answer else 0
 
     fire_reason = "stop_drain"
@@ -410,7 +426,7 @@ def drain_session(
     files removed, ``collected_scored`` of them scored first).
     """
     from claude_mcp_servers.rl_client.answer_window import (
-        load_messages_cached,
+        load_transcript_skeleton,
         find_kg_positions,
         find_cli_kg_queries,
         token_estimate,
@@ -435,6 +451,7 @@ def drain_session(
         record_unscored,
         collect_abandoned,
         pending_dir,
+        drain_state_dir,
         staged_transcript,
     )
 
@@ -457,16 +474,19 @@ def drain_session(
                "collected": 0, "collected_scored": 0, "collected_unscored": 0}
     known = transcript_path or ""
 
-    # v0.2.73 (Concern-B) / W6-MEM: shared cached loader (one home with the
-    # MCP monitor); the drain is a one-shot process so its cache starts empty,
-    # but routing through the SAME function keeps the (slim) parsed-message
-    # shape — and thus the extracted answer window — byte-identical across
-    # both paths. W6-C2 F12: one parse per DISTINCT transcript.
+    # RL-DRAIN (v0.2.107, A-024): each transcript is read as its persisted
+    # SKELETON (answer_window.load_transcript_skeleton): only the bytes
+    # appended since the last drain are parsed, a live window below the gate
+    # is decided by subtraction, and the window text is read only for a file
+    # that fires — the same positions, matches and extracted window as the
+    # slim messages the MCP monitor reads. W6-C2 F12: one load per DISTINCT
+    # transcript.
+    state_dir = drain_state_dir(project_root)
     _loaded: dict = {}
 
     def _load(tp: str):
         if tp not in _loaded:
-            msgs = load_messages_cached(tp) if tp else []
+            msgs = load_transcript_skeleton(tp, state_dir) if tp else []
             _loaded[tp] = (msgs, find_kg_positions(msgs) if msgs else [])
         return _loaded[tp]
 
@@ -586,10 +606,16 @@ def drain_session(
         """Whether a file staged without a session id — pending OR under
         another process's claim (the MCP monitor's) — belongs to ended
         session ``sid``: its query is in ``sid``'s own transcript ``tp``.
-        ``True`` when ``tp`` is unknown and such files exist (the record is
-        kept rather than lost: a later drain that knows the transcript folder
-        attributes them). The end record stays while this holds, so a file
-        the monitor hands back is finalized by the next drain."""
+        ``True`` when this drain knows no transcript folder at all and such
+        files exist (the record is kept rather than lost: a later drain that
+        knows the folder attributes them). ``False`` when the folder is known
+        and ``sid``'s transcript is not in it (A-032): no drain can ever
+        attribute a file to a chat whose transcript is gone, and keeping the
+        record only made every later drain walk it again. The end record
+        stays while this holds, so a file the monitor hands back is finalized
+        by the next drain."""
+        if not tp and known:
+            return False
         d = pending_dir(project_root)
         if d is None or not d.exists():
             return False
@@ -836,6 +862,15 @@ def drain_session(
                     and not _holds_nosession(sid, sess_tp)):
                 clear_session_ended(sid, project_root)
 
+    # A-032: this session's own end record outlives this drain only while it
+    # has something left to finalize — a file of its own (pending or under a
+    # claim) or an unattributed one its transcript holds. Recorded FIRST
+    # above, so a drain that dies midway still leaves it.
+    if (session_end and session_id and not agent_id
+            and not session_has_pending(session_id, project_root)
+            and not _holds_nosession(session_id, known)):
+        clear_session_ended(session_id, project_root)
+
     # W6-RL2: the only time bound left — garbage collection of PROVABLY
     # abandoned files (transcript idle >= RL_CITATION_ABANDONED_DAYS, no live
     # owner), each scored first when its transcript is readable.
@@ -845,7 +880,160 @@ def drain_session(
         source_fn=_collector_source, score_fn=_score_final, counts=gc_counts)
     summary["collected_scored"] = gc_counts.get("scored", 0)
     summary["collected_unscored"] = gc_counts.get("unscored", 0)
+    sweep_drain_state(state_dir)
     return summary
+
+
+# ── RL-DRAIN (v0.2.107, A-024): single flight per transcript ───────────────
+#
+# Every Stop, SubagentStop and SessionEnd spawns a drain. Two drains of the
+# same transcript would read it twice and race for the same files, so a drain
+# runs only under the transcript's lock (``<state dir>/<key>.lock``,
+# ``vco_lib.atomic.exclusive_file_lock`` taken NON-blocking: a real flock /
+# msvcrt lock, released by the kernel if the holder dies). A request is a
+# marker file written BEFORE the lock is tried — ``<key>.rerun`` for a Stop,
+# ``<key>.rerun_end`` for a SessionEnd — so a drain that finds the lock held
+# just leaves its marker and exits; the holder consumes the markers in a loop
+# and runs once more while any is present (any number of requests during one
+# run coalesce into ONE rerun; an end request makes that rerun a SessionEnd
+# drain, which does everything a Stop drain does). After releasing, the
+# holder looks once more, so a request written between its last look and its
+# release is never stranded.
+RERUN_SUFFIX = ".rerun"
+RERUN_END_SUFFIX = ".rerun_end"
+LOCK_SUFFIX = ".lock"
+
+
+def _touch(path) -> bool:
+    try:
+        path.touch()
+        return True
+    except OSError:
+        return False
+
+
+def _take(path) -> bool:
+    """Consume a request marker; whether it was there."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def run_single_flight(state_dir, key: str, run, *, session_end: bool = False) -> int:
+    """Request a drain of ``key`` and run it here unless another process holds
+    ``key``'s lock (that holder then runs it). ``run(session_end)`` is one
+    drain. Returns how many drains THIS process ran. Without a writable state
+    dir the request cannot be recorded, so the drain runs here, unlocked
+    (the pre-RL-DRAIN behaviour)."""
+    from pathlib import Path
+
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
+    if state_dir is None:
+        run(session_end)
+        return 1
+    state_dir = Path(state_dir)
+    plain, end = state_dir / f"{key}{RERUN_SUFFIX}", state_dir / f"{key}{RERUN_END_SUFFIX}"
+    if not _touch(end if session_end else plain):
+        run(session_end)
+        return 1
+    runs = 0
+    while True:
+        try:
+            with exclusive_file_lock(state_dir / f"{key}{LOCK_SUFFIX}", timeout_s=0):
+                while True:
+                    want_end = _take(end)
+                    want_plain = _take(plain)
+                    if not (want_end or want_plain):
+                        break
+                    try:
+                        run(want_end)
+                    except Exception as exc:  # noqa: BLE001 — one failed run never strands the queue
+                        print(f"rl_drain_citations: soft-fail ({exc})", file=sys.stderr)
+                    runs += 1
+        except LockTimeout:
+            return runs  # the holder sees this request and runs it
+        if not (plain.exists() or end.exists()):
+            return runs
+
+
+def sweep_drain_state(state_dir, *, idle_s: "float | None" = None,
+                      now: "float | None" = None) -> int:
+    """Remove the drain state of transcripts that are gone (A-024 / A-032):
+    a persisted skeleton whose transcript no longer exists — or that nobody
+    has advanced for the abandoned-file bound (``RL_CITATION_ABANDONED_DAYS``;
+    a later drain just indexes it again) — together with its key's request
+    markers and lock; and a key's markers / lock left with no skeleton for
+    that long. A lock some drain holds is never removed. Returns the count of
+    files removed. Never raises."""
+    from pathlib import Path
+
+    from claude_mcp_servers.rl_client.answer_window import (
+        SKELETON_INDEX_SUFFIX,
+        skeleton_index_transcript,
+    )
+    from claude_mcp_servers.rl_client.citation_pending import abandoned_after_seconds
+    from vco_lib.atomic import LockTimeout, exclusive_file_lock
+
+    if state_dir is None:
+        return 0
+    d = Path(state_dir)
+    idle = abandoned_after_seconds() if idle_s is None else float(idle_s)
+    now_s = time.time() if now is None else float(now)
+
+    def _old(p) -> bool:
+        try:
+            return (now_s - p.stat().st_mtime) >= idle
+        except OSError:
+            return False
+
+    def _drop_key(key: str) -> int:
+        n = 0
+        lock = d / f"{key}{LOCK_SUFFIX}"
+        # Checked free, then removed after release (Windows cannot unlink a
+        # file this process holds open); the transcript is gone, so no new
+        # drain of this key starts in between.
+        if lock.exists():
+            try:
+                with exclusive_file_lock(lock, timeout_s=0):
+                    pass  # free: no drain of this key is running
+            except LockTimeout:
+                return n  # a drain of this key is running: leave the key alone
+            except OSError:
+                return n
+        for suffix in (LOCK_SUFFIX, SKELETON_INDEX_SUFFIX, RERUN_SUFFIX, RERUN_END_SUFFIX):
+            if _take(d / f"{key}{suffix}"):
+                n += 1
+        return n
+
+    removed = 0
+    try:
+        entries = list(d.iterdir())
+    except OSError:
+        return 0
+    indexed = set()
+    for p in entries:
+        if not p.name.endswith(SKELETON_INDEX_SUFFIX):
+            continue
+        key = p.name[: -len(SKELETON_INDEX_SUFFIX)]
+        tp = skeleton_index_transcript(p)
+        if tp is None or not os.path.exists(tp) or _old(p):
+            removed += _drop_key(key)
+        else:
+            indexed.add(key)
+    for p in entries:
+        name = p.name
+        for suffix in (LOCK_SUFFIX, RERUN_SUFFIX, RERUN_END_SUFFIX):
+            if name.endswith(suffix):
+                key = name[: -len(suffix)]
+                if key not in indexed and _old(p) and p.exists():
+                    removed += _drop_key(key)
+                break
+    return removed
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -884,17 +1072,29 @@ def main(argv: "list[str] | None" = None) -> int:
             print(f"rl_drain_citations: adopt soft-fail ({exc})", file=sys.stderr)
         return 0
 
-    try:
+    def _run(session_end: bool) -> None:
         summary = drain_session(
             args.session_id,
             args.transcript_path or None,
             agent_id=args.agent_id,
-            session_end=args.session_end,
+            session_end=session_end,
         )
         # Stdout is discarded by the detached hook run except for the per-run
         # log it is redirected to; print for that log and manual runs.
         print("rl_drain_citations: " + " ".join(
             f"{k}={v}" for k, v in summary.items()))
+
+    try:
+        from claude_mcp_servers.rl_client.answer_window import transcript_key
+        from claude_mcp_servers.rl_client.citation_pending import drain_state_dir
+
+        # One flight per transcript (a subagent's is its own transcript).
+        key = transcript_key(args.transcript_path or f"session:{args.session_id}")
+        ran = run_single_flight(drain_state_dir(), key, _run,
+                                session_end=args.session_end)
+        if not ran:
+            print("rl_drain_citations: queued (a drain of this transcript is "
+                  "running and will run once more)")
     except Exception as exc:  # noqa: BLE001 — telemetry must not break Stop
         print(f"rl_drain_citations: soft-fail ({exc})", file=sys.stderr)
         return 0
