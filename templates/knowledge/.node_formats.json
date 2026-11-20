@@ -361,7 +361,7 @@
     "summary": "The orchestrator's lifecycle hooks are shell scripts (with Python helpers) registered in `.claude/settings.json` and bound to Claude Code events such as SessionStart, PreToolUse, PostToolUse, PreCompact, and Stop, where a non-zero exit from a blocking hook aborts the operation. They handle security scanning, Weaviate knowledge-graph sync, and context preservation across compaction.",
     "generated_at": "2026-11-19T23:15:12.883584+00:00",
     "backend": "manual",
-    "content_hash": "3be8b75f669e87f8",
+    "content_hash": "f201e3be94c99e41",
     "total_chunks": 1
   },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {

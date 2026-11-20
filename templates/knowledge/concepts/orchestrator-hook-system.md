@@ -137,7 +137,7 @@ Context nearing limit
 ### SubagentStop (blocking)
 
 **subagent-stop-reconcile.sh** / **stop-drain-citations.sh** (async)
-- Reconciles subagent output in a DETACHED job (v0.2.102): marks an unchanged worktree a reap candidate and a changed one kept (never removed at SubagentStop — it also fires on an interim stop; `session-worktree-reap` removes them at SessionStart, v0.2.107), scans and indexes what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
+- Reconciles subagent output in a DETACHED job (v0.2.102): marks an unchanged worktree a reap candidate and a changed one kept (never removed at SubagentStop — it also fires on an interim stop; `session-worktree-reap` removes them at SessionStart, v0.2.107), credential-scans what the agent changed (its own worktree when it had one, else the shared-tree snapshot diff, recorded as unattributed), syncs the shared tree's changed `knowledge/**` and `docs/**.md` files to the KG (a worktree's files are indexed when its work is merged; code reaches the code graph only through the commit that moves the main checkout's HEAD), and files alerts for the PARENT. The citation drain scores the RL citations staged by the subagent's injections against the subagent's own transcript (`agent_transcript_path`).
 
 ### SessionEnd
 
