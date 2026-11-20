@@ -1702,9 +1702,9 @@ def _protect_weaviate_move(result: ReconcileResult, root: Path, runtime: str,
     from vco_lib import container_upgrade as _cu  # noqa: PLC0415
     from vco_lib import data_identity as _di  # noqa: PLC0415
 
-    live = _mount_of("weaviate", c)
-    if installer_mount is None or live is None \
-            or _di.mount_key(live) != _di.mount_key(dict(installer_mount)):
+    live_mount = _mount_of("weaviate", c)
+    if installer_mount is None or live_mount is None \
+            or _di.mount_key(live_mount) != _di.mount_key(dict(installer_mount)):
         return  # not on the installer's mount: step 5's data-identity guard decides
     if mover is None:
         # Printed as it happens (a multi-gigabyte copy must not look like a

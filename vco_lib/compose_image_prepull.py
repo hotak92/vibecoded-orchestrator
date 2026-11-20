@@ -290,7 +290,7 @@ def pull_space_shortfall(service: str, runtime: str, image: str, *,
             return None
         free_b = (free or _free_bytes)(where)
         need = int(installed[0] * PULL_SPACE_FACTOR) + _floor_bytes()
-        if decide_pull_fits(need, free_b):
+        if free_b is None or decide_pull_fits(need, free_b):
             return None
         return SpaceShortfall(service=service, image=image, need_bytes=need,
                               free_bytes=int(free_b), where=str(where),
