@@ -60,8 +60,7 @@ if "%FOUND%"=="" (
         echo   git checkout HEAD -- launcher/dist/windows-x64/
         echo   .venv\Scripts\python.exe install.py --update
         echo.
-        pause
-        exit /b 1
+        goto :interrupted_update
     )
     if defined SKIPPED (
         echo Skipped broken binary/binaries ^(no embedded frontend^):
@@ -87,6 +86,12 @@ REM quoted path as the title and doesn't actually launch anything.
 REM This is a known Windows cmd gotcha.
 start "" "%FOUND%" %*
 exit /b 0
+
+REM Top-level on purpose: an `exit /b 1` inside a NESTED if-block loses its
+REM exit code in cmd (the caller saw 0 on the interrupted-update path).
+:interrupted_update
+pause
+exit /b 1
 
 REM ─── helpers ────────────────────────────────────────────────────────────
 :probe
