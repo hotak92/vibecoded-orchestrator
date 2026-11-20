@@ -7,8 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A lane worktree is removed once its work is merged.** A worktree VCO created for an isolated subagent that is KEPT
+  because it has commits is removed at the next session start once those commits are merged into the main checkout's
+  current branch and it has nothing uncommitted or untracked (ignored files such as build output do not count). The
+  branch VCO created for it is removed too, with `git branch -d`, and only after the worktree removal succeeded. Any
+  doubt keeps the worktree, and the reason is logged to `.claude/logs/worktree-guard.jsonl`: a `git worktree lock`, a
+  process working inside it, a failing git command, a detached main checkout, or a record that does not match the
+  worktree. Worktrees of the session that is starting, adopted (`--existing-path`) worktrees and worktrees VCO did
+  not create are never touched. On Windows, where VCO cannot see which folder a process works in, the same rules rely
+  on Windows' own lock: the folder is first renamed aside and straight back, which Windows refuses while a process
+  works in it or holds a file in it open (nothing is deleted), and only then the plain `git worktree remove` (never
+  `--force`) runs. A refusal at either step keeps the worktree, its branch and its record, and the next session start
+  tries again.
+- **The hub ends a weaviate-kg server that is still running but no longer serving.** Each VCO stdio MCP server keeps
+  a heartbeat file in `~/.vct/run/mcp/` (refreshed every 30 s while its event loop runs; a long tool call keeps it
+  beating). When a heartbeat has been stale for 10 minutes and is still unchanged 75 seconds later, whatever the
+  watchdog interval, and the pid, process start time and command line still name that server, the hub terminates it
+  and logs one line; Claude Code starts a fresh server on the next call. A process whose pid was reused is never
+  signalled. The "Restart stopped services automatically" preference and `VCT_HUB_INFRA_WATCHDOG=0` turn it off
+  together with the infra watchdog. The uninstaller removes the heartbeat records.
+
+### Changed
+
+- **The code graph follows the commits of the main checkout, never an edit.** An Edit or Write no longer queues code
+  for re-indexing; edits in git worktrees (lanes) are never indexed and arrive when merged, and uncommitted edits are
+  indexed with the commit that carries them. The HEAD catch-up is the one writer, one analyzer run per HEAD move, and
+  now also runs at session start (`startup` and `resume`), so a pull made outside a session is picked up. A project
+  folder inside a larger git repository (a monorepo sub-project, a folder under a home-directory repository) is
+  followed like any main checkout; only a real linked worktree is skipped. A project that is not a git repository is
+  updated by Re-analyze. The catch-up, the extra-folder check and the path reconciliation share one lock per
+  checkout, which is broken only when its holder is provably gone (its pid is dead, or was reused by another process
+  start). The per-edit drain queue, the worktree gate, `code-graph-incremental.{sh,ps1}`, `--canonical-source` and
+  `codegraph_extras_refresh --queued` are retired; leftover queue files are removed automatically, and the
+  `VCO_CODEGRAPH_DRAIN_MIN_INTERVAL_SECONDS` knob is gone with the drain. The launcher's Codegraph tab says the graph
+  follows the main checkout's commits.
+- **A code-graph resync after an embedding-revision change re-extracts only the files that own outdated rows.** The
+  background resync used to walk the whole project; it now runs one scoped analyzer run over those files. Files with
+  uncommitted changes, untracked files and files in a linked worktree are left for their commit. When the outdated
+  rows cannot be counted or listed, nothing is changed or deleted and the resync stays pending in
+  `UPDATE_DEFERRED.md`. An extractor change or a code-model fill still walks the whole project. The resync log prints
+  `revision heal: verdict=… owed_rows=… files=… held: …`.
+- **RL training rows in `launcher.db` are about a third of their former size.** Every stored vector is a compact
+  half-float string (`f16:` + base64) instead of decimal JSON numbers (a 1024-dimension vector: 8,592 bytes before,
+  2,738 after), at the precision the trainer keeps anyway. The trainer, the training export and the trainability
+  check read both forms, so older rows still train.
+
 ### Fixed
 
+- **An isolated subagent's worktree is no longer removed while the agent is only paused.** SubagentStop also fires
+  when an agent ends its turn to wait on its own background work or a lock, and VCO removed an unchanged worktree right
+  then, so the agent could not be resumed ("its worktree no longer exists"). SubagentStop now only marks the worktree;
+  the new `session-worktree-reap` hook, run at every session start, removes an unchanged one after it has been idle for
+  7 days - not when its chat ends, because the chat may still be resumed - and only if it is still unchanged.
+- **A second launcher no longer runs the start-up work.** Two launchers started at the same time (for example at login
+  on Windows) both used to open the launcher database, seed, auto-start the container engine and start the hub, and
+  quitting one with "Quit and stop services" stopped the services under the other. The launcher now takes a per-user
+  instance lock (`~/.vct/state/launcher-instance.lock`) before anything else: a second copy exits at once, and
+  launching the app again brings the running launcher's window to the front. The uninstaller removes the lock files.
+- **The session-start hook and the VS Code folder-open task no longer start the hub, the model gateway or the
+  launcher twice when they fire together.** The "is it running? then start it" step runs under one per-user lock
+  (`~/.vct/state/ensure-<service>.lock`), so one of them starts the service and the other finds it running.
+- **Unregistering a project no longer deletes its RL training events.** They stay in the launcher database with the
+  project's name and id and can still be exported for training. The settings page's Unregister panel has a new
+  checkbox, unticked by default, "Also delete this project's N RL training events", which deletes them in batches. The
+  unregister summary, the Remove dialog and `vct-launcher --remove-project` / `vct-cli project delete` say how many
+  events are kept. launcher.db migration 053 removes the `rl_events` → `projects` cascade without rebuilding the table
+  (no extra disk space, no long boot) and fills in a missing `project_name` on existing events. If that cascade is
+  still present, unregister refuses before it touches anything, so the project stays registered with its files,
+  collections, secrets and grants.
+- **Windows: an orchestrator update no longer leaves `vct-launcher.exe` and `vct-hub.exe` missing while install.py
+  runs.** Right after the git step the launcher puts back every binary the pull did not replace, and if the launcher
+  dies before that, the next launcher start, the next Claude Code session or `start-launcher.bat` restores the binary
+  from the `.old-<pid>` file the update left next to it (previously the launcher's start-up deleted that file, and
+  `start-launcher.bat` told you to build the launcher by hand).
+- **An update no longer downloads a new service image (Weaviate, Ollama) that does not fit on the drive the container
+  engine stores images on** (under Docker Desktop: the drive holding its disk image). The estimate is about 1.5× the
+  installed image's size plus the `VCT_DISK_SPACE_MIN_FREE_GB` floor. When it does not fit, the service keeps running
+  on its current image and `UPDATE_DEFERRED.md` gets a `service_image_no_disk_space` entry naming the space needed,
+  the space free and the drive to clean up; every update checks again.
+- **The turn-end citation drain no longer runs at every Stop, SubagentStop and SessionEnd regardless of work.** The
+  hook starts it only when the session has a staged citation (its own, one staged without a session, or, when a chat
+  ends, one a drain is still scoring), and at most one drain per transcript runs at a time: a turn that ends while one
+  runs leaves a rerun request and the running drain runs once more.
+- **A citation drain reads only the transcript bytes appended since the previous drain** (a per-transcript index under
+  `.claude/state/rl_drain/`, rebuilt from the start when the transcript was truncated or replaced) and reads an answer
+  window's text only when it reaches the citation gate. On a 1 GB synthetic transcript a drain went from 241 MB /
+  3.7 CPU-s to 110 MB / 0.5 CPU-s; the citations it computes are unchanged.
+- **Ended-session markers in `.claude/state/rl_pending/` no longer pile up.** A marker is cleared once the session's
+  transcript is gone, and a SessionEnd drain that left nothing to finalize keeps none.
+- **The hooks' background cache warmer no longer writes RL retrieval events for results nobody has seen.** The events
+  are held with the cached result and written, under the viewing session, when a later hook shows it.
+- **The RL retention prune keeps up, and a new `launcher.db` shrinks after it.** The prune verifies each archive by
+  row count and SHA-256 before it deletes, and one prune now runs up to 20 batches
+  (`RL_EVENTS_PRUNE_MAX_BATCHES_PER_PASS`), so it keeps up with tens of thousands of rows a day. A `launcher.db`
+  created from this version on hands freed pages back to the disk after each prune; an existing one keeps its size
+  until one full `VACUUM`.
+- **RL fine-tune and retrain reads page through their whole event window.** They used to receive one response of up
+  to 1.5 GB holding only the newest rows of the window; they now page newest-first in pages of at most 32 MiB. A
+  training load keeps the newest 10,000 rows of its window, which is what it effectively read before.
+- **A VCO stdio MCP server (weaviate-kg) can no longer stay alive after it began to shut down.** Every shutdown path
+  (client gone, stdin closed, the env-reload SIGHUP) now ends the process within 15 s even when something blocks the
+  exit. Before, a server could hang for days with `/mcp` still showing "connected" while every KG tool call of that
+  chat, and of its subagents, hung.
+- **Rows of deleted code are removed from the code graph once a day.** A path-existence check deletes code-graph rows
+  whose file is gone from the project folder and is no longer in HEAD's tree; a committed file missing only from your
+  working tree keeps its rows until the commit that deletes it is caught up. It deletes nothing when the project
+  folder is missing or empty, when every indexed path is missing, or when git cannot read HEAD.
+- **A small code-graph update no longer loads the whole graph.** A scoped run reads only the rows of its files and the
+  names they use, and keeps the caller counts of the functions it rewrites; a failed load skips the cross-reference
+  pass instead of re-adding every edge.
+- **A skipped forced code-graph re-walk stays owed.** A manifest version no longer marks the extractor re-walk done.
+- **The code-graph catch-up sees insert errors, and walk logs show what a run cost.** The catch-up asks the analyzer
+  for its final report, so a partial index is no longer recorded as current; the catch-up and extra-folder logs
+  carry the walk tally (embeds, stamped, skipped and written rows, cross-reference reads, start and end time).
+- **A code-graph walk replaces a file's rows only after the new ones are written.** A file listed for the revision heal
+  that disappeared before the analyzer read it keeps its rows, and when an entity shrinks to fewer chunks its surplus
+  chunk rows are removed only after every write of that file succeeded.
+- **Re-enabling a hook that a Stop disable had also kept off SessionEnd or SubagentStop puts it back into the shipped
+  group** beside that event's other VCO hook, as a fresh install has it. It is no longer restored as a second group,
+  which the next update would fold.
 - **Every shipped hook registration states its timeout.** Six registrations (`pre-compact-save`, `agent-alerts-deliver`
   on two events, `subagent-start-kg-inject`, `subagent-stop-reconcile`, `worktree-guard`) had none and ran on Claude
   Code's default. They now state 600 s, which is that default: the bound is unchanged, now written down. A project
@@ -90,11 +209,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evidence, and user-role blocks never. `vco fix-transcript` repairs request-blob rows and reports conversion counts.
 - **Hook injections cost far fewer Weaviate requests.** At most two routers query Weaviate at once machine-wide (a
   router with no free slot waits up to 5 s, then skips its injection for that call); the code-graph leg is cached per
-  symbol; an identical re-Read with nothing new returns before any query; a lookup that finished empty is cached for
-  300 s and a timeout or error never is (a failed lookup is re-run by a detached warmer, whose lookups are bounded by
-  `VCO_WARM_LEG_TIMEOUT_S`); citation context is staged only for results actually shown; neighbour chunks appear on
-  hook surfaces only at the full-render score; when any hook finds Weaviate unreachable every hook skips its queries
-  for the next 30 s; and the cache is cleaned past its first 200 entries.
+  symbol, while the knowledge-graph leg is cached per turn (a new turn re-queries, so results follow that turn's
+  conversation and the current knowledge graph); an identical re-Read in the same turn with nothing new returns before
+  any query; a lookup that finished empty is cached for 300 s and a timeout or error never is (a failed lookup is re-run
+  by a detached warmer, whose lookups are bounded by `VCO_WARM_LEG_TIMEOUT_S`); citation context is staged only for
+  results actually shown; neighbour chunks appear on hook surfaces only at the full-render score; when any hook finds
+  Weaviate unreachable every hook skips its queries for the next 30 s; and the cache is cleaned past its first 200
+  entries.
 - **Update all decides each project's index work, and says why.** After a bundle update, a KG sync is queued only when
   a knowledge node the sync ingests changed (or the store is missing nodes), and a code-graph pass only when HEAD
   moved since the last build (incremental) or a full re-walk is owed - one walk per project, handed between the
@@ -105,11 +226,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pending_requeues`; at most three boot requeues, then the row fails with Retry).
 - **Index jobs refuse only the start of an orchestrator update or a hardware reconfiguration.** Continuing, resuming,
   aborting or re-applying an update already under way is never refused for code-graph or knowledge-graph jobs, and the
-  refusal names the action and says it can start when the jobs finish. When the launcher cannot run git, a bundle
-  update queues a full code-graph pass instead of treating the project as having no git HEAD; the bundle's
-  knowledge-change statement counts Markdown files under dot-prefixed folders, as the sync does; and rows left at
-  embed revision 0 by a failed embed are healed by the next incremental pass (next commit or edit), not by every
-  bundle update.
+  refusal names the action and says it can start when the jobs finish. When the launcher cannot run git, a bundle update
+  queues a full code-graph pass instead of treating the project as having no git HEAD; the bundle's knowledge-change
+  statement counts Markdown files under dot-prefixed folders, as the sync does; and rows left at embed revision 0 by a
+  failed embed are healed by the next incremental pass (the next commit the code graph catches up), not by every bundle
+  update.
 - **An update moves Weaviate to the pinned image only through a protected, verified move.** A Weaviate container this
   install's compose created, on the installer's data mount, is recorded as VCO-managed and moved through
   `vco_lib.container_upgrade`: every class counted, a raft snapshot by the old image, a free-space check and a copy of

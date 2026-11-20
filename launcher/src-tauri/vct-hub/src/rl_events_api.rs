@@ -182,9 +182,12 @@ async fn post_event(
         Ok(id) => (StatusCode::OK, Json(PostEventResponse { ok: true, id })).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "[vct-hub] post_rl_event insert failed");
-            // v0.2.102 (W3R-9 follow-up): an FK failure with a non-null
-            // project_id means the referenced project row is gone (deleted /
-            // re-registered) — the writer's CACHED identity is stale. Answer
+            // v0.2.102 (W3R-9 follow-up): with a non-null project_id, the
+            // "FOREIGN KEY" text is `Db::insert_rl_event`'s
+            // UNKNOWN_PROJECT_ID_ERROR (since migration 053 the insert itself
+            // refuses a project_id that names no registered project): the
+            // project row is gone (deleted / re-registered) — the writer's
+            // CACHED identity is stale. Answer
             // 422 with a machine-readable code so the writer drops the cached
             // identity and re-resolves, instead of losing events as generic
             // 500s for the rest of the identity-cache TTL.
