@@ -317,14 +317,18 @@ def arm_exit_backstop(name: str, code: int = 0, *, delay_s: Optional[float] = No
     return True
 
 
-def heartbeat_dir() -> Path:
+def heartbeat_dir(root: Optional[Path] = None) -> Path:
     """``<vct_root>/run/mcp`` — per user; the hub's watchdog scans it.
+    ``root`` overrides the resolved vct root (the uninstaller plans against
+    the root it was given).
 
     Must match ``launcher/src-tauri/vct-hub/src/mcp_liveness.rs::heartbeat_dir``.
     """
-    from vco_lib.paths import vct_root_dir  # noqa: PLC0415
+    if root is None:
+        from vco_lib.paths import vct_root_dir  # noqa: PLC0415
 
-    return vct_root_dir() / "run" / "mcp"
+        root = vct_root_dir()
+    return root / "run" / "mcp"
 
 
 def heartbeat_marker(argv0: Optional[str] = None) -> Optional[str]:
