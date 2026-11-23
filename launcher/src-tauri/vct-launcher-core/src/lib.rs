@@ -54,6 +54,9 @@ pub mod manifest;
 // `vco_lib/mcp_scan_rules.toml` (one home for the rule DATA). Rust embeds
 // the .toml at compile time via `include_str!`; Python parses the same file.
 pub mod mcp_scan_rules;
+// v0.2.108 HFKILL: the MCP liveness heartbeat's location and freshness rule —
+// one home for the hub's watchdog and the launcher's boot orphan reaper.
+pub mod mcp_heartbeat;
 // v0.2.97 (review R6 round 2): the `requirements.depends_on` reader — one home
 // for the install/update/enable gate and validate-manifest's known-id rule.
 pub mod module_deps;

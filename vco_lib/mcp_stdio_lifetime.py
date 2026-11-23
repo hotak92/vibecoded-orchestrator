@@ -61,7 +61,18 @@ Claude Code's ``/mcp`` still said "connected"):
    server that is alive with a stale file (identity checked by pid + start
    token + cmdline), so Claude Code sees EOF and starts a fresh one. The
    file is removed on every exit through :func:`_finish`; one left by a hard
-   exit is deleted by the hub once its pid is gone.
+   exit is deleted by the hub once its pid is gone. The launcher's boot
+   orphan reaper (``update_gate.rs::steady_state_orphaned_mcp_reap``) reads
+   the same file the other way round: a fresh one spares the server.
+
+   **Which pid names the file.** ``<pid>`` is ``os.getpid()`` of the
+   interpreter running the server. On Windows that is NOT the pid the
+   client started: a venv's ``python.exe`` is a launcher stub that starts the
+   real interpreter as its child, so the file is named after the child and
+   the stub has none. The hub starts from the files and reads the pid from
+   the record, so it is unaffected; anything that starts from the client's
+   spawned pid must look at that process's descendants too
+   (``vct_launcher_core::mcp_heartbeat::fresh_heartbeat_in_tree``).
 
 The reaper in :mod:`vco_lib.mcp_singleton` stays as it was: it handles
 cross-workspace peers at spawn time; this module makes each server end itself.
@@ -117,8 +128,9 @@ PARENT_POLL_SECONDS = 5.0
 #: bounded ``atexit`` run always gets its whole budget before the backstop.
 EXIT_BACKSTOP_SECONDS = EXIT_HANDLERS_SECONDS + 5.0
 
-#: How often the liveness heartbeat file is touched. The hub's stale bound
-#: (``mcp_liveness.rs`` ``STALE_SECS``, 10 min) is twenty of these.
+#: How often the liveness heartbeat file is touched. The stale bound
+#: (``vct-launcher-core/src/mcp_heartbeat.rs`` ``STALE_SECS``, 10 min — read by
+#: the hub's watchdog and the launcher's boot orphan reaper) is twenty of these.
 HEARTBEAT_SECONDS = 30.0
 
 #: The heartbeat stops (and the hub may end the server) once the event loop
@@ -322,7 +334,7 @@ def heartbeat_dir(root: Optional[Path] = None) -> Path:
     ``root`` overrides the resolved vct root (the uninstaller plans against
     the root it was given).
 
-    Must match ``launcher/src-tauri/vct-hub/src/mcp_liveness.rs::heartbeat_dir``.
+    Must match ``launcher/src-tauri/vct-launcher-core/src/mcp_heartbeat.rs::heartbeat_dir``.
     """
     if root is None:
         from vco_lib.paths import vct_root_dir  # noqa: PLC0415
@@ -372,6 +384,9 @@ class Heartbeat:
         self.interval_s = interval_s
         self.stall_s = stall_s
         self.directory = directory if directory is not None else heartbeat_dir()
+        # Named after THIS interpreter's pid. On Windows that is the child
+        # of the venv ``python.exe`` stub the client started, not the stub
+        # (module doc, 6.).
         self.path = self.directory / f"{os.getpid()}.json"
         self.last_tick = time.monotonic()
         self._stop = threading.Event()

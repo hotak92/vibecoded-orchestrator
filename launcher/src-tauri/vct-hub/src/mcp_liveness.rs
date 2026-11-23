@@ -13,7 +13,12 @@
 //! Each server keeps a heartbeat file `<vct_root>/run/mcp/<pid>.json`
 //! (`vco_lib/mcp_stdio_lifetime.py::Heartbeat` — the writer and the home of
 //! the record format) whose mtime it refreshes every 30 s while its event
-//! loop runs. This module runs inside the infra watchdog's tick (one
+//! loop runs. `<pid>` is the server's own interpreter pid; on Windows that
+//! is the CHILD of the venv `python.exe` stub the client started, not the
+//! stub (`vct_launcher_core::mcp_heartbeat`). This sweep starts from the
+//! files and reads the pid from the record (`McpRecord::pid`), so every
+//! check and the terminate act on the interpreter that wrote it — never on
+//! a pid guessed from the client's side. This module runs inside the infra watchdog's tick (one
 //! scheduler, no second loop) and, per file:
 //!
 //! * process gone → delete the file;
@@ -45,11 +50,9 @@ use vct_launcher_core::process::{
     terminate_verified, StartTokenVerdict,
 };
 
-/// A heartbeat this old is stale: twenty missed 30 s beats. The Python side
-/// keeps beating through long synchronous tool calls (its beat comes from a
-/// thread that only checks that the loop is running), so this bound is
-/// about a loop that stopped, not one that is busy.
-pub const STALE_SECS: u64 = 600;
+/// The stale bound and the heartbeat location live in ONE home shared with
+/// the launcher's boot orphan reaper: `vct_launcher_core::mcp_heartbeat`.
+pub use vct_launcher_core::mcp_heartbeat::{heartbeat_dir, STALE_SECS};
 
 /// How long after the first stale observation of one mtime a tick may
 /// confirm it: 2.5 x the server's 30 s beat
@@ -70,12 +73,6 @@ pub type Suspects = HashMap<PathBuf, Suspect>;
 
 /// Between the graceful signal and the hard kill.
 pub const TERM_GRACE: Duration = Duration::from_secs(5);
-
-/// `<vct_root>/run/mcp`. MUST MATCH
-/// `vco_lib/mcp_stdio_lifetime.py::heartbeat_dir`.
-pub fn heartbeat_dir() -> PathBuf {
-    vct_launcher_core::paths::vct_root_dir().join("run").join("mcp")
-}
 
 /// One heartbeat file. MUST MATCH the record `Heartbeat._write_record`
 /// writes in `vco_lib/mcp_stdio_lifetime.py`.
@@ -214,7 +211,7 @@ pub fn sweep(
         let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
             continue;
         };
-        let age_secs = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
+        let age_secs = vct_launcher_core::mcp_heartbeat::age_secs(mtime, now);
         let record: Option<McpRecord> = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
