@@ -141,8 +141,8 @@ EXPECTED_NOTES = [
                       "reviews and fix-delta verifications; a large first-pass "
                       "review stays on GLM-5.3."),
     ("qwen4-max-preview", "**Qwen4-Max preview** — a clear step over Qwen3.8-Max "
-                          "on agentic work (an independent agent test passed "
-                          "59/59 hidden tests in every run where Qwen3.8-Max "
+                          "on agentic work (on an independent agent test it "
+                          "passed all 59 hidden tests, where Qwen3.8-Max "
                           "finished none; Terminal-Bench 4.0 48.5%: above "
                           "GLM-5.3 and DeepSeek, below Kimi), and the Qwen4-Max "
                           "family is 25% cheaper per token, but it is slow to "
