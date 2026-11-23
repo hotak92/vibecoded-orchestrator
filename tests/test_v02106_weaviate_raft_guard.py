@@ -136,9 +136,16 @@ class Runtime:
     """A scripted podman for ONE Weaviate container (``vco_weaviate``)."""
 
     def __init__(self, *, image=OLD_IMAGE, running="true", exec_meta=None,
-                 run_rc=0, exists=True, memory="0", live_mount=None, one_off_running="true"):
+                 run_rc=0, exists=True, memory="0", live_mount=None, one_off_running="true",
+                 stop_ref=None, one_off_rm_fails=0):
         self.image, self.running, self.exists = image, running, exists
         self.one_off_running = one_off_running
+        #: ``"timeout"`` = the stop client times out (the engine still stops it);
+        #: ``"fail"`` = the engine refuses the stop (still running)
+        self.stop_ref = stop_ref
+        #: how many ``rm -f`` of the one-off leave it running (a stuck removal)
+        self.one_off_rm_fails = one_off_rm_fails
+        self.one_off_exists = False
         self.exec_meta = exec_meta
         self.run_rc = run_rc
         self.memory = memory
@@ -161,6 +168,8 @@ class Runtime:
         if verb == "inspect":
             name = argv[-1]
             if name == "vco_weaviate" + rg.ONE_OFF_SUFFIX and "{{.State.Running}}" in argv:
+                if not self.one_off_exists:
+                    return _cp(argv, 125, "", f"Error: no such container {name}")
                 return _cp(argv, 0, self.one_off_running + "\n")
             if not self.exists or name != "vco_weaviate":
                 return _cp(argv, 125, "", f"Error: no such container {name}")
@@ -183,10 +192,27 @@ class Runtime:
         if verb == "port":
             return _cp(argv, 0, "127.0.0.1:41234\n") if self.run_rc == 0 else _cp(argv, 1)
         if verb == "run":
+            self.one_off_exists = self.run_rc == 0
             return _cp(argv, self.run_rc, "id\n" if self.run_rc == 0 else "",
                        "" if self.run_rc == 0 else "Error: image not known")
         if verb == "logs":
             return _cp(argv, 0, "", "panic: could not open raft.db\n")
+        if verb == "rm" and argv[-1] == "vco_weaviate" + rg.ONE_OFF_SUFFIX:
+            if self.one_off_exists and self.one_off_rm_fails:
+                self.one_off_rm_fails -= 1
+                return _cp(argv, 1, "", "Error: container is in use")
+            self.one_off_exists = False
+            return _cp(argv)
+        if verb == "stop" and argv[-1] == "vco_weaviate":
+            if self.stop_ref == "fail":
+                return _cp(argv, 125, "", "Error: cannot stop")
+            self.running = "false"
+            if self.stop_ref == "timeout":
+                raise subprocess.TimeoutExpired(argv, 180)
+            return _cp(argv)
+        if verb == "start" and argv[-1] == "vco_weaviate":
+            self.running = "true"
+            return _cp(argv)
         if verb in ("stop", "start", "rm"):
             return _cp(argv)
         raise AssertionError(f"unexpected argv {argv}")
@@ -1270,3 +1296,80 @@ def test_a_dismissal_of_the_same_exposure_skips_the_wait_but_not_of_another(
     assert result2 is not None and result2.exposed
     assert fake2.stat_reads == 1 + int(rg.SETTLE_S // rg.SETTLE_POLL_S), \
         fake2.stat_reads  # a different state: the full wait ran
+
+
+# ─── HOTFIX-CHECK m-1 / m-2: a visible wait; never two Weaviates on one folder ──
+
+
+def test_a_long_wait_prints_progress_at_a_bounded_interval(one_off):
+    now = [0.0]
+
+    def clock():
+        now[0] += 10.0
+        return now[0]
+
+    one_off((7, 0), ready_after=10**6)
+    said: list[str] = []
+    v = _snapshot(Runtime(), monotonic=clock, timeout=600, log=said.append)
+    assert v.status == rg.REFUSED
+    progress = [m for m in said if "is stopped for the snapshot run" in m]
+    # one line per PROGRESS_EVERY_S of the 600 s budget, never one per poll
+    assert 5 <= len(progress) <= int(600 / rg.PROGRESS_EVERY_S), progress
+    assert "of 600 s" in progress[0] and "not reported ready" in progress[0]
+
+
+def test_the_progress_line_names_the_last_marker_error(one_off):
+    now = [0.0]
+
+    def clock():
+        now[0] += 25.0
+        return now[0]
+
+    one_off((7, 0), post=[503])
+    said: list[str] = []
+    _snapshot(Runtime(), monotonic=clock, timeout=300, log=said.append)
+    assert any("marker attempt" in m and "HTTP 503" in m for m in said), said
+
+
+def test_a_quick_snapshot_prints_no_progress_line(one_off):
+    one_off((7, 0), (9, 0), (9, 9))
+    said: list[str] = []
+    assert _snapshot(Runtime(), log=said.append).status == rg.PREPARED
+    assert not [m for m in said if "is stopped for the snapshot run" in m]
+
+
+def test_a_stop_that_times_out_starts_the_stopped_container_again(one_off):
+    one_off((7, 0))
+    box = Runtime(stop_ref="timeout")
+    v = _snapshot(box)
+    assert v.status == rg.REFUSED and "could not be stopped" in v.reason
+    assert "started again" in v.reason
+    assert box.verbs()[-1] == "start vco_weaviate" and box.running == "true"
+    assert not [a for a in box.argv if a[1] == "run"]  # no one-off ever ran
+
+
+def test_a_refused_stop_of_a_still_running_container_starts_nothing(one_off):
+    """Leave-alone arm: the engine refused the stop and it still runs."""
+    one_off((7, 0))
+    box = Runtime(stop_ref="fail")
+    v = _snapshot(box)
+    assert v.status == rg.REFUSED and "could not be stopped" in v.reason
+    assert not [a for a in box.argv if a[1] == "start"]
+
+
+def test_a_one_off_that_cannot_be_removed_keeps_the_live_container_stopped(one_off):
+    one_off((7, 0), (9, 0), (9, 9))
+    box = Runtime(one_off_rm_fails=10)
+    v = _snapshot(box)
+    assert not [a for a in box.argv if a[1] == "start"], box.verbs()
+    assert "was NOT started again" in v.reason
+    assert "podman rm -f vco_weaviate-raft-snapshot" in v.reason
+    assert "podman start vco_weaviate" in v.reason
+
+
+def test_a_one_off_removed_on_the_second_try_lets_the_live_container_start(one_off):
+    one_off((7, 0), (9, 0), (9, 9))
+    box = Runtime(one_off_rm_fails=1)
+    v = _snapshot(box)
+    assert v.status == rg.PREPARED, v.reason
+    assert box.verbs()[-1] == "start vco_weaviate"

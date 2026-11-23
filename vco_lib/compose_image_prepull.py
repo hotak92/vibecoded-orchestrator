@@ -34,7 +34,10 @@ v0.2.108: the image VCO BUILDS (code_embed, whose ``--build`` step 5 adds when
 the running image is not provably built from the checkout) gets the same
 check: :func:`build_space_shortfall` estimates the build from the image the
 service's existing container runs — the previous build of the same compose
-image — with the same factor and floor. When it does not fit, ``--build`` is
+image — with the same factor and floor. A rebuild reuses the Dockerfile's base
+image from the engine's store, so only the layers above it count when that
+base is stored locally (:func:`built_image_size`); otherwise the whole image
+does. When it does not fit, ``--build`` is
 dropped, the container keeps running on its current image, and the same
 ``service_image_no_disk_space`` row is recorded. No existing container (a
 first build) or an unreadable size → the build runs as before. The two other
@@ -47,6 +50,7 @@ service alone (exit 3) and records the same row. Each prints
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -326,12 +330,82 @@ def pull_space_shortfall(service: str, runtime: str, image: str, *,
         return None
 
 
-def built_image_size(service: str, runtime: str, *,
-                     run: Optional[RunFn] = None) -> Optional[tuple[int, str]]:
-    """``(bytes, ref)`` of the image *service*'s existing container runs — the
-    previous build of that compose image — or ``None`` when no container
-    exists or its image size cannot be read. Local only: ``inspect`` +
-    ``image inspect --format {{.Size}}``."""
+#: The build context of the code_embed image VCO ships (compose ``build:``):
+#: its ``Dockerfile*`` name the base images a rebuild starts FROM.
+_CODE_EMBED_CONTEXT = Path(__file__).resolve().parents[1] / "claude_mcp_servers" / \
+    "code_embedding_service"
+_FROM = re.compile(r"^\s*FROM\s+(?:--\S+\s+)*(\S+)", re.IGNORECASE | re.MULTILINE)
+
+
+def _image_size_layers(run: Optional[RunFn], runtime: str,
+                       ref: str) -> tuple[Optional[int], Optional[list[str]]]:
+    """``(bytes, layer diff ids)`` of the LOCAL image *ref*; either is ``None``
+    when unreadable. ``image inspect`` answers the same on docker and podman."""
+    rc, out = _capture(run, [runtime, "image", "inspect", "--format",
+                             "{{.Size}} {{json .RootFS.Layers}}", ref], 60.0)
+    if rc != 0:
+        return None, None
+    size_s, _, layers_s = out.strip().partition(" ")
+    size = int(size_s) if size_s.isdigit() else None
+    try:
+        layers = json.loads(layers_s) if layers_s else None
+    except ValueError:
+        layers = None
+    if not isinstance(layers, list) or not all(isinstance(x, str) for x in layers):
+        layers = None
+    return size, layers
+
+
+def dockerfile_bases(context: Path) -> list[str]:
+    """The base images the ``Dockerfile*`` in *context* build FROM (no
+    ``${ARG}`` refs, no ``scratch``, no earlier stage names), in file order."""
+    refs: list[str] = []
+    for f in sorted(Path(context).glob("Dockerfile*")):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        stages = {m.lower() for m in re.findall(r"(?im)^\s*FROM\s+.*\s+AS\s+(\S+)\s*$", text)}
+        for ref in _FROM.findall(text):
+            if "$" in ref or ref.lower() == "scratch" or ref.lower() in stages:
+                continue
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def _cached_base(run: Optional[RunFn], runtime: str, layers: Sequence[str],
+                 context: Path) -> Optional[tuple[int, str]]:
+    """``(bytes, ref)`` of the base image a rebuild reuses from the engine's
+    store: a Dockerfile base that is stored locally AND whose layers are the
+    bottom of *layers* (the built image's). ``None`` when there is none —
+    the base was pruned, or the Dockerfile now builds from another one."""
+    best: Optional[tuple[int, str, int]] = None
+    for ref in dockerfile_bases(context):
+        size, base_layers = _image_size_layers(run, runtime, ref)
+        if size is None or not base_layers or len(base_layers) >= len(layers):
+            continue
+        if list(layers[:len(base_layers)]) != list(base_layers):
+            continue
+        if best is None or len(base_layers) > best[2]:
+            best = (size, ref, len(base_layers))
+    return (best[0], best[1]) if best else None
+
+
+def built_image_size(service: str, runtime: str, *, run: Optional[RunFn] = None,
+                     context: Optional[Path] = None) -> Optional[tuple[int, str]]:
+    """``(bytes, what)`` a rebuild of *service*'s image can add, from the image
+    its existing container runs — the previous build of that compose image —
+    or ``None`` when no container exists or its image size cannot be read.
+
+    A rebuild reuses the base image (the Dockerfile's ``FROM``) from the
+    engine's store and re-creates only the layers the Dockerfile adds above
+    it (for code_embed the ``pip install`` layer, a few hundred MB, and the
+    ``COPY`` layers, kB), so when that base is stored locally and is the
+    bottom of the built image, the need is the built image's size minus the
+    base's. When it is not (pruned, or the Dockerfile moved to another base)
+    the build pulls the base too, and the whole image size is the honest
+    need. Local only: ``inspect`` + ``image inspect``."""
     from vco_lib.containers import all_known_names  # noqa: PLC0415
 
     for name in all_known_names(service):
@@ -340,12 +414,16 @@ def built_image_size(service: str, runtime: str, *,
         image_id = image_id.strip()
         if rc != 0 or not image_id:
             continue
-        rc, size = _capture(run, [runtime, "image", "inspect", "--format", "{{.Size}}",
-                                  image_id], 60.0)
-        size = size.strip()
-        if rc == 0 and size.isdigit():
-            return int(size), f"the image of container {name}"
-        return None
+        size, layers = _image_size_layers(run, runtime, image_id)
+        if size is None:
+            return None
+        if layers and service in BUILT_SERVICES:
+            base = _cached_base(run, runtime, layers, context or _CODE_EMBED_CONTEXT)
+            if base is not None:
+                return (max(0, size - base[0]),
+                        f"the layers the image of container {name} adds to its base "
+                        f"{base[1]}, which the build reuses")
+        return size, f"the image of container {name}"
     return None
 
 
@@ -529,7 +607,9 @@ def drop_unfittable_builds(build_services: list, services_to_recreate: list,
     build_services[:] = [s for s in build_services if s not in refused]
     for svc in [s for s in recreate_for_rebuild if s in refused]:
         recreate_for_rebuild.remove(svc)
-        if svc in services_to_recreate:  # added for the rebuild only (plan_rebuild)
+        # in recreate_for_rebuild = recreated ONLY for the rebuild (plan_rebuild);
+        # a config reason moves it out first (code_embed_image.fold_config_recreate)
+        if svc in services_to_recreate:
             services_to_recreate.remove(svc)
     _report_no_space(short, "building", "image build refused: not enough disk space",
                      runtime=runtime, rerun=rerun, deferral_report=deferral_report,

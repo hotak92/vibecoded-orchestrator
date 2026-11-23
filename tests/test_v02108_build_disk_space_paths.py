@@ -2,7 +2,8 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.108 HFBUILD — the two other code_embed image REBUILD paths get the
 A-021 free-space check install step 5 has (``compose_image_prepull.
-build_space_shortfall``: the image the existing container runs x 1.5 + the
+build_space_shortfall``: what the existing container's image adds above its
+locally stored base — here no base is stored, so the whole image — x 1.5 + the
 floor, against the engine's image store).
 
 * ``service_lifecycle.migrate_managed_service`` (the launcher's service move,

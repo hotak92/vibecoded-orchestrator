@@ -11679,10 +11679,14 @@ def _start_services(
                   "served_sha": _rebuild.served_sha},
         )
     # v0.2.103 R42-L1: a stale CODE_EMBED_OLLAMA_BODY is rewritten + recreated BEFORE the guards below.
-    services_to_recreate.extend(_cei.plan_body_template_recreate(
+    # v0.2.108: a recreate the rebuild already asked for does not absorb it — it becomes a CONFIG
+    # recreate too, so a rebuild later refused for disk space still recreates (on the current image).
+    _cei.fold_config_recreate(_cei.plan_body_template_recreate(
         _rebuild, force_separate=force_separate, url=detected.get("code_embed_url"), infra_dir=infra_dir,
-        embed_config=embed_config, services=services_to_start + services_to_recreate,
-        write_env=_write_infrastructure_env, log_event=_log_install_event))
+        embed_config=embed_config,
+        services=services_to_start + [s for s in services_to_recreate if s not in recreate_for_rebuild],
+        write_env=_write_infrastructure_env, log_event=_log_install_event),
+        services_to_recreate=services_to_recreate, recreate_for_rebuild=recreate_for_rebuild)
 
     # Nothing to start or recreate → nothing to do. v0.2.93: a container
     # another compose identity created is never recreated.

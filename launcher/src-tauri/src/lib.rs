@@ -821,25 +821,6 @@ pub fn run() {
     // any DB / Tauri init so a stale lock never blocks boot.
     reap_stale_install_py_lock();
 
-    // v0.2.71 (P6), conservative since v0.2.108: steady-state reap of
-    // ORPHANED VCO stdio MCP servers whose controlling Claude session is gone.
-    // Backstops the pre-v0.2.71 `vct-coordination` zombie-poller (an MCP that
-    // ignored stdin-EOF survived session close and accumulated one
-    // CPU-burning orphan per closed surface). It ends a process only when it
-    // runs one of THIS install's own server scripts (exact path under the
-    // orchestrator root), is orphaned (dead parent / reparented to a
-    // subreaper) and past the spawn grace window, and has no fresh liveness
-    // heartbeat on itself or a child; one log line per MCP process, ended or
-    // spared. `VCT_LAUNCHER_ORPHAN_MCP_REAP=0` turns it off. Soft-fail, never
-    // blocks boot; runs at startup alongside the install.py-lock reaper.
-    let reaped = crate::commands::update_gate::steady_state_orphaned_mcp_reap();
-    if reaped > 0 {
-        tracing::info!(
-            "[vct] steady-state reaper terminated {} orphaned MCP process(es) at boot",
-            reaped
-        );
-    }
-
     let _initial_registry = registry::load_service_registry();
 
     let app_manager = AppManager(Mutex::new(HashMap::new()));
@@ -892,6 +873,29 @@ pub fn run() {
             "[vct] install root not resolvable at boot (no launcher.db install path and no \
              orchestrator clone above the running binary)"
         ),
+    }
+
+    // v0.2.71 (P6), conservative since v0.2.108: steady-state reap of
+    // ORPHANED VCO stdio MCP servers whose controlling Claude session is gone.
+    // Backstops the pre-v0.2.71 `vct-coordination` zombie-poller (an MCP that
+    // ignored stdin-EOF survived session close and accumulated one
+    // CPU-burning orphan per closed surface). It ends a process only when it
+    // runs one of THIS install's own server scripts (exact path under the
+    // orchestrator root), is orphaned (dead parent / reparented to a
+    // subreaper) and past the spawn grace window, and has no fresh liveness
+    // heartbeat on itself or a child; one log line per MCP process, ended or
+    // spared. `VCT_LAUNCHER_ORPHAN_MCP_REAP=0` turns it off. Soft-fail, never
+    // blocks boot. It runs HERE, after the install-root cache above is primed
+    // (still after the instance lock): a launcher binary outside the clone
+    // (the Windows / macOS first-install layout) finds the root launcher.db
+    // names exactly as every other launcher path does, instead of sparing
+    // everything for want of one. No resolvable root → everything is spared.
+    let reaped = crate::commands::update_gate::steady_state_orphaned_mcp_reap();
+    if reaped > 0 {
+        tracing::info!(
+            "[vct] steady-state reaper terminated {} orphaned MCP process(es) at boot",
+            reaped
+        );
     }
 
     // v0.2.92 WP-11: seed the chat-model context table from the ONE shipped

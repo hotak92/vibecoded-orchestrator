@@ -19,11 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A marker create that timed out but did land is recognised on the next try and removed. A definite refusal (an HTTP
   4xx) still stops the move at once, and when the budget runs out the refusal says which marker step failed last. In
   every refused case the old container is started again and nothing is removed. `python -m vco_lib.weaviate_raft_guard
-  snapshot` uses the same path.
+  snapshot` uses the same path. While it waits (the old container is stopped meanwhile) it prints every 60 s how long
+  it has waited of the budget and what it is waiting for. A stop of the old container that fails or times out starts
+  it again when it stopped anyway. The old container is started again only once the one-off is gone or stopped, so two
+  Weaviate processes never open one data folder: if the one-off cannot be removed, the refusal names the two commands
+  to run (`<runtime> rm -f <container>-raft-snapshot`, then `<runtime> start <container>`).
 - **An update no longer rebuilds the code-embedding image when the build would fill the disk.** v0.2.107 checks the
   free space before an update downloads a new Weaviate or Ollama image. The code_embed image, which VCO builds from
-  source when the running one is out of date, now gets the same check. The estimate is the size of the image the
-  existing `vco_code_embed` container runs × 1.5, plus the free-space floor (`VCT_DISK_SPACE_MIN_FREE_GB`). When the
+  source when the running one is out of date, now gets the same check. A rebuild reuses the Dockerfile's base image
+  from the engine's store, so the estimate is what the existing `vco_code_embed` container's image adds above that
+  base (about 350 MB for the CUDA image) × 1.5, plus the free-space floor (`VCT_DISK_SPACE_MIN_FREE_GB`); when the
+  base is not stored locally (pruned, or the Dockerfile moved to another one) the whole image counts. When the
   drive the container engine stores images on has less free space than that, the rebuild is skipped, the container
   keeps running on its current image, and the `service_image_no_disk_space` deferral names the space needed and the
   space free. On a first build (no existing container) the build runs as before. The two other places that rebuild
@@ -33,8 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drive and what to free — and `python -m vco_lib.service_lifecycle up --build` (used by the session hooks) leaves
   the service as it is, exits non-zero with the same line and records the same deferral. The update's
   re-creation of code_embed with its cache (when another compose project created it) is refused the same way, and its
-  `services_foreign_compose_identity` entry carries that line.
-- **The launcher's boot orphan-MCP reaper ends only this install's own, provably abandoned MCP servers** (v0.2.107 Windows checks, Part B). Right after winning its instance lock the launcher scanned every process on the machine and force-ended (`taskkill /T /F` on Windows, SIGTERM elsewhere) any MCP-shaped process whose parent was dead or a subreaper — any `claude_mcp_servers` script of any checkout and any npm MCP — with no way to turn it off and no record of what it spared. It now ends a process only when it runs one of this install's own server scripts by exact path (`<orchestrator root>/claude_mcp_servers/weaviate_mcp/server.py` or `…/vct_coordination_mcp/server.py`), is orphaned and older than 60 s, and neither it nor a child process has a fresh liveness heartbeat (`<vct_root>/run/mcp/<pid>.json`); a server that is still beating is alive and is never ended. Every MCP process it looks at gets one launcher-log line, ended or spared, with the reason. New switch `VCT_LAUNCHER_ORPHAN_MCP_REAP=0` turns the reaper off (documented in `docs/CONFIGURATION.md`).
+  `services_foreign_compose_identity` entry carries that line. When the same update also changed the code_embed
+  container's `CODE_EMBED_OLLAMA_BODY` (num_ctx / keep_alive), a skipped rebuild still recreates the container on its
+  current image so the new setting reaches it.
+- **The launcher's boot orphan-MCP reaper ends only this install's own, provably abandoned MCP servers** (v0.2.107 Windows checks, Part B). Right after winning its instance lock the launcher scanned every process on the machine and force-ended (`taskkill /T /F` on Windows, SIGTERM elsewhere) any MCP-shaped process whose parent was dead or a subreaper — any `claude_mcp_servers` script of any checkout and any npm MCP — with no way to turn it off and no record of what it spared. It now ends a process only when it runs one of this install's own server scripts by exact path (`<orchestrator root>/claude_mcp_servers/weaviate_mcp/server.py` or `…/vct_coordination_mcp/server.py`), is orphaned and older than 60 s, and neither it nor a child process has a fresh liveness heartbeat (`<vct_root>/run/mcp/<pid>.json`); a server that is still beating is alive and is never ended. Every MCP process it looks at gets one launcher-log line, ended or spared, with the reason. New switch `VCT_LAUNCHER_ORPHAN_MCP_REAP=0` turns the reaper off (documented in `docs/CONFIGURATION.md`). It runs once the launcher has resolved its orchestrator root, so a launcher installed outside the clone (the Windows and macOS first-install layout) finds the root launcher.db names; with no resolvable root it spares everything.
 
 ### Changed
 

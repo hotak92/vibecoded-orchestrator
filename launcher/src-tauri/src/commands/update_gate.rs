@@ -1553,6 +1553,13 @@ fn run_orphaned_mcp_reap(
 /// enforces that. Its argv match reads the [`refresh_with_cmdlines`]
 /// snapshot (argv exists only there).
 ///
+/// The root comes from [`resolve_current_exe_without_db`]: the clone above
+/// the binary, else the process cache `lib.rs` primes from launcher.db just
+/// before calling this — so a launcher installed outside the clone (Windows /
+/// macOS first install) reaps too. No root → every process is spared.
+///
+/// [`resolve_current_exe_without_db`]: vct_launcher_core::services::install_root::resolve_current_exe_without_db
+///
 /// Posture: [`terminate_mcp_server`] (SIGTERM on POSIX, never SIGKILL; a
 /// `taskkill /T /F` tree kill on Windows — which is why a fresh heartbeat
 /// anywhere in the tree spares the process) + soft-fail, never blocks boot.

@@ -82,6 +82,7 @@ __all__ = [
     "parse_raft_stats",
     "upgrade_check",
     "snapshot_with_container_image",
+    "one_off_gone",
     "scan",
 ]
 
@@ -130,6 +131,9 @@ MARKER_CLASS = "VcoRaftSnapshotMarker"
 MARKER_REQUEST_CAP_S = 120.0
 #: Ceiling of the wait between two marker attempts (doubling from the poll).
 MARKER_BACKOFF_CAP_S = 30.0
+#: How often a snapshot run still waiting prints where it stands (the live
+#: Weaviate is stopped meanwhile, so a long wait must be visible).
+PROGRESS_EVERY_S = 60.0
 #: Where the data lives inside the container (compose's PERSISTENCE_DATA_PATH).
 DEFAULT_DATA_PATH = "/var/lib/weaviate"
 
@@ -435,6 +439,34 @@ def _marker_deadline_note(state: _MarkerState) -> str:
     return note + (f"; {_marker_left_note()}" if state.may_remain() else "")
 
 
+def one_off_gone(one_off: str, runtime: str, run: RunFn) -> bool:
+    """The one-off can no longer open the data folder: the engine says there
+    is no such container, or that it is not running. Anything else — still
+    running, or the engine did not answer — is ``False``."""
+    res = _run(run, [runtime, "inspect", "--type", "container", "--format",
+                     "{{.State.Running}}", one_off], 30)
+    if res is None:
+        return False
+    if res.returncode != 0:
+        return "no such" in ((res.stderr or "") + (res.stdout or "")).lower()
+    return (res.stdout or "").strip() == "false"
+
+
+def _restore_after_failed_stop(ref: str, runtime: str, run: RunFn) -> str:
+    """A ``stop`` of *ref* that failed or timed out may still have stopped it
+    (a client killed at its timeout while the engine finished the stop).
+    Start it again when it is positively stopped; return the note to add."""
+    state = _inspect(ref, "{{.State.Running}}", runtime, run)
+    if state == "true":
+        return ""
+    if state == "false":
+        res = _run(run, [runtime, "start", ref], 180)
+        if res is not None and res.returncode == 0:
+            return f"; '{ref}' had stopped anyway and was started again"
+        return f"; container '{ref}' could NOT be started again — start it by hand"
+    return f"; its state could not be read afterwards — check that '{ref}' is running"
+
+
 def snapshot_with_container_image(
     ref: str,
     *,
@@ -457,7 +489,15 @@ def snapshot_with_container_image(
     last index, and waits until ``lastSnapshotIndex`` reaches it — the whole
     log is then inside the snapshot. The one-off is removed and *ref* started
     again when it was running, so the machine is left as it was found plus
-    the snapshot. Any failure is a ``refused`` verdict naming the step."""
+    the snapshot. Any failure is a ``refused`` verdict naming the step.
+
+    While it waits it prints where it stands every :data:`PROGRESS_EVERY_S`
+    (the live container is stopped meanwhile). A stop of *ref* that fails or
+    times out starts *ref* again when it has stopped anyway. *ref* is started
+    again only once the one-off is positively gone or stopped
+    (:func:`one_off_gone`): two Weaviate processes must never open one data
+    folder, so a one-off that cannot be removed leaves *ref* stopped and the
+    reason says which two commands to run."""
     say = log or (lambda _m: None)
     sleep_fn, clock = sleep or _sleep, monotonic or _monotonic
     deadline_s = timeout if timeout is not None else timeout_s()
@@ -481,7 +521,8 @@ def snapshot_with_container_image(
         say(f"  [raft] stopping {ref} to take a schema snapshot with its own image")
         res = _run(run, [runtime, "stop", "-t", "120", ref], 180)
         if res is None or res.returncode != 0:
-            verdict.reason = f"container '{ref}' could not be stopped for the snapshot run"
+            verdict.reason = (f"container '{ref}' could not be stopped for the snapshot run"
+                              + _restore_after_failed_stop(ref, runtime, run))
             return verdict
     restart_note = ""
     try:
@@ -507,6 +548,8 @@ def snapshot_with_container_image(
         target: Optional[int] = None
         marker = _MarkerState()
         start = clock()
+        next_progress = PROGRESS_EVERY_S
+        phase = "the one-off is not answering yet"
         while True:
             wait = poll_s
             stats = _one_off_stats(base)
@@ -521,6 +564,7 @@ def snapshot_with_container_image(
                 left = deadline_s - (clock() - start)  # each request gets at most this
                 # the statistics route answers before the schema is loaded;
                 # a schema write is served in time only once the node is ready
+                phase = "the one-off has not reported ready yet"
                 if _one_off_ready(base, max(1.0, min(left, 15.0))):
                     marker_error = _write_marker(
                         base, marker, max(1.0, min(left, MARKER_REQUEST_CAP_S)))
@@ -529,6 +573,8 @@ def snapshot_with_container_image(
                         return verdict
                     if not marker.done:  # not yet: back off, doubling from the poll
                         wait = min(MARKER_BACKOFF_CAP_S, poll_s * 2 ** (marker.attempts - 1))
+                        phase = (f"marker attempt {marker.attempts} not done "
+                                 f"({marker.last_error or 'no answer'})")
             if stats is not None and target is None and marker.done:
                 stats = _one_off_stats(base)
                 target = stats.last_log_index if stats is not None else None
@@ -538,7 +584,15 @@ def snapshot_with_container_image(
                                   f"the whole schema log (last index {target})")
                 verdict.lines.append(f"  [raft] {ref}: {verdict.reason}")
                 return verdict
-            remaining = deadline_s - (clock() - start)
+            elapsed = clock() - start
+            remaining = deadline_s - elapsed
+            if target is not None:
+                phase = (f"waiting for the snapshot to reach index {target}"
+                         + (f" (at {stats.last_snapshot_index})" if stats is not None else ""))
+            if remaining > 0 and elapsed >= next_progress:
+                say(f"  [raft] {ref} is stopped for the snapshot run: waited {int(elapsed)} s "
+                    f"of {int(deadline_s)} s; {phase}")
+                next_progress = (elapsed // PROGRESS_EVERY_S + 1) * PROGRESS_EVERY_S
             if remaining <= 0:
                 verdict.reason = (f"no raft snapshot covering the log within {int(deadline_s)} s "
                                   f"(set {TIMEOUT_ENV} for a slower disk)"
@@ -548,7 +602,18 @@ def snapshot_with_container_image(
     finally:
         _run(run, [runtime, "stop", "-t", "60", one_off], 120)
         _run(run, [runtime, "rm", "-f", one_off], 60)
-        if was_running:
+        gone = one_off_gone(one_off, runtime, run)
+        if not gone:  # one more removal before deciding (only VCO's own one-off name)
+            _run(run, [runtime, "rm", "-f", one_off], 120)
+            gone = one_off_gone(one_off, runtime, run)
+        if not gone:
+            restart_note = (f"; the one-off snapshot container '{one_off}' could not be "
+                            f"removed" + (f", so '{ref}' was NOT started again (two Weaviate "
+                                          "processes must never open one data folder)"
+                                          if was_running else "")
+                            + f" — run `{runtime} rm -f {one_off}`"
+                            + (f", then `{runtime} start {ref}`" if was_running else ""))
+        elif was_running:
             res = _run(run, [runtime, "start", ref], 180)
             if res is None or res.returncode != 0:
                 restart_note = f"; container '{ref}' could NOT be started again — start it by hand"
