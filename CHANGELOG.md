@@ -26,7 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing `vco_code_embed` container runs × 1.5, plus the free-space floor (`VCT_DISK_SPACE_MIN_FREE_GB`). When the
   drive the container engine stores images on has less free space than that, the rebuild is skipped, the container
   keeps running on its current image, and the `service_image_no_disk_space` deferral names the space needed and the
-  space free. On a first build (no existing container) the build runs as before.
+  space free. On a first build (no existing container) the build runs as before. The two other places that rebuild
+  that image use the same estimate: moving code_embed to another port from the launcher's Services page (or
+  `python -m vco_lib.service_endpoints move`) is refused before anything is stopped when the rebuild would not fit —
+  the service stays on its old port and container, and the failed move names the space needed, the space free, the
+  drive and what to free — and `python -m vco_lib.service_lifecycle up --build` (used by the session hooks) leaves
+  the service as it is, exits non-zero with the same line and records the same deferral. The update's
+  re-creation of code_embed with its cache (when another compose project created it) is refused the same way, and its
+  `services_foreign_compose_identity` entry carries that line.
 
 ## [0.2.107] - 2026-11-20
 

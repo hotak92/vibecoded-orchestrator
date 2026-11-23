@@ -37,7 +37,13 @@ service's existing container runs — the previous build of the same compose
 image — with the same factor and floor. When it does not fit, ``--build`` is
 dropped, the container keeps running on its current image, and the same
 ``service_image_no_disk_space`` row is recorded. No existing container (a
-first build) or an unreadable size → the build runs as before.
+first build) or an unreadable size → the build runs as before. The two other
+paths that rebuild that image ask the same :func:`build_space_shortfall`:
+``service_lifecycle.migrate_managed_service`` (the launcher's service move and
+install's code_embed migration) refuses the recreate before anything is
+stopped, and ``python -m vco_lib.service_lifecycle up --build`` leaves the
+service alone (exit 3) and records the same row. Each prints
+:func:`no_space_line`.
 """
 from __future__ import annotations
 
@@ -395,13 +401,13 @@ def no_space_entry(short: Sequence[SpaceShortfall], *, runtime: str, rerun: str)
     return DeferralEntry(
         condition_id=CID_NO_DISK_SPACE,
         title="A service's new image does not fit on the disk; it was not updated",
-        detected=f"The update did not download or build the new image of:\n{lines}",
+        detected=f"VCO did not download or build the new image of:\n{lines}",
         why_deferred=(
             "Getting it would have filled the drive the container engine stores images "
             "on. The service keeps running on its current image and its data is untouched. "
             f"Free at least {_gb(gap)} on that drive (`{runtime} system df` shows what the "
             f"engine holds; `{runtime} image prune` removes images no container uses), then "
-            "re-run the update; every update checks again."),
+            "run the command below; every update checks again."),
         command_to_apply=rerun,
         severity="warning",
         kg_node_refs=[],
@@ -471,14 +477,23 @@ def deferral_entry(refused: Sequence[tuple[str, str, str]], *, runtime: str, rer
     )
 
 
+def no_space_line(s: SpaceShortfall, doing: str, *, runtime: str, then: str) -> str:
+    """The one-line refusal every path prints for *s*: need, free, where, what
+    to free, and *then* (the caller's retry). *doing*: ``downloading`` /
+    ``building``."""
+    return (f"{s.service}: {s.image} needs about {_gb(s.need_bytes)} free on {s.where}, "
+            f"{_gb(s.free_bytes)} is free. Not {doing} it; keeping the running container. "
+            f"Free at least {_gb(s.need_bytes - s.free_bytes)} there (`{runtime} system df` "
+            f"shows what the engine holds; `{runtime} image prune` removes images no "
+            f"container uses), then {then}.")
+
+
 def _report_no_space(short: Sequence[SpaceShortfall], doing: str, event: str, *,
                      runtime: str, rerun: str, deferral_report: Any,
                      log_event: Optional[Callable[..., None]]) -> None:
     """Print, install-log and ledger refused pulls/builds (one home)."""
     for s in short:
-        print(f"  [!] {s.service}: {s.image} needs about {_gb(s.need_bytes)} free on "
-              f"{s.where}, {_gb(s.free_bytes)} is free. Not {doing} it; keeping the "
-              f"running container. Free space and re-run the update.")
+        print(f"  [!] {no_space_line(s, doing, runtime=runtime, then='re-run the update')}")
     if log_event is not None:
         log_event("5/10", "warn", event,
                   data={"refused": [[s.service, s.image, s.need_bytes, s.free_bytes,

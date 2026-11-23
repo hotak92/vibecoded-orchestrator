@@ -592,7 +592,10 @@ def migrate_managed_service(
 
     1. The live container's data mount (``/var/lib/weaviate``,
        ``/root/.ollama``, ``/cache``) is read (inspect). No container →
-       ``not_needed``; no data mount, or a bind whose host path is
+       ``not_needed``. A code-embed rebuild that would not fit on the drive
+       the engine stores images on
+       (:func:`vco_lib.compose_image_prepull.build_space_shortfall`, v0.2.108)
+       → ``refused``. No data mount, or a bind whose host path is
        missing/empty → ``refused``. The data inventory is read too (Weaviate's
        class list ``/v1/schema``, Ollama's model list ``/api/tags``);
        unreadable → ``refused``. The data proof is
@@ -681,6 +684,18 @@ def migrate_managed_service(
     if ref is None:
         result.lines.append(f"{tag} no container to migrate; the next compose up creates it.")
         return result
+    if rebuild:
+        # v0.2.108 (A-021 for builds): the rebuild must fit on the drive the
+        # engine stores images on — the one estimate, shared with install
+        # step 5. It does not fit → refused before anything is written or
+        # stopped: the container keeps its image, port and project. Unknown
+        # (no readable size / free space) → the build runs as before.
+        from vco_lib import compose_image_prepull as _pp  # noqa: PLC0415
+
+        short = _pp.build_space_shortfall(service, runtime, run=run)
+        if short is not None:
+            return refuse(_pp.no_space_line(short, "building", runtime=runtime,
+                                            then="try again"))
     live = _sa.live_service_state(ref, runtime, run)
     if live is None:
         return refuse(f"could not positively read container '{ref}' (inspect failed)")
@@ -979,6 +994,13 @@ def up_services(
     ``guard_only``: guard (and remove cleared zombies), but leave the compose
     call to the caller (the CDI-wait wrapper).
 
+    v0.2.108: with *build*, a code_embed whose rebuild would not fit on the
+    drive the engine stores images on
+    (:func:`vco_lib.compose_image_prepull.build_space_shortfall`, the estimate
+    install step 5 uses) is refused before its guard: never removed, never
+    composed, one line naming need / free / where, and a
+    ``service_image_no_disk_space`` entry. Unknown → it builds as before.
+
     v0.2.107 (audit C-1): a Weaviate whose recreate would change the version
     its live container runs is refused by the guard
     (``data_identity.REFUSE_VERSION``) — the container is never removed and
@@ -988,6 +1010,7 @@ def up_services(
     *protected_move*. No ledger row from here: the update that owns the move
     records why it was not made (or the user switched it off)."""
     from vco_lib import code_embed_image as _cei  # noqa: PLC0415
+    from vco_lib import compose_image_prepull as _pp  # noqa: PLC0415
     from vco_lib import compose_provider as _cp  # noqa: PLC0415
     from vco_lib import compose_recovery as _cr  # noqa: PLC0415
     from vco_lib import containers as _containers  # noqa: PLC0415
@@ -1014,6 +1037,18 @@ def up_services(
             out(f"  [{service}] not VCO-managed ({row.mode}) — never composed")
             result.refused.append(service)
             continue
+        if build and service in _pp.BUILT_SERVICES:
+            # v0.2.108 (A-021 for builds): the same estimate as install step
+            # 5. Does not fit → not built, not removed, not composed: the
+            # container keeps running on its current image. Unknown → builds.
+            short = _pp.build_space_shortfall(service, runtime, run=_run)
+            if short is not None:
+                out(f"  [{service}] " + _pp.no_space_line(
+                    short, "building", runtime=runtime, then="run `python install.py --update`"))
+                result.refused.append(service)
+                result.entries.append(_pp.no_space_entry(
+                    [short], runtime=runtime, rerun="python install.py --update"))
+                continue
         g = _di.guard_recreate(service, runtime=runtime, infra_dir=infra, compose_argv=compose_argv,
                                row=row, rows=current, db_path=db_path, run=_run, files=files,
                                project=project, protected_move=protected_move)
