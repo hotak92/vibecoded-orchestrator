@@ -8,7 +8,7 @@
 # (The standalone PyPI `fastmcp` package is NOT a dependency — its only
 # call site, an unused `ToolResult` import in weaviate_mcp/server.py, was
 # removed on 2026-04-28. See PR #31 for context.)
-mcp>=1.27.0,<2
+mcp>=1.27.0,<3
 
 # ─── Weaviate ───
 # Weaviate Python client (BSD-3-Clause)
