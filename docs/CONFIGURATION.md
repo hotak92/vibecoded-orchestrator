@@ -341,6 +341,14 @@ Environment keys for this leg:
 | `VCT_LAUNCHER_BIN` | unset | Explicit path to the launcher binary, highest precedence in the discovery chain (the `VCT_HUB_BIN` of this leg). |
 | `VCO_LAUNCHER_STATE` / `VCO_LAUNCHER_PID` / `VCO_LAUNCHER_REASON` | — | Not inputs: what `launcher_ensure ensure --shell` PRINTS for the bash hook to `eval` (the PowerShell sibling reads the same fields from `--json`). |
 
+### Launcher boot orphan-MCP reaper (v0.2.108)
+
+Right after it wins its instance lock, the launcher looks for VCO stdio MCP servers left behind by a closed Claude session and ends them. It ends a process only when it runs one of this install's own server scripts by exact path (`<orchestrator root>/claude_mcp_servers/weaviate_mcp/server.py` or `…/vct_coordination_mcp/server.py`), is orphaned (dead parent, or reparented to a subreaper on Linux/macOS) and older than 60 s, and has no fresh liveness heartbeat (`<vct_root>/run/mcp/<pid>.json`, younger than 10 min) on itself or a child process. Each MCP process it looks at gets one line in the launcher log, ended or spared, with the reason. Details: `docs/features/01-launcher.md`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `VCT_LAUNCHER_ORPHAN_MCP_REAP` | unset (reaper on) | Set to `0`, `false`, `no` or `off` (case-insensitive) to turn the boot reaper off: the launcher then reads no process table and ends nothing at start, and logs one line saying so. Read from the launcher's own environment at start. It does not affect the pre-update MCP sweep of an orchestrator update, nor the hub's MCP liveness watchdog (governed by the "Restart stopped services automatically" switch). |
+
 ### Launcher process timing knobs (v0.2.102)
 
 The launcher reads these from its own environment at start, so set them in the environment the launcher is started from (the session hook's, or your desktop session's). Each takes a positive integer number of seconds; an unset, empty, non-numeric, zero or negative value means the default. None of them can turn its mechanism off.

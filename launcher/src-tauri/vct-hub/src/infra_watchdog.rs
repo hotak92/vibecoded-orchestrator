@@ -290,13 +290,7 @@ impl WatchdogConfig {
 /// (including unset / empty) → enabled. Enabled-by-default is the whole
 /// point: the watchdog is the safety net.
 pub fn parse_enabled(raw: Option<&str>) -> bool {
-    match raw {
-        None => true,
-        Some(v) => {
-            let norm = v.trim().to_lowercase();
-            !matches!(norm.as_str(), "0" | "false" | "no" | "off")
-        }
-    }
+    vct_launcher_core::config::switch_enabled(raw)
 }
 
 /// Parse the interval override into a seconds value, applying the

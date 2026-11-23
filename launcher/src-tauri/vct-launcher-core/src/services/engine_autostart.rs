@@ -44,16 +44,11 @@ pub const APP_STATE_ENGINE_AUTOSTART: &str = "engine.autostart";
 /// Shipped default: ON. MUST MATCH the Python `DEFAULT_ENGINE_AUTOSTART`.
 pub const DEFAULT_ENGINE_AUTOSTART: bool = true;
 
-/// The falsy values that disable auto-start (lowercase). Kept in step with
-/// the Python `_FALSY` set.
-const FALSY: [&str; 4] = ["0", "false", "no", "off"];
-
-/// True unless [`ENV_AUTOSTART`] is set to a falsy value.
+/// True unless [`ENV_AUTOSTART`] is set to a falsy value (the shared switch
+/// reader, [`crate::config::switch_enabled`], whose off set is kept in step
+/// with the Python `_FALSY` set).
 pub fn autostart_enabled() -> bool {
-    match std::env::var(ENV_AUTOSTART) {
-        Ok(v) => !FALSY.contains(&v.trim().to_ascii_lowercase().as_str()),
-        Err(_) => true,
-    }
+    crate::config::switch_enabled(std::env::var(ENV_AUTOSTART).ok().as_deref())
 }
 
 /// The Preferences toggle (review R19 F4): an absent row, an unreadable

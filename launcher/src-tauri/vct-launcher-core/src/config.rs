@@ -55,9 +55,36 @@ impl LocalConfig {
     }
 }
 
+/// The values that turn an on-by-default env switch OFF (compared trimmed and
+/// lowercased). Kept in step with the Python `_FALSY` set of
+/// `vco_lib.container_engine_start`.
+pub const SWITCH_OFF_VALUES: [&str; 4] = ["0", "false", "no", "off"];
+
+/// The one reader of an on-by-default env switch's raw value: unset, empty
+/// or anything but `0` / `false` / `no` / `off` (case-insensitive, trimmed)
+/// means ON. Shared by `VCT_CONTAINER_ENGINE_AUTOSTART`,
+/// `VCT_HUB_INFRA_WATCHDOG` and `VCT_LAUNCHER_ORPHAN_MCP_REAP`.
+pub fn switch_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => !SWITCH_OFF_VALUES.contains(&v.trim().to_ascii_lowercase().as_str()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_enabled_reads_only_the_off_values_as_off() {
+        assert!(switch_enabled(None));
+        for on in ["", "1", "true", "yes", "on", "banana"] {
+            assert!(switch_enabled(Some(on)), "{on:?} must leave the switch on");
+        }
+        for off in ["0", "false", "FALSE", " no ", "Off", "off"] {
+            assert!(!switch_enabled(Some(off)), "{off:?} must turn the switch off");
+        }
+    }
 
     /// The struct states no endpoint, whatever the environment says: the
     /// retired `VCT_WEAVIATE_URL` / `WEAVIATE_URL` are not read into it (the

@@ -46,6 +46,7 @@ from vco_lib import mcp_stdio_lifetime as lt
 
 REPO = Path(__file__).resolve().parents[1]
 RUST = REPO / "launcher/src-tauri/vct-hub/src/mcp_liveness.rs"
+RUST_HEARTBEAT = REPO / "launcher/src-tauri/vct-launcher-core/src/mcp_heartbeat.rs"
 RUST_CORE = REPO / "launcher/src-tauri/vct-launcher-core/src/process.rs"
 
 def _write_server(tmp_path: Path, body: str) -> Path:
@@ -352,10 +353,14 @@ def test_the_hub_reads_the_record_this_module_writes():
     struct = struct[:struct.index("\n}\n")]
     fields = re.findall(r"pub (\w+):", struct)
     assert sorted(fields) == sorted(["pid", "start_token", "server", "marker", "started_at"])
-    assert 'join("run").join("mcp")' in src
-    assert "MUST MATCH\n/// `vco_lib/mcp_stdio_lifetime.py::heartbeat_dir`" in src
-    # The hub's stale bound is well above the beat interval.
-    stale = int(re.search(r"pub const STALE_SECS: u64 = (\d+);", src).group(1))
+    # The location and the stale bound live in ONE home the hub re-exports
+    # and the launcher's boot orphan reaper also reads (v0.2.108).
+    assert "pub use vct_launcher_core::mcp_heartbeat::{heartbeat_dir, STALE_SECS};" in src
+    home = RUST_HEARTBEAT.read_text(encoding="utf-8")
+    assert 'join("run").join("mcp")' in home
+    assert "MUST MATCH\n/// `vco_lib/mcp_stdio_lifetime.py::heartbeat_dir`" in home
+    # The stale bound is well above the beat interval.
+    stale = int(re.search(r"pub const STALE_SECS: u64 = (\d+);", home).group(1))
     assert stale >= 10 * lt.HEARTBEAT_SECONDS
 
 

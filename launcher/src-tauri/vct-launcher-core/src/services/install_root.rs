@@ -134,7 +134,7 @@ pub fn strip_windows_verbatim_prefix(s: &str) -> String {
 /// letter or UNC) are also ASCII-lowercased because Win32 paths are
 /// case-insensitive. POSIX paths keep their case (conservative: a mismatch
 /// reads as "outside", which refuses a self-update rather than risking one).
-fn containment_key(p: &str) -> String {
+pub fn containment_key(p: &str) -> String {
     let stripped = strip_windows_verbatim_prefix(p);
     let b = stripped.as_bytes();
     let windows_shaped = (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')

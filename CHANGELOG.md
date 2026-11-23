@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The launcher's boot orphan-MCP reaper ends only this install's own, provably abandoned MCP servers** (v0.2.107 Windows checks, Part B). Right after winning its instance lock the launcher scanned every process on the machine and force-ended (`taskkill /T /F` on Windows, SIGTERM elsewhere) any MCP-shaped process whose parent was dead or a subreaper — any `claude_mcp_servers` script of any checkout and any npm MCP — with no way to turn it off and no record of what it spared. It now ends a process only when it runs one of this install's own server scripts by exact path (`<orchestrator root>/claude_mcp_servers/weaviate_mcp/server.py` or `…/vct_coordination_mcp/server.py`), is orphaned and older than 60 s, and neither it nor a child process has a fresh liveness heartbeat (`<vct_root>/run/mcp/<pid>.json`); a server that is still beating is alive and is never ended. Every MCP process it looks at gets one launcher-log line, ended or spared, with the reason. New switch `VCT_LAUNCHER_ORPHAN_MCP_REAP=0` turns the reaper off (documented in `docs/CONFIGURATION.md`).
+
+### Changed
+
+- **The MCP heartbeat's location and 10-minute stale bound have one home** (`vct_launcher_core::mcp_heartbeat`), read by the hub's liveness watchdog and the launcher's boot reaper. Its docs now say that on Windows the heartbeat file is named after the Python interpreter that runs the server (the child of the venv `python.exe` stub), not the pid Claude Code started; the hub reads the pid from the record, so its watchdog is unaffected. The on/off env switches `VCT_CONTAINER_ENGINE_AUTOSTART`, `VCT_HUB_INFRA_WATCHDOG` and the new reaper switch share one reader (same off values: `0` / `false` / `no` / `off`).
+
 ## [0.2.107] - 2026-11-20
 
 ### Added
