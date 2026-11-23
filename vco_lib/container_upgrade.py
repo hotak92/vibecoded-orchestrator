@@ -354,6 +354,17 @@ class ContainerEngine:
         return self._ok(["stop", "-t", "120", name], 300)
 
     def start(self, name: str) -> bool:
+        """Start *name* — only once the raft guard's one-off snapshot container
+        on the same data (``<name>-raft-snapshot``) is positively gone or
+        stopped: two Weaviate processes must never open one data folder, so
+        a one-off that could not be removed keeps *name* stopped (the
+        snapshot's refusal names both commands to run)."""
+        from vco_lib import weaviate_raft_guard as _rg  # noqa: PLC0415
+
+        if not _rg.one_off_gone(f"{name}{_rg.ONE_OFF_SUFFIX}", self.runtime, self.run):
+            self.log(f"  [weaviate] {name} NOT started: its one-off snapshot container "
+                     f"{name}{_rg.ONE_OFF_SUFFIX} is still there")
+            return False
         return self._ok(["start", name], 300)
 
     def remove_container(self, name: str) -> bool:

@@ -9,8 +9,10 @@ row names both numbers. Unknown size → pull as before; free ≥ need → pull.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -266,3 +268,87 @@ def test_step5_drops_the_build_before_compose_runs(tmp_path, monkeypatch):
             assert pp.CID_NO_DISK_SPACE not in w.ledger.cids
         else:
             assert pp.CID_NO_DISK_SPACE in w.ledger.cids
+
+
+# ─── HOTFIX-CHECK M-2: a rebuild counts only the layers above a cached base ──
+
+BASE_REF = "docker.io/pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime"
+BASE_LAYERS = ["sha256:b1", "sha256:b2", "sha256:b3"]
+BASE_SIZE = 6_041_235_685           # measured: the pytorch CUDA base
+BUILT_SIZE = 6_393_463_121          # measured: base + 352 MB pip layer + COPY layers
+
+
+class LayeredEngine:
+    """``image inspect --format '{{.Size}} {{json .RootFS.Layers}}'`` answers as
+    both engines print it (the Go template output is the same shape on docker
+    and podman). *base* = layers of the stored base, ``None`` = not stored."""
+
+    def __init__(self, runtime, graph_root, *, base=BASE_LAYERS, built_layers=None):
+        self.runtime, self.graph_root, self.base = runtime, graph_root, base
+        self.built_layers = built_layers or [*BASE_LAYERS, "sha256:pip", "sha256:copy"]
+
+    def __call__(self, argv, **_kw):
+        cp = subprocess.CompletedProcess
+        assert argv[0] == self.runtime
+        if argv[1] == "inspect" and "--type" in argv:
+            return (cp(argv, 0, "sha256builtce\n", "") if argv[-1] == "vco_code_embed"
+                    else cp(argv, 125, "", "no such container"))
+        if argv[1:3] == ["image", "inspect"]:
+            assert argv[4] == "{{.Size}} {{json .RootFS.Layers}}", argv
+            if argv[-1] == "sha256builtce":
+                return cp(argv, 0, f"{BUILT_SIZE} {json.dumps(self.built_layers)}\n", "")
+            if argv[-1] == BASE_REF and self.base is not None:
+                return cp(argv, 0, f"{BASE_SIZE} {json.dumps(self.base)}\n", "")
+            return cp(argv, 125, "", f"Error: {argv[-1]}: image not known")
+        if argv[1] == "info":
+            return cp(argv, 0, self.graph_root + "\n", "")
+        raise AssertionError(argv)
+
+
+def _ctx(tmp_path):
+    ctx = tmp_path / "ctx"
+    ctx.mkdir(exist_ok=True)
+    (ctx / "Dockerfile").write_text("FROM docker.io/pytorch/pytorch:2.6.0-cpu\nRUN x\n")
+    (ctx / "Dockerfile.cuda").write_text(f"# c\nFROM --platform=linux/amd64 {BASE_REF}\n")
+    return ctx
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker"])
+def test_a_cached_base_counts_only_the_layers_above_it(tmp_path, runtime):
+    eng = LayeredEngine(runtime, str(tmp_path))
+    size, basis = pp.built_image_size("code_embed", runtime, run=eng, context=_ctx(tmp_path))
+    assert size == BUILT_SIZE - BASE_SIZE and BASE_REF in basis
+    # 352 MB x 1.5 + 2 GB floor: about 2.5 GB, not the 11.6 GB the whole image gave
+    need = int(size * pp.PULL_SPACE_FACTOR) + 2 * GIB
+    assert need < 3 * GIB
+    with mock.patch.object(pp, "_CODE_EMBED_CONTEXT", _ctx(tmp_path)):
+        assert pp.build_space_shortfall("code_embed", runtime, run=eng,
+                                        free=lambda _p: 3 * GIB) is None
+        sf = pp.build_space_shortfall("code_embed", runtime, run=eng, free=lambda _p: 2 * GIB)
+    assert sf is not None and sf.need_bytes == need and BASE_REF in sf.basis
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker"])
+def test_a_pruned_base_counts_the_whole_image(tmp_path, runtime):
+    eng = LayeredEngine(runtime, str(tmp_path), base=None)
+    assert pp.built_image_size("code_embed", runtime, run=eng, context=_ctx(tmp_path)) == \
+        (BUILT_SIZE, "the image of container vco_code_embed")
+
+
+def test_a_base_that_is_not_the_bottom_of_the_image_counts_the_whole_image(tmp_path):
+    """The Dockerfile now builds FROM another base (stored, but not the one the
+    old image sits on): the build adds every layer → the whole size."""
+    eng = LayeredEngine("podman", str(tmp_path), base=["sha256:other", "sha256:b2"])
+    size, _ = pp.built_image_size("code_embed", "podman", run=eng, context=_ctx(tmp_path))
+    assert size == BUILT_SIZE
+
+
+def test_dockerfile_bases_reads_the_shipped_dockerfiles():
+    assert pp.dockerfile_bases(pp._CODE_EMBED_CONTEXT) == [
+        "docker.io/pytorch/pytorch:2.6.0-cpu", BASE_REF]
+
+
+def test_dockerfile_bases_skips_args_scratch_and_stages(tmp_path):
+    (tmp_path / "Dockerfile").write_text(
+        "FROM ${BASE} AS a\nFROM scratch\nFROM python:3.12 AS build\nFROM build\n")
+    assert pp.dockerfile_bases(tmp_path) == ["python:3.12"]
