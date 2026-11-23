@@ -275,9 +275,10 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
             # eight QwenCloud Token-Plan rows (v0.2.96) + the Kimi Code k3
             # row and the three Claude 5.5 rows — Opus, Sonnet, Haiku
             # (v0.2.102) + the dated deepseek-v4.1-flash-1017 row (v0.2.106)
+            # + the qwen4-max-preview row (v0.2.108, owner 2026-11-23)
             # — the id sets are pinned in
             # tests/test_model_router_context_table.py.
-            self.assertEqual(len(table.rows), 26)
+            self.assertEqual(len(table.rows), 27)
 
     def test_the_one_m_decisions_survive_the_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

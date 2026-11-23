@@ -435,7 +435,15 @@ VENDORS: Mapping[str, Vendor] = {
         # No claude-* alias table is documented for this endpoint (UNVERIFIED
         # either way); routing's honest-naming guard applies regardless, and
         # server.py's model_echo_mismatches counter is the tripwire for an
-        # undocumented one.
+        # undocumented one. One DOCUMENTED same-model alias exists: the vendor
+        # states qwen4.0-max-preview is the billing spelling of
+        # qwen4-max-preview ("Both IDs can be used; bills uniformly show
+        # qwen4.0-max-preview" — docs.qwencloud.com/token-plan/personal/
+        # token-plan-personal-overview), so a response to that id echoes the
+        # dotted spelling and increments model_echo_mismatches by design. The
+        # gateway has no benign-echo exception mechanism, so the counter is
+        # left to fire (hotfix brief 2026-11-23): a known, documented echo,
+        # not a model swap.
         alias_trap=False,
         # The keyless / fetch-failed fallback, live-verified against the
         # compatible-mode list (probe 2026-11-10): the twenty live ids minus
@@ -444,8 +452,15 @@ VENDORS: Mapping[str, Vendor] = {
         # above. deepseek-v4.1-flash-1017 is listed HERE, which is what makes
         # it an offered id the dated-build rule keeps (owner 2026-11-10: the
         # one approved dated build). validate_registry requires static_ids
-        # on a catalog_url row.
+        # on a catalog_url row. qwen4-max-preview (owner ruling 2026-11-23,
+        # v0.2.108: the shipped qwen implementers pin it) postdates that
+        # probe — the preview opened 2026-11-11 — so it is declared here
+        # ahead of the next live-list capture; a live fetch that lists it
+        # publishes it through the ordinary path. Its "-preview" tail is not
+        # a dated build, and its parsed family (qwen-max-preview) is distinct
+        # from qwen-max, so the latest-only filter keeps both generations.
         static_ids=(
+            "qwen4-max-preview",
             "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
             "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash-1017",
             "deepseek-v4.1-flash", "deepseek-v4-pro",

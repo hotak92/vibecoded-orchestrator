@@ -842,6 +842,10 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 f"claude-sonnet-5-5{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3-flash{ONE_M_SUFFIX}",
+                # v0.2.108 (owner 2026-11-23): the declared-only preview id
+                # parses as its own family (qwen-max-preview), so the
+                # latest-only filter publishes it beside qwen3.8-max.
+                f"claude-gw/qwen/qwen4-max-preview{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.8-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.8-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/glm-5.3{ONE_M_SUFFIX}",

@@ -143,13 +143,20 @@ reach_via = "model: sonnet"
 providers = ["anthropic"]
 scores = ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"]
 
+# v0.2.108 (owner ruling 2026-11-23): the shipped qwen implementers move from
+# Qwen3.8-Max to the Qwen4-Max family's Token Plan preview id (qwen4-max-preview,
+# cheaper than the production qwen4-max while the preview promotion runs).
+# Scores are the Qwen4-Max re-score of 2026-11-17 (independent agent-test and
+# Terminal-Bench evidence); the dagger stays because every published result is
+# at xhigh — no medium/high data exists. The preview retires after 2026-11-25;
+# the note says so and names the production id.
 [[row]]
-id = "qwen3.8-max"
-model = "Qwen3.8-Max"
+id = "qwen4-max-preview"
+model = "Qwen4-Max preview"
 dagger = true
 reach_via = "qwen-implementer / qwen-implementer-high"
 providers = ["qwen"]
-scores = ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"]
+scores = ["7", "6", "5", "6*", "3", "7", "8*", "8", "8*", "8", "5"]
 
 [[row]]
 id = "glm-5.3-flash"
@@ -238,5 +245,5 @@ models = ["glm-5.3-flash"]
 text = "**GLM-5.3-Flash** suits bulk / first-pass work behind a verifier — tests, a diff review or a stronger second pass; retries help it, more effort does not (longer runs helped it only 46% of the time, below chance). Keep it off shared-component extractions, where one un-migrated call-site leaves the suite green while defeating the change, and never give it unsupervised writes to a green test suite (it broke a passing baseline test in 6.9% of rollouts). `glm-flash-researcher` takes bounded code reviews and fix-delta verifications; a large first-pass review stays on GLM-5.3."
 
 [[note]]
-models = ["qwen3.8-max"]
-text = "**Qwen3.8-Max** — best prose and literal instruction-following, but it defaults to xhigh effort (≈$5.4 per task there) and users report it leaves work half-done and skips tests unless asked: state \"add tests and run them\"."
+models = ["qwen4-max-preview"]
+text = "**Qwen4-Max preview** — a clear step over Qwen3.8-Max on agentic work (on an independent agent test it passed all 59 hidden tests, where Qwen3.8-Max finished none; Terminal-Bench 4.0 48.5%: above GLM-5.3 and DeepSeek, below Kimi), and the Qwen4-Max family is 25% cheaper per token, but it is slow to start (≈180 s to first token, 54 tok/s) — not for bulk. Every published score is at xhigh while the API default is high, so a medium-effort lane runs below the benchmarked setting: treat the scores as an upper bound. The preview id (`qwen4-max-preview`) is Token Plan only and the vendor retires it after 2026-11-25 — the production id is `qwen4-max`. Effort set unconfirmed (vendor pages disagree: low/medium/xhigh vs low/high) — probe live before relying on the high-effort lane."

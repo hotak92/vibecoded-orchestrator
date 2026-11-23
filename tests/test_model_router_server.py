@@ -1457,8 +1457,12 @@ class QwenVendorTests(GatewayTestBase):
             row["id"] for row in body["data"]
             if row["id"].startswith("claude-gw/qwen/")
         }
-        self.assertEqual(len(ids), 4)
+        # Five since v0.2.108: the four live-chat winners plus the
+        # declared-only qwen4-max-preview (owner ruling 2026-11-23), whose
+        # parsed family (qwen-max-preview) no latest-only sibling outranks.
+        self.assertEqual(len(ids), 5)
         self.assertIn(qwen_catalog_id("qwen3.8-max"), ids)
+        self.assertIn(qwen_catalog_id("qwen4-max-preview"), ids)
         # No key, no fetch — the picker must not require the key to exist.
         self.assertEqual(self.qwen_up.requests, [])
 
