@@ -168,3 +168,101 @@ def test_condition_is_registered_owned_and_action_required():
     spec = dr.condition(pp.CID_NO_DISK_SPACE)
     assert spec is not None and spec.condition_class == "action_required"
     assert pp.CID_NO_DISK_SPACE in dr.install_owned_ids()
+
+
+# ─── v0.2.108: the code_embed image BUILD gets the same check ─────────────
+
+CE_SIZE = int(7.5 * GIB)
+
+
+class BuildEngine:
+    """A fake engine whose ``vco_code_embed`` container runs a previously
+    built image of *size* bytes (``None`` = no container: a first build)."""
+
+    def __init__(self, graph_root: str, *, size=CE_SIZE):
+        self.graph_root, self.size = graph_root, size
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **_kw):
+        self.calls.append(list(argv))
+        cp = subprocess.CompletedProcess
+        if argv[1] == "inspect" and "--type" in argv:
+            if self.size is None or argv[-1] != "vco_code_embed":
+                return cp(argv, 125, "", f"no such container {argv[-1]}")
+            return cp(argv, 0, "sha256builtce\n", "")
+        if argv[1:3] == ["image", "inspect"] and argv[-1] == "sha256builtce":
+            return cp(argv, 0, f"{self.size}\n", "")
+        if argv[1] == "info":
+            return cp(argv, 0, self.graph_root + "\n", "")
+        raise AssertionError(argv)
+
+
+def _drop_build(engine, free_bytes, *, recreate=("code_embed",), rebuild=("code_embed",)):
+    plan = {"build": ["code_embed"], "recreate": list(recreate), "rebuild": list(rebuild)}
+    report = Report()
+    pp.drop_unfittable_builds(plan["build"], plan["recreate"], plan["rebuild"],
+                              runtime="podman", deferral_report=report,
+                              rerun="python install.py --update", run=engine,
+                              free=lambda _p: free_bytes)
+    return plan, report
+
+
+def test_a_rebuild_that_does_not_fit_loses_its_build_and_keeps_the_container(tmp_path, capsys):
+    plan, report = _drop_build(BuildEngine(str(tmp_path)), int(10 * GIB))
+    assert plan == {"build": [], "recreate": [], "rebuild": []}
+    (entry,) = report.entries
+    assert entry.condition_id == pp.CID_NO_DISK_SPACE
+    text = entry.detected + entry.why_deferred
+    need = int(CE_SIZE * pp.PULL_SPACE_FACTOR) + 2 * GIB
+    assert f"{need / GIB:.1f} GB" in text and "10.0 GB free" in text and str(tmp_path) in text
+    assert "vco_code_embed" in text and "download or build" in text
+    assert "Not building it; keeping the running container" in capsys.readouterr().out
+
+
+def test_a_rebuild_that_fits_is_left_alone(tmp_path):
+    plan, report = _drop_build(BuildEngine(str(tmp_path)), 100 * GIB)
+    assert plan == {"build": ["code_embed"], "recreate": ["code_embed"],
+                    "rebuild": ["code_embed"]}
+    assert report.entries == []
+
+
+def test_a_first_build_with_no_previous_image_runs_as_before(tmp_path):
+    plan, report = _drop_build(BuildEngine(str(tmp_path), size=None), 1)
+    assert plan["build"] == ["code_embed"] and report.entries == []
+
+
+def test_a_recreate_owed_to_a_config_change_survives_a_refused_build(tmp_path):
+    # plan_rebuild adds no recreate when code_embed is already recreated for
+    # its config: only `--build` goes, the config recreate stays
+    plan, report = _drop_build(BuildEngine(str(tmp_path)), 1, rebuild=())
+    assert plan == {"build": [], "recreate": ["code_embed"], "rebuild": []}
+    assert len(report.entries) == 1
+
+
+def test_step5_drops_the_build_before_compose_runs(tmp_path, monkeypatch):
+    """Wiring: install step 5 (compose_up_step) runs the build check, so a
+    rebuild that does not fit never reaches compose; one that fits does."""
+    from tests.test_v02100_install_services_up import World
+
+    for free_bytes, compose_ran in ((1, False), (100 * GIB, True)):
+        root = tmp_path / str(free_bytes)
+        root.mkdir()
+        w = World(root)
+        engine = BuildEngine(str(root))
+        base_run = w.run
+
+        def run(argv, _engine=engine, _base=base_run, **kw):
+            if (argv[1] == "inspect" and "--type" in argv) \
+                    or argv[1:] == ["info", "--format", "{{.Store.GraphRoot}}"] \
+                    or argv[1:3] == ["image", "inspect"]:
+                return _engine(argv)
+            return _base(argv, **kw)
+
+        monkeypatch.setattr(pp, "_free_bytes", lambda _p, _f=free_bytes: _f)
+        w.go(run=run)
+        assert bool(w.compose_calls) is compose_ran
+        if compose_ran:
+            assert "--build" in w.compose_calls[0]
+            assert pp.CID_NO_DISK_SPACE not in w.ledger.cids
+        else:
+            assert pp.CID_NO_DISK_SPACE in w.ledger.cids

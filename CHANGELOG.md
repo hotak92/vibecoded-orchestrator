@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The protected Weaviate move no longer gives up on a large schema after 15 seconds.** Before an update moves
+  Weaviate data onto a new release, a one-off container of the old version takes a raft snapshot, and it first writes
+  a marker class. On a schema with many classes (120 on Weaviate 1.28.4) that write took longer than its fixed 15 s
+  request timeout right after the one-off started, and that single timeout refused the whole move
+  (`weaviate_upgrade_snapshot_refused`) although the snapshot may take up to `VCT_WEAVIATE_SNAPSHOT_TIMEOUT_S` (1800
+  s). The marker is now written only once the one-off reports ready (`/v1/.well-known/ready`), and a timeout, a
+  connection error or a 5xx answer is retried with backoff inside that same budget, each request allowed up to 120 s.
+  A marker create that timed out but did land is recognised on the next try and removed. A definite refusal (an HTTP
+  4xx) still stops the move at once, and when the budget runs out the refusal says which marker step failed last. In
+  every refused case the old container is started again and nothing is removed. `python -m vco_lib.weaviate_raft_guard
+  snapshot` uses the same path.
+- **An update no longer rebuilds the code-embedding image when the build would fill the disk.** v0.2.107 checks the
+  free space before an update downloads a new Weaviate or Ollama image. The code_embed image, which VCO builds from
+  source when the running one is out of date, now gets the same check. The estimate is the size of the image the
+  existing `vco_code_embed` container runs × 1.5, plus the free-space floor (`VCT_DISK_SPACE_MIN_FREE_GB`). When the
+  drive the container engine stores images on has less free space than that, the rebuild is skipped, the container
+  keeps running on its current image, and the `service_image_no_disk_space` deferral names the space needed and the
+  space free. On a first build (no existing container) the build runs as before.
+
 ## [0.2.107] - 2026-11-20
 
 ### Added

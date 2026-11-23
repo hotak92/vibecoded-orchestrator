@@ -29,6 +29,15 @@ when it does not fit, the service is not recreated (it keeps running on its
 current image) and the run records ``service_image_no_disk_space`` naming both
 numbers and the place to free. When either number is unknown the pull runs as
 before.
+
+v0.2.108: the image VCO BUILDS (code_embed, whose ``--build`` step 5 adds when
+the running image is not provably built from the checkout) gets the same
+check: :func:`build_space_shortfall` estimates the build from the image the
+service's existing container runs — the previous build of the same compose
+image — with the same factor and floor. When it does not fit, ``--build`` is
+dropped, the container keeps running on its current image, and the same
+``service_image_no_disk_space`` row is recorded. No existing container (a
+first build) or an unreadable size → the build runs as before.
 """
 from __future__ import annotations
 
@@ -47,6 +56,8 @@ CID_PULL_FAILED = "service_image_pull_failed"
 CID_NO_DISK_SPACE = "service_image_no_disk_space"
 #: Services whose pinned image comes from a registry.
 PULLED_SERVICES: tuple[str, ...] = ("weaviate", "ollama")
+#: Services whose image VCO builds from source (compose ``build:``).
+BUILT_SERVICES: tuple[str, ...] = ("code_embed",)
 
 #: A-021 — what a pull needs, estimated WITHOUT a network call: the on-disk
 #: (uncompressed) size of the image of the SAME repository already installed
@@ -166,7 +177,7 @@ def _pull_from_mirror(runtime: str, image: str, refusal: str, *, run: Optional[R
 
 @dataclass(frozen=True)
 class SpaceShortfall:
-    """A pull refused because it does not fit (both numbers in bytes)."""
+    """A pull or build refused because it does not fit (both numbers in bytes)."""
 
     service: str
     image: str
@@ -274,6 +285,27 @@ def _floor_bytes() -> int:
         return 2 * _GIB
 
 
+def _shortfall(service: str, image: str, previous: Optional[tuple[int, str]], runtime: str,
+               *, run: Optional[RunFn],
+               free: Optional[Callable[[Path], Optional[int]]],
+               ) -> Optional[SpaceShortfall]:
+    """The one estimate: *previous* ``(bytes, ref)`` x :data:`PULL_SPACE_FACTOR`
+    + the free-space floor, against the free space where the engine stores
+    images. ``None`` when it fits or any number is unknown."""
+    if previous is None:
+        return None
+    where = engine_storage_path(runtime, run=run)
+    if where is None:
+        return None
+    free_b = (free or _free_bytes)(where)
+    need = int(previous[0] * PULL_SPACE_FACTOR) + _floor_bytes()
+    if free_b is None or decide_pull_fits(need, free_b):
+        return None
+    return SpaceShortfall(service=service, image=image, need_bytes=need,
+                          free_bytes=int(free_b), where=str(where),
+                          basis=f"{previous[1]}, {previous[0] / _GIB:.1f} GB installed")
+
+
 def pull_space_shortfall(service: str, runtime: str, image: str, *,
                          run: Optional[RunFn] = None,
                          free: Optional[Callable[[Path], Optional[int]]] = None,
@@ -282,20 +314,47 @@ def pull_space_shortfall(service: str, runtime: str, image: str, *,
     ``None`` — including whenever the size or the free space cannot be read
     (then the pull runs as before). Never raises."""
     try:
-        installed = installed_repo_size(runtime, image, run=run)
-        if installed is None:
-            return None
-        where = engine_storage_path(runtime, run=run)
-        if where is None:
-            return None
-        free_b = (free or _free_bytes)(where)
-        need = int(installed[0] * PULL_SPACE_FACTOR) + _floor_bytes()
-        if free_b is None or decide_pull_fits(need, free_b):
-            return None
-        return SpaceShortfall(service=service, image=image, need_bytes=need,
-                              free_bytes=int(free_b), where=str(where),
-                              basis=f"{installed[1]}, {installed[0] / _GIB:.1f} GB installed")
+        return _shortfall(service, image, installed_repo_size(runtime, image, run=run),
+                          runtime, run=run, free=free)
     except Exception:  # noqa: BLE001 — a probe fault never blocks the pull
+        return None
+
+
+def built_image_size(service: str, runtime: str, *,
+                     run: Optional[RunFn] = None) -> Optional[tuple[int, str]]:
+    """``(bytes, ref)`` of the image *service*'s existing container runs — the
+    previous build of that compose image — or ``None`` when no container
+    exists or its image size cannot be read. Local only: ``inspect`` +
+    ``image inspect --format {{.Size}}``."""
+    from vco_lib.containers import all_known_names  # noqa: PLC0415
+
+    for name in all_known_names(service):
+        rc, image_id = _capture(run, [runtime, "inspect", "--type", "container", "--format",
+                                      "{{.Image}}", name], 60.0)
+        image_id = image_id.strip()
+        if rc != 0 or not image_id:
+            continue
+        rc, size = _capture(run, [runtime, "image", "inspect", "--format", "{{.Size}}",
+                                  image_id], 60.0)
+        size = size.strip()
+        if rc == 0 and size.isdigit():
+            return int(size), f"the image of container {name}"
+        return None
+    return None
+
+
+def build_space_shortfall(service: str, runtime: str, *,
+                          run: Optional[RunFn] = None,
+                          free: Optional[Callable[[Path], Optional[int]]] = None,
+                          ) -> Optional[SpaceShortfall]:
+    """A :class:`SpaceShortfall` when rebuilding *service*'s image would not
+    fit, else ``None`` — including a first build (no previous image) and any
+    unreadable number (then the build runs as before). Never raises."""
+    try:
+        return _shortfall(service, f"{service} (built from source)",
+                          built_image_size(service, runtime, run=run),
+                          runtime, run=run, free=free)
+    except Exception:  # noqa: BLE001 — a probe fault never blocks the build
         return None
 
 
@@ -336,9 +395,9 @@ def no_space_entry(short: Sequence[SpaceShortfall], *, runtime: str, rerun: str)
     return DeferralEntry(
         condition_id=CID_NO_DISK_SPACE,
         title="A service's new image does not fit on the disk; it was not updated",
-        detected=f"The update did not download the pinned image of:\n{lines}",
+        detected=f"The update did not download or build the new image of:\n{lines}",
         why_deferred=(
-            "Downloading it would have filled the drive the container engine stores images "
+            "Getting it would have filled the drive the container engine stores images "
             "on. The service keeps running on its current image and its data is untouched. "
             f"Free at least {_gb(gap)} on that drive (`{runtime} system df` shows what the "
             f"engine holds; `{runtime} image prune` removes images no container uses), then "
@@ -412,6 +471,56 @@ def deferral_entry(refused: Sequence[tuple[str, str, str]], *, runtime: str, rer
     )
 
 
+def _report_no_space(short: Sequence[SpaceShortfall], doing: str, event: str, *,
+                     runtime: str, rerun: str, deferral_report: Any,
+                     log_event: Optional[Callable[..., None]]) -> None:
+    """Print, install-log and ledger refused pulls/builds (one home)."""
+    for s in short:
+        print(f"  [!] {s.service}: {s.image} needs about {_gb(s.need_bytes)} free on "
+              f"{s.where}, {_gb(s.free_bytes)} is free. Not {doing} it; keeping the "
+              f"running container. Free space and re-run the update.")
+    if log_event is not None:
+        log_event("5/10", "warn", event,
+                  data={"refused": [[s.service, s.image, s.need_bytes, s.free_bytes,
+                                     s.where] for s in short]})
+    if deferral_report is not None:
+        deferral_report.add_entry(no_space_entry(short, runtime=runtime, rerun=rerun))
+
+
+def drop_unfittable_builds(build_services: list, services_to_recreate: list,
+                           recreate_for_rebuild: list, *, runtime: str,
+                           deferral_report: Any, rerun: str, run: Optional[RunFn] = None,
+                           log_event: Optional[Callable[..., None]] = None,
+                           free: Optional[Callable[[Path], Optional[int]]] = None) -> None:
+    """Step 5's build check (v0.2.108, A-021 for builds): for each service in
+    *build_services* whose rebuild does not fit (:func:`build_space_shortfall`),
+    remove it (in place) from *build_services*, and from *recreate_for_rebuild*
+    and *services_to_recreate* where it was there only for the rebuild — so
+    compose gets no ``--build`` and the container keeps running on its current
+    image — then print why and record :data:`CID_NO_DISK_SPACE`. An unknown
+    estimate keeps the build. Never raises."""
+    if not build_services or not runtime:
+        return
+    try:
+        short = [sf for sf in (build_space_shortfall(svc, runtime, run=run, free=free)
+                               for svc in build_services if svc in BUILT_SERVICES)
+                 if sf is not None]
+    except Exception as exc:  # noqa: BLE001 — a probe fault keeps the old plan
+        print(f"  [!] image build disk-space check failed ({exc}); continuing as planned")
+        return
+    if not short:
+        return
+    refused = {sf.service for sf in short}
+    build_services[:] = [s for s in build_services if s not in refused]
+    for svc in [s for s in recreate_for_rebuild if s in refused]:
+        recreate_for_rebuild.remove(svc)
+        if svc in services_to_recreate:  # added for the rebuild only (plan_rebuild)
+            services_to_recreate.remove(svc)
+    _report_no_space(short, "building", "image build refused: not enough disk space",
+                     runtime=runtime, rerun=rerun, deferral_report=deferral_report,
+                     log_event=log_event)
+
+
 def drop_unpullable_recreates(services_to_recreate: list, *, runtime: str, root: Path,
                               deferral_report: Any, rerun: str,
                               run: Optional[RunFn] = None, timeout: float = 900.0,
@@ -430,16 +539,9 @@ def drop_unpullable_recreates(services_to_recreate: list, *, runtime: str, root:
         fits, short = list(services_to_recreate), []
     if short:
         services_to_recreate[:] = fits
-        for s in short:
-            print(f"  [!] {s.service}: {s.image} needs about {_gb(s.need_bytes)} free on "
-                  f"{s.where}, {_gb(s.free_bytes)} is free. Not downloading it; keeping the "
-                  f"running container. Free space and re-run the update.")
-        if log_event is not None:
-            log_event("5/10", "warn", "image pull refused: not enough disk space",
-                      data={"refused": [[s.service, s.image, s.need_bytes, s.free_bytes,
-                                         s.where] for s in short]})
-        if deferral_report is not None:
-            deferral_report.add_entry(no_space_entry(short, runtime=runtime, rerun=rerun))
+        _report_no_space(short, "downloading", "image pull refused: not enough disk space",
+                         runtime=runtime, rerun=rerun, deferral_report=deferral_report,
+                         log_event=log_event)
     if not services_to_recreate:
         return
     try:

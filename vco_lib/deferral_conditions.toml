@@ -203,9 +203,13 @@ engine, the host folder of the VM disk under Docker Desktop / podman machine) \
 with an estimate of the pull (the installed image of the same repository x 1.5 \
 + the doctor's free-space floor). When it does not fit, the service keeps \
 running on its current image and this row names both numbers and the drive to \
-free. action_required: only the user can free the space. Added to the install \
-run's report, so the next update re-checks and a run whose pull fits does not \
-re-emit it (owned/drop-when-absent)."""
+free. v0.2.108: a code_embed image REBUILD (step 5's `--build`) gets the same \
+check (`compose_image_prepull.drop_unfittable_builds`), its estimate made from \
+the image the existing container runs; a rebuild that does not fit loses its \
+`--build` and the container keeps running. action_required: only the user can \
+free the space. Added to the install run's report, so the next update \
+re-checks and a run whose pull or build fits does not re-emit it \
+(owned/drop-when-absent)."""
 
 [conditions.weaviate_vector_index_update_failed]
 class = "auto_retryable"
