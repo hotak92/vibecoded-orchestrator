@@ -73,6 +73,15 @@
       "source": "https://docs.z.ai/guides/llm/glm-4.5",
       "source_note": "This model has no page of its own (https://docs.z.ai/guides/llm/glm-4.5-air returns 404); its specification sits on the GLM-4.5 card, which is what the cited URL is. Third-party listings of a 1M variant of this model are NOT official and are deliberately not reflected here."
     },
+    "qwen4-max-preview": {
+      "vendor": "qwen",
+      "context_window": 983616,
+      "max_output": 393216,
+      "window_1m": true,
+      "text_only": false,
+      "source": "https://docs.qwencloud.com/models/qwen4-max-preview",
+      "source_note": "The Qwen4-Max family's preview id (owner ruling 2026-11-23, v0.2.108: the shipped qwen implementers pin it). Token Plan only — no pay-as-you-go — and the vendor retires it after the preview ends at 24:00 on 2026-11-25 (UTC+8); the production id is qwen4-max. Figures are VENDOR-STATED (pages read 2026-11-17) unless noted: the cited page gives a 1M-token context and 'Maximum output: 393,216 tokens, shared by thinking and the final answer' — max_output is that shared ceiling, deliberately LARGER than production qwen4-max's 262,144 (do not copy this number onto that id). context_window is 983616, the endpoint's Claude Code ceiling, not the architectural 1M: the vendor's Claude Code page (developer-guides/clients-and-developer-tools/claude-code) sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 in the very example block that uses qwen4-max-preview, and the same ceiling was live-verified on this endpoint for qwen3.8-max (2026-10-06, HTTP 400 InvalidParameter 'Range of input length should be [1, 983616]' — a per-request RANGE, so it is the endpoint's ceiling). Live evidence for THIS id: one gateway request at roughly 85k context tokens answered HTTP 200 (2026-11-17); the window and output figures themselves are not live-probed for this id. window_1m stays true (983,616 is far above the client's 200K default, so the row still earns the [1m] companion; the context guard enforces the delta). text_only=false: the page accepts text, images and video. The vendor documents qwen4.0-max-preview as this id's billing alias ('Both IDs can be used; bills uniformly show qwen4.0-max-preview' — token-plan/personal/token-plan-personal-overview), so a response's model field echoes that dotted spelling — the same model, not a swap."
+    },
     "qwen3.8-max": {
       "vendor": "qwen",
       "context_window": 983616,

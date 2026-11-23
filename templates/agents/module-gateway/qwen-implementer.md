@@ -1,7 +1,7 @@
 ---
 name: qwen-implementer
-description: Qwen3.8-Max lane via the claude-gw gateway for bounded multi-file/multi-step fixes — top qwen-vendor rung above deepseek-implementer; not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer/kimi-reviewer.
-model: claude-gw/qwen/qwen3.8-max[1m]
+description: Qwen4-Max preview lane via the claude-gw gateway for bounded multi-file/multi-step fixes — top qwen-vendor rung above deepseek-implementer; not a reviewer. Worktree lane — research → deepseek-researcher, review → glm-reviewer/kimi-reviewer.
+model: claude-gw/qwen/qwen4-max-preview[1m]
 effort: medium
 background: true
 autoCompactWindow: 750000
@@ -36,11 +36,11 @@ Rules that are absolute:
   file:line evidence rather than inventing work.
 
 Where this lane fits:
-- It is the top rung because the vendor ranks it so: Alibaba's model-selection
-  guide lists qwen3.8-max under "Highest capability" and both
-  deepseek-v4.1-flash (the deepseek lanes pin its 1017 build) and qwen3.8-flash
-  under "Lightweight & low-cost". That
-  is the vendor's tiering, not a VCO measurement.
+- It is the top rung because the vendor ranks it so: QwenCloud's latest-model
+  guide names Qwen4-Max its recommended flagship (this lane pins the family's
+  Token Plan preview id, qwen4-max-preview), while deepseek-v4.1-flash (the
+  deepseek lanes pin its 1017 build) and qwen3.8-flash sit in the lightweight
+  tier. That is the vendor's tiering, not a VCO measurement.
 - Reach for it when one lane must hold several files in view at once, or when
   the cheap flash lane has already produced a lead that needs a second,
   independent implementation attempt in a different model family.

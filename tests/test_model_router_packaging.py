@@ -414,9 +414,10 @@ class FreshVenvInstallTests(unittest.TestCase):
         # 9 GLM rows + the 4 Claude 5 family rows added in v0.2.93 + the 8
         # Token-Plan rows added in v0.2.96 + the Kimi Code k3 row and the 3
         # Claude 5.5 rows (Opus, Sonnet, Haiku) added in v0.2.102 + the
-        # dated deepseek-v4.1-flash-1017 row added in v0.2.106 (the
+        # dated deepseek-v4.1-flash-1017 row added in v0.2.106 + the
+        # qwen4-max-preview row added in v0.2.108 (owner 2026-11-23) (the
         # installed copy must carry the SAME seed the checkout ships).
-        self.assertEqual(completed.stdout.strip(), "26")
+        self.assertEqual(completed.stdout.strip(), "27")
 
     def test_the_console_script_is_installed_and_executable(self) -> None:
         """A declared entry point that produces no runnable file is a promise."""

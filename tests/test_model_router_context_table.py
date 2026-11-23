@@ -43,9 +43,11 @@ EXPECTED_VENDOR_SEED_IDS = {
     "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
 }
 
-#: The nine Token-Plan rows (owner order 2026-09-21, expanded 2026-09-22
-#: with the live compatible-mode probe's deepseek-v4.1-flash, and 2026-11-10
-#: with its dated build deepseek-v4.1-flash-1017). ``glm-5.3``
+#: The ten Token-Plan rows (owner order 2026-09-21, expanded 2026-09-22
+#: with the live compatible-mode probe's deepseek-v4.1-flash, 2026-11-10
+#: with its dated build deepseek-v4.1-flash-1017, and 2026-11-23 with
+#: qwen4-max-preview — owner ruling, v0.2.108: the shipped qwen implementers
+#: pin it). ``glm-5.3``
 #: is NOT duplicated here although that endpoint serves
 #: them too: lookup keys are bare ids and vendor-agnostic, and the rows
 #: above already carry the verified windows — a second row under another
@@ -57,6 +59,9 @@ EXPECTED_QWEN_SEED_IDS = {
     # v0.2.106 (owner 2026-11-10): the published DeepSeek flash is the dated
     # build; same architecture as the undated line, so the same figures.
     "deepseek-v4.1-flash-1017",
+    # v0.2.108 (owner 2026-11-23): the Qwen4-Max family's Token Plan preview
+    # id; its own model page states the figures (see the row's source_note).
+    "qwen4-max-preview",
 }
 
 #: The one Kimi Code row — K3.1 Pro only (owner ruling 2026-11-10, replacing
@@ -98,6 +103,10 @@ QWEN_PER_MODEL_SOURCE = (
     "https://docs.qwencloud.com/developer-guides/getting-started/"
     "text-generation-models"
 )
+
+#: The preview id has its OWN model page (v0.2.108, owner 2026-11-23); the
+#: text-generation-models table does not carry it.
+QWEN_PREVIEW_SOURCE = "https://docs.qwencloud.com/models/qwen4-max-preview"
 
 #: Exactly the models whose official page states a 1M window.
 EXPECTED_1M_IDS = (
@@ -257,6 +266,12 @@ class SeedTests(unittest.TestCase):
             # above the 200K default), and the gateway's context guard plus
             # the overflow translation enforce the 16,384-token delta.
             "qwen3.8-max": (983_616, 128_000),
+            # v0.2.108 (owner 2026-11-23): the same endpoint ceiling (the
+            # vendor's Claude Code page uses this id in its 983616 example
+            # block); max_output is the preview page's own shared
+            # thinking+answer budget, vendor-stated, larger than production
+            # qwen4-max's 262,144. Only a ~85k-context 200 is live for this id.
+            "qwen4-max-preview": (983_616, 393_216),
             # The other rows keep the cited page's 1M: the vendor-wide
             # config value is stated for the endpoint, but only qwen3.8-max
             # is live-verified against it. The guard protects the rest.
@@ -278,8 +293,12 @@ class SeedTests(unittest.TestCase):
                 self.assertEqual(row.context_window, window)
                 self.assertTrue(row.window_1m)
                 self.assertEqual(row.max_output, max_output)
+                expected_source = (
+                    QWEN_PREVIEW_SOURCE if model_id == "qwen4-max-preview"
+                    else QWEN_PER_MODEL_SOURCE
+                )
                 self.assertEqual(
-                    row.source, QWEN_PER_MODEL_SOURCE,
+                    row.source, expected_source,
                     "a window must cite the page that states the PER-MODEL "
                     "figure, not the page describing the client's default",
                 )

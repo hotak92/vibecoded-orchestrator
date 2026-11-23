@@ -37,14 +37,22 @@ QWEN_LIVE_IDS = (
 #: That list as the endpoint serves it.
 QWEN_LIVE_MODELS = {"data": [{"id": model_id} for model_id in QWEN_LIVE_IDS]}
 
-#: The nine chat ids the picker may publish from it — and exactly the shipped
-#: row's declared fallback. ``deepseek-v4.1-flash-1017`` is the one dated
-#: build the row offers (owner 2026-11-10).
+#: The nine chat ids the picker may publish from that live list.
+#: ``deepseek-v4.1-flash-1017`` is the one dated build the row offers
+#: (owner 2026-11-10).
 QWEN_CHAT_IDS = (
     "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
     "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash-1017",
     "deepseek-v4.1-flash", "deepseek-v4-pro",
 )
+
+#: Declared-only ids: in the shipped row's ``static_ids`` (the keyless /
+#: fetch-failed fallback) but NOT in the 2026-11-10 live probe above.
+#: ``qwen4-max-preview`` (owner ruling 2026-11-23, v0.2.108: the shipped qwen
+#: implementers pin it) opened 2026-11-11, after that probe — declared here
+#: so the fallback offers the model the agent files name; a live fetch that
+#: lists it publishes it through the ordinary path.
+QWEN_DECLARED_ONLY_IDS = ("qwen4-max-preview",)
 
 #: The curated-hidden three among them (``catalog_hide_ids``): reported
 #: hidden, routable by name, never published.
@@ -73,7 +81,8 @@ def assert_matches_shipped_row(test, vendor) -> None:
 
     Every id is accounted for exactly once, the excluded set is what the
     catalog's exclusion (prefixes + rules) selects for this row, and the
-    published nine are the row's declared fallback. Pass ``VENDORS["qwen"]``.
+    row's declared fallback is the published nine plus the declared-only
+    ids (newest first). Pass ``VENDORS["qwen"]``.
     """
     from model_router import catalog as cat
 
@@ -103,8 +112,9 @@ def assert_matches_shipped_row(test, vendor) -> None:
         "the row retires exactly glm-5.2",
     )
     test.assertEqual(
-        tuple(vendor.static_ids), QWEN_CHAT_IDS,
-        "the row's declared fallback is the published nine",
+        tuple(vendor.static_ids), QWEN_DECLARED_ONLY_IDS + QWEN_CHAT_IDS,
+        "the row's declared fallback is the published nine plus the "
+        "declared-only preview id, newest first",
     )
     test.assertEqual(
         tuple(vendor.catalog_hide_ids), QWEN_HIDDEN_IDS,

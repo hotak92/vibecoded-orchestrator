@@ -320,5 +320,55 @@ class ShippedAgentPinTests(unittest.TestCase):
                 )
 
 
+class ShippedQwen4PreviewPinTests(unittest.TestCase):
+    """v0.2.108 (owner ruling 2026-11-23): the shipped qwen implementers pin
+    the Qwen4-Max preview id, and that id must resolve everywhere a pin is
+    checked — the keyless static fallback, the context seed, and the
+    router's own validation (the check ``vco doctor`` runs over agent
+    definitions). The flash sweeper stays on qwen3.8-flash."""
+
+    PIN = re.compile(r"^model:\s*(\S+)\s*$", re.MULTILINE)
+    WANT = f"{Q}qwen4-max-preview{ONE_M_SUFFIX}"
+
+    def _pin(self, name: str) -> str:
+        path = REPO / "templates" / "agents" / "module-gateway" / name
+        match = self.PIN.search(path.read_text(encoding="utf-8"))
+        assert match is not None, f"no model pin in {name}"
+        return match.group(1)
+
+    def test_every_shipped_qwen_implementer_pins_qwen4_max_preview(self) -> None:
+        for name in ("qwen-implementer.md", "qwen-implementer-high.md"):
+            with self.subTest(agent=name):
+                self.assertEqual(self._pin(name), self.WANT)
+
+    def test_the_flash_sweeper_stays_on_qwen38_flash(self) -> None:
+        self.assertEqual(
+            self._pin("qwen-flash-sweeper.md"),
+            f"{Q}qwen3.8-flash{ONE_M_SUFFIX}",
+        )
+
+    def test_the_pin_resolves_in_the_static_fallback(self) -> None:
+        vendor = VENDORS["qwen"]
+        self.assertIn("qwen4-max-preview", vendor.static_ids)
+        self.assertNotIn("qwen4-max-preview", vendor.catalog_hide_ids)
+        self.assertNotIn("qwen4-max-preview", vendor.retired_ids)
+
+    def test_the_pin_resolves_in_the_context_seed(self) -> None:
+        row = load_seed().lookup("qwen4-max-preview", "qwen")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row.context_window, 983_616)
+        self.assertEqual(row.max_output, 393_216)
+        self.assertTrue(row.window_1m)
+        self.assertFalse(row.text_only)
+
+    def test_the_router_validates_and_routes_the_pinned_id(self) -> None:
+        ok, _, _ = routing.validate_model_id(self.WANT)
+        self.assertTrue(ok)
+        decision = routing.route(self.WANT)
+        assert isinstance(decision, Route)
+        self.assertEqual(decision.forward_model, "qwen4-max-preview")
+
+
 if __name__ == "__main__":
     unittest.main()

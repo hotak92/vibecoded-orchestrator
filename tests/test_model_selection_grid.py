@@ -30,7 +30,9 @@ from vco_lib import materialize, model_selection
 #: Review 7, `*` dropped on Opus Instr / Kimi Review / DeepSeek Instr;
 #: v0.2.106, owner 2026-11-10: Fable 5.1 -> Fable 5.2 (Claude Code 2.1.321)
 #: re-scored from benchmark evidence — Code/Debug/Review/Plan/Tools 10,
-#: Cost 2), transcribed verbatim: row id -> the 11
+#: Cost 2; v0.2.108, owner 2026-11-23: Qwen3.8-Max -> Qwen4-Max preview,
+#: the shipped qwen implementers' new pin, re-scored from 2026-11-17
+#: evidence), transcribed verbatim: row id -> the 11
 #: column scores, in the source's row ORDER.
 #: Columns: Code, Debug, Review, Plan, Bulk, Tools, Instr, LongCtx, Docs,
 #: Vision, Cost.
@@ -46,7 +48,11 @@ EXPECTED_SCORES = {
     # figures (vendor-reported); every other cell unchanged.
     "deepseek-v4.1-flash": ["7", "6", "7", "6", "9", "7", "7", "8", "7", "7", "10"],
     "sonnet": ["6", "6", "5*", "5", "6", "5", "6*", "7", "7", "8*", "6"],
-    "qwen3.8-max": ["6", "6", "5", "6*", "4", "5", "8", "8", "9", "8", "3"],
+    # v0.2.108 (owner 2026-11-23): the qwen implementer lane moves from
+    # Qwen3.8-Max to the Qwen4-Max preview id, re-scored 2026-11-17 from
+    # independent agent-test and Terminal-Bench evidence — see the comment
+    # above the row in model_selection.toml.
+    "qwen4-max-preview": ["7", "6", "5", "6*", "3", "7", "8*", "8", "8*", "8", "5"],
     "glm-5.3-flash": ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"],
     "qwen3.8-flash": ["5*", "4", "4*", "4*", "7", "4", "8*", "7", "5*", "7", "9"],
     "haiku": ["4", "4", "3*", "3", "8", "5", "6*", "7", "4*", "6", "9"],
@@ -54,7 +60,7 @@ EXPECTED_SCORES = {
 
 #: Rows carrying the `†` marker (only xhigh/max benchmark results).
 #: GLM-5.3 lost its dagger 2026-10-16 (owner): ~110 own medium-effort lanes.
-EXPECTED_DAGGERS = {"kimi-k3.1-pro", "qwen3.8-max", "glm-5.3-flash", "qwen3.8-flash"}
+EXPECTED_DAGGERS = {"kimi-k3.1-pro", "qwen4-max-preview", "glm-5.3-flash", "qwen3.8-flash"}
 
 EXPECTED_COLUMNS = ["Code", "Debug", "Review", "Plan", "Bulk", "Tools",
                     "Instr", "LongCtx", "Docs", "Vision", "Cost"]
@@ -134,10 +140,22 @@ EXPECTED_NOTES = [
                       "rollouts). `glm-flash-researcher` takes bounded code "
                       "reviews and fix-delta verifications; a large first-pass "
                       "review stays on GLM-5.3."),
-    ("qwen3.8-max", "**Qwen3.8-Max** — best prose and literal instruction-"
-                    "following, but it defaults to xhigh effort (≈$5.4 per task "
-                    "there) and users report it leaves work half-done and skips "
-                    "tests unless asked: state \"add tests and run them\"."),
+    ("qwen4-max-preview", "**Qwen4-Max preview** — a clear step over Qwen3.8-Max "
+                          "on agentic work (an independent agent test passed "
+                          "59/59 hidden tests in every run where Qwen3.8-Max "
+                          "finished none; Terminal-Bench 4.0 48.5%: above "
+                          "GLM-5.3 and DeepSeek, below Kimi), and the Qwen4-Max "
+                          "family is 25% cheaper per token, but it is slow to "
+                          "start (≈180 s to first token, 54 tok/s) — not for "
+                          "bulk. Every published score is at xhigh while the "
+                          "API default is high, so a medium-effort lane runs "
+                          "below the benchmarked setting: treat the scores as "
+                          "an upper bound. The preview id (`qwen4-max-preview`) "
+                          "is Token Plan only and the vendor retires it after "
+                          "2026-11-25 — the production id is `qwen4-max`. "
+                          "Effort set unconfirmed (vendor pages disagree: "
+                          "low/medium/xhigh vs low/high) — probe live before "
+                          "relying on the high-effort lane."),
 ]
 
 #: The model-INDEPENDENT caveats — rendered for every grid, whatever the
@@ -172,7 +190,7 @@ class TestProviderFilter:
         assert "6.9% of rollouts" not in md          # GLM-5.3-Flash note
         assert "GLM-5.3 as implementer" not in md    # GLM-5.3 note
         assert "fragile tool calls" not in md        # DeepSeek note
-        assert "best prose" not in md                # Qwen3.8-Max note
+        assert "a clear step over" not in md         # Qwen4-Max preview note
         assert "GLM-5.3-Flash" not in md and "Qwen3.8" not in md
 
     def test_zai_key_adds_the_glm_rows_only(self):
@@ -190,10 +208,11 @@ class TestProviderFilter:
         per-vendor-block."""
         md = model_selection.render_grid(providers=frozenset({"anthropic", "qwen"}))
         assert _rows_rendered(md) == set(CLAUDE_ROWS) | {
-            "GLM-5.3", "DeepSeek V4.1 Flash (1017)", "Qwen3.8-Max †", "Qwen3.8-Flash †",
+            "GLM-5.3", "DeepSeek V4.1 Flash (1017)", "Qwen4-Max preview †",
+            "Qwen3.8-Flash †",
         }
         assert "GLM-5.3-Flash" not in md
-        assert "best prose and literal instruction-following" in md
+        assert "a clear step over Qwen3.8-Max on agentic work" in md
 
     def test_kimi_key_adds_the_kimi_row_only(self):
         md = model_selection.render_grid(providers=frozenset({"anthropic", "kimi"}))

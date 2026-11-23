@@ -46,6 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The shipped qwen implementer lanes move to Qwen4-Max preview.** `qwen-implementer` and
+  `qwen-implementer-high` now pin `claude-gw/qwen/qwen4-max-preview[1m]` (owner ruling 2026-11-23:
+  cheaper than the production `qwen4-max` while the preview promotion runs) instead of
+  `qwen3.8-max[1m]` — the Qwen4-Max family finishes long agent tasks its predecessor abandons.
+  The gateway declares the id in the qwen row's keyless/fetch-failed fallback, the chat-model
+  context seed carries its row (983,616-token endpoint ceiling, the preview page's 393,216-token
+  shared thinking+answer output budget, vision-capable, `[1m]` companion), and the model-selection
+  grid's qwen row is re-scored and renamed to match. `qwen-flash-sweeper` stays on `qwen3.8-flash`.
+  The vendor retires the preview id after 2026-11-25 (the production id is `qwen4-max`); the grid
+  note and the seed row say so. The vendor documents `qwen4.0-max-preview` as the preview's billing
+  alias, so responses echo that dotted spelling and the gateway's `model_echo_mismatches` counter
+  counts it — a documented same-model echo, not a model swap.
 - **The MCP heartbeat's location and 10-minute stale bound have one home** (`vct_launcher_core::mcp_heartbeat`), read by the hub's liveness watchdog and the launcher's boot reaper. Its docs now say that on Windows the heartbeat file is named after the Python interpreter that runs the server (the child of the venv `python.exe` stub), not the pid Claude Code started; the hub reads the pid from the record, so its watchdog is unaffected. The on/off env switches `VCT_CONTAINER_ENGINE_AUTOSTART`, `VCT_HUB_INFRA_WATCHDOG` and the new reaper switch share one reader (same off values: `0` / `false` / `no` / `off`).
 
 ## [0.2.107] - 2026-11-20
