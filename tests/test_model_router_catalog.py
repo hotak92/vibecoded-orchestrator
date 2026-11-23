@@ -703,14 +703,16 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
             len([c for c in calls if "lists.acme.example" in c]), first,
         )
 
-    async def test_the_shipped_row_falls_back_to_its_nine_declared_ids(self) -> None:
+    async def test_the_shipped_row_falls_back_to_its_ten_declared_ids(self) -> None:
         """The shipped Token-Plan row HAS discovery (``catalog_url``), so
         this drives its fallback: the injected fetch answers nothing, the
         row's declared ids answer instead, under the ``declared`` source.
-        Four rows survive as the owner's final advertised qwen list
-        (older same-family siblings hide under the latest filter; the two
-        curated-hidden ids hide under both filters), and ``all`` publishes
-        the nine declared minus the curated-hidden two. The shared glm ids
+        Five rows survive as the owner's final advertised qwen list
+        (older same-family siblings hide under the latest filter; the
+        curated-hidden ids hide under both filters; qwen4-max-preview,
+        declared since v0.2.108, parses as its own family and survives),
+        and ``all`` publishes the ten declared minus the curated-hidden
+        three. The shared glm ids
         are published with the ``[1m]`` suffix — the context table keys on
         the bare id and those ids' verified window is 1M, whatever endpoint
         serves them."""
@@ -721,8 +723,9 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
             e.id for e in default_catalog.entries
             if e.id.startswith("claude-gw/qwen/")
         ]
-        self.assertEqual(len(ids), 4)
+        self.assertEqual(len(ids), 5)
         self.assertIn("claude-gw/qwen/glm-5.3[1m]", ids)
+        self.assertIn("claude-gw/qwen/qwen4-max-preview[1m]", ids)
         self.assertEqual(default_catalog.sources["qwen"], cat.SOURCE_DECLARED)
 
         full_catalog = await _service(
@@ -756,12 +759,14 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(full_catalog.sources["qwen"], cat.SOURCE_DECLARED)
 
-    def test_the_shipped_static_ids_are_exactly_the_live_chat_set(self) -> None:
+    def test_the_shipped_static_ids_are_the_live_chat_set_plus_declared_only(self) -> None:
         """The declared fallback is curated from the same probe: the twenty
         live ids (2026-11-10) minus the ten excluded (eight non-chat ids and
-        two un-offered dated builds) and the retired glm-5.2, with no drift in either direction — a
-        stale fallback would silently differ from the list the
-        endpoint actually serves."""
+        two un-offered dated builds) and the retired glm-5.2, plus the
+        declared-only ids that postdate the probe (qwen4-max-preview, owner
+        ruling 2026-11-23) — with no drift in either direction: a stale
+        fallback would silently differ from the list the endpoint actually
+        serves."""
         assert_matches_shipped_row(self, VENDORS["qwen"])
 
 

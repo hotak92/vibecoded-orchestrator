@@ -557,6 +557,26 @@ def plan_body_template_recreate(
     return (COMPOSE_SERVICE,)
 
 
+def fold_config_recreate(services: Sequence[str], *, services_to_recreate: list,
+                         recreate_for_rebuild: list) -> None:
+    """Add *services* (recreates a CONFIG change asks for, e.g.
+    :func:`plan_body_template_recreate`'s) to step 5's lists, in place.
+
+    A service already in *recreate_for_rebuild* is there only because its
+    image is stale; a config reason now wants it recreated as well, so it
+    leaves that list and stays once in *services_to_recreate*. Step 5's disk
+    check (:func:`vco_lib.compose_image_prepull.drop_unfittable_builds`) then
+    drops only the ``--build`` when the rebuild does not fit, and compose
+    still recreates the container on its current image with the new config —
+    what a config-only change did before v0.2.108. Without this the rewritten
+    ``.env`` would read as applied while the container kept the old one."""
+    for svc in services:
+        if svc in recreate_for_rebuild:
+            recreate_for_rebuild.remove(svc)
+        elif svc not in services_to_recreate:
+            services_to_recreate.append(svc)
+
+
 def build_rejected_lines(failure, manual_cmd: str, infra_dir) -> tuple:
     """What the installer prints when its compose rejected ``--build``.
 

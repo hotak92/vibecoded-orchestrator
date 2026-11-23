@@ -43,7 +43,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from claude_mcp_servers.weaviate_mcp import chunking  # noqa: E402
-from vco_lib import code_embed_image, compose_env, containers  # noqa: E402
+from vco_lib import code_embed_image, compose_env, compose_image_prepull, containers  # noqa: E402
 from vco_lib.ollama_embed_body import (  # noqa: E402
     CONTAINER_BODY_ENV_KEY,
     container_body_template,
@@ -237,7 +237,8 @@ _DEFAULT = object()
 
 
 def _start(install, root: Path, *, identity="infrastructure", in_stack=True, decisions=_DEFAULT,
-           code_embed_url: "str | None" = "http://localhost:11440", embed_config=None):
+           code_embed_url: "str | None" = "http://localhost:11440", embed_config=None,
+           state=None, build_short=None):
     recorded: dict = {}
 
     def fake_run(cmd, **kwargs):
@@ -255,7 +256,7 @@ def _start(install, root: Path, *, identity="infrastructure", in_stack=True, dec
         "weaviate": {"action": install.ACTION_ADOPT, "probe": install.PROBE_FOREIGN},
         "ollama": {"action": install.ACTION_ADOPT, "probe": install.PROBE_FOREIGN},
     }
-    current = code_embed_image.ImageState(code_embed_image.CURRENT, "summary(current)")
+    current = state or code_embed_image.ImageState(code_embed_image.CURRENT, "summary(current)")
     # The ONE in-stack decision reads launcher.db; pinned so the host's own
     # bindings never decide these tests.
     with mock.patch.object(compose_env, "code_embed_container_in_stack", return_value=in_stack), \
@@ -274,6 +275,8 @@ def _start(install, root: Path, *, identity="infrastructure", in_stack=True, dec
                            side_effect=lambda svc, runtime="podman": f"vco_{svc}"), \
          mock.patch.object(install._containers, "compose_identity_of",
                            return_value=containers.ComposeIdentity(identity)), \
+         mock.patch.object(compose_image_prepull, "build_space_shortfall",
+                           return_value=build_short), \
          mock.patch.object(subprocess, "run", side_effect=fake_run):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -343,3 +346,53 @@ def test_the_legacy_branch_follows_the_one_in_stack_decision(install, tmp_path, 
     cmd, _out = _start(install, root, in_stack=True, embed_config=GPU_CFG, decisions=None,
                        code_embed_url=None)
     assert "code_embed" in cmd
+
+
+# ── v0.2.108 (HOTFIX-CHECK M-1): a refused rebuild keeps the config recreate ──
+_STALE = code_embed_image.ImageState(code_embed_image.STALE, "summary(stale)")
+_NO_ROOM = compose_image_prepull.SpaceShortfall(
+    service="code_embed", image="code_embed (built from source)", need_bytes=12 * 1024 ** 3,
+    free_bytes=1024 ** 3, where="/var/lib/containers", basis="the image of container vco_code_embed")
+
+
+def test_a_refused_rebuild_still_recreates_for_the_body_template(install, stale_infra, root_with):
+    """Stale image + body drift + no room for the build: `--build` goes, the
+    body-template recreate stays (on the current image), as a config-only
+    change did before v0.2.108. RED-PROOF: folding the body recreate into the
+    rebuild's (pre-fix install.py) leaves compose not run at all."""
+    root = root_with(stale_infra)
+    cmd, out = _start(install, root, state=_STALE, build_short=_NO_ROOM)
+    assert "--force-recreate" in cmd and "code_embed" in cmd, out
+    assert "--build" not in cmd, cmd
+    assert "Not building it" in out
+    assert _env_value(root / "infrastructure", CONTAINER_BODY_ENV_KEY) == \
+        container_body_template(MODEL)
+
+
+def test_a_rebuild_that_fits_builds_and_recreates_once(install, stale_infra, root_with):
+    root = root_with(stale_infra)
+    cmd, out = _start(install, root, state=_STALE, build_short=None)
+    assert "--build" in cmd and "--force-recreate" in cmd, out
+    assert cmd.count("code_embed") == 1, cmd
+
+
+def test_a_refused_rebuild_without_body_drift_leaves_the_container_alone(install, tmp_path,
+                                                                           root_with):
+    """Leave-alone arm: only the image is stale → the refused build recreates nothing."""
+    infra = tmp_path / "infra_src"
+    infra.mkdir()
+    compose_env.write_infrastructure_env(infra, OLLAMA_CFG)
+    cmd, out = _start(install, root_with(infra), state=_STALE, build_short=_NO_ROOM)
+    assert "code_embed" not in cmd, cmd
+    assert "Not building it" in out
+
+
+def test_fold_config_recreate_moves_a_rebuild_recreate_to_config():
+    recreate, rebuild = ["weaviate", "code_embed"], ["code_embed"]
+    code_embed_image.fold_config_recreate(("code_embed",), services_to_recreate=recreate,
+                                          recreate_for_rebuild=rebuild)
+    assert recreate == ["weaviate", "code_embed"] and rebuild == []
+    recreate = []
+    code_embed_image.fold_config_recreate(("code_embed",), services_to_recreate=recreate,
+                                          recreate_for_rebuild=[])
+    assert recreate == ["code_embed"]

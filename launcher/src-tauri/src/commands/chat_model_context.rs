@@ -1309,7 +1309,8 @@ mod tests {
     /// cited GLM rows, the four first-party Claude 5 rows (read only by
     /// `vco_lib.vscode_settings.decorate_1m`; the gateway publishes
     /// first-party ids verbatim), the v0.2.98-CORRECTED qwen Token-Plan
-    /// rows, nine since v0.2.106's dated DeepSeek flash (the vendor's
+    /// rows, ten since v0.2.108's qwen4-max-preview (nine since v0.2.106's
+    /// dated DeepSeek flash) (the vendor's
     /// PER-MODEL figures — 1M window, `[1m]`, stated `max_output`; until
     /// v0.2.98 they carried the integration page's CLIENT-default 200K and
     /// an unstated 0 output), the Kimi Code row (k3 in v0.2.102, k3.1-pro
@@ -1336,13 +1337,14 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            26,
+            27,
             "the cited GLM rows of handoff §7 minus glm-5.2 (owner-retired in \
              v0.2.100), the four Claude 5 rows plus the three 5.5 rows \
              (v0.2.102: Opus/Sonnet owner-confirmed 2026-10-07, Haiku read \
-             from the models overview 2026-10-08), the nine qwen Token-Plan \
+             from the models overview 2026-10-08), the ten qwen Token-Plan \
              rows (eight from v0.2.96, plus deepseek-v4.1-flash-1017 in \
-             v0.2.106), and the one Kimi Code row (k3.1-pro since the owner \
+             v0.2.106 and qwen4-max-preview in v0.2.108, owner 2026-11-23), \
+             and the one Kimi Code row (k3.1-pro since the owner \
              ruling of 2026-11-10, replacing v0.2.102's k3)"
         );
         // The Kimi Code k3.1-pro row (owner ruling 2026-11-10: K3.1 Pro
@@ -1418,7 +1420,7 @@ mod tests {
         // CLIENT's default window.
         let qwen: Vec<&ChatModelContextInput> =
             rows.iter().filter(|r| r.vendor == "qwen").collect();
-        assert_eq!(qwen.len(), 9, "the nine Token-Plan rows; no PAYG row exists");
+        assert_eq!(qwen.len(), 10, "the ten Token-Plan rows; no PAYG row exists");
         for row in &qwen {
             // v0.2.102 (S16-10): qwen3.8-max carries the endpoint's REAL
             // Claude Code ceiling — 983,616, live-verified by the vendor's
@@ -1426,19 +1428,23 @@ mod tests {
             // matching the vendor's CLAUDE_CODE_MAX_CONTEXT_TOKENS. Still
             // window_1m (983,616 is far above the 200K default); the
             // gateway's context guard and overflow translation enforce the
-            // delta. The other seven rows keep the cited page's per-model
-            // 1M: only qwen3.8-max is live-verified against the endpoint
-            // config value.
-            let expected_window = if row.model_id == "qwen3.8-max" {
+            // delta. qwen4-max-preview (v0.2.108, owner 2026-11-23) carries
+            // the same endpoint ceiling — the vendor's Claude Code page
+            // uses that id in its 983616 example block. The other seven
+            // rows keep the cited page's per-model 1M: only qwen3.8-max is
+            // live-verified against the endpoint config value.
+            let expected_window = if row.model_id == "qwen3.8-max"
+                || row.model_id == "qwen4-max-preview"
+            {
                 983_616
             } else {
                 1_000_000
             };
             assert_eq!(
                 row.context_window, expected_window,
-                "{}: the vendor's per-model window (or, for qwen3.8-max, \
-                 the live-verified endpoint ceiling), never the client \
-                 default",
+                "{}: the vendor's per-model window (or, for qwen3.8-max \
+                 and qwen4-max-preview, the endpoint ceiling), never the \
+                 client default",
                 row.model_id
             );
             assert!(

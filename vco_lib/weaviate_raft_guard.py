@@ -82,6 +82,7 @@ __all__ = [
     "parse_raft_stats",
     "upgrade_check",
     "snapshot_with_container_image",
+    "one_off_gone",
     "scan",
 ]
 
@@ -124,6 +125,15 @@ ONE_OFF_SUFFIX = "-raft-snapshot"
 #: The class the one-off creates and deletes so raft has a command to apply
 #: after the start's configuration entry (see :func:`_write_marker`).
 MARKER_CLASS = "VcoRaftSnapshotMarker"
+#: Cap on ONE marker create/delete request (the remaining budget is used when
+#: smaller): a large schema makes the first schema write on a freshly started
+#: node slow — 120 classes took longer than 15 s on 1.28.4 (v0.2.108 field bug).
+MARKER_REQUEST_CAP_S = 120.0
+#: Ceiling of the wait between two marker attempts (doubling from the poll).
+MARKER_BACKOFF_CAP_S = 30.0
+#: How often a snapshot run still waiting prints where it stands (the live
+#: Weaviate is stopped meanwhile, so a long wait must be visible).
+PROGRESS_EVERY_S = 60.0
 #: Where the data lives inside the container (compose's PERSISTENCE_DATA_PATH).
 DEFAULT_DATA_PATH = "/var/lib/weaviate"
 
@@ -334,37 +344,127 @@ def _one_off_stats(base: str) -> Optional[RaftStats]:
         return None
 
 
-def _write_marker(base: str) -> Optional[str]:
-    """Create and delete :data:`MARKER_CLASS` — two schema COMMANDS. hashicorp
-    raft refuses a snapshot while the FSM has not applied the configuration
-    entry a start appends ("cannot take snapshot now, wait until the
-    configuration entry at N has been applied", measured on 1.28.4), and on an
-    idle node nothing would ever be applied after it. Both commands land in
-    the snapshot, so neither is ever replayed.
-
-    ``None`` on success, else the refusal reason — which names a marker class
-    left in the schema when the create landed and the delete did not (review
-    A-L2; the next attempt removes it through the 422 path)."""
-    created = False
+def _one_off_ready(base: str, timeout: float) -> bool:
+    """``/v1/.well-known/ready`` answers 200: the node has loaded its schema.
+    The statistics route answers earlier, before a schema write can be
+    served in time."""
     try:
-        status, _ = _method_http("POST", f"{base}/v1/schema",
-                                 body={"class": MARKER_CLASS, "vectorizer": "none"})
-        if status not in (200, 422):  # 422: a leftover marker from an interrupted run
-            return (f"the one-off snapshot container did not accept the marker class "
-                    f"{MARKER_CLASS} (HTTP {status})")
-        created = True
-        status, _ = _method_http("DELETE", f"{base}/v1/schema/{MARKER_CLASS}")
-        if status in (200, 204):
-            return None
-        detail = f"HTTP {status}"
-    except Exception as exc:  # noqa: BLE001
-        detail = f"{type(exc).__name__}: {exc}"
-        if not created:
-            return (f"the one-off snapshot container did not accept the marker class "
-                    f"{MARKER_CLASS} ({detail})")
-    return (f"the marker class {MARKER_CLASS} was created but its delete failed ({detail}); "
-            f"an empty {MARKER_CLASS} class may remain in the schema — the next snapshot "
+        status, _ = _method_http("GET", f"{base}/v1/.well-known/ready", timeout=timeout)
+    except Exception:  # noqa: BLE001 — still starting
+        return False
+    return status == 200
+
+
+@dataclass
+class _MarkerState:
+    """Where the marker writes stand across attempts (:func:`_write_marker`)."""
+    #: The marker class is known to be in the schema (create answered 200/422).
+    created: bool = False
+    #: A create got no answer: it may have landed (the next try then gets 422).
+    maybe_created: bool = False
+    #: Create and delete both done.
+    done: bool = False
+    #: Why the last attempt was not final ("" = no attempt failed yet).
+    last_error: str = ""
+    attempts: int = 0
+
+    def may_remain(self) -> bool:
+        return not self.done and (self.created or self.maybe_created)
+
+
+def _marker_left_note() -> str:
+    return (f"an empty {MARKER_CLASS} class may remain in the schema — the next snapshot "
             "attempt removes it")
+
+
+def _write_marker(base: str, state: _MarkerState,
+                  timeout: float = MARKER_REQUEST_CAP_S) -> Optional[str]:
+    """One attempt at creating and deleting :data:`MARKER_CLASS` — two schema
+    COMMANDS. hashicorp raft refuses a snapshot while the FSM has not applied
+    the configuration entry a start appends ("cannot take snapshot now, wait
+    until the configuration entry at N has been applied", measured on
+    1.28.4), and on an idle node nothing would ever be applied after it. Both
+    commands land in the snapshot, so neither is ever replayed.
+
+    Returns a refusal reason only for a DEFINITE refusal (an HTTP 4xx other
+    than the create's 422 and the delete's 404). A timeout, a connection
+    error or a 5xx is "not yet": it is recorded in *state* and the caller
+    retries within its deadline. A create that answered 422 (a leftover
+    marker, or an earlier create of this run that timed out but landed)
+    counts as created, and only the delete is retried after that. A refused
+    delete names the class left in the schema (review A-L2)."""
+    state.attempts += 1
+    try:
+        if not state.created:
+            try:
+                status, _ = _method_http("POST", f"{base}/v1/schema", timeout=timeout,
+                                         body={"class": MARKER_CLASS, "vectorizer": "none"})
+            except Exception:
+                state.maybe_created = True
+                raise
+            if status in (200, 422):  # 422: a leftover marker, or our own create that landed
+                state.created = True
+            elif 400 <= status < 500:
+                if state.maybe_created:
+                    return (f"the one-off snapshot container did not accept the marker class "
+                            f"{MARKER_CLASS} (HTTP {status}); an earlier create got no "
+                            f"answer, so {_marker_left_note()}")
+                return (f"the one-off snapshot container did not accept the marker class "
+                        f"{MARKER_CLASS} (HTTP {status})")
+            else:
+                state.last_error = f"create: HTTP {status}"
+                return None
+        status, _ = _method_http("DELETE", f"{base}/v1/schema/{MARKER_CLASS}", timeout=timeout)
+        if status in (200, 204, 404):  # 404: an earlier delete of this run landed
+            state.done = True
+            return None
+        if 400 <= status < 500:
+            return (f"the marker class {MARKER_CLASS} was created but its delete failed "
+                    f"(HTTP {status}); {_marker_left_note()}")
+        state.last_error = f"delete: HTTP {status}"
+    except Exception as exc:  # noqa: BLE001 — not answered in time / not reachable yet
+        step = "delete" if state.created else "create"
+        state.last_error = f"{step}: {type(exc).__name__}: {exc}"
+    return None
+
+
+def _marker_deadline_note(state: _MarkerState) -> str:
+    """What the deadline refusal adds about an unfinished marker."""
+    if state.done:
+        return ""
+    if not state.attempts:
+        return "; the one-off never reported ready, so the marker class was not written"
+    note = (f"; the marker class {MARKER_CLASS} was not written and removed in time "
+            f"(last attempt: {state.last_error or 'not ready'})")
+    return note + (f"; {_marker_left_note()}" if state.may_remain() else "")
+
+
+def one_off_gone(one_off: str, runtime: str, run: RunFn) -> bool:
+    """The one-off can no longer open the data folder: the engine says there
+    is no such container, or that it is not running. Anything else — still
+    running, or the engine did not answer — is ``False``."""
+    res = _run(run, [runtime, "inspect", "--type", "container", "--format",
+                     "{{.State.Running}}", one_off], 30)
+    if res is None:
+        return False
+    if res.returncode != 0:
+        return "no such" in ((res.stderr or "") + (res.stdout or "")).lower()
+    return (res.stdout or "").strip() == "false"
+
+
+def _restore_after_failed_stop(ref: str, runtime: str, run: RunFn) -> str:
+    """A ``stop`` of *ref* that failed or timed out may still have stopped it
+    (a client killed at its timeout while the engine finished the stop).
+    Start it again when it is positively stopped; return the note to add."""
+    state = _inspect(ref, "{{.State.Running}}", runtime, run)
+    if state == "true":
+        return ""
+    if state == "false":
+        res = _run(run, [runtime, "start", ref], 180)
+        if res is not None and res.returncode == 0:
+            return f"; '{ref}' had stopped anyway and was started again"
+        return f"; container '{ref}' could NOT be started again — start it by hand"
+    return f"; its state could not be read afterwards — check that '{ref}' is running"
 
 
 def snapshot_with_container_image(
@@ -383,12 +483,21 @@ def snapshot_with_container_image(
     *ref* is stopped (two processes must never open one data folder). A
     one-off container of the same image runs with ``--volumes-from ref``, the
     container's own environment plus :data:`ONE_OFF_SNAPSHOT_ENV`, its own
-    memory limit and a loopback-only random host port. Once it answers, VCO
-    writes the marker commands (:func:`_write_marker`), reads the raft log's
+    memory limit and a loopback-only random host port. Once it answers and
+    reports ready, VCO writes the marker commands (:func:`_write_marker`,
+    retried with backoff while they time out or answer 5xx), reads the raft log's
     last index, and waits until ``lastSnapshotIndex`` reaches it — the whole
     log is then inside the snapshot. The one-off is removed and *ref* started
     again when it was running, so the machine is left as it was found plus
-    the snapshot. Any failure is a ``refused`` verdict naming the step."""
+    the snapshot. Any failure is a ``refused`` verdict naming the step.
+
+    While it waits it prints where it stands every :data:`PROGRESS_EVERY_S`
+    (the live container is stopped meanwhile). A stop of *ref* that fails or
+    times out starts *ref* again when it has stopped anyway. *ref* is started
+    again only once the one-off is positively gone or stopped
+    (:func:`one_off_gone`): two Weaviate processes must never open one data
+    folder, so a one-off that cannot be removed leaves *ref* stopped and the
+    reason says which two commands to run."""
     say = log or (lambda _m: None)
     sleep_fn, clock = sleep or _sleep, monotonic or _monotonic
     deadline_s = timeout if timeout is not None else timeout_s()
@@ -412,7 +521,8 @@ def snapshot_with_container_image(
         say(f"  [raft] stopping {ref} to take a schema snapshot with its own image")
         res = _run(run, [runtime, "stop", "-t", "120", ref], 180)
         if res is None or res.returncode != 0:
-            verdict.reason = f"container '{ref}' could not be stopped for the snapshot run"
+            verdict.reason = (f"container '{ref}' could not be stopped for the snapshot run"
+                              + _restore_after_failed_stop(ref, runtime, run))
             return verdict
     restart_note = ""
     try:
@@ -436,8 +546,12 @@ def snapshot_with_container_image(
             return verdict
         base = f"http://127.0.0.1:{port}"
         target: Optional[int] = None
+        marker = _MarkerState()
         start = clock()
+        next_progress = PROGRESS_EVERY_S
+        phase = "the one-off is not answering yet"
         while True:
+            wait = poll_s
             stats = _one_off_stats(base)
             if stats is None and _inspect(one_off, "{{.State.Running}}", runtime, run) != "true":
                 logs = _run(run, [runtime, "logs", "--tail", "3", one_off], 30)
@@ -446,11 +560,22 @@ def snapshot_with_container_image(
                 verdict.reason = ("the one-off snapshot container stopped before it answered"
                                   + (f": {tail[0][:300]}" if tail else ""))
                 return verdict
-            if stats is not None and target is None:
-                marker_error = _write_marker(base)
-                if marker_error is not None:
-                    verdict.reason = marker_error
-                    return verdict
+            if stats is not None and target is None and not marker.done:
+                left = deadline_s - (clock() - start)  # each request gets at most this
+                # the statistics route answers before the schema is loaded;
+                # a schema write is served in time only once the node is ready
+                phase = "the one-off has not reported ready yet"
+                if _one_off_ready(base, max(1.0, min(left, 15.0))):
+                    marker_error = _write_marker(
+                        base, marker, max(1.0, min(left, MARKER_REQUEST_CAP_S)))
+                    if marker_error is not None:
+                        verdict.reason = marker_error
+                        return verdict
+                    if not marker.done:  # not yet: back off, doubling from the poll
+                        wait = min(MARKER_BACKOFF_CAP_S, poll_s * 2 ** (marker.attempts - 1))
+                        phase = (f"marker attempt {marker.attempts} not done "
+                                 f"({marker.last_error or 'no answer'})")
+            if stats is not None and target is None and marker.done:
                 stats = _one_off_stats(base)
                 target = stats.last_log_index if stats is not None else None
             if stats is not None and target is not None and stats.last_snapshot_index >= target:
@@ -459,15 +584,36 @@ def snapshot_with_container_image(
                                   f"the whole schema log (last index {target})")
                 verdict.lines.append(f"  [raft] {ref}: {verdict.reason}")
                 return verdict
-            if clock() - start >= deadline_s:
+            elapsed = clock() - start
+            remaining = deadline_s - elapsed
+            if target is not None:
+                phase = (f"waiting for the snapshot to reach index {target}"
+                         + (f" (at {stats.last_snapshot_index})" if stats is not None else ""))
+            if remaining > 0 and elapsed >= next_progress:
+                say(f"  [raft] {ref} is stopped for the snapshot run: waited {int(elapsed)} s "
+                    f"of {int(deadline_s)} s; {phase}")
+                next_progress = (elapsed // PROGRESS_EVERY_S + 1) * PROGRESS_EVERY_S
+            if remaining <= 0:
                 verdict.reason = (f"no raft snapshot covering the log within {int(deadline_s)} s "
-                                  f"(set {TIMEOUT_ENV} for a slower disk)")
+                                  f"(set {TIMEOUT_ENV} for a slower disk)"
+                                  + _marker_deadline_note(marker))
                 return verdict
-            sleep_fn(poll_s)
+            sleep_fn(min(wait, remaining))
     finally:
         _run(run, [runtime, "stop", "-t", "60", one_off], 120)
         _run(run, [runtime, "rm", "-f", one_off], 60)
-        if was_running:
+        gone = one_off_gone(one_off, runtime, run)
+        if not gone:  # one more removal before deciding (only VCO's own one-off name)
+            _run(run, [runtime, "rm", "-f", one_off], 120)
+            gone = one_off_gone(one_off, runtime, run)
+        if not gone:
+            restart_note = (f"; the one-off snapshot container '{one_off}' could not be "
+                            f"removed" + (f", so '{ref}' was NOT started again (two Weaviate "
+                                          "processes must never open one data folder)"
+                                          if was_running else "")
+                            + f" — run `{runtime} rm -f {one_off}`"
+                            + (f", then `{runtime} start {ref}`" if was_running else ""))
+        elif was_running:
             res = _run(run, [runtime, "start", ref], 180)
             if res is None or res.returncode != 0:
                 restart_note = f"; container '{ref}' could NOT be started again — start it by hand"

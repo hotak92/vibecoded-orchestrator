@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.108] - 2026-11-23
+
+### Fixed
+
+- **The protected Weaviate move no longer gives up on a large schema after 15 seconds.** Before an update moves
+  Weaviate data onto a new release, a one-off container of the old version takes a raft snapshot, and it first writes
+  a marker class. On a schema with many classes (120 on Weaviate 1.28.4) that write took longer than its fixed 15 s
+  request timeout right after the one-off started, and that single timeout refused the whole move
+  (`weaviate_upgrade_snapshot_refused`) although the snapshot may take up to `VCT_WEAVIATE_SNAPSHOT_TIMEOUT_S` (1800
+  s). The marker is now written only once the one-off reports ready (`/v1/.well-known/ready`), and a timeout, a
+  connection error or a 5xx answer is retried with backoff inside that same budget, each request allowed up to 120 s.
+  A marker create that timed out but did land is recognised on the next try and removed. A definite refusal (an HTTP
+  4xx) still stops the move at once, and when the budget runs out the refusal says which marker step failed last. In
+  every refused case the old container is started again and nothing is removed. `python -m vco_lib.weaviate_raft_guard
+  snapshot` uses the same path. While it waits (the old container is stopped meanwhile) it prints every 60 s how long
+  it has waited of the budget and what it is waiting for. A stop of the old container that fails or times out starts
+  it again when it stopped anyway. The old container is started again only once the one-off is gone or stopped, so two
+  Weaviate processes never open one data folder: if the one-off cannot be removed, the refusal names the two commands
+  to run (`<runtime> rm -f <container>-raft-snapshot`, then `<runtime> start <container>`).
+- **An update no longer rebuilds the code-embedding image when the build would fill the disk.** v0.2.107 checks the
+  free space before an update downloads a new Weaviate or Ollama image. The code_embed image, which VCO builds from
+  source when the running one is out of date, now gets the same check. A rebuild reuses the Dockerfile's base image
+  from the engine's store, so the estimate is what the existing `vco_code_embed` container's image adds above that
+  base (about 350 MB for the CUDA image) × 1.5, plus the free-space floor (`VCT_DISK_SPACE_MIN_FREE_GB`); when the
+  base is not stored locally (pruned, or the Dockerfile moved to another one) the whole image counts. When the
+  drive the container engine stores images on has less free space than that, the rebuild is skipped, the container
+  keeps running on its current image, and the `service_image_no_disk_space` deferral names the space needed and the
+  space free. On a first build (no existing container) the build runs as before. The two other places that rebuild
+  that image use the same estimate: moving code_embed to another port from the launcher's Services page (or
+  `python -m vco_lib.service_endpoints move`) is refused before anything is stopped when the rebuild would not fit —
+  the service stays on its old port and container, and the failed move names the space needed, the space free, the
+  drive and what to free — and `python -m vco_lib.service_lifecycle up --build` (used by the session hooks) leaves
+  the service as it is, exits non-zero with the same line and records the same deferral. The update's
+  re-creation of code_embed with its cache (when another compose project created it) is refused the same way, and its
+  `services_foreign_compose_identity` entry carries that line. When the same update also changed the code_embed
+  container's `CODE_EMBED_OLLAMA_BODY` (num_ctx / keep_alive), a skipped rebuild still recreates the container on its
+  current image so the new setting reaches it.
+- **The launcher's boot orphan-MCP reaper ends only this install's own, provably abandoned MCP servers** (v0.2.107 Windows checks, Part B). Right after winning its instance lock the launcher scanned every process on the machine and force-ended (`taskkill /T /F` on Windows, SIGTERM elsewhere) any MCP-shaped process whose parent was dead or a subreaper — any `claude_mcp_servers` script of any checkout and any npm MCP — with no way to turn it off and no record of what it spared. It now ends a process only when it runs one of this install's own server scripts by exact path (`<orchestrator root>/claude_mcp_servers/weaviate_mcp/server.py` or `…/vct_coordination_mcp/server.py`), is orphaned and older than 60 s, and neither it nor a child process has a fresh liveness heartbeat (`<vct_root>/run/mcp/<pid>.json`); a server that is still beating is alive and is never ended. Every MCP process it looks at gets one launcher-log line, ended or spared, with the reason. New switch `VCT_LAUNCHER_ORPHAN_MCP_REAP=0` turns the reaper off (documented in `docs/CONFIGURATION.md`). It runs once the launcher has resolved its orchestrator root, so a launcher installed outside the clone (the Windows and macOS first-install layout) finds the root launcher.db names; with no resolvable root it spares everything.
+
+### Changed
+
+- **The shipped qwen implementer lanes move to Qwen4-Max preview.** `qwen-implementer` and
+  `qwen-implementer-high` now pin `claude-gw/qwen/qwen4-max-preview[1m]` (owner ruling 2026-11-23:
+  cheaper than the production `qwen4-max` while the preview promotion runs) instead of
+  `qwen3.8-max[1m]` — the Qwen4-Max family finishes long agent tasks its predecessor abandons.
+  The gateway declares the id in the qwen row's keyless/fetch-failed fallback, the chat-model
+  context seed carries its row (983,616-token endpoint ceiling, the preview page's 393,216-token
+  shared thinking+answer output budget, vision-capable, `[1m]` companion), and the model-selection
+  grid's qwen row is re-scored and renamed to match. `qwen-flash-sweeper` stays on `qwen3.8-flash`.
+  The vendor retires the preview id after 2026-11-25 (the production id is `qwen4-max`); the grid
+  note and the seed row say so. The vendor documents `qwen4.0-max-preview` as the preview's billing
+  alias, so responses echo that dotted spelling and the gateway's `model_echo_mismatches` counter
+  counts it — a documented same-model echo, not a model swap.
+- **The MCP heartbeat's location and 10-minute stale bound have one home** (`vct_launcher_core::mcp_heartbeat`), read by the hub's liveness watchdog and the launcher's boot reaper. Its docs now say that on Windows the heartbeat file is named after the Python interpreter that runs the server (the child of the venv `python.exe` stub), not the pid Claude Code started; the hub reads the pid from the record, so its watchdog is unaffected. The on/off env switches `VCT_CONTAINER_ENGINE_AUTOSTART`, `VCT_HUB_INFRA_WATCHDOG` and the new reaper switch share one reader (same off values: `0` / `false` / `no` / `off`).
+- **Release mechanics:** version 0.2.107 → 0.2.108 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No new code-graph extractor-generation rung — 0.2.108 is recorded as a non-bump in `EXTRACTOR_GENERATION_NON_BUMPS` (no file of the extractor surface changed since v0.2.107), so no graph is re-walked for this release; `CODEGRAPH_EMBED_REVISION` is unchanged.
+
 ## [0.2.107] - 2026-11-20
 
 ### Added
@@ -14769,7 +14825,8 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.108...HEAD
+[0.2.108]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...v0.2.108
 [0.2.107]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.106...v0.2.107
 [0.2.106]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.105...v0.2.106
 [0.2.105]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.104...v0.2.105

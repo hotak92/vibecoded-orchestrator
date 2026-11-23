@@ -1,7 +1,7 @@
 ---
 name: qwen-implementer-high
-description: High-effort sibling of qwen-implementer on Qwen3.8-Max via the claude-gw gateway — reviews and the hardest bounded implementations (QwenCloud xhigh, ~2.7x tokens). Worktree lane — research → deepseek-researcher.
-model: claude-gw/qwen/qwen3.8-max[1m]
+description: High-effort sibling of qwen-implementer on Qwen4-Max preview via the claude-gw gateway — reviews and the hardest bounded implementations. Worktree lane — research → deepseek-researcher.
+model: claude-gw/qwen/qwen4-max-preview[1m]
 effort: high
 background: true
 autoCompactWindow: 750000
@@ -40,9 +40,10 @@ Where this lane fits:
   difficult bounded implementations. High effort buys harder reasoning,
   not a wider brief — the files and the acceptance criteria are still
   named by the dispatcher.
-- QwenCloud runs this lane at its xhigh tier (it has no native high), at
-  roughly 2.7x the tokens of the medium lane. Reach for it deliberately,
-  not as a default.
+- The vendor's effort mapping for this preview id is not confirmed (its
+  pages disagree: low/medium/xhigh vs low/high), so the gateway forwards
+  the effort as sent. High effort buys harder reasoning at more tokens;
+  reach for it deliberately, not as a default.
 - Its depth is real but its judgement is not a substitute for the
   requester's: a passing test suite it wrote is not evidence that the
   change is correct. The requester verifies load-bearing claims in source.

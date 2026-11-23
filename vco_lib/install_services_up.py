@@ -345,7 +345,13 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
     # recreate whose pull then fails would remove the running container and
     # leave the service down; such a service keeps running and is ledgered.
     from vco_lib.compose_image_prepull import (  # noqa: PLC0415
-        drop_unpullable_recreates, prepull_starts)
+        drop_unfittable_builds, drop_unpullable_recreates, prepull_starts)
+    # v0.2.108: a code_embed REBUILD must fit on the disk too (A-021); one
+    # that does not loses its `--build` and keeps the running container.
+    drop_unfittable_builds(
+        plan.build_services, plan.services_to_recreate, plan.recreate_for_rebuild,
+        runtime=plan.runtime, deferral_report=plan.deferral_report, rerun=_rerun_cmd(plan),
+        run=hooks.run, log_event=hooks.log_event)
     drop_unpullable_recreates(
         plan.services_to_recreate, runtime=plan.runtime,
         root=plan.install_root or plan.infra_dir.parent, deferral_report=plan.deferral_report,

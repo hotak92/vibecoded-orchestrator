@@ -129,7 +129,7 @@ class TestTransientKeepsRows:
             sleeper=_no_sleep)
         assert providers == frozenset({"anthropic", "zai", "qwen"})
         md = model_selection.render_grid(providers=providers)
-        assert "| GLM-5.3 (" in md and "Qwen3.8-Max †" in md
+        assert "| GLM-5.3 (" in md and "Qwen4-Max preview †" in md
         assert "Kimi K3" not in md
 
     def test_unavailable_is_retried_before_the_record_is_consulted(

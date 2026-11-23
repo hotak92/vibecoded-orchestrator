@@ -56,6 +56,7 @@
 //! commands) — silence the false-positive dead-code warnings.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -755,17 +756,28 @@ fn runtime_of(argv0: &str) -> Option<Runtime> {
     })
 }
 
-/// Python: `-m claude_mcp_servers.…` or a script under `claude_mcp_servers`.
-/// `-c <code>` executes text, not a server file → never a match.
-fn python_executes_mcp(args: &[&str]) -> bool {
+/// What a Python argv (after the interpreter) executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonTarget<'a> {
+    /// A script file (the first positional argument, or the one after `--`).
+    Script(&'a str),
+    /// `-m <module>`.
+    Module(&'a str),
+    /// `-c <code>`, a script from stdin, or nothing at all.
+    Other,
+}
+
+/// Read the Python argv (after the interpreter) the way the interpreter does,
+/// up to the thing it runs. `-c <code>` executes text → [`PythonTarget::Other`].
+fn python_target<'a>(args: &[&'a str]) -> PythonTarget<'a> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
         if a == "--" {
-            return args.get(i + 1).is_some_and(|s| is_claude_mcp_script_path(s));
+            return args.get(i + 1).map_or(PythonTarget::Other, |s| PythonTarget::Script(s));
         }
         if a == "-" {
-            return false; // script from stdin
+            return PythonTarget::Other; // script from stdin
         }
         if let Some(flags) = a.strip_prefix('-').filter(|_| !a.starts_with("--")) {
             for (pos, ch) in flags.char_indices() {
@@ -773,9 +785,9 @@ fn python_executes_mcp(args: &[&str]) -> bool {
                 match ch {
                     'm' => {
                         let module = if rest.is_empty() { args.get(i + 1).copied() } else { Some(rest) };
-                        return module.is_some_and(is_claude_mcp_module);
+                        return module.map_or(PythonTarget::Other, PythonTarget::Module);
                     }
-                    'c' => return false,
+                    'c' => return PythonTarget::Other,
                     'W' | 'X' => {
                         if rest.is_empty() {
                             i += 1; // the option's value
@@ -792,9 +804,19 @@ fn python_executes_mcp(args: &[&str]) -> bool {
             i += 1; // long options (`--check-hash-based-pycs` takes a value; harmless to over-skip a flag)
             continue;
         }
-        return is_claude_mcp_script_path(a);
+        return PythonTarget::Script(a);
     }
-    false
+    PythonTarget::Other
+}
+
+/// Python: `-m claude_mcp_servers.…` or a script under `claude_mcp_servers`.
+/// `-c <code>` executes text, not a server file → never a match.
+fn python_executes_mcp(args: &[&str]) -> bool {
+    match python_target(args) {
+        PythonTarget::Script(s) => is_claude_mcp_script_path(s),
+        PythonTarget::Module(m) => is_claude_mcp_module(m),
+        PythonTarget::Other => false,
+    }
 }
 
 /// npx / `npm exec`: the command that actually RUNS — the first positional
@@ -1125,9 +1147,136 @@ pub fn parent_pid_is_subreaper(parent_pid: u32, parent_comm: &str) -> bool {
     }
 }
 
-/// Everything [`steady_state_mcp_should_reap`] needs about one process, read
+// ─── Boot orphan reaper: which processes are VCO's own, and the switch ───
+//
+// v0.2.108 HFKILL (owner's standing rule: "be conservative in what gets
+// deleted to never delete something that was still needed/in use"). The
+// reaper used to end ANY MCP-shaped process with a dead / subreaper parent —
+// any `claude_mcp_servers` script of any checkout, any npm MCP package —
+// with no way to turn it off. It now ends only a process that is:
+//   1. one of VCO's OWN stdio MCP servers, by EXACT script path under THIS
+//      install's orchestrator root ([`vco_own_mcp_script`]);
+//   2. orphaned ([`steady_state_orphan_signal`]: dead parent, or reparented
+//      to a subreaper) and past the spawn-race grace window;
+//   3. without a FRESH liveness heartbeat on itself or any descendant
+//      (`vct_launcher_core::mcp_heartbeat`) — a server whose event loop is
+//      still beating is alive and is never ended here;
+// and only while [`ENV_ORPHAN_MCP_REAP`] is not switched off. Every MCP-shaped
+// process it looks at gets one log line: terminated, or spared and why.
+
+/// The off switch of the boot orphan reaper. `0` / `false` / `no` / `off`
+/// (case-insensitive) → the reaper examines and ends nothing. Documented in
+/// `docs/CONFIGURATION.md`.
+pub const ENV_ORPHAN_MCP_REAP: &str = "VCT_LAUNCHER_ORPHAN_MCP_REAP";
+
+/// VCO's own stdio MCP server scripts, relative to the orchestrator root —
+/// the only processes the boot reaper may end. `weaviate-kg` is the server
+/// VCO registers (`vct_launcher_core::types::default_mcp_servers`);
+/// `vct-coordination` is the VCO-exclusive Pro-tier server that installs into
+/// the same `claude_mcp_servers/` folder of the root, and the reason the
+/// reaper exists (its pre-v0.2.71 server ignored stdin EOF and piled up one
+/// orphan per closed session). Anything else — another checkout's
+/// `claude_mcp_servers`, `-m claude_mcp_servers.…` (no path to anchor), an
+/// npm MCP — is not provably this install's and is spared.
+pub const VCO_STDIO_MCP_SCRIPTS: &[&str] = &[
+    "claude_mcp_servers/weaviate_mcp/server.py",
+    "claude_mcp_servers/vct_coordination_mcp/server.py",
+];
+
+/// Is the boot orphan reaper on? (Pure over the switch's raw value.)
+pub fn orphan_reap_enabled(raw: Option<&str>) -> bool {
+    vct_launcher_core::config::switch_enabled(raw)
+}
+
+/// The VCO server script this argv runs, when it is EXACTLY one of
+/// [`VCO_STDIO_MCP_SCRIPTS`] under `root`: argv[0] a Python runtime (on
+/// Windows the venv `python.exe` stub and its child interpreter both carry
+/// the same argv) and the script an absolute path equal to
+/// `<root>/<script>`. A relative script path, `..` tricks, a module run, a
+/// shell / uv / npx wrapper or another root → `None` (spared).
+pub fn vco_own_mcp_script<S: AsRef<str>>(argv: &[S], root: &Path) -> Option<&'static str> {
+    let argv: Vec<&str> = argv.iter().map(AsRef::as_ref).collect();
+    let (argv0, args) = argv.split_first()?;
+    if runtime_of(argv0) != Some(Runtime::Python) {
+        return None;
+    }
+    let PythonTarget::Script(script) = python_target(args) else {
+        return None;
+    };
+    // One comparison key for both sides (`install_root::containment_key`:
+    // `/` separators, no `\\?\` prefix, no trailing separator, Windows-shaped
+    // paths lowercased).
+    use vct_launcher_core::services::install_root::containment_key;
+    let script = containment_key(script);
+    if path_components(&script).iter().any(|c| *c == "." || *c == "..") {
+        return None;
+    }
+    let root = root.to_string_lossy();
+    let root_key = containment_key(&root);
+    let b = root_key.as_bytes();
+    let root_is_absolute =
+        root_key.starts_with('/') || (b.len() >= 3 && b[1] == b':' && b[2] == b'/');
+    if !root_is_absolute {
+        return None;
+    }
+    VCO_STDIO_MCP_SCRIPTS
+        .iter()
+        .copied()
+        .find(|rel| script == containment_key(&format!("{}/{rel}", root.trim_end_matches(['/', '\\']))))
+}
+
+/// Why the boot reaper left an MCP-shaped process alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpareReason {
+    /// The launcher could not resolve its orchestrator root, so no process
+    /// is provably this install's.
+    NoInstallRoot,
+    /// Not one of [`VCO_STDIO_MCP_SCRIPTS`] under this install's root.
+    NotThisInstallsServer,
+    /// Younger than [`STEADY_STATE_MCP_MIN_AGE_SECS`].
+    TooYoung,
+    /// No parent pid known: orphanhood cannot be confirmed.
+    ParentUnknown,
+    /// Its liveness heartbeat (on this pid, or on a descendant — the Windows
+    /// interpreter child of a venv stub) is fresh: the server is alive.
+    FreshHeartbeat(u32),
+    /// Its parent is alive and is not a subreaper: a session is attached.
+    ParentAlive,
+}
+
+impl SpareReason {
+    /// Human-readable reason for the "spared" log line.
+    pub fn describe(self) -> String {
+        match self {
+            SpareReason::NoInstallRoot => {
+                "the orchestrator root is unknown, so no process is provably this install's".into()
+            }
+            SpareReason::NotThisInstallsServer => {
+                "not one of this install's own MCP server scripts".into()
+            }
+            SpareReason::TooYoung => format!(
+                "younger than {STEADY_STATE_MCP_MIN_AGE_SECS} s (spawn-race grace)"
+            ),
+            SpareReason::ParentUnknown => "its parent is unknown".into(),
+            SpareReason::FreshHeartbeat(pid) => format!(
+                "its liveness heartbeat ({pid}.json) is fresh — the server is alive"
+            ),
+            SpareReason::ParentAlive => "its parent is alive".into(),
+        }
+    }
+}
+
+/// The boot reaper's verdict on one MCP-shaped process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapDecision {
+    Reap(OrphanSignal),
+    Spare(SpareReason),
+}
+
+/// Everything the boot reaper's decision needs about one process, read
 /// from a [`refresh_with_cmdlines`] snapshot. Split from the reaper loop so a
-/// real-process test can assert what the reaper actually sees.
+/// real-process test can assert what the reaper actually sees, and so the
+/// decision ([`ReapInputs::decision`]) is a pure function of plain data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReapInputs {
     pub pid: u32,
@@ -1140,15 +1289,17 @@ pub(crate) struct ReapInputs {
     pub parent_pid: Option<u32>,
     pub parent_alive: Option<bool>,
     pub parent_is_subreaper: bool,
+    /// The orchestrator root was resolved (else nothing is provably ours).
+    pub root_known: bool,
+    /// [`vco_own_mcp_script`] for this argv under that root.
+    pub vco_script: Option<&'static str>,
+    /// The first pid of this process's tree (itself, then descendants) with a
+    /// fresh heartbeat. Only looked up for this install's own servers.
+    pub fresh_heartbeat: Option<u32>,
 }
 
 impl ReapInputs {
-    /// Apply the orphan predicate to these inputs.
-    pub(crate) fn should_reap(&self) -> bool {
-        self.orphan_signal().is_some()
-    }
-
-    /// The orphan decision with its reason.
+    /// The orphan predicate alone (no identity / heartbeat gates).
     pub(crate) fn orphan_signal(&self) -> Option<OrphanSignal> {
         steady_state_orphan_signal(
             self.is_self,
@@ -1159,6 +1310,64 @@ impl ReapInputs {
             self.parent_is_subreaper,
         )
     }
+
+    /// The boot reaper's decision (pure). `None` for a process that is not
+    /// MCP-shaped (or is the launcher itself) — it is neither reaped nor
+    /// logged. Gates, in order: install root known → this install's own
+    /// server → old enough → parent known → no fresh heartbeat → orphaned.
+    pub(crate) fn decision(&self) -> Option<ReapDecision> {
+        if self.is_self || !is_mcp_server_argv(&self.argv) {
+            return None;
+        }
+        let spare = |r| Some(ReapDecision::Spare(r));
+        if !self.root_known {
+            return spare(SpareReason::NoInstallRoot);
+        }
+        if self.vco_script.is_none() {
+            return spare(SpareReason::NotThisInstallsServer);
+        }
+        if self.run_time_secs < STEADY_STATE_MCP_MIN_AGE_SECS {
+            return spare(SpareReason::TooYoung);
+        }
+        if self.parent_pid.is_none() {
+            return spare(SpareReason::ParentUnknown);
+        }
+        if let Some(pid) = self.fresh_heartbeat {
+            return spare(SpareReason::FreshHeartbeat(pid));
+        }
+        match self.orphan_signal() {
+            Some(signal) => Some(ReapDecision::Reap(signal)),
+            None => spare(SpareReason::ParentAlive),
+        }
+    }
+
+    /// Would the boot reaper end this process?
+    pub(crate) fn should_reap(&self) -> bool {
+        matches!(self.decision(), Some(ReapDecision::Reap(_)))
+    }
+}
+
+/// What one boot-reaper run needs besides the process table.
+#[derive(Debug, Clone)]
+pub(crate) struct ReapContext {
+    /// [`ENV_ORPHAN_MCP_REAP`] read through [`orphan_reap_enabled`].
+    pub enabled: bool,
+    /// This install's orchestrator root; `None` spares everything.
+    pub root: Option<PathBuf>,
+    /// `<vct_root>/run/mcp`.
+    pub heartbeat_dir: PathBuf,
+    pub now: std::time::SystemTime,
+}
+
+/// pid → direct children, from one snapshot (the heartbeat tree walk).
+fn children_map(sys: &sysinfo::System) -> HashMap<u32, Vec<u32>> {
+    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, proc) in sys.processes() {
+        if let Some(ppid) = proc.parent() {
+            map.entry(ppid.as_u32()).or_default().push(pid.as_u32());
+        }
+    }
+    map
 }
 
 /// Read the reaper's inputs for `proc` out of the snapshot `sys`.
@@ -1167,6 +1376,8 @@ pub(crate) fn reap_inputs(
     pid: sysinfo::Pid,
     proc: &sysinfo::Process,
     my_pid: u32,
+    ctx: &ReapContext,
+    children: &HashMap<u32, Vec<u32>>,
 ) -> ReapInputs {
     use vct_launcher_core::process::pid_is_alive;
 
@@ -1184,11 +1395,12 @@ pub(crate) fn reap_inputs(
     // Orphan signal (b) — POSIX reparenting. Resolve whether the parent is a
     // subreaper (PID 1 / systemd / launchd). On POSIX an orphan is reparented
     // to a live subreaper the instant its real parent exits, so signal (a)
-    // (dead parent) is unreachable there; (b) catches it. A live session-
-    // attached MCP's parent is the Claude process, never a subreaper, so this
-    // never reaps a healthy MCP. Look up the parent process's exe basename
-    // from the same snapshot; "" when the parent row isn't in the table
-    // (then only the PID-1 check inside parent_pid_is_subreaper applies).
+    // (dead parent) is unreachable there; (b) catches it. A subreaper parent
+    // alone is NOT proof (a process a user starts from a `systemd --user`
+    // unit has one too): the reaper also needs the exact VCO script path and
+    // a heartbeat that is not fresh before it acts. Look up the parent
+    // process's exe basename from the same snapshot; "" when the parent row
+    // isn't in the table (then only the PID-1 check applies).
     let parent_is_subreaper = parent_pid
         .map(|ppid| {
             let comm = sys
@@ -1205,75 +1417,152 @@ pub(crate) fn reap_inputs(
         })
         .unwrap_or(false);
 
+    let argv = argv_of(proc);
+    let vco_script = ctx
+        .root
+        .as_deref()
+        .filter(|_| is_mcp_server_argv(&argv))
+        .and_then(|root| vco_own_mcp_script(&argv, root));
+    // Heartbeat files are read only for this install's own servers. The
+    // tree walk matters on Windows: the matched process is often the venv
+    // stub, and the file is named after its child interpreter.
+    let fresh_heartbeat = vco_script.and_then(|_| {
+        vct_launcher_core::mcp_heartbeat::fresh_heartbeat_in_tree(
+            pid.as_u32(),
+            children,
+            &|p| vct_launcher_core::mcp_heartbeat::heartbeat_is_fresh(&ctx.heartbeat_dir, p, ctx.now),
+        )
+    });
+
     ReapInputs {
         pid: pid.as_u32(),
         is_self: pid.as_u32() == my_pid,
-        argv: argv_of(proc),
         cmdline: joined_cmdline(proc),
+        argv,
         run_time_secs: proc.run_time(),
         parent_pid,
         parent_alive,
         parent_is_subreaper,
+        root_known: ctx.root.is_some(),
+        vco_script,
+        fresh_heartbeat,
     }
+}
+
+/// The boot reaper's plan over already-read inputs (pure): nothing at all
+/// when the switch is off, else every MCP-shaped row with its decision.
+pub(crate) fn plan_orphaned_mcp_reap(
+    rows: Vec<ReapInputs>,
+    enabled: bool,
+) -> Vec<(ReapInputs, ReapDecision)> {
+    if !enabled {
+        return Vec::new();
+    }
+    rows.into_iter()
+        .filter_map(|r| r.decision().map(|d| (r, d)))
+        .collect()
 }
 
 /// The orphan reaper over an existing snapshot, terminate step injected (see
 /// [`run_mcp_kill_sweep`]). Returns the number of orphans handed to
-/// `terminate`.
+/// `terminate`. One log line per MCP-shaped process: terminated, or spared
+/// with the reason.
 fn run_orphaned_mcp_reap(
     sys: &sysinfo::System,
     my_pid: u32,
+    ctx: &ReapContext,
     terminate: &mut dyn FnMut(&sysinfo::Process),
 ) -> usize {
-    let mut matched = 0usize;
-    let mut orphans: Vec<(&sysinfo::Process, ReapInputs, OrphanSignal)> = Vec::new();
-    for (pid, proc) in sys.processes() {
-        let inputs = reap_inputs(sys, *pid, proc, my_pid);
-        if is_mcp_server_argv(&inputs.argv) {
-            matched += 1;
-        }
-        if let Some(signal) = inputs.orphan_signal() {
-            orphans.push((proc, inputs, signal));
-        }
-    }
-    // Counters first, so they are on record even if a terminate misbehaves.
-    log_enumeration("steady-state reap", enumeration_stats(sys), matched);
-
-    for (proc, inputs, signal) in &orphans {
-        tracing::warn!(
-            "[update_gate] steady-state reap: terminating ORPHANED MCP PID {} \
-             ({}, age {}s, cmd: {})",
-            inputs.pid,
-            signal.describe(inputs.parent_pid),
-            inputs.run_time_secs,
-            inputs.cmdline.chars().take(120).collect::<String>()
+    if !ctx.enabled {
+        tracing::info!(
+            "[update_gate] steady-state reap: off ({}) — no process examined",
+            ENV_ORPHAN_MCP_REAP
         );
-        terminate(proc);
+        return 0;
     }
-    orphans.len()
+    let children = children_map(sys);
+    let rows: Vec<ReapInputs> = sys
+        .processes()
+        .iter()
+        .map(|(pid, proc)| reap_inputs(sys, *pid, proc, my_pid, ctx, &children))
+        .collect();
+    let plan = plan_orphaned_mcp_reap(rows, ctx.enabled);
+    // Counters first, so they are on record even if a terminate misbehaves.
+    log_enumeration("steady-state reap", enumeration_stats(sys), plan.len());
+    if ctx.root.is_none() {
+        tracing::warn!(
+            "[update_gate] steady-state reap: the orchestrator root could not be \
+             resolved — every MCP process is spared"
+        );
+    }
+
+    let mut reaped = 0usize;
+    for (inputs, decision) in &plan {
+        let cmd = inputs.cmdline.chars().take(160).collect::<String>();
+        match decision {
+            ReapDecision::Reap(signal) => {
+                let Some(proc) = sys.process(sysinfo::Pid::from_u32(inputs.pid)) else {
+                    continue;
+                };
+                tracing::warn!(
+                    "[update_gate] steady-state reap: terminating ORPHANED VCO MCP PID {} \
+                     ({}, no fresh heartbeat, age {}s, cmd: {})",
+                    inputs.pid,
+                    signal.describe(inputs.parent_pid),
+                    inputs.run_time_secs,
+                    cmd
+                );
+                terminate(proc);
+                reaped += 1;
+            }
+            ReapDecision::Spare(reason) => {
+                tracing::info!(
+                    "[update_gate] steady-state reap: sparing MCP PID {} — {} (cmd: {})",
+                    inputs.pid,
+                    reason.describe(),
+                    cmd
+                );
+            }
+        }
+    }
+    reaped
 }
 
-/// v0.2.71 (P6): best-effort steady-state reaper for ORPHANED coordination /
-/// MCP processes whose controlling Claude session is gone.
+/// v0.2.71 (P6), made conservative in v0.2.108: best-effort boot reaper for
+/// ORPHANED VCO stdio MCP servers whose controlling Claude session is gone.
 ///
 /// WHY this exists: a coordination MCP that ignores stdin-EOF (the
 /// `vct-coordination` server.py pre-v0.2.71 zombie-poller bug) survives session
 /// close and accumulates one orphan per closed Claude surface, each burning CPU
 /// polling Supabase forever. The server-side fix (cancel the poll loop on EOF)
 /// makes such processes self-exit, so on a fixed install this reaper finds
-/// NOTHING. It is defense-in-depth: it backstops any MCP — present or future —
-/// that regresses to ignoring EOF, by reaping only processes we can POSITIVELY
-/// confirm are orphaned (dead parent + past the spawn-race grace window).
+/// NOTHING.
+///
+/// How much it still adds (v0.2.108 review): for `weaviate-kg` very little —
+/// since v0.2.106 the server ends itself when its client goes (stdin EOF, or
+/// its parent watchdog), and since v0.2.107 the hub's liveness watchdog
+/// (`vct-hub/src/mcp_liveness.rs`) ends one that hangs. What remains is a
+/// server that writes no heartbeat (`vct-coordination`, a server from before
+/// v0.2.107) and the window when the hub is not running. It is kept as that
+/// backstop, with the gates listed at [`ENV_ORPHAN_MCP_REAP`]'s section.
 ///
 /// Unlike `pre_update_mcp_kill_sweep` (which runs inside the update flow and
 /// reaps ALL matching MCPs because the whole MCP fleet is about to respawn
-/// against a fresh binary), this runs in STEADY STATE (e.g. launcher startup)
-/// and must NOT touch MCPs with a live parent session. The orphan predicate
-/// ([`steady_state_mcp_should_reap`]) enforces that. Its argv match reads
-/// the [`refresh_with_cmdlines`] snapshot (argv exists only there).
+/// against a fresh binary), this runs in STEADY STATE (launcher startup)
+/// and must NOT touch a server that is still in use. [`ReapInputs::decision`]
+/// enforces that. Its argv match reads the [`refresh_with_cmdlines`]
+/// snapshot (argv exists only there).
+///
+/// The root comes from [`resolve_current_exe_without_db`]: the clone above
+/// the binary, else the process cache `lib.rs` primes from launcher.db just
+/// before calling this — so a launcher installed outside the clone (Windows /
+/// macOS first install) reaps too. No root → every process is spared.
+///
+/// [`resolve_current_exe_without_db`]: vct_launcher_core::services::install_root::resolve_current_exe_without_db
 ///
 /// Posture: [`terminate_mcp_server`] (SIGTERM on POSIX, never SIGKILL; a
-/// `taskkill /T /F` tree kill on Windows) + soft-fail, never blocks boot.
+/// `taskkill /T /F` tree kill on Windows — which is why a fresh heartbeat
+/// anywhere in the tree spares the process) + soft-fail, never blocks boot.
 /// Returns the number of orphans signalled (informational). Refuses under a
 /// cargo test binary — a real orphaned MCP on the developer's machine is not
 /// the test's to reap; tests drive [`run_orphaned_mcp_reap`] with an injected
@@ -1286,8 +1575,27 @@ pub fn steady_state_orphaned_mcp_reap() -> usize {
         );
         return 0;
     }
-    let sys = process_table_with_cmdlines();
-    run_orphaned_mcp_reap(&sys, std::process::id(), &mut terminate_mcp_server)
+    let enabled = orphan_reap_enabled(std::env::var(ENV_ORPHAN_MCP_REAP).ok().as_deref());
+    let root = if enabled {
+        match vct_launcher_core::services::install_root::resolve_current_exe_without_db() {
+            Ok(r) => Some(r.path),
+            Err(e) => {
+                tracing::warn!("[update_gate] steady-state reap: orchestrator root not found: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let ctx = ReapContext {
+        enabled,
+        root,
+        heartbeat_dir: vct_launcher_core::mcp_heartbeat::heartbeat_dir(),
+        now: std::time::SystemTime::now(),
+    };
+    // Switched off: not even the process table is read.
+    let sys = if enabled { process_table_with_cmdlines() } else { sysinfo::System::new() };
+    run_orphaned_mcp_reap(&sys, std::process::id(), &ctx, &mut terminate_mcp_server)
 }
 
 /// v0.2.59: return true if a process's executable BASENAME identifies it
@@ -2012,7 +2320,8 @@ mod tests {
     fn reaper_runner_is_no_panic_and_returns_count() {
         let sys = process_table_with_cmdlines();
         let mut targeted = Vec::new();
-        let reaped = run_orphaned_mcp_reap(&sys, std::process::id(), &mut |p| {
+        let ctx = reap_ctx(Some(PathBuf::from("/nonexistent-vco-root")), PathBuf::from("/nonexistent-hb"));
+        let reaped = run_orphaned_mcp_reap(&sys, std::process::id(), &ctx, &mut |p| {
             targeted.push(p.pid().as_u32())
         });
         assert_eq!(reaped, targeted.len());
@@ -2027,7 +2336,8 @@ mod tests {
         let me = std::process::id();
         let sys = process_table_with_cmdlines();
         let mut targeted = Vec::new();
-        let _ = run_orphaned_mcp_reap(&sys, me, &mut |p| targeted.push(p.pid().as_u32()));
+        let ctx = reap_ctx(Some(PathBuf::from("/nonexistent-vco-root")), PathBuf::from("/nonexistent-hb"));
+        let _ = run_orphaned_mcp_reap(&sys, me, &ctx, &mut |p| targeted.push(p.pid().as_u32()));
         assert!(!targeted.contains(&me), "the reaper targeted its own process");
         assert!(pid_alive_self_sanity());
     }
@@ -2398,7 +2708,8 @@ mod tests {
 
         let pid = sysinfo::Pid::from_u32(child.pid());
         let proc = sys.process(pid).expect("child present in the snapshot");
-        let inputs = reap_inputs(&sys, pid, proc, me);
+        let ctx = reap_ctx(None, PathBuf::from("/nonexistent-hb"));
+        let inputs = reap_inputs(&sys, pid, proc, me, &ctx, &children_map(&sys));
         assert!(
             inputs.cmdline.contains(&marker),
             "the reaper read an empty cmdline for a live MCP child: {inputs:?}"
@@ -2412,7 +2723,214 @@ mod tests {
         assert_eq!(inputs.orphan_signal(), None);
 
         let mut targeted = Vec::new();
-        let _ = run_orphaned_mcp_reap(&sys, me, &mut |p| targeted.push(p.pid().as_u32()));
+        let _ = run_orphaned_mcp_reap(&sys, me, &ctx, &mut |p| targeted.push(p.pid().as_u32()));
+        assert!(!targeted.contains(&child.pid()));
+    }
+
+    // ── v0.2.108 HFKILL: the boot reaper's conservative gates ────────────
+    //
+    // Each guard gets its act and its leave-alone case on the pure decision
+    // (`ReapInputs::decision`, `plan_orphaned_mcp_reap`), plus real-process
+    // checks that `reap_inputs` reads identity and heartbeat from a live
+    // child the way the decision expects.
+
+    fn reap_ctx(root: Option<PathBuf>, heartbeat_dir: PathBuf) -> ReapContext {
+        ReapContext { enabled: true, root, heartbeat_dir, now: std::time::SystemTime::now() }
+    }
+
+    const ROOT: &str = "/opt/vco";
+    const OWN_WEAVIATE: &[&str] =
+        &["/opt/vco/.venv/bin/python", "/opt/vco/claude_mcp_servers/weaviate_mcp/server.py"];
+
+    /// An orphaned (dead parent), old, heartbeat-less instance of this
+    /// install's own weaviate-kg server: the one case the reaper acts on.
+    fn orphan_row() -> ReapInputs {
+        let argv: Vec<String> = OWN_WEAVIATE.iter().map(|s| s.to_string()).collect();
+        ReapInputs {
+            pid: 5001,
+            is_self: false,
+            cmdline: argv.join(" "),
+            vco_script: vco_own_mcp_script(&argv, Path::new(ROOT)),
+            argv,
+            run_time_secs: 3600,
+            parent_pid: Some(4242),
+            parent_alive: Some(false),
+            parent_is_subreaper: false,
+            root_known: true,
+            fresh_heartbeat: None,
+        }
+    }
+
+    #[test]
+    fn an_orphaned_own_server_without_a_fresh_heartbeat_is_reaped() {
+        let row = orphan_row();
+        assert_eq!(row.vco_script, Some("claude_mcp_servers/weaviate_mcp/server.py"));
+        assert_eq!(row.decision(), Some(ReapDecision::Reap(OrphanSignal::ParentDead)));
+        // POSIX shape: reparented to a live subreaper, file stale/absent.
+        let posix = ReapInputs {
+            parent_pid: Some(1),
+            parent_alive: Some(true),
+            parent_is_subreaper: true,
+            ..orphan_row()
+        };
+        assert_eq!(posix.decision(), Some(ReapDecision::Reap(OrphanSignal::ReparentedToSubreaper)));
+    }
+
+    #[test]
+    fn a_fresh_heartbeat_spares_an_orphaned_own_server() {
+        for fresh in [5001, 5002] {
+            // 5001 = the process itself; 5002 = its child (the Windows
+            // interpreter of a venv stub — the file is named after it).
+            let row = ReapInputs { fresh_heartbeat: Some(fresh), ..orphan_row() };
+            assert_eq!(
+                row.decision(),
+                Some(ReapDecision::Spare(SpareReason::FreshHeartbeat(fresh)))
+            );
+            let posix = ReapInputs { parent_is_subreaper: true, parent_pid: Some(1), ..row };
+            assert!(!posix.should_reap());
+        }
+    }
+
+    #[test]
+    fn a_foreign_path_is_spared_even_when_orphaned() {
+        for argv in [
+            // Another checkout's claude_mcp_servers.
+            &["/opt/other/.venv/bin/python", "/opt/other/claude_mcp_servers/weaviate_mcp/server.py"][..],
+            // Under this root, but not one of VCO's server scripts.
+            &["/opt/vco/.venv/bin/python", "/opt/vco/claude_mcp_servers/x_mcp/server.py"][..],
+            // A module run: no path to anchor.
+            &["/opt/vco/.venv/bin/python", "-m", "claude_mcp_servers.weaviate_mcp.server"][..],
+            // A relative script path, and a `..` detour.
+            &["python3", "claude_mcp_servers/weaviate_mcp/server.py"][..],
+            &["python3", "/opt/vco/x/../claude_mcp_servers/weaviate_mcp/server.py"][..],
+            // A sibling root sharing the prefix.
+            &["python3", "/opt/vco2/claude_mcp_servers/weaviate_mcp/server.py"][..],
+            // A third-party npm MCP.
+            &["npx", "-y", "@playwright/mcp@0.0.83"][..],
+        ] {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            assert!(is_mcp_server_argv(&argv), "{argv:?} must be MCP-shaped for this test");
+            let row = ReapInputs {
+                vco_script: vco_own_mcp_script(&argv, Path::new(ROOT)),
+                argv,
+                ..orphan_row()
+            };
+            assert_eq!(
+                row.decision(),
+                Some(ReapDecision::Spare(SpareReason::NotThisInstallsServer)),
+                "{:?}",
+                row.argv
+            );
+        }
+        // No resolvable root: nothing is provably ours.
+        let row = ReapInputs { root_known: false, vco_script: None, ..orphan_row() };
+        assert_eq!(row.decision(), Some(ReapDecision::Spare(SpareReason::NoInstallRoot)));
+    }
+
+    #[test]
+    fn own_script_identity_matches_exact_paths_across_separators() {
+        let own = |argv: &[&str], root: &str| vco_own_mcp_script(argv, Path::new(root));
+        assert!(own(OWN_WEAVIATE, "/opt/vco/").is_some(), "a trailing separator on the root");
+        assert!(own(
+            &["/opt/vco/.venv/bin/python", "/opt/vco/claude_mcp_servers/vct_coordination_mcp/server.py"],
+            ROOT
+        )
+        .is_some());
+        // Windows: backslashes, a verbatim prefix and a case difference.
+        assert!(own(
+            &[r"C:\VCO\.venv\Scripts\python.exe", r"C:\VCO\claude_mcp_servers\weaviate_mcp\server.py"],
+            r"\\?\C:\vco"
+        )
+        .is_some());
+        // Not a Python runtime in front of it.
+        assert!(own(&["/bin/sh", "/opt/vco/claude_mcp_servers/weaviate_mcp/server.py"], ROOT).is_none());
+        // A relative root proves nothing.
+        assert!(own(OWN_WEAVIATE, "vco").is_none());
+    }
+
+    #[test]
+    fn a_live_parent_spares_an_own_server() {
+        let row = ReapInputs { parent_alive: Some(true), ..orphan_row() };
+        assert_eq!(row.decision(), Some(ReapDecision::Spare(SpareReason::ParentAlive)));
+        let unknown = ReapInputs { parent_pid: None, parent_alive: None, ..orphan_row() };
+        assert_eq!(unknown.decision(), Some(ReapDecision::Spare(SpareReason::ParentUnknown)));
+        let young = ReapInputs { run_time_secs: STEADY_STATE_MCP_MIN_AGE_SECS - 1, ..orphan_row() };
+        assert_eq!(young.decision(), Some(ReapDecision::Spare(SpareReason::TooYoung)));
+        let me = ReapInputs { is_self: true, ..orphan_row() };
+        assert_eq!(me.decision(), None);
+    }
+
+    #[test]
+    fn the_off_switch_plans_nothing() {
+        assert!(orphan_reap_enabled(None));
+        assert!(orphan_reap_enabled(Some("1")));
+        for off in ["0", "false", "no", "off", " OFF "] {
+            assert!(!orphan_reap_enabled(Some(off)), "{off:?}");
+        }
+        let rows = vec![orphan_row(), ReapInputs { pid: 5003, ..orphan_row() }];
+        let on = plan_orphaned_mcp_reap(rows.clone(), true);
+        assert_eq!(on.len(), 2);
+        assert!(on.iter().all(|(_, d)| matches!(d, ReapDecision::Reap(_))));
+        assert!(plan_orphaned_mcp_reap(rows, false).is_empty());
+    }
+
+    #[test]
+    fn the_runner_switched_off_terminates_nothing() {
+        let sys = process_table_with_cmdlines();
+        let ctx = ReapContext { enabled: false, ..reap_ctx(Some(PathBuf::from(ROOT)), PathBuf::from("/x")) };
+        let mut targeted = Vec::new();
+        assert_eq!(run_orphaned_mcp_reap(&sys, std::process::id(), &ctx, &mut |p| targeted.push(p.pid())), 0);
+        assert!(targeted.is_empty());
+    }
+
+    #[test]
+    fn reap_inputs_reads_own_identity_and_a_fresh_heartbeat_from_a_live_child() {
+        let me = std::process::id();
+        let py = python_runtime_exe();
+        let root = tempfile::tempdir().expect("root");
+        let hb = tempfile::tempdir().expect("heartbeat dir");
+        let script = root.path().join("claude_mcp_servers").join("weaviate_mcp").join("server.py");
+        let script = script.to_string_lossy().into_owned();
+        let child = spawn_mcp_probe(&py, &script, &[]);
+        let sys = snapshot_seeing(child.pid(), &script);
+        let pid = sysinfo::Pid::from_u32(child.pid());
+        let proc = sys.process(pid).expect("child present in the snapshot");
+        let children = children_map(&sys);
+
+        // This install's root, no heartbeat: identified, spared only by its
+        // live parent (us) — and by its age, which the probe cannot fake.
+        let ctx = reap_ctx(Some(root.path().to_path_buf()), hb.path().to_path_buf());
+        let inputs = reap_inputs(&sys, pid, proc, me, &ctx, &children);
+        assert_eq!(inputs.vco_script, Some("claude_mcp_servers/weaviate_mcp/server.py"));
+        assert_eq!(inputs.fresh_heartbeat, None);
+        let aged = ReapInputs { run_time_secs: 3600, ..inputs.clone() };
+        assert_eq!(aged.decision(), Some(ReapDecision::Spare(SpareReason::ParentAlive)));
+        // The same child as an orphan would be reaped …
+        let orphaned = ReapInputs { parent_alive: Some(false), ..aged.clone() };
+        assert!(orphaned.should_reap());
+
+        // … but not once its heartbeat file is fresh.
+        std::fs::write(vct_launcher_core::mcp_heartbeat::heartbeat_path(hb.path(), child.pid()), b"{}")
+            .expect("heartbeat");
+        let inputs = reap_inputs(&sys, pid, proc, me, &ctx, &children);
+        assert_eq!(inputs.fresh_heartbeat, Some(child.pid()));
+        let orphaned = ReapInputs { run_time_secs: 3600, parent_alive: Some(false), ..inputs };
+        assert_eq!(
+            orphaned.decision(),
+            Some(ReapDecision::Spare(SpareReason::FreshHeartbeat(child.pid())))
+        );
+
+        // Another root: not this install's server, whatever else holds.
+        let other = tempfile::tempdir().expect("other root");
+        let ctx = reap_ctx(Some(other.path().to_path_buf()), hb.path().to_path_buf());
+        let inputs = reap_inputs(&sys, pid, proc, me, &ctx, &children);
+        assert_eq!(inputs.vco_script, None);
+        assert_eq!(inputs.decision(), Some(ReapDecision::Spare(SpareReason::NotThisInstallsServer)));
+
+        // And the runner over the live table never targets it.
+        let ctx = reap_ctx(Some(root.path().to_path_buf()), hb.path().to_path_buf());
+        let mut targeted = Vec::new();
+        let _ = run_orphaned_mcp_reap(&sys, me, &ctx, &mut |p| targeted.push(p.pid().as_u32()));
         assert!(!targeted.contains(&child.pid()));
     }
 

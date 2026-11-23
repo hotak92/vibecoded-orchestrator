@@ -136,9 +136,16 @@ class Runtime:
     """A scripted podman for ONE Weaviate container (``vco_weaviate``)."""
 
     def __init__(self, *, image=OLD_IMAGE, running="true", exec_meta=None,
-                 run_rc=0, exists=True, memory="0", live_mount=None, one_off_running="true"):
+                 run_rc=0, exists=True, memory="0", live_mount=None, one_off_running="true",
+                 stop_ref=None, one_off_rm_fails=0):
         self.image, self.running, self.exists = image, running, exists
         self.one_off_running = one_off_running
+        #: ``"timeout"`` = the stop client times out (the engine still stops it);
+        #: ``"fail"`` = the engine refuses the stop (still running)
+        self.stop_ref = stop_ref
+        #: how many ``rm -f`` of the one-off leave it running (a stuck removal)
+        self.one_off_rm_fails = one_off_rm_fails
+        self.one_off_exists = False
         self.exec_meta = exec_meta
         self.run_rc = run_rc
         self.memory = memory
@@ -161,6 +168,8 @@ class Runtime:
         if verb == "inspect":
             name = argv[-1]
             if name == "vco_weaviate" + rg.ONE_OFF_SUFFIX and "{{.State.Running}}" in argv:
+                if not self.one_off_exists:
+                    return _cp(argv, 125, "", f"Error: no such container {name}")
                 return _cp(argv, 0, self.one_off_running + "\n")
             if not self.exists or name != "vco_weaviate":
                 return _cp(argv, 125, "", f"Error: no such container {name}")
@@ -183,10 +192,27 @@ class Runtime:
         if verb == "port":
             return _cp(argv, 0, "127.0.0.1:41234\n") if self.run_rc == 0 else _cp(argv, 1)
         if verb == "run":
+            self.one_off_exists = self.run_rc == 0
             return _cp(argv, self.run_rc, "id\n" if self.run_rc == 0 else "",
                        "" if self.run_rc == 0 else "Error: image not known")
         if verb == "logs":
             return _cp(argv, 0, "", "panic: could not open raft.db\n")
+        if verb == "rm" and argv[-1] == "vco_weaviate" + rg.ONE_OFF_SUFFIX:
+            if self.one_off_exists and self.one_off_rm_fails:
+                self.one_off_rm_fails -= 1
+                return _cp(argv, 1, "", "Error: container is in use")
+            self.one_off_exists = False
+            return _cp(argv)
+        if verb == "stop" and argv[-1] == "vco_weaviate":
+            if self.stop_ref == "fail":
+                return _cp(argv, 125, "", "Error: cannot stop")
+            self.running = "false"
+            if self.stop_ref == "timeout":
+                raise subprocess.TimeoutExpired(argv, 180)
+            return _cp(argv)
+        if verb == "start" and argv[-1] == "vco_weaviate":
+            self.running = "true"
+            return _cp(argv)
         if verb in ("stop", "start", "rm"):
             return _cp(argv)
         raise AssertionError(f"unexpected argv {argv}")
@@ -199,27 +225,50 @@ class Runtime:
 class OneOff:
     """The one-off container's REST on its loopback port (``_method_http``).
     *stats* are the successive ``(lastLogIndex, lastSnapshotIndex)`` answers;
-    ``None`` = not answering yet; the last one repeats."""
+    ``None`` = not answering yet; the last one repeats. ``/v1/.well-known/ready``
+    answers 503 for the first *ready_after* reads, then 200. *post* / *delete*
+    are the successive marker answers — an HTTP status, or an exception the
+    call raises (a timeout) — the last one repeats."""
 
-    def __init__(self, *stats, marker_status=200):
+    def __init__(self, *stats, marker_status=200, ready_after=0, post=None, delete=None):
         self.stats = list(stats)
-        self.marker_status = marker_status
+        self.ready_after = ready_after
+        self.post = list(post) if post is not None else [marker_status]
+        self.delete = list(delete) if delete is not None else [200]
         self.calls: list[tuple[str, str]] = []
+        self.timeouts: list[tuple[str, float]] = []
+
+    @staticmethod
+    def _next(answers):
+        item = answers.pop(0) if len(answers) > 1 else answers[0]
+        if isinstance(item, BaseException):
+            raise item
+        return item, b"{}"
 
     def __call__(self, method, url, body=None, timeout=15.0):
         assert url.startswith("http://127.0.0.1:41234"), url
         path = url[len("http://127.0.0.1:41234"):]
         self.calls.append((method, path))
+        self.timeouts.append((method, timeout))
+        if (method, path) == ("GET", "/v1/.well-known/ready"):
+            if self.ready_after > 0:
+                self.ready_after -= 1
+                return 503, b""
+            return 200, b""
         if method == "GET":
+            assert path == "/v1/cluster/statistics", path
             item = self.stats.pop(0) if len(self.stats) > 1 else self.stats[0]
             if item is None:
                 raise OSError("connection refused")
             return 200, _stats(*item).encode()
         if method == "POST":
             assert body == {"class": rg.MARKER_CLASS, "vectorizer": "none"}
-            return self.marker_status, b"{}"
+            return self._next(self.post)
         assert (method, path) == ("DELETE", f"/v1/schema/{rg.MARKER_CLASS}")
-        return 200, b""
+        return self._next(self.delete)
+
+    def writes(self) -> list[str]:
+        return [m for m, _p in self.calls if m in ("POST", "DELETE")]
 
 
 @pytest.fixture()
@@ -271,11 +320,11 @@ def test_the_target_is_the_log_index_after_the_marker_writes():
     one_off_rest = OneOff((7, 0), (9, 0), (9, 8), (9, 9))
     with mock.patch.object(rg, "_method_http", one_off_rest):
         assert _check(Runtime()).status == rg.PREPARED
-    assert [c[0] for c in one_off_rest.calls].count("GET") == 4
+    assert one_off_rest.calls.count(("GET", "/v1/cluster/statistics")) == 4
 
 
 def test_a_refused_marker_refuses_and_restores(one_off):
-    one_off((7, 0), marker_status=500)
+    one_off((7, 0), marker_status=400)
     box = Runtime()
     v = _check(box)
     assert v.status == rg.REFUSED and rg.MARKER_CLASS in v.reason
@@ -682,21 +731,127 @@ def test_a_release_without_the_orphan_drop_is_not_kept_waiting(tmp_path, monkeyp
 
 
 def test_a_marker_whose_delete_failed_is_named_in_the_refusal(monkeypatch):
-    """Review A-L2: a created marker whose DELETE failed is named, with the
-    note that the next attempt removes it; success and a refused create keep
-    their own answers."""
-    answers = {"POST": 200, "DELETE": 500}
+    """Review A-L2: a created marker whose DELETE was refused is named, with
+    the note that the next attempt removes it; success and a refused create
+    keep their own answers."""
+    answers = {"POST": 200, "DELETE": 400}
     monkeypatch.setattr(rg, "_method_http",
                         lambda method, url, body=None, **k: (answers[method], b""))
-    reason = rg._write_marker("http://127.0.0.1:1")
+    reason = rg._write_marker("http://127.0.0.1:1", rg._MarkerState())
     assert reason is not None and "may remain in the schema" in reason
-    assert rg.MARKER_CLASS in reason and "HTTP 500" in reason
+    assert rg.MARKER_CLASS in reason and "HTTP 400" in reason
     answers["DELETE"] = 200
-    assert rg._write_marker("http://127.0.0.1:1") is None
-    answers["POST"] = 503
-    reason = rg._write_marker("http://127.0.0.1:1")
+    state = rg._MarkerState()
+    assert rg._write_marker("http://127.0.0.1:1", state) is None and state.done
+    answers["POST"] = 403
+    reason = rg._write_marker("http://127.0.0.1:1", rg._MarkerState())
     assert reason is not None and "did not accept" in reason
     assert "may remain" not in reason
+
+
+# ─── v0.2.108: the marker waits for /ready and retries within the budget ──
+# Field bug: Weaviate 1.28.4 with 120 classes — the marker create took longer
+# than the fixed 15 s request timeout right after the one-off answered, and
+# that one TimeoutError refused the whole protected move.
+
+
+def _snapshot(box: "Runtime", **kw) -> rg.UpgradeVerdict:
+    return rg.snapshot_with_container_image("vco_weaviate", runtime="podman", run=box.run, **kw)
+
+
+def test_the_marker_waits_until_the_one_off_reports_ready(one_off):
+    rest = one_off((7, 0), (9, 0), (9, 9), ready_after=3)
+    v = _snapshot(Runtime())
+    assert v.status == rg.PREPARED, v.reason
+    first_post = rest.calls.index(("POST", "/v1/schema"))
+    readies = [i for i, c in enumerate(rest.calls) if c[1] == "/v1/.well-known/ready"]
+    assert len(readies) == 4 and readies[-1] < first_post  # 3 x 503, then 200, then the create
+
+
+def test_a_marker_create_that_times_out_is_retried_with_the_long_request_timeout(one_off):
+    rest = one_off((7, 0), (9, 0), (9, 9), post=[TimeoutError("timed out"), 200])
+    box = Runtime()
+    v = _snapshot(box)
+    assert v.status == rg.PREPARED, v.reason
+    assert rest.writes() == ["POST", "POST", "DELETE"]
+    assert {t for m, t in rest.timeouts if m in ("POST", "DELETE")} == {rg.MARKER_REQUEST_CAP_S}
+    assert box.verbs()[-1] == "start vco_weaviate"
+
+
+def test_a_timed_out_create_that_landed_is_deleted_through_the_422_path(one_off):
+    rest = one_off((7, 0), (9, 0), (9, 9), post=[TimeoutError("timed out"), 422])
+    assert _snapshot(Runtime()).status == rg.PREPARED
+    assert rest.writes() == ["POST", "POST", "DELETE"]
+
+
+def test_a_5xx_and_a_timed_out_delete_are_retried_with_backoff(monkeypatch, one_off):
+    waits: list[float] = []
+    monkeypatch.setattr(rg, "_sleep", waits.append)
+    rest = one_off((7, 0), (9, 0), (9, 9), post=[503, 503, 200],
+                   delete=[TimeoutError("timed out"), 404])  # 404: the first delete landed
+    v = _snapshot(Runtime())
+    assert v.status == rg.PREPARED, v.reason
+    assert rest.writes() == ["POST", "POST", "POST", "DELETE", "DELETE"]  # create never re-sent
+    assert waits[:3] == [2.0, 4.0, 8.0]  # doubling from the 2 s poll
+
+
+def test_a_definite_4xx_refuses_at_once_and_restores(one_off):
+    rest = one_off((7, 0), marker_status=400)
+    box = Runtime()
+    v = _snapshot(box)
+    assert v.status == rg.REFUSED and "did not accept" in v.reason and "HTTP 400" in v.reason
+    assert rest.writes() == ["POST"]
+    one_off_name = "vco_weaviate" + rg.ONE_OFF_SUFFIX
+    assert box.verbs()[-3:] == [f"stop {one_off_name}", f"rm {one_off_name}",
+                                "start vco_weaviate"]
+
+
+def test_a_definite_4xx_on_the_delete_names_the_class_left_behind(one_off):
+    rest = one_off((7, 0), delete=[400])
+    v = _snapshot(Runtime())
+    assert v.status == rg.REFUSED and "may remain in the schema" in v.reason
+    assert rest.writes() == ["POST", "DELETE"]
+
+
+def test_a_marker_that_never_lands_ends_at_the_deadline_with_its_reason(monkeypatch, one_off):
+    now = [0.0]
+
+    def clock():
+        now[0] += 40.0
+        return now[0]
+
+    rest = one_off((7, 0), post=[TimeoutError("timed out")])
+    box = Runtime()
+    v = _snapshot(box, monotonic=clock, timeout=600)
+    assert v.status == rg.REFUSED
+    assert v.reason.startswith("no raft snapshot covering the log within 600 s")
+    assert "TimeoutError" in v.reason and "may remain in the schema" in v.reason
+    posts = [t for m, t in rest.timeouts if m == "POST"]
+    assert len(posts) > 1 and all(1.0 <= t <= rg.MARKER_REQUEST_CAP_S for t in posts)
+    assert min(posts) < rg.MARKER_REQUEST_CAP_S  # the last ones get only what is left
+    assert box.verbs()[-1] == "start vco_weaviate"
+
+
+def test_a_one_off_never_ready_ends_at_the_deadline_without_a_write(one_off):
+    now = [0.0]
+
+    def clock():
+        now[0] += 50.0
+        return now[0]
+
+    rest = one_off((7, 0), ready_after=10**6)
+    v = _snapshot(Runtime(), monotonic=clock, timeout=300)
+    assert v.status == rg.REFUSED and "never reported ready" in v.reason
+    assert rest.writes() == []
+
+
+def test_the_snapshot_cli_takes_the_same_retrying_path(monkeypatch, one_off, capsys):
+    rest = one_off((7, 0), (9, 0), (9, 9), ready_after=2, post=[TimeoutError("timed out"), 422])
+    box = Runtime()
+    monkeypatch.setattr(rg.subprocess, "run", box.run)
+    assert rg.main(["snapshot", "--container", "vco_weaviate", "--runtime", "podman"]) == 0
+    assert rest.writes() == ["POST", "POST", "DELETE"]
+    assert "covers the whole schema log" in capsys.readouterr().out
 
 
 def test_a_bound_above_a_restarted_log_is_replaced(tmp_path, monkeypatch):
@@ -1141,3 +1296,80 @@ def test_a_dismissal_of_the_same_exposure_skips_the_wait_but_not_of_another(
     assert result2 is not None and result2.exposed
     assert fake2.stat_reads == 1 + int(rg.SETTLE_S // rg.SETTLE_POLL_S), \
         fake2.stat_reads  # a different state: the full wait ran
+
+
+# ─── HOTFIX-CHECK m-1 / m-2: a visible wait; never two Weaviates on one folder ──
+
+
+def test_a_long_wait_prints_progress_at_a_bounded_interval(one_off):
+    now = [0.0]
+
+    def clock():
+        now[0] += 10.0
+        return now[0]
+
+    one_off((7, 0), ready_after=10**6)
+    said: list[str] = []
+    v = _snapshot(Runtime(), monotonic=clock, timeout=600, log=said.append)
+    assert v.status == rg.REFUSED
+    progress = [m for m in said if "is stopped for the snapshot run" in m]
+    # one line per PROGRESS_EVERY_S of the 600 s budget, never one per poll
+    assert 5 <= len(progress) <= int(600 / rg.PROGRESS_EVERY_S), progress
+    assert "of 600 s" in progress[0] and "not reported ready" in progress[0]
+
+
+def test_the_progress_line_names_the_last_marker_error(one_off):
+    now = [0.0]
+
+    def clock():
+        now[0] += 25.0
+        return now[0]
+
+    one_off((7, 0), post=[503])
+    said: list[str] = []
+    _snapshot(Runtime(), monotonic=clock, timeout=300, log=said.append)
+    assert any("marker attempt" in m and "HTTP 503" in m for m in said), said
+
+
+def test_a_quick_snapshot_prints_no_progress_line(one_off):
+    one_off((7, 0), (9, 0), (9, 9))
+    said: list[str] = []
+    assert _snapshot(Runtime(), log=said.append).status == rg.PREPARED
+    assert not [m for m in said if "is stopped for the snapshot run" in m]
+
+
+def test_a_stop_that_times_out_starts_the_stopped_container_again(one_off):
+    one_off((7, 0))
+    box = Runtime(stop_ref="timeout")
+    v = _snapshot(box)
+    assert v.status == rg.REFUSED and "could not be stopped" in v.reason
+    assert "started again" in v.reason
+    assert box.verbs()[-1] == "start vco_weaviate" and box.running == "true"
+    assert not [a for a in box.argv if a[1] == "run"]  # no one-off ever ran
+
+
+def test_a_refused_stop_of_a_still_running_container_starts_nothing(one_off):
+    """Leave-alone arm: the engine refused the stop and it still runs."""
+    one_off((7, 0))
+    box = Runtime(stop_ref="fail")
+    v = _snapshot(box)
+    assert v.status == rg.REFUSED and "could not be stopped" in v.reason
+    assert not [a for a in box.argv if a[1] == "start"]
+
+
+def test_a_one_off_that_cannot_be_removed_keeps_the_live_container_stopped(one_off):
+    one_off((7, 0), (9, 0), (9, 9))
+    box = Runtime(one_off_rm_fails=10)
+    v = _snapshot(box)
+    assert not [a for a in box.argv if a[1] == "start"], box.verbs()
+    assert "was NOT started again" in v.reason
+    assert "podman rm -f vco_weaviate-raft-snapshot" in v.reason
+    assert "podman start vco_weaviate" in v.reason
+
+
+def test_a_one_off_removed_on_the_second_try_lets_the_live_container_start(one_off):
+    one_off((7, 0), (9, 0), (9, 9))
+    box = Runtime(one_off_rm_fails=1)
+    v = _snapshot(box)
+    assert v.status == rg.PREPARED, v.reason
+    assert box.verbs()[-1] == "start vco_weaviate"

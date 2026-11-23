@@ -9,8 +9,10 @@ row names both numbers. Unknown size → pull as before; free ≥ need → pull.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -168,3 +170,185 @@ def test_condition_is_registered_owned_and_action_required():
     spec = dr.condition(pp.CID_NO_DISK_SPACE)
     assert spec is not None and spec.condition_class == "action_required"
     assert pp.CID_NO_DISK_SPACE in dr.install_owned_ids()
+
+
+# ─── v0.2.108: the code_embed image BUILD gets the same check ─────────────
+
+CE_SIZE = int(7.5 * GIB)
+
+
+class BuildEngine:
+    """A fake engine whose ``vco_code_embed`` container runs a previously
+    built image of *size* bytes (``None`` = no container: a first build)."""
+
+    def __init__(self, graph_root: str, *, size=CE_SIZE):
+        self.graph_root, self.size = graph_root, size
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **_kw):
+        self.calls.append(list(argv))
+        cp = subprocess.CompletedProcess
+        if argv[1] == "inspect" and "--type" in argv:
+            if self.size is None or argv[-1] != "vco_code_embed":
+                return cp(argv, 125, "", f"no such container {argv[-1]}")
+            return cp(argv, 0, "sha256builtce\n", "")
+        if argv[1:3] == ["image", "inspect"] and argv[-1] == "sha256builtce":
+            return cp(argv, 0, f"{self.size}\n", "")
+        if argv[1] == "info":
+            return cp(argv, 0, self.graph_root + "\n", "")
+        raise AssertionError(argv)
+
+
+def _drop_build(engine, free_bytes, *, recreate=("code_embed",), rebuild=("code_embed",)):
+    plan = {"build": ["code_embed"], "recreate": list(recreate), "rebuild": list(rebuild)}
+    report = Report()
+    pp.drop_unfittable_builds(plan["build"], plan["recreate"], plan["rebuild"],
+                              runtime="podman", deferral_report=report,
+                              rerun="python install.py --update", run=engine,
+                              free=lambda _p: free_bytes)
+    return plan, report
+
+
+def test_a_rebuild_that_does_not_fit_loses_its_build_and_keeps_the_container(tmp_path, capsys):
+    plan, report = _drop_build(BuildEngine(str(tmp_path)), int(10 * GIB))
+    assert plan == {"build": [], "recreate": [], "rebuild": []}
+    (entry,) = report.entries
+    assert entry.condition_id == pp.CID_NO_DISK_SPACE
+    text = entry.detected + entry.why_deferred
+    need = int(CE_SIZE * pp.PULL_SPACE_FACTOR) + 2 * GIB
+    assert f"{need / GIB:.1f} GB" in text and "10.0 GB free" in text and str(tmp_path) in text
+    assert "vco_code_embed" in text and "download or build" in text
+    assert "Not building it; keeping the running container" in capsys.readouterr().out
+
+
+def test_a_rebuild_that_fits_is_left_alone(tmp_path):
+    plan, report = _drop_build(BuildEngine(str(tmp_path)), 100 * GIB)
+    assert plan == {"build": ["code_embed"], "recreate": ["code_embed"],
+                    "rebuild": ["code_embed"]}
+    assert report.entries == []
+
+
+def test_a_first_build_with_no_previous_image_runs_as_before(tmp_path):
+    plan, report = _drop_build(BuildEngine(str(tmp_path), size=None), 1)
+    assert plan["build"] == ["code_embed"] and report.entries == []
+
+
+def test_a_recreate_owed_to_a_config_change_survives_a_refused_build(tmp_path):
+    # plan_rebuild adds no recreate when code_embed is already recreated for
+    # its config: only `--build` goes, the config recreate stays
+    plan, report = _drop_build(BuildEngine(str(tmp_path)), 1, rebuild=())
+    assert plan == {"build": [], "recreate": ["code_embed"], "rebuild": []}
+    assert len(report.entries) == 1
+
+
+def test_step5_drops_the_build_before_compose_runs(tmp_path, monkeypatch):
+    """Wiring: install step 5 (compose_up_step) runs the build check, so a
+    rebuild that does not fit never reaches compose; one that fits does."""
+    from tests.test_v02100_install_services_up import World
+
+    for free_bytes, compose_ran in ((1, False), (100 * GIB, True)):
+        root = tmp_path / str(free_bytes)
+        root.mkdir()
+        w = World(root)
+        engine = BuildEngine(str(root))
+        base_run = w.run
+
+        def run(argv, _engine=engine, _base=base_run, **kw):
+            if (argv[1] == "inspect" and "--type" in argv) \
+                    or argv[1:] == ["info", "--format", "{{.Store.GraphRoot}}"] \
+                    or argv[1:3] == ["image", "inspect"]:
+                return _engine(argv)
+            return _base(argv, **kw)
+
+        monkeypatch.setattr(pp, "_free_bytes", lambda _p, _f=free_bytes: _f)
+        w.go(run=run)
+        assert bool(w.compose_calls) is compose_ran
+        if compose_ran:
+            assert "--build" in w.compose_calls[0]
+            assert pp.CID_NO_DISK_SPACE not in w.ledger.cids
+        else:
+            assert pp.CID_NO_DISK_SPACE in w.ledger.cids
+
+
+# ─── HOTFIX-CHECK M-2: a rebuild counts only the layers above a cached base ──
+
+BASE_REF = "docker.io/pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime"
+BASE_LAYERS = ["sha256:b1", "sha256:b2", "sha256:b3"]
+BASE_SIZE = 6_041_235_685           # measured: the pytorch CUDA base
+BUILT_SIZE = 6_393_463_121          # measured: base + 352 MB pip layer + COPY layers
+
+
+class LayeredEngine:
+    """``image inspect --format '{{.Size}} {{json .RootFS.Layers}}'`` answers as
+    both engines print it (the Go template output is the same shape on docker
+    and podman). *base* = layers of the stored base, ``None`` = not stored."""
+
+    def __init__(self, runtime, graph_root, *, base=BASE_LAYERS, built_layers=None):
+        self.runtime, self.graph_root, self.base = runtime, graph_root, base
+        self.built_layers = built_layers or [*BASE_LAYERS, "sha256:pip", "sha256:copy"]
+
+    def __call__(self, argv, **_kw):
+        cp = subprocess.CompletedProcess
+        assert argv[0] == self.runtime
+        if argv[1] == "inspect" and "--type" in argv:
+            return (cp(argv, 0, "sha256builtce\n", "") if argv[-1] == "vco_code_embed"
+                    else cp(argv, 125, "", "no such container"))
+        if argv[1:3] == ["image", "inspect"]:
+            assert argv[4] == "{{.Size}} {{json .RootFS.Layers}}", argv
+            if argv[-1] == "sha256builtce":
+                return cp(argv, 0, f"{BUILT_SIZE} {json.dumps(self.built_layers)}\n", "")
+            if argv[-1] == BASE_REF and self.base is not None:
+                return cp(argv, 0, f"{BASE_SIZE} {json.dumps(self.base)}\n", "")
+            return cp(argv, 125, "", f"Error: {argv[-1]}: image not known")
+        if argv[1] == "info":
+            return cp(argv, 0, self.graph_root + "\n", "")
+        raise AssertionError(argv)
+
+
+def _ctx(tmp_path):
+    ctx = tmp_path / "ctx"
+    ctx.mkdir(exist_ok=True)
+    (ctx / "Dockerfile").write_text("FROM docker.io/pytorch/pytorch:2.6.0-cpu\nRUN x\n")
+    (ctx / "Dockerfile.cuda").write_text(f"# c\nFROM --platform=linux/amd64 {BASE_REF}\n")
+    return ctx
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker"])
+def test_a_cached_base_counts_only_the_layers_above_it(tmp_path, runtime):
+    eng = LayeredEngine(runtime, str(tmp_path))
+    size, basis = pp.built_image_size("code_embed", runtime, run=eng, context=_ctx(tmp_path))
+    assert size == BUILT_SIZE - BASE_SIZE and BASE_REF in basis
+    # 352 MB x 1.5 + 2 GB floor: about 2.5 GB, not the 11.6 GB the whole image gave
+    need = int(size * pp.PULL_SPACE_FACTOR) + 2 * GIB
+    assert need < 3 * GIB
+    with mock.patch.object(pp, "_CODE_EMBED_CONTEXT", _ctx(tmp_path)):
+        assert pp.build_space_shortfall("code_embed", runtime, run=eng,
+                                        free=lambda _p: 3 * GIB) is None
+        sf = pp.build_space_shortfall("code_embed", runtime, run=eng, free=lambda _p: 2 * GIB)
+    assert sf is not None and sf.need_bytes == need and BASE_REF in sf.basis
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker"])
+def test_a_pruned_base_counts_the_whole_image(tmp_path, runtime):
+    eng = LayeredEngine(runtime, str(tmp_path), base=None)
+    assert pp.built_image_size("code_embed", runtime, run=eng, context=_ctx(tmp_path)) == \
+        (BUILT_SIZE, "the image of container vco_code_embed")
+
+
+def test_a_base_that_is_not_the_bottom_of_the_image_counts_the_whole_image(tmp_path):
+    """The Dockerfile now builds FROM another base (stored, but not the one the
+    old image sits on): the build adds every layer → the whole size."""
+    eng = LayeredEngine("podman", str(tmp_path), base=["sha256:other", "sha256:b2"])
+    size, _ = pp.built_image_size("code_embed", "podman", run=eng, context=_ctx(tmp_path))
+    assert size == BUILT_SIZE
+
+
+def test_dockerfile_bases_reads_the_shipped_dockerfiles():
+    assert pp.dockerfile_bases(pp._CODE_EMBED_CONTEXT) == [
+        "docker.io/pytorch/pytorch:2.6.0-cpu", BASE_REF]
+
+
+def test_dockerfile_bases_skips_args_scratch_and_stages(tmp_path):
+    (tmp_path / "Dockerfile").write_text(
+        "FROM ${BASE} AS a\nFROM scratch\nFROM python:3.12 AS build\nFROM build\n")
+    assert pp.dockerfile_bases(tmp_path) == ["python:3.12"]

@@ -1390,3 +1390,39 @@ def test_an_update_with_nothing_to_move_re_emits_the_kept_backup(tmp_path, monke
                           mover=lambda **_kw: _outcome(cu.NOT_NEEDED))
     kept = [e for e in result.entries if e.condition_id == cu.CID_BACKUP_KEPT]
     assert len(kept) == 1 and "vco-weaviate-backup-1" in kept[0].detected
+
+
+# ─── HOTFIX-CHECK m-2: never start the live Weaviate beside a live one-off ──
+
+
+class OneOffRecorder(Recorder):
+    """``inspect`` of the one-off answers *one_off* (``None`` = no such container)."""
+
+    def __init__(self, one_off):
+        super().__init__()
+        self.one_off = one_off
+
+    def __call__(self, argv, **_kw):
+        self.calls.append(list(argv))
+        if argv[1] == "inspect":
+            if self.one_off is None:
+                return mock.Mock(returncode=125, stdout="",
+                                 stderr=f"Error: no such container {argv[-1]}")
+            return mock.Mock(returncode=0, stdout=self.one_off + "\n", stderr="")
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+
+@pytest.mark.parametrize("one_off", [None, "false"])
+def test_start_runs_once_the_one_off_is_gone_or_stopped(root, one_off):
+    run = OneOffRecorder(one_off)
+    assert cu.ContainerEngine("podman", root, run=run).start(NAME) is True
+    assert run.calls[0][-1] == NAME + "-raft-snapshot"
+    assert run.calls[-1] == ["podman", "start", NAME]
+
+
+def test_start_is_refused_while_the_one_off_still_runs(root):
+    run = OneOffRecorder("true")
+    said: list[str] = []
+    assert cu.ContainerEngine("podman", root, run=run, log=said.append).start(NAME) is False
+    assert not [a for a in run.calls if a[1] == "start"]
+    assert any("NOT started" in m for m in said)
