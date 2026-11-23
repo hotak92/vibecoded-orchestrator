@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.108] - 2026-11-23
+
 ### Fixed
 
 - **The protected Weaviate move no longer gives up on a large schema after 15 seconds.** Before an update moves
@@ -59,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alias, so responses echo that dotted spelling and the gateway's `model_echo_mismatches` counter
   counts it — a documented same-model echo, not a model swap.
 - **The MCP heartbeat's location and 10-minute stale bound have one home** (`vct_launcher_core::mcp_heartbeat`), read by the hub's liveness watchdog and the launcher's boot reaper. Its docs now say that on Windows the heartbeat file is named after the Python interpreter that runs the server (the child of the venv `python.exe` stub), not the pid Claude Code started; the hub reads the pid from the record, so its watchdog is unaffected. The on/off env switches `VCT_CONTAINER_ENGINE_AUTOSTART`, `VCT_HUB_INFRA_WATCHDOG` and the new reaper switch share one reader (same off values: `0` / `false` / `no` / `off`).
+- **Release mechanics:** version 0.2.107 → 0.2.108 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No new code-graph extractor-generation rung — 0.2.108 is recorded as a non-bump in `EXTRACTOR_GENERATION_NON_BUMPS` (no file of the extractor surface changed since v0.2.107), so no graph is re-walked for this release; `CODEGRAPH_EMBED_REVISION` is unchanged.
 
 ## [0.2.107] - 2026-11-20
 
@@ -14822,7 +14825,8 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.108...HEAD
+[0.2.108]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...v0.2.108
 [0.2.107]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.106...v0.2.107
 [0.2.106]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.105...v0.2.106
 [0.2.105]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.104...v0.2.105
