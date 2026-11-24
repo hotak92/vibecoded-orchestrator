@@ -46,7 +46,7 @@ re-index may need:
 Env overrides (shared knobs — the ``KG_SUMMARY_*`` names stay canonical for
 BOTH callers; the code generator adds a ``CODE_SUMMARY_BACKEND`` alias that
 falls back to ``KG_SUMMARY_BACKEND`` via the ``env_keys`` parameter):
-  KG_SUMMARY_BACKEND        → force "cli" | "zai" | "qwen" | "ollama" | "api" |
+  KG_SUMMARY_BACKEND        → force "cli" | "kimi" | "zai" | "qwen" | "ollama" | "api" |
                               "openai" | "skip" (auto-detect default; "api" =
                               Anthropic, "openai" = OpenAI, "zai"/"qwen" = the
                               cloud vendor tiers). Unset: the launcher
@@ -305,7 +305,7 @@ SYSTEM_PROMPT = (
 # The valid KG_SUMMARY_BACKEND / CODE_SUMMARY_BACKEND force values. v0.2.103
 # (8b) added the cloud vendor tiers "zai" and "qwen" (the model gateway's
 # registry ids) between the CLI and local Ollama.
-VALID_BACKENDS = {"cli", "zai", "qwen", "ollama", "api", "openai", "skip"}
+VALID_BACKENDS = {"cli", "kimi", "zai", "qwen", "ollama", "api", "openai", "skip"}
 
 _BACKEND_CACHE: dict[str, str] = {}
 
@@ -441,6 +441,11 @@ _TRUST_SIGNALS = (
 _QUOTA_SIGNALS = (
     "usage limit", "usage_limit", "quota", "insufficient_quota",
     "out of credits", "credit balance is too low",
+    # Claude's subscription exhaustion wording (v0.2.109): "This request
+    # would exceed your account's rate limit" is the 5-hour window, NOT a
+    # transient per-minute throttle. Without this it matched _RATE_LIMIT_SIGNALS
+    # ("rate limit") and got the 900 s cooldown — ~20 futile re-probes per outage.
+    "exceed your account",
 )
 #: v0.2.96 WP-7 — reduced to the TRANSIENT shapes only (429-class). Quota
 #: wording moved to ``_QUOTA_SIGNALS``; a bare HTTP 429 body with no quota
@@ -1635,7 +1640,14 @@ def call_cli(prompt: str) -> str:
 #: before QwenCloud. These are the model gateway's own registry ids
 #: (``model_router.vendors.VENDORS`` keys) — the tier names double as the
 #: ``KG_SUMMARY_BACKEND`` force values and breaker keys.
-CLOUD_VENDOR_TIERS: tuple[str, ...] = ("zai", "qwen")
+#: Summary cloud tiers in fallback order (owner 2026-11-24: Kimi first).
+#: Each resolves through the gateway registry; the model comes from
+#: SUMMARY_TIER_MODELS when present, else the FALLBACK_LADDER's cheap rung.
+CLOUD_VENDOR_TIERS: tuple[str, ...] = ("kimi", "zai", "qwen")
+
+#: Model overrides for tiers whose model is NOT the FALLBACK_LADDER's cheap
+#: rung (kimi has no ladder rung; its summary model is k3.1-pro).
+SUMMARY_TIER_MODELS: dict[str, str] = {"kimi": "k3.1-pro"}
 
 #: Resolved tier facts per vendor id (see :func:`_vendor_tier_state`), or an
 #: empty dict caching "known not selectable" so the miss is probed (and its
@@ -1702,16 +1714,15 @@ def _vendor_tier_state_uncached(vendor_id: str) -> "dict | None":
     vendor = vendors.get(vendor_id)
     if vendor is None:
         return None
-    # The summary model: the gateway's own CHEAP rung for this vendor. The
-    # ladder's contract is that a rung's ``to_model_id`` is an id the vendor
-    # row is known to serve, so this can never name an un-routable id.
-    model = next(
+    # The summary model: an explicit override (SUMMARY_TIER_MODELS) when the
+    # vendor has no FALLBACK_LADDER rung (kimi), else the ladder's cheap rung.
+    model = SUMMARY_TIER_MODELS.get(vendor_id) or next(
         (rung.to_model_id for rung in ladder if rung.to_vendor_id == vendor_id),
         None,
     )
     if model is None:
         _log(f"  summary: cloud tier '{vendor_id}' not selectable "
-             "(no cheap rung in the gateway fallback ladder)")
+             "(no model override and no cheap rung in the gateway fallback ladder)")
         return None
     try:
         key = resolver.resolve(vendor).key
@@ -1743,6 +1754,11 @@ def zai_available() -> bool:
 def qwen_available() -> bool:
     """The QwenCloud tier is selectable (its key resolves on this machine)."""
     return _vendor_available("qwen")
+
+
+def kimi_available() -> bool:
+    """The Kimi tier is selectable (its key resolves on this machine)."""
+    return _vendor_available("kimi")
 
 
 def _vendor_summary_model(vendor_id: str) -> str:
@@ -1799,6 +1815,10 @@ def call_zai(prompt: str) -> str:
 
 def call_qwen(prompt: str) -> str:
     return _call_vendor("qwen", prompt)
+
+
+def call_kimi(prompt: str) -> str:
+    return _call_vendor("kimi", prompt)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2526,7 +2546,7 @@ def select_backend(
         # Resolved through the per-tier probe functions (``zai_available`` /
         # ``qwen_available``) so a substituted or pinned probe governs
         # selection exactly as for every other tier.
-        probe = {"zai": zai_available, "qwen": qwen_available}.get(vendor_id)
+        probe = {"kimi": kimi_available, "zai": zai_available, "qwen": qwen_available}.get(vendor_id)
         if probe is None:
             continue
         if _tier_selectable(vendor_id, label) and probe():
@@ -2577,7 +2597,7 @@ def select_backend(
     else:
         _log(
             f"  {label}: no backend available (no claude CLI, no cloud-vendor "
-            f"key (z.ai / QwenCloud), no Ollama at {OLLAMA_URL} or VRAM-"
+            f"key (Kimi / z.ai / QwenCloud), no Ollama at {OLLAMA_URL} or VRAM-"
             f"deferred, no OPENAI_API_KEY, no ANTHROPIC_API_KEY). Skipping."
         )
     return "skip"
@@ -2598,7 +2618,7 @@ def _dispatch(backend: str, prompt: str) -> str:
     if backend == "cli":
         return call_cli(prompt)
     if backend in CLOUD_VENDOR_TIERS:
-        call = {"zai": call_zai, "qwen": call_qwen}[backend]
+        call = {"kimi": call_kimi, "zai": call_zai, "qwen": call_qwen}[backend]
         return call(prompt)
     if backend == "ollama":
         return call_ollama(prompt)

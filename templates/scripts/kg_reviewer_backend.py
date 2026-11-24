@@ -369,7 +369,7 @@ def select_reviewer_backend(
                           "summaries consent granted (degraded: review "
                           "only, no KG writes)"}
     log("every rung unavailable — commit not reviewed this time (no "
-        "flash-model fallback, by design)")
+        "comparable-model fallback)")
     return {"mode": "skip", "model": "", "base_url": None,
             "reason": "no rung available"}
 
