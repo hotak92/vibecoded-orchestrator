@@ -144,7 +144,7 @@ Each task gets a status banner on the project page (`pending` / `running` / `fai
 
 ## Downloads (Launcher GUI)
 
-Each release on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases) carries one `.zip` per OS (plus its `.sha256`). The archive is the whole orchestrator with the prebuilt launcher, hub and updater binaries inside (`launcher/dist/<os>-<arch>/`) — there is no separate launcher installer (no `.exe` setup, AppImage, `.deb` or `.dmg`). Extract it and run the `first-install` entry point for your OS; a `git clone` gets the same binaries from the repository.
+Each release on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases) carries one `.zip` per OS (plus its `.sha256`). The archive is the whole orchestrator — the tagged source tree, minus the developer test suite (`tests/`) and the CI configuration (`.github/`) — with the prebuilt launcher, hub, updater and `vct-cli` binaries for that OS inside `launcher/dist/<os>-<arch>/`, the same place a `git clone` has them. There is no separate launcher installer (no `.exe` setup, AppImage, `.deb` or `.dmg`). Extract it and run the `first-install` entry point for your OS (`first-install.bat`, `first-install.command` or `first-install.sh`). Before a release is published, CI installs from each zip on its own OS.
 
 | OS                                  | Artifact                                              | Notes |
 |-------------------------------------|-------------------------------------------------------|-------|
