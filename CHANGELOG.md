@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An install or update no longer pulls a Weaviate client that refuses an older Weaviate.** `weaviate-client`
+  4.25.0 (released 2026-11-26) refuses every Weaviate server older than 1.32. VCO declared the client with no upper
+  bound, so an install or update from that day on would get 4.25. On a machine whose Weaviate has not yet moved to the
+  version VCO ships (1.37.18), the knowledge-graph server, the hooks and the scripts could then no longer connect, including
+  while an update waits to move Weaviate. The client is now declared `>=4.21.0,<4.25` in `requirements.txt`,
+  `pyproject.toml` and `claude_mcp_servers/pyproject.toml`, and an update moves an already-installed 4.25 back.
+
 - **Background jobs stop retrying Claude every 15 minutes when the subscription is used up.** Claude Code reports an
   exhausted subscription as "This request would exceed your account's rate limit". The summary generator and the
   post-commit KG reviewer read the words "rate limit" in it as a short throttle and retried after 15 minutes, so a
