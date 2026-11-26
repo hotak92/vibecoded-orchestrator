@@ -441,6 +441,11 @@ _TRUST_SIGNALS = (
 _QUOTA_SIGNALS = (
     "usage limit", "usage_limit", "quota", "insufficient_quota",
     "out of credits", "credit balance is too low",
+    # Claude's subscription exhaustion wording (v0.2.109): "This request
+    # would exceed your account's rate limit" is the 5-hour window, NOT a
+    # transient per-minute throttle. Without this it matched _RATE_LIMIT_SIGNALS
+    # ("rate limit") and got the 900 s cooldown — ~20 futile re-probes per outage.
+    "exceed your account",
 )
 #: v0.2.96 WP-7 — reduced to the TRANSIENT shapes only (429-class). Quota
 #: wording moved to ``_QUOTA_SIGNALS``; a bare HTTP 429 body with no quota
@@ -1635,7 +1640,18 @@ def call_cli(prompt: str) -> str:
 #: before QwenCloud. These are the model gateway's own registry ids
 #: (``model_router.vendors.VENDORS`` keys) — the tier names double as the
 #: ``KG_SUMMARY_BACKEND`` force values and breaker keys.
+#: Summary cloud tiers in fallback order. Summaries are BULK work (one call
+#: per node), so only cheap/fast models serve them (owner 2026-11-24: Claude
+#: -> GLM-flash -> DeepSeek); a slow, small-window model such as Kimi K3.1 Pro
+#: is deliberately not a summary tier. Each resolves through the gateway
+#: registry; the model comes from SUMMARY_TIER_MODELS when present, else the
+#: FALLBACK_LADDER's cheap rung for that vendor.
 CLOUD_VENDOR_TIERS: tuple[str, ...] = ("zai", "qwen")
+
+#: Model overrides for tiers whose summary model is NOT the gateway
+#: FALLBACK_LADDER's cheap rung: on QwenCloud the summaries run on DeepSeek
+#: V4.1 Flash 1017 (owner 2026-11-24), the ladder's rung there is qwen3.8-flash.
+SUMMARY_TIER_MODELS: dict[str, str] = {"qwen": "deepseek-v4.1-flash-1017"}
 
 #: Resolved tier facts per vendor id (see :func:`_vendor_tier_state`), or an
 #: empty dict caching "known not selectable" so the miss is probed (and its
@@ -1702,16 +1718,15 @@ def _vendor_tier_state_uncached(vendor_id: str) -> "dict | None":
     vendor = vendors.get(vendor_id)
     if vendor is None:
         return None
-    # The summary model: the gateway's own CHEAP rung for this vendor. The
-    # ladder's contract is that a rung's ``to_model_id`` is an id the vendor
-    # row is known to serve, so this can never name an un-routable id.
-    model = next(
+    # The summary model: an explicit override (SUMMARY_TIER_MODELS) when the
+    # vendor has no FALLBACK_LADDER rung (kimi), else the ladder's cheap rung.
+    model = SUMMARY_TIER_MODELS.get(vendor_id) or next(
         (rung.to_model_id for rung in ladder if rung.to_vendor_id == vendor_id),
         None,
     )
     if model is None:
         _log(f"  summary: cloud tier '{vendor_id}' not selectable "
-             "(no cheap rung in the gateway fallback ladder)")
+             "(no model override and no cheap rung in the gateway fallback ladder)")
         return None
     try:
         key = resolver.resolve(vendor).key
@@ -1743,6 +1758,7 @@ def zai_available() -> bool:
 def qwen_available() -> bool:
     """The QwenCloud tier is selectable (its key resolves on this machine)."""
     return _vendor_available("qwen")
+
 
 
 def _vendor_summary_model(vendor_id: str) -> str:
@@ -1799,6 +1815,7 @@ def call_zai(prompt: str) -> str:
 
 def call_qwen(prompt: str) -> str:
     return _call_vendor("qwen", prompt)
+
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -120,19 +120,24 @@ def test_f1_live_catalogue_shape_serves_the_first_gateway_rung(
     rig.latch("kg_reviewer:haiku")
     d = rig.decide()
     assert d["mode"] == "claude", (d, rig.lines)
-    assert d["model"] == GLM, (d, rig.lines)
+    assert d["model"] == KIMI, (d, rig.lines)
     assert d["base_url"] == "http://127.0.0.1:11460"
 
 
+DEEPSEEK = "claude-gw/qwen/deepseek-v4.1-flash-1017[1m]"
+
+
 @pytest.mark.parametrize("latched, expected", [
-    (("kg_reviewer:claude-gw/glm-5.3",), KIMI),
-    (("kg_reviewer:claude-gw/glm-5.3", "kg_reviewer:claude-gw/kimi/k3.1-pro"),
-     None),
+    (("kg_reviewer:claude-gw/kimi/k3.1-pro",), GLM),
+    (("kg_reviewer:claude-gw/kimi/k3.1-pro", "kg_reviewer:claude-gw/glm-5.3"),
+     DEEPSEEK),
+    (("kg_reviewer:claude-gw/kimi/k3.1-pro", "kg_reviewer:claude-gw/glm-5.3",
+      "kg_reviewer:claude-gw/qwen/deepseek-v4.1-flash-1017"), None),
 ])
 def test_f1_owner_order_walks_the_namespaced_rungs(
         chain, monkeypatch, latched, expected):
-    """GLM-5.3 (z.ai, ``claude-gw/``) then Kimi K3.1 Pro (``claude-gw/kimi/``);
-    with both latched the walk skips — never to a served flash model."""
+    """Kimi K3.1 Pro first (owner 2026-11-24), then GLM-5.3, then DeepSeek;
+    with all latched the walk skips."""
     rig = _Rig(chain, monkeypatch, catalogue=_live_ids())
     rig.latch("kg_reviewer:haiku")
     for tier in latched:
@@ -154,9 +159,9 @@ def test_f1_plain_spelling_is_matched_and_1m_row_preferred(chain,
     rig.latch("kg_reviewer:haiku")
     assert rig.decide()["model"] == "claude-gw/glm-5.3"
     rig2 = _Rig(chain, monkeypatch, catalogue=frozenset(
-        {"claude-gw/glm-5.3", GLM}))
+        {"claude-gw/kimi/k3.1-pro", KIMI}))
     rig2.latch("kg_reviewer:haiku")
-    assert rig2.decide()["model"] == GLM
+    assert rig2.decide()["model"] == KIMI
 
 
 def test_f1_hand_spelled_ids_are_not_accepted(chain, monkeypatch):
@@ -182,7 +187,7 @@ def test_f1_rung_ids_derive_from_model_router_and_match_shipped_agents(
         if m:
             agent_models.add(m.group(1))
     rungs = chain.gateway_rungs()
-    assert rungs == ("claude-gw/glm-5.3", "claude-gw/kimi/k3.1-pro")
+    assert rungs == ("claude-gw/kimi/k3.1-pro", "claude-gw/glm-5.3", "claude-gw/qwen/deepseek-v4.1-flash-1017")
     for (vendor_id, bare), rung in zip(chain.GATEWAY_RUNG_MODELS, rungs):
         vendor = VENDORS[vendor_id]
         assert bare in (vendor.verified_ids or ()) + (vendor.static_ids or ()), (
@@ -237,7 +242,7 @@ def test_f1_end_to_end_through_a_live_shape_gateway(chain, monkeypatch,
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
-    assert d["model"] == GLM, (d, lines)
+    assert d["model"] == KIMI, (d, lines)
     assert d["base_url"] == f"http://127.0.0.1:{port}"
 
 

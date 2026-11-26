@@ -6,8 +6,8 @@ Owner ruling 2026-10-11, revised 2026-10-15 (v0.2.103): the reviewer runs
 the CHOSEN Claude model (one machine-wide setting; these tests pin it to
 ``haiku`` through ``VCO_KG_REVIEW_MODEL`` so the chain mechanics stay the
 subject); when it is unavailable (a REAL signal — quota / 429 / auth /
-absent), fall back to the comparable non-flash gateway rungs
-``claude-gw/glm-5.3[1m]`` → ``claude-gw/kimi/k3.1-pro[1m]`` — each only when the
+absent), fall back to the comparable gateway rungs
+``claude-gw/kimi/k3.1-pro[1m]`` → ``claude-gw/glm-5.3[1m]`` → ``claude-gw/qwen/deepseek-v4.1-flash-1017[1m]`` — each only when the
 LOCAL MODEL GATEWAY actually serves it (the catalogue is ASKED, never
 assumed) — and use OpenAI when the user enabled OpenAI for SUMMARIES. The
 retired flash rungs are covered in tests/test_v02103_kg_reviewer_safety.py.
@@ -110,7 +110,7 @@ def test_latched_model_falls_to_the_first_served_gateway_model(
     rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
     assert d["mode"] == "claude"
-    assert d["model"] == "claude-gw/glm-5.3[1m]"
+    assert d["model"] == "claude-gw/kimi/k3.1-pro[1m]"
     assert d["base_url"] == "http://127.0.0.1:11460"
     rig.assert_logged("rung haiku: latched (quota)")
 
@@ -124,7 +124,6 @@ def test_quota_latched_model_is_a_real_signal_and_falls_back(chain, monkeypatch)
     d = rig.decide()
     assert d["model"] == "claude-gw/kimi/k3.1-pro[1m]", d
     rig.assert_logged("rung haiku: latched (quota)")
-    rig.assert_logged("rung claude-gw/glm-5.3: not served")
 
 
 def test_catalogue_membership_is_asked_not_assumed(chain, monkeypatch):
@@ -137,7 +136,6 @@ def test_catalogue_membership_is_asked_not_assumed(chain, monkeypatch):
     rig.latched["kg_reviewer:haiku"] = {"reason": "quota", "remaining": 1}
     d = rig.decide()
     assert d["model"] == "claude-gw/kimi/k3.1-pro[1m]"
-    rig.assert_logged("rung claude-gw/glm-5.3: not served")
 
 
 def test_no_gateway_falls_to_openai_only_with_summaries_consent(

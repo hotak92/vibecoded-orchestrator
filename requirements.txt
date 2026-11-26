@@ -11,8 +11,9 @@
 mcp>=1.27.0,<2
 
 # ─── Weaviate ───
-# Weaviate Python client (BSD-3-Clause)
-weaviate-client>=4.21.0
+# Weaviate Python client (BSD-3-Clause).
+# <4.25 (v0.2.109): weaviate-client 4.25.0 (2026-11-26) refuses every Weaviate server older than 1.32, so an install whose Weaviate has not yet moved to the version VCO ships (1.37.18) would lose the KG; capped until VCO stops supporting the move from a pre-1.32 server.
+weaviate-client>=4.21.0,<4.25
 
 # ─── HTTP / async ───
 aiohttp>=3.13.5

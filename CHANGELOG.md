@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.109] - 2026-11-26
+
+### Fixed
+
+- **An install or update no longer pulls a Weaviate client that refuses an older Weaviate.** `weaviate-client`
+  4.25.0 (released 2026-11-26) refuses every Weaviate server older than 1.32. VCO declared the client with no upper
+  bound, so an install or update from that day on would get 4.25. On a machine whose Weaviate has not yet moved to the
+  version VCO ships (1.37.18), the knowledge-graph server, the hooks and the scripts could then no longer connect, including
+  while an update waits to move Weaviate. The client is now declared `>=4.21.0,<4.25` in `requirements.txt`,
+  `pyproject.toml` and `claude_mcp_servers/pyproject.toml`, and an update moves an already-installed 4.25 back.
+
+- **Background jobs stop retrying Claude every 15 minutes when the subscription is used up.** Claude Code reports an
+  exhausted subscription as "This request would exceed your account's rate limit". The summary generator and the
+  post-commit KG reviewer read the words "rate limit" in it as a short throttle and retried after 15 minutes, so a
+  user out of Claude usage got a "rate_limit (429)" desktop notification again and again for hours. That wording now
+  counts as an exhausted quota: the Claude tier rests for 5 hours (`VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN`) and the next
+  tier answers meanwhile.
+
+- **Installing from a downloaded release zip works again, on every OS.** The v0.2.108 zips were missing the Python
+  package (`vco_lib/`), `scripts/`, the `launcher/` folder, `migrations/` and `pyproject.toml`, and carried the
+  launcher, hub and CLI binaries at the top of the archive, so `first-install` stopped at its first step with
+  `No module named 'vco_lib'`. The zip is now the full tagged tree (without the developer test suite and the CI
+  configuration) with the launcher, hub, updater and `vct-cli` binaries in `launcher/dist/<os>-<arch>/` — where a
+  clone has them and where the start scripts look. CI now installs from the zip on Linux, macOS and Windows, on pull
+  requests and before a release is published.
+- **The first-install bootstrap probe no longer fails silently.** When `install.py --bootstrap --json` failed,
+  `first-install.sh`, `first-install.command` and `install.ps1` (behind `first-install.bat`) threw its error away and
+  left an empty `state/logs/bootstrap-prepass.json`. The probe is still optional, but its error is now kept in
+  `state/logs/bootstrap-prepass.stderr` and the exit code and the end of the error are printed.
+
+### Changed
+
+- **New fallback order for the post-commit KG reviewer and the summary generator.** When the chosen Claude model is
+  unavailable, the reviewer now tries Kimi K3.1 Pro first, then GLM-5.3, then DeepSeek V4.1 Flash 1017 (before: GLM-5.3,
+  then Kimi). Each runs only when the local model gateway serves it. The summary generator's QwenCloud tier now uses
+  DeepSeek V4.1 Flash 1017 instead of Qwen3.8-Flash. Summaries are one call per node, so only cheap, fast models
+  serve them.
+- **Release mechanics:** version 0.2.108 → 0.2.109 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No new code-graph extractor-generation rung — 0.2.109 is recorded as a non-bump in `EXTRACTOR_GENERATION_NON_BUMPS` (no file of the extractor surface changed since v0.2.108), so no graph is re-walked for this release; `CODEGRAPH_EMBED_REVISION` is unchanged.
+
 ## [0.2.108] - 2026-11-23
 
 ### Fixed
@@ -14825,7 +14864,8 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.108...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.109...HEAD
+[0.2.109]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.108...v0.2.109
 [0.2.108]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...v0.2.108
 [0.2.107]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.106...v0.2.107
 [0.2.106]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.105...v0.2.106
