@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.common.pwsh import PWSH_BASE_FLAGS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STAGE = REPO_ROOT / "scripts" / "stage-release-archive.sh"
 SMOKE = REPO_ROOT / "scripts" / "smoke-install-from-zip.sh"
@@ -312,7 +314,7 @@ def test_failed_bootstrap_probe_is_surfaced_not_fatal(tmp_path: Path, shim: str)
     env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(home), "CI": "1",
            "VCT_NON_INTERACTIVE": "1"}
     if shim.endswith(".ps1"):
-        cmd = [shutil.which("pwsh") or "pwsh", "-NoProfile", "-File", shim,
+        cmd = [shutil.which("pwsh") or "pwsh", *PWSH_BASE_FLAGS, "-File", shim,
                "-NonInteractive", "-NoContainers"]
     else:
         cmd = ["bash", shim, "--no-auto-launch"]

@@ -15,7 +15,7 @@ Auto-generated 2-3 sentence summaries for every KG node, written to `knowledge/.
 
 1. **`claude` CLI on PATH** — best quality, requires CLI install (Max sub OAuth or API key). Gated by a smoke-test, not just `--version`, so an installed-but-unauthenticated CLI doesn't get picked.
 2. **z.ai GLM (cloud, `zai`)** — selectable only when the z.ai key resolves on this machine, through the model gateway's own vendor registry and key resolver; the model is the gateway fallback ladder's cheap rung for that vendor. No key → the tier is skipped with a log line, never an error.
-3. **QwenCloud (cloud, `qwen`)** — the same shape on the qwen key, on DeepSeek V4.1 Flash (`deepseek-v4.1-flash-1017`, v0.2.109).
+3. **QwenCloud (cloud, `qwen`)** — the same shape on the qwen key.
 4. **Ollama (local, FREE)** at `http://localhost:11435` — the machine's ONE generation model (see "Ollama defaults" below). The tier is **skipped** when Ollama does not already hold that model (nothing is pulled at runtime), and **deferred** — the node stays owed for the next run — while a code-graph embedding walk is running or free VRAM is below a floor derived from the model's own size (on-disk weights plus a KV-cache margin; 8192 MB when the size cannot be read; override `KG_SUMMARY_MIN_FREE_VRAM_MB`). A model already resident in Ollama needs no new VRAM, so the floor is not applied to it.
 5. **OpenAI API (opt-in)** — needs a key **and** consent: the `kg_summary_openai_consent` app_state key (default false; set via launcher Preferences → KG Summaries; operator bypass `--force-api`). Costs apply. The only consent-gated tier: z.ai and QwenCloud are subscriptions and need no consent.
 6. **`ANTHROPIC_API_KEY` direct** — legacy opt-in fallback, cost warning logged.
