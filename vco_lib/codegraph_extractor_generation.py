@@ -252,6 +252,14 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "golden snapshots (tests/fixtures/codegraph_golden) are byte-identical to "
         "v0.2.102. _CHUNKER_REVISION and CODEGRAPH_EMBED_REVISION unchanged."
     ),
+    "0.2.109": (
+        "No extraction-semantics change: `git diff v0.2.108..HEAD` touches no "
+        "file of the extractor surface (analyze_code_graph.py, codegraph_*, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py); the "
+        "hotfix is the release-zip packaging, the Claude quota latch and the "
+        "reviewer/summary fallback order. _CHUNKER_REVISION and "
+        "CODEGRAPH_EMBED_REVISION unchanged."
+    ),
     "0.2.108": (
         "No extraction-semantics change: `git diff v0.2.107..HEAD` touches no "
         "file of the extractor surface (analyze_code_graph.py, codegraph_*, "

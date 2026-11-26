@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.109] - 2026-11-26
+
 ### Fixed
 
 - **Background jobs stop retrying Claude every 15 minutes when the subscription is used up.** Claude Code reports an
@@ -35,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then Kimi). Each runs only when the local model gateway serves it. The summary generator's QwenCloud tier now uses
   DeepSeek V4.1 Flash 1017 instead of Qwen3.8-Flash. Summaries are one call per node, so only cheap, fast models
   serve them.
+- **Release mechanics:** version 0.2.108 → 0.2.109 through `scripts/bump-version.sh` (all pins agree, `check-version-pins.sh`). No new code-graph extractor-generation rung — 0.2.109 is recorded as a non-bump in `EXTRACTOR_GENERATION_NON_BUMPS` (no file of the extractor surface changed since v0.2.108), so no graph is re-walked for this release; `CODEGRAPH_EMBED_REVISION` is unchanged.
 
 ## [0.2.108] - 2026-11-23
 
@@ -14854,7 +14857,8 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.108...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.109...HEAD
+[0.2.109]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.108...v0.2.109
 [0.2.108]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.107...v0.2.108
 [0.2.107]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.106...v0.2.107
 [0.2.106]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.105...v0.2.106
