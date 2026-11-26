@@ -1041,6 +1041,21 @@ jobs:
           copy_subtree infrastructure "$stage_root/infrastructure"
           copy_subtree tools "$stage_root/tools"
 
+          # 3b. Installer runtime code. install.py imports `vco_lib` at
+          # module load (before argparse), and the post-install steps use
+          # VCThelpers/, migrations/ and scripts/ (post-install-launcher,
+          # launcher_acquire helpers). Before this block these were left
+          # out of the archive, so `python install.py` died immediately
+          # with `ModuleNotFoundError: No module named 'vco_lib'` for every
+          # user who followed the "download the zip" path (v0.2.108 and
+          # earlier). pyproject.toml is read by the installer for
+          # version/extras.
+          copy_subtree vco_lib "$stage_root/vco_lib"
+          copy_subtree VCThelpers "$stage_root/VCThelpers"
+          copy_subtree migrations "$stage_root/migrations"
+          copy_subtree scripts "$stage_root/scripts"
+          cp pyproject.toml "$stage_root/"
+
           # .claude/ has additional exclusions for runtime state we
           # never want shipped: logs, metrics, ephemeral context.
           #
@@ -1070,6 +1085,11 @@ jobs:
             cp install.py "$stage_root/"
             cp first-install.bat "$stage_root/"
             cp start-launcher.bat "$stage_root/"
+            cp uninstall.bat "$stage_root/"
+            # install.py's validate_source_repo() requires install.py AND
+            # first-install.sh side by side, on every OS. Ship the .sh on
+            # Windows too (it is not used there, it is the marker).
+            cp first-install.sh "$stage_root/"
           else
             # Linux + macOS share the .sh entry points; the .command
             # variant is macOS-friendly (Finder double-click) and the
@@ -1084,6 +1104,7 @@ jobs:
             cp start-launcher.sh "$stage_root/"
             cp start-launcher.command "$stage_root/"
             cp start-launcher.desktop "$stage_root/"
+            cp uninstall.sh "$stage_root/"
           fi
 
           # 5. Top-level docs + manifests.
@@ -1140,6 +1161,23 @@ jobs:
           du -sh "$stage_root"
           du -sh "$stage_root"/* 2>/dev/null || true
           echo "::endgroup::"
+
+      # Regression guard for the v0.2.108 failure: the archive was built
+      # without vco_lib/, so the installer crashed on import. Run the
+      # installer entry point from the STAGED tree (not from the repo
+      # checkout) so a missing runtime file fails the release here, before
+      # anything is uploaded. --help exits after argparse, installs nothing.
+      - name: Smoke-test staged archive (installer must start)
+        shell: bash
+        env:
+          ARCHIVE_BASE: ${{ steps.archive_meta.outputs.archive_base }}
+        run: |
+          set -euo pipefail
+          cd "dist/${ARCHIVE_BASE}"
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          PYTHONDONTWRITEBYTECODE=1 "$PY" install.py --help > /dev/null
+          echo "installer starts from the staged archive: OK"
 
       - name: Create archive (Linux/macOS — zip)
         if: matrix.os != 'windows-latest'
