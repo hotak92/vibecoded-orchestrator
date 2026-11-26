@@ -43,7 +43,7 @@ the node is left without a summary, flagged as refused in the sidecar, and
 the NEXT ordinary sync tries it again — the flag is a record, not a skip.
 
 Env overrides:
-  KG_SUMMARY_BACKEND        → force "cli" | "kimi" | "zai" | "qwen" | "ollama" | "openai" | "api" | "skip"
+  KG_SUMMARY_BACKEND        → force "cli" | "zai" | "qwen" | "ollama" | "openai" | "api" | "skip"
                               (auto-detect default; "api" = Anthropic, "openai" = OpenAI).
                               Unset: the launcher Preferences backend pin
   KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag. Unset: the machine's generation

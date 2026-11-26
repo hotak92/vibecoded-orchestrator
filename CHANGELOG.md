@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Background jobs stop retrying Claude every 15 minutes when the subscription is used up.** Claude Code reports an
+  exhausted subscription as "This request would exceed your account's rate limit". The summary generator and the
+  post-commit KG reviewer read the words "rate limit" in it as a short throttle and retried after 15 minutes, so a
+  user out of Claude usage got a "rate_limit (429)" desktop notification again and again for hours. That wording now
+  counts as an exhausted quota: the Claude tier rests for 5 hours (`VCO_SUMMARY_BREAKER_QUOTA_COOLDOWN`) and the next
+  tier answers meanwhile.
+
 - **Installing from a downloaded release zip works again, on every OS.** The v0.2.108 zips were missing the Python
   package (`vco_lib/`), `scripts/`, the `launcher/` folder, `migrations/` and `pyproject.toml`, and carried the
   launcher, hub and CLI binaries at the top of the archive, so `first-install` stopped at its first step with
@@ -20,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `first-install.sh`, `first-install.command` and `install.ps1` (behind `first-install.bat`) threw its error away and
   left an empty `state/logs/bootstrap-prepass.json`. The probe is still optional, but its error is now kept in
   `state/logs/bootstrap-prepass.stderr` and the exit code and the end of the error are printed.
+
+### Changed
+
+- **New fallback order for the post-commit KG reviewer and the summary generator.** When the chosen Claude model is
+  unavailable, the reviewer now tries Kimi K3.1 Pro first, then GLM-5.3, then DeepSeek V4.1 Flash 1017 (before: GLM-5.3,
+  then Kimi). Each runs only when the local model gateway serves it. The summary generator's QwenCloud tier now uses
+  DeepSeek V4.1 Flash 1017 instead of Qwen3.8-Flash. Summaries are one call per node, so only cheap, fast models
+  serve them.
 
 ## [0.2.108] - 2026-11-23
 

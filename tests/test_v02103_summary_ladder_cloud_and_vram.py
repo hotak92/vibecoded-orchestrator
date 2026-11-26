@@ -173,13 +173,39 @@ def _fake_registry(monkeypatch, sb, *, zai_key="", qwen_key=""):
 
 
 def test_vendor_state_model_is_the_gateway_cheap_rung(sb, monkeypatch):
-    """The summary model comes from the gateway's own FALLBACK_LADDER —
-    glm-5.3-flash / qwen3.8-flash, the cheap escalation rungs (summaries
-    are short). No vendor model id is duplicated here."""
+    """The z.ai summary model comes from the gateway's own FALLBACK_LADDER
+    (glm-5.3-flash, the cheap escalation rung); QwenCloud's is the explicit
+    SUMMARY_TIER_MODELS override, DeepSeek V4.1 Flash 1017 (owner
+    2026-11-24: summaries are bulk work, cheap fast models only)."""
     _fake_registry(monkeypatch, sb, zai_key="z", qwen_key="q")
     assert sb._vendor_summary_model("zai") == "glm-5.3-flash"
-    assert sb._vendor_summary_model("qwen") == "qwen3.8-flash"
+    assert sb._vendor_summary_model("qwen") == "deepseek-v4.1-flash-1017"
     assert sb._vendor_available("zai") and sb._vendor_available("qwen")
+
+
+def test_every_summary_model_override_is_an_id_its_vendor_row_declares():
+    """An override bypasses the FALLBACK_LADDER, whose contract guarantees a
+    routable id — so each override must be an id the gateway's own vendor row
+    declares (static or verified), or the tier would call a model the gateway
+    cannot route. A rename on either side fails here, not on a user machine."""
+    import importlib.util
+    import sys as _sys
+    root = Path(__file__).resolve().parents[1]
+    _sys.path.insert(0, str(root / "claude_mcp_servers"))
+    try:
+        from model_router.vendors import VENDORS
+    finally:
+        _sys.path.remove(str(root / "claude_mcp_servers"))
+    spec = importlib.util.spec_from_file_location(
+        "_sb_overrides", root / "templates" / "scripts" / "summary_backends.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.SUMMARY_TIER_MODELS, "no overrides left: drop this test with them"
+    for vendor_id, model in mod.SUMMARY_TIER_MODELS.items():
+        assert vendor_id in mod.CLOUD_VENDOR_TIERS, vendor_id
+        row = VENDORS[vendor_id]
+        declared = set(row.static_ids or ()) | set(row.verified_ids or ())
+        assert model in declared, (vendor_id, model, sorted(declared))
 
 
 def test_no_key_skips_the_tier_silently(sb, monkeypatch):

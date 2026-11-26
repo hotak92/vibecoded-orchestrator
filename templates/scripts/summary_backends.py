@@ -46,7 +46,7 @@ re-index may need:
 Env overrides (shared knobs — the ``KG_SUMMARY_*`` names stay canonical for
 BOTH callers; the code generator adds a ``CODE_SUMMARY_BACKEND`` alias that
 falls back to ``KG_SUMMARY_BACKEND`` via the ``env_keys`` parameter):
-  KG_SUMMARY_BACKEND        → force "cli" | "kimi" | "zai" | "qwen" | "ollama" | "api" |
+  KG_SUMMARY_BACKEND        → force "cli" | "zai" | "qwen" | "ollama" | "api" |
                               "openai" | "skip" (auto-detect default; "api" =
                               Anthropic, "openai" = OpenAI, "zai"/"qwen" = the
                               cloud vendor tiers). Unset: the launcher
@@ -305,7 +305,7 @@ SYSTEM_PROMPT = (
 # The valid KG_SUMMARY_BACKEND / CODE_SUMMARY_BACKEND force values. v0.2.103
 # (8b) added the cloud vendor tiers "zai" and "qwen" (the model gateway's
 # registry ids) between the CLI and local Ollama.
-VALID_BACKENDS = {"cli", "kimi", "zai", "qwen", "ollama", "api", "openai", "skip"}
+VALID_BACKENDS = {"cli", "zai", "qwen", "ollama", "api", "openai", "skip"}
 
 _BACKEND_CACHE: dict[str, str] = {}
 
@@ -1640,14 +1640,18 @@ def call_cli(prompt: str) -> str:
 #: before QwenCloud. These are the model gateway's own registry ids
 #: (``model_router.vendors.VENDORS`` keys) — the tier names double as the
 #: ``KG_SUMMARY_BACKEND`` force values and breaker keys.
-#: Summary cloud tiers in fallback order (owner 2026-11-24: Kimi first).
-#: Each resolves through the gateway registry; the model comes from
-#: SUMMARY_TIER_MODELS when present, else the FALLBACK_LADDER's cheap rung.
-CLOUD_VENDOR_TIERS: tuple[str, ...] = ("kimi", "zai", "qwen")
+#: Summary cloud tiers in fallback order. Summaries are BULK work (one call
+#: per node), so only cheap/fast models serve them (owner 2026-11-24: Claude
+#: -> GLM-flash -> DeepSeek); a slow, small-window model such as Kimi K3.1 Pro
+#: is deliberately not a summary tier. Each resolves through the gateway
+#: registry; the model comes from SUMMARY_TIER_MODELS when present, else the
+#: FALLBACK_LADDER's cheap rung for that vendor.
+CLOUD_VENDOR_TIERS: tuple[str, ...] = ("zai", "qwen")
 
-#: Model overrides for tiers whose model is NOT the FALLBACK_LADDER's cheap
-#: rung (kimi has no ladder rung; its summary model is k3.1-pro).
-SUMMARY_TIER_MODELS: dict[str, str] = {"kimi": "k3.1-pro"}
+#: Model overrides for tiers whose summary model is NOT the gateway
+#: FALLBACK_LADDER's cheap rung: on QwenCloud the summaries run on DeepSeek
+#: V4.1 Flash 1017 (owner 2026-11-24), the ladder's rung there is qwen3.8-flash.
+SUMMARY_TIER_MODELS: dict[str, str] = {"qwen": "deepseek-v4.1-flash-1017"}
 
 #: Resolved tier facts per vendor id (see :func:`_vendor_tier_state`), or an
 #: empty dict caching "known not selectable" so the miss is probed (and its
@@ -1756,10 +1760,6 @@ def qwen_available() -> bool:
     return _vendor_available("qwen")
 
 
-def kimi_available() -> bool:
-    """The Kimi tier is selectable (its key resolves on this machine)."""
-    return _vendor_available("kimi")
-
 
 def _vendor_summary_model(vendor_id: str) -> str:
     state = _vendor_tier_state(vendor_id)
@@ -1816,9 +1816,6 @@ def call_zai(prompt: str) -> str:
 def call_qwen(prompt: str) -> str:
     return _call_vendor("qwen", prompt)
 
-
-def call_kimi(prompt: str) -> str:
-    return _call_vendor("kimi", prompt)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2546,7 +2543,7 @@ def select_backend(
         # Resolved through the per-tier probe functions (``zai_available`` /
         # ``qwen_available``) so a substituted or pinned probe governs
         # selection exactly as for every other tier.
-        probe = {"kimi": kimi_available, "zai": zai_available, "qwen": qwen_available}.get(vendor_id)
+        probe = {"zai": zai_available, "qwen": qwen_available}.get(vendor_id)
         if probe is None:
             continue
         if _tier_selectable(vendor_id, label) and probe():
@@ -2597,7 +2594,7 @@ def select_backend(
     else:
         _log(
             f"  {label}: no backend available (no claude CLI, no cloud-vendor "
-            f"key (Kimi / z.ai / QwenCloud), no Ollama at {OLLAMA_URL} or VRAM-"
+            f"key (z.ai / QwenCloud), no Ollama at {OLLAMA_URL} or VRAM-"
             f"deferred, no OPENAI_API_KEY, no ANTHROPIC_API_KEY). Skipping."
         )
     return "skip"
@@ -2618,7 +2615,7 @@ def _dispatch(backend: str, prompt: str) -> str:
     if backend == "cli":
         return call_cli(prompt)
     if backend in CLOUD_VENDOR_TIERS:
-        call = {"kimi": call_kimi, "zai": call_zai, "qwen": call_qwen}[backend]
+        call = {"zai": call_zai, "qwen": call_qwen}[backend]
         return call(prompt)
     if backend == "ollama":
         return call_ollama(prompt)

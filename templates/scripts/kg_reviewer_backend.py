@@ -29,12 +29,13 @@ Model chain (owner rulings 2026-10-11, revised 2026-10-15):
    ``claude`` CLI, or its tier is breaker-latched for a REAL signal (quota /
    429 / auth), recorded by the ``record`` subcommand below;
 2. a gateway model of COMPARABLE capability — ``[fallback] gateway_rungs``
-   in ``vco_lib/kg_reviewer_config.toml`` (GLM-5.3, then Kimi K3.1 Pro) — ONLY
+   in ``vco_lib/kg_reviewer_config.toml`` (Kimi K3.1 Pro, then GLM-5.3, then
+   DeepSeek V4.1 Flash 1017 — owner 2026-11-24) — ONLY
    when the local model gateway actually serves it (the catalogue is ASKED
    via ``GET /v1/models``, authenticated with the daemon's host token), its
    tier is not latched, and the ``claude`` CLI the rung spawns is on PATH.
-   Flash models are deliberately not rungs: too weak for this job, so the
-   chain never degrades to one. The gateway spelling of each id is DERIVED
+   The only flash rung is DeepSeek V4.1 Flash 1017 (owner 2026-11-24: capable
+   enough for a review); the cheap GLM/Qwen flash models are not rungs. The gateway spelling of each id is DERIVED
    from model_router's vendor table, never hand-written;
 3. OpenAI — only when the user enabled OpenAI for SUMMARIES (the
    ``kg_summary_openai_consent`` gate from :mod:`summary_backends`); this
