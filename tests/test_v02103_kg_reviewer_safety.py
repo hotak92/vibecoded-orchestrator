@@ -316,34 +316,37 @@ def test_chain_runs_the_chosen_model(chain, monkeypatch):
     assert rig.decide()["model"] == "opus"
 
 
-def test_unavailable_model_falls_back_to_glm_53_not_a_flash(chain, monkeypatch):
+def test_unavailable_model_falls_back_to_kimi_first(chain, monkeypatch):
     rig = _Rig(chain, monkeypatch, catalogue=_live_ids())
     rig.latch("kg_reviewer:sonnet")
     d = rig.decide()
-    assert d["model"] == "claude-gw/glm-5.3[1m]", (d, rig.lines)
-    rig.latch("kg_reviewer:claude-gw/glm-5.3")
-    assert rig.decide()["model"] == "claude-gw/kimi/k3.1-pro[1m]", rig.lines
+    assert d["model"] == "claude-gw/kimi/k3.1-pro[1m]", (d, rig.lines)
+    rig.latch("kg_reviewer:claude-gw/kimi/k3.1-pro")
+    assert rig.decide()["model"] == "claude-gw/glm-5.3[1m]", rig.lines
 
 
 def test_flash_only_gateway_means_skip(chain, monkeypatch):
-    flash = frozenset(i for i in _live_ids() if "flash" in i)
+    # A gateway serving only the cheap flash models (glm-5.3-flash,
+    # qwen3.8-flash) but NOT the reviewer's deepseek-1017 rung still skips.
+    flash = frozenset(i for i in _live_ids()
+                      if "flash" in i and "1017" not in i)
     rig = _Rig(chain, monkeypatch, catalogue=flash)
     rig.latch("kg_reviewer:sonnet")
     d = rig.decide()
     assert d["mode"] == "skip", (d, rig.lines)
-    assert any("no flash-model fallback" in ln for ln in rig.lines)
-    assert all("flash" not in r for r in chain.gateway_rungs())
 
 
 def test_every_comparable_rung_down_keeps_the_openai_consent_gate(
         chain, monkeypatch):
     rig = _Rig(chain, monkeypatch, catalogue=_live_ids(), consent=True)
-    rig.latch("kg_reviewer:sonnet", "kg_reviewer:claude-gw/glm-5.3",
-              "kg_reviewer:claude-gw/kimi/k3.1-pro")
+    rig.latch("kg_reviewer:sonnet", "kg_reviewer:claude-gw/kimi/k3.1-pro",
+              "kg_reviewer:claude-gw/glm-5.3",
+              "kg_reviewer:claude-gw/qwen/deepseek-v4.1-flash-1017")
     assert rig.decide()["mode"] == "openai"
     rig2 = _Rig(chain, monkeypatch, catalogue=_live_ids(), consent=False)
-    rig2.latch("kg_reviewer:sonnet", "kg_reviewer:claude-gw/glm-5.3",
-               "kg_reviewer:claude-gw/kimi/k3.1-pro")
+    rig2.latch("kg_reviewer:sonnet", "kg_reviewer:claude-gw/kimi/k3.1-pro",
+               "kg_reviewer:claude-gw/glm-5.3",
+               "kg_reviewer:claude-gw/qwen/deepseek-v4.1-flash-1017")
     assert rig2.decide()["mode"] == "skip"
 
 

@@ -40,14 +40,15 @@ choices = ["haiku", "sonnet", "opus"]
 # When the chosen Claude model is unavailable (no `claude` CLI, or its tier is
 # breaker-latched on a REAL quota/429/auth signal), the reviewer may run on a
 # gateway model of COMPARABLE capability — only when the local model gateway
-# actually serves it (the catalogue is asked, never assumed). Flash models are
-# deliberately absent: they are too weak for this job (owner ruling
-# 2026-10-15), so with none of these served the review is SKIPPED with a log
-# line, never degraded. Each row is [vendor row id, bare model id]; the
+# actually serves it (the catalogue is asked, never assumed). Order: Kimi 3.1
+# Pro first (owner 2026-11-24), then GLM-5.3, then DeepSeek V4.1 Flash at high
+# effort (owner 2026-11-24: capable enough at high effort for this job). With
+# none served the review is SKIPPED with a log line, never degraded. Each row is [vendor row id, bare model id]; the
 # gateway spelling is derived from model_router's vendor table.
 gateway_rungs = [
-    ["zai", "glm-5.3"],
     ["kimi", "k3.1-pro"],
+    ["zai", "glm-5.3"],
+    ["qwen", "deepseek-v4.1-flash-1017"],
 ]
 
 [prompt]
