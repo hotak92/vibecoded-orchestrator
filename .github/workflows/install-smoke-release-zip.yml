@@ -1,0 +1,176 @@
+# Install smoke FROM THE RELEASE ZIP (v0.2.109).
+#
+# Why this exists: install-smoke-tri-os.yml installs from a git clone, so it
+# could not see that the v0.2.108 release zips held a hand-picked subset of
+# the tree (no vco_lib/, scripts/, launcher/, migrations/, pyproject.toml;
+# binaries at the zip root) — `install.py` died on its first import on every
+# OS. This workflow stages the archive with the SAME script the release uses
+# (scripts/stage-release-archive.sh, the one home for the layout), zips it,
+# extracts it to a fresh folder OUTSIDE the checkout, and runs the OS's own
+# first-install entry point there, exactly as a user who downloaded the zip
+# would.
+#
+# Binaries: PR CI does not build the Tauri launcher. The staging script lays
+# the binaries from launcher/dist/<target>/ — in this checkout those are the
+# committed prebuilt binaries (the release refreshes them after each tag),
+# so the extracted tree is the realistic one a user gets.
+#
+# Triggers: pull_request touching install / packaging surfaces, push to main,
+# workflow_dispatch, and workflow_call — release.yml's `zip-install-smoke`
+# job calls it on every release tag and `build` needs that job, so a red
+# install-from-zip means no assets are built. Separately, release.yml's build
+# job runs `smoke-install-from-zip.sh extract` + `probe` on the REAL zip it is
+# about to upload.
+#
+# Mirror guard: same repository pin as install-smoke-tri-os.yml — the private
+# mirror this file syncs to has a small Actions quota, and the full install on
+# three OSes costs ~30 billed minutes per run.
+
+name: Install Smoke (release zip)
+
+on:
+  pull_request:
+    paths:
+      - "install.py"
+      - "install.sh"
+      - "install.ps1"
+      - "first-install.*"
+      - "start-launcher.*"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - "vco_lib/**"
+      - "scripts/**"
+      - "migrations/**"
+      - "templates/**"
+      - "launcher/dist/**"
+      - ".gitattributes"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/install-smoke-release-zip.yml"
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # Under workflow_call github.workflow / event_name are the CALLER's (see
+  # install-smoke-tri-os.yml); the suffix keeps this group distinct from the
+  # tri-OS smoke the same caller runs.
+  group: ${{ github.workflow }}-${{ github.ref }}-release-zip
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  zip-install:
+    name: install from zip (${{ matrix.target }})
+    if: ${{ github.repository == 'hotak92/vibecoded-orchestrator' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: macos-15
+            target: macos-arm64
+          - os: windows-latest
+            target: windows-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+            ~/AppData/Local/pip/Cache
+          key: zip-smoke-pip-${{ runner.os }}-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            zip-smoke-pip-${{ runner.os }}-
+
+      # Same script, same layout as the published asset.
+      - name: Stage + zip the release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/zip-stage"
+          bash scripts/stage-release-archive.sh --target "$TARGET" --out-dir "$out" --zip
+          zip_path="$(ls "$out"/*.zip)"
+          echo "ZIP_PATH=$zip_path" >> "$GITHUB_ENV"
+
+      # Fresh folder OUTSIDE the checkout: nothing from the clone can leak
+      # into the install (no .git, no untracked files).
+      - name: Extract the zip + pre-install probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(bash scripts/smoke-install-from-zip.sh extract "$ZIP_PATH" "$RUNNER_TEMP/zip-install")"
+          echo "ZIP_ROOT=$root" >> "$GITHUB_ENV"
+          # cmd.exe cannot cd into Git Bash's /d/a/... form.
+          if command -v cygpath >/dev/null 2>&1; then
+            echo "ZIP_ROOT_WIN=$(cygpath -w "$root")" >> "$GITHUB_ENV"
+          fi
+          bash scripts/smoke-install-from-zip.sh probe "$root" "$TARGET"
+
+      # The OS's own entry point, invoked as the tri-OS smoke does (same
+      # flags: no containers and no model pulls on runners, no GUI spawn).
+      - name: first-install.sh (Linux)
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$ZIP_ROOT"
+          bash first-install.sh --yes --no-auto-launch --no-containers --skip-models
+
+      - name: first-install.command (macOS)
+        if: matrix.target == 'macos-arm64'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Finder runs a .command with PWD=$HOME: start elsewhere to prove
+          # the shim cd's into its own folder.
+          cd "$RUNNER_TEMP"
+          bash "$ZIP_ROOT/first-install.command" --yes --no-auto-launch --no-containers --skip-models
+
+      # cmd.exe, not bash: the point is the .bat parser. Paren-free echo
+      # text inside ( ) blocks (tests/test_workflow_cmd_paren_safety.py).
+      - name: first-install.bat (Windows, cmd.exe)
+        if: matrix.target == 'windows-x64'
+        shell: cmd
+        run: |
+          cd /d "%ZIP_ROOT_WIN%"
+          call first-install.bat --yes --no-auto-launch --no-containers --skip-models
+          if errorlevel 1 (
+            echo ::error::first-install.bat exited non-zero
+            if exist state\logs\install.jsonl type state\logs\install.jsonl
+            exit /b 1
+          )
+          echo first-install.bat exited 0
+
+      - name: Verify the install from the zip
+        shell: bash
+        run: bash scripts/smoke-install-from-zip.sh verify "$ZIP_ROOT" "$TARGET"
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: zip-install-diagnostics-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/zip-install/*/bootstrap-pre.json
+            ${{ runner.temp }}/zip-install/*/bootstrap-pre.stderr
+            ${{ runner.temp }}/zip-install/*/bootstrap-post.json
+            ${{ runner.temp }}/zip-install/*/bootstrap-post.stderr
+            ${{ runner.temp }}/zip-install/*/state/logs/
+          if-no-files-found: ignore
+          retention-days: 14

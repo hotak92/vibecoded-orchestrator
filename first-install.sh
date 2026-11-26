@@ -99,10 +99,22 @@ done
 # door to v0.2.54 prepass-based blocker detection. Best-effort:
 # failure does not stop the install (--bootstrap is exclusive with
 # --update etc., so we invoke it ALONE in a separate process).
+#
+# Optional, so a failure never stops the install — but it is never silent:
+# its stderr goes to state/logs/bootstrap-prepass.stderr and a failed probe
+# prints the exit code and the end of that error here, before the install
+# step (which usually fails the same way, e.g. a tree without vco_lib/).
 mkdir -p state/logs 2>/dev/null || true
+prepass_status=0
 "$PYTHON" install.py --bootstrap --json \
-    > state/logs/bootstrap-prepass.json 2>/dev/null \
-    || true
+    > state/logs/bootstrap-prepass.json \
+    2> state/logs/bootstrap-prepass.stderr \
+    || prepass_status=$?
+if [ "$prepass_status" -ne 0 ]; then
+    echo "[first-install] WARNING: the bootstrap probe (install.py --bootstrap --json) exited $prepass_status; continuing with the install." >&2
+    echo "[first-install] Its error (full text: state/logs/bootstrap-prepass.stderr):" >&2
+    tail -n 20 state/logs/bootstrap-prepass.stderr >&2 || true
+fi
 
 # ---- Step 2: full install ----
 # Forward the user's argv unchanged (NOT --bootstrap; bootstrap is

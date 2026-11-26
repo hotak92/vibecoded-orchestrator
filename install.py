@@ -16503,7 +16503,10 @@ def _download_release_binary(
     inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
 
     is_win = platform.system().lower().startswith("win")
-    inner_member = f"{inner_root}/{binary_basename}" + (".exe" if is_win else "")
+    # The zip is the whole tagged tree with the binaries at
+    # launcher/dist/<os-arch>/ (scripts/stage-release-archive.sh, the one
+    # home for that layout) — the same path a clone has them at.
+    inner_member = f"{inner_root}/launcher/dist/{subdir}/{fname}"
 
     tmpdir = Path(tempfile.mkdtemp(prefix=tmpdir_prefix))
     try:

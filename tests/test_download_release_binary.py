@@ -29,6 +29,7 @@ INSTALL_PY = REPO_ROOT / "install.py"
 @pytest.fixture(scope="module")
 def install_module():
     spec = importlib.util.spec_from_file_location("install_under_test_d2", INSTALL_PY)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules["install_under_test_d2"] = mod
     spec.loader.exec_module(mod)
@@ -221,3 +222,35 @@ def test_helper_falls_back_from_gh_to_curl(install_module, tmp_path):
         )
     assert result is not None
     assert result.exists()
+
+
+def test_helper_takes_the_binary_from_launcher_dist_in_the_full_tree_zip(install_module, tmp_path):
+    """v0.2.109: the zip is the whole tagged tree with the binaries at
+    ``<root>/launcher/dist/<os-arch>/`` (scripts/stage-release-archive.sh).
+    The helper must take THAT member even when another member that ends in
+    the same basename is listed first (a by-suffix match alone would pick
+    the decoy)."""
+    version = "0.2.109"
+    artifact = f"vibecoded-orchestrator-{version}-linux-x64.zip"
+    root = f"vibecoded-orchestrator-{version}-linux-x64"
+
+    def fake_run(cmd, **kw):
+        if "--dir" in cmd:
+            dest = Path(cmd[cmd.index("--dir") + 1])
+            with zipfile.ZipFile(dest / artifact, "w") as z:
+                z.writestr(f"{root}/docs/examples/vct-launcher", b"decoy")
+                z.writestr(f"{root}/launcher/dist/linux-x64/vct-launcher", b"\x7fELF real")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch.object(install_module, "_read_launcher_version", return_value=version), \
+         patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}" if name == "gh" else None), \
+         patch("subprocess.run", side_effect=fake_run), \
+         patch("platform.system", return_value="Linux"):
+        result = install_module._download_release_binary(
+            install_root=tmp_path,
+            binary_basename="vct-launcher",
+            bin_subdir_fname=("linux-x64", "vct-launcher"),
+            tmpdir_prefix="t-",
+        )
+    assert result is not None
+    assert result.read_bytes() == b"\x7fELF real"

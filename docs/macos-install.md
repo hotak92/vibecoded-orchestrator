@@ -20,11 +20,13 @@ cd vibecoded-orchestrator
 bash first-install.command
 ```
 
+Or download `vibecoded-orchestrator-<version>-macos-arm64.zip` from the GitHub Release, extract it and run `first-install.command` from the extracted folder: the zip is the same tree as a clone (minus `tests/` and `.github/`), with the binaries already in `launcher/dist/macos-arm64/`. Strip the quarantine flag from the extracted folder first (`xattr -dr com.apple.quarantine <folder>`, see below); if Finder will not run the `.command`, `bash first-install.command` from Terminal does the same.
+
 `first-install.command` is the macOS shim (~130 LoC; see [`first-install.command:1-131`](../first-install.command)). It runs three steps in order, all forwarding your argv verbatim to `install.py`:
 
 1. **Python detect** — Apple Silicon Homebrew cascade first (`/opt/homebrew/opt/python@3.13/bin/python3.13`, `/opt/homebrew/opt/python@3.12/bin/python3.12`, `/opt/homebrew/opt/python@3.11/bin/python3.11`, then `/opt/homebrew/bin/python3.{13,12,11}`), then PATH (`python3.13`, `python3.12`, `python3.11`, `python3`, `python`). Each candidate is version-probed (`sys.version_info >= (3, 11)`); the first match wins. Intel Homebrew under `/usr/local/bin/` is reached via PATH probes. If no usable Python is found and Homebrew is installed, the shim prompts to run `brew install python@3.13` and re-probes.
 
-2. **Bootstrap prepass** — `install.py --bootstrap --json` writes a system-detection envelope to `state/logs/bootstrap-prepass.json`. Read-only; no network, no prompts. The envelope's `system.podman.machine_running` field is the cue for the next step.
+2. **Bootstrap prepass** — `install.py --bootstrap --json` writes a system-detection envelope to `state/logs/bootstrap-prepass.json`. Read-only; no network, no prompts. Optional — a failure does not stop the install — but not silent: its error goes to `state/logs/bootstrap-prepass.stderr` and the shim prints the exit code and the end of that error. The envelope's `system.podman.machine_running` field is the cue for the next step.
 
 3. **Full install** — `install.py <forwarded args>` runs the canonical 10-step flow (Python check → system detection → optional companions → venv → dependencies → containers → Ollama models → Weaviate collections + KG seed → MCP server registration in `~/.claude.json` → Claude CLI check).
 

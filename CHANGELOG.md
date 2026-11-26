@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Installing from a downloaded release zip works again, on every OS.** The v0.2.108 zips were missing the Python
+  package (`vco_lib/`), `scripts/`, the `launcher/` folder, `migrations/` and `pyproject.toml`, and carried the
+  launcher, hub and CLI binaries at the top of the archive, so `first-install` stopped at its first step with
+  `No module named 'vco_lib'`. The zip is now the full tagged tree (without the developer test suite and the CI
+  configuration) with the launcher, hub, updater and `vct-cli` binaries in `launcher/dist/<os>-<arch>/` — where a
+  clone has them and where the start scripts look. CI now installs from the zip on Linux, macOS and Windows, on pull
+  requests and before a release is published.
+- **The first-install bootstrap probe no longer fails silently.** When `install.py --bootstrap --json` failed,
+  `first-install.sh`, `first-install.command` and `install.ps1` (behind `first-install.bat`) threw its error away and
+  left an empty `state/logs/bootstrap-prepass.json`. The probe is still optional, but its error is now kept in
+  `state/logs/bootstrap-prepass.stderr` and the exit code and the end of the error are printed.
+
 ## [0.2.108] - 2026-11-23
 
 ### Fixed

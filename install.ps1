@@ -640,16 +640,38 @@ if (-not (Test-Path $prepassDir)) {
     New-Item -ItemType Directory -Path $prepassDir -Force | Out-Null
 }
 $prepassPath = Join-Path $prepassDir "bootstrap-prepass.json"
+# Optional, so a failure never stops the install — but it is never silent:
+# stderr goes to state\logs\bootstrap-prepass.stderr and a failed probe
+# prints its exit code and the end of that error here, before the install
+# step (which usually fails the same way, e.g. a tree without vco_lib\).
+# Same contract as first-install.sh / first-install.command. The preference
+# is relaxed around the call because under "Stop" Windows PowerShell 5.1
+# turns the first native stderr line into a terminating error.
+$prepassErr = Join-Path $prepassDir "bootstrap-prepass.stderr"
+$prepassExit = 0
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 try {
     if ($pythonArgs.Count -gt 0) {
-        & $pythonCmd @pythonArgs install.py --bootstrap --json 2>$null `
+        & $pythonCmd @pythonArgs install.py --bootstrap --json 2> $prepassErr `
             | Out-File -Encoding utf8 $prepassPath
     } else {
-        & $pythonCmd install.py --bootstrap --json 2>$null `
+        & $pythonCmd install.py --bootstrap --json 2> $prepassErr `
             | Out-File -Encoding utf8 $prepassPath
     }
+    $prepassExit = $LASTEXITCODE
 } catch {
-    # Soft-fail: any prepass error is non-blocking.
+    $prepassExit = -1
+    $_.Exception.Message | Out-File -Append -Encoding utf8 $prepassErr
+} finally {
+    $ErrorActionPreference = $prevEap
+}
+if ($prepassExit -ne 0) {
+    Write-Host "[first-install] WARNING: the bootstrap probe (install.py --bootstrap --json) exited $prepassExit; continuing with the install." -ForegroundColor Yellow
+    Write-Host "[first-install] Its error (full text: $prepassErr):" -ForegroundColor Yellow
+    if (Test-Path $prepassErr) {
+        Get-Content -LiteralPath $prepassErr -Tail 20 | ForEach-Object { Write-Host "  $_" }
+    }
 }
 
 # ---- Step 2: full install ----

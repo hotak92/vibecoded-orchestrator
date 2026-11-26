@@ -24,7 +24,9 @@ Download the latest archive for your OS from
 - macOS arm64: `vibecoded-orchestrator-<version>-macos-arm64.zip`
 - Windows x64: `vibecoded-orchestrator-<version>-windows-x64.zip`
 
-Extract, then double-click `first-install.{sh,command,desktop,bat}` for
+The zip holds the whole orchestrator (the same tree as a clone, with the
+prebuilt binaries for your OS in `launcher/dist/<os>-<arch>/`). Extract,
+then double-click `first-install.{sh,command,desktop,bat}` for
 your platform. The installer will:
 - Detect or auto-install Python 3.11+ (asks before sudo)
 - Detect or prompt for Podman/Docker
